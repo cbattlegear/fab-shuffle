@@ -1,0 +1,21 @@
+{
+    "id": "CREATE_NEW_GUID",
+    "properties": {
+        "source": {
+        },
+        "destination": {
+            "partitionOption": "None",
+            "writeBehavior": "Overwrite"
+        },
+        "enableStaging": false,
+        "translator": {
+            "type": "TabularTranslator"
+        },
+        "typeConversionSettings": {
+            "typeConversion": {
+                "allowDataTruncation": true,
+                "treatBooleanAsNumber": false
+            }
+        }
+    }
+}

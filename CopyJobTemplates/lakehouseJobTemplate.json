@@ -1,0 +1,30 @@
+{
+    "properties": {
+        "jobMode": "Batch",
+        "source": {
+            "type": "LakehouseTable",
+            "connectionSettings": {
+                "type": "Lakehouse",
+                "typeProperties": {
+                    "workspaceId": "SOURCE_WORKSPACE_ID",
+                    "artifactId": "SOURCE_LAKEHOUSE_ID",
+                    "rootFolder": "Tables"
+                }
+            }
+        },
+        "destination": {
+            "type": "LakehouseTable",
+            "connectionSettings": {
+                "type": "Lakehouse",
+                "typeProperties": {
+                    "workspaceId": "TARGET_WORKSPACE_ID",
+                    "artifactId": "TARGET_LAKEHOUSE_ID",
+                    "rootFolder": "Tables"
+                }
+            }
+        },
+        "policy": {
+            "timeout": "0.12:00:00"
+        }
+    }
+}

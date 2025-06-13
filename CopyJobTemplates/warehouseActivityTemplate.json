@@ -1,0 +1,20 @@
+{
+    "id": "CREATE_NEW_GUID",
+    "properties": {
+        "source": {
+        },
+        "destination": {
+            "tableOption": "autoCreate"
+        },
+        "enableStaging": true,
+        "translator": {
+            "type": "TabularTranslator"
+        },
+        "typeConversionSettings": {
+            "typeConversion": {
+                "allowDataTruncation": true,
+                "treatBooleanAsNumber": false
+            }
+        }
+    }
+}

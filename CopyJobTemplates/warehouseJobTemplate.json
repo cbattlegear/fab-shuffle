@@ -1,0 +1,30 @@
+{
+    "properties": {
+        "jobMode": "Batch",
+        "source": {
+            "type": "DataWarehouseTable",
+            "connectionSettings": {
+                "type": "DataWarehouse",
+                "typeProperties": {
+                    "workspaceId": "SOURCE_WORKSPACE_ID",
+                    "artifactId": "SOURCE_WAREHOUSE_ID",
+                    "endPoint": "SOURCE_WAREHOUSE_ENDPOINT"
+                }
+            }
+        },
+        "destination": {
+            "type": "DataWarehouseTable",
+            "connectionSettings": {
+                "type": "DataWarehouse",
+                "typeProperties": {
+                    "workspaceId": "TARGET_WORKSPACE_ID",
+                    "artifactId": "TARGET_WAREHOUSE_ID",
+                    "endPoint": "TARGET_WAREHOUSE_ENDPOINT"
+                }
+            }
+        },
+        "policy": {
+            "timeout": "0.12:00:00"
+        }
+    }
+}
