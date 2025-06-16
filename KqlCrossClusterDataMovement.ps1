@@ -57,7 +57,7 @@ function KqlCrossClusterDataMovement {
                     return
                 }
                 Write-Host "Retrying in $(5*$tryCount) seconds... Attempt $tryCount"
-                Sleep -Seconds 5*$tryCount
+                Start-Sleep -Seconds 5*$tryCount
             }
         }
     }    
