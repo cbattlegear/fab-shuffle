@@ -54,18 +54,29 @@ if ($capExists -eq $trueString) {
     if ($workspaceExists -eq $trueString) {
         Write-Host "Workspace $workspaceName exists."
         fab create "$workspaceName-$capacityRegion.Workspace" -P "capacityname=$capacityName"
-        
-        $scratchWorkspaceName = "scratch"
+
+        $scratchWorkspaceName = [guid]::NewGuid().ToString()
         Write-Host "Creating scratch workspace $scratchWorkspaceName and Lakehouse for CopyJobs."
         New-Item -ItemType Directory -Path "./local/$scratchWorkspaceName/" -Force | Out-Null
         #Create scratch workspace for CopyJobs
         fab create "$scratchWorkspaceName.Workspace" -P "capacityname=$capacityName"
+
         fab create "$scratchWorkspaceName.Workspace/hold.Lakehouse"
 
         $workspaces = fab api workspaces | ConvertFrom-Json
         $currentWorkspace = $workspaces.text.value | Where-Object { $_.displayName -eq "$workspaceName" }
         $newWorkspace = $workspaces.text.value | Where-Object { $_.displayName -eq "$workspaceName-$capacityRegion" }
         $scratchWorkspace = $workspaces.text.value | Where-Object { $_.displayName -eq "$scratchWorkspaceName" }
+
+        $CurrentWorkspaceAclRespose = fab api -X get "/admin/workspaces/$($currentWorkspace.id)/users" | ConvertFrom-Json
+        $CurrentWorkspaceAcl = $CurrentWorkspaceAclRespose.text.accessDetails
+
+        #Add all workspace Admins to the scratch workspace
+        foreach ($acl in $CurrentWorkspaceAcl) {
+            if (($acl.principal.type -eq 'User' -or $acl.principal.type -eq 'Group') -and $acl.workspaceAccessDetails.workspaceRole -eq 'Admin') {
+                fab acl set "$scratchWorkspaceName.Workspace" -I $acl.principal.id -R $acl.workspaceAccessDetails.workspaceRole.ToLower() -f
+            }
+        }
 
         $replacements = @{
             $currentWorkspace.id = $newWorkspace.id
@@ -220,6 +231,13 @@ if ($capExists -eq $trueString) {
 
             DacFxSchemaTransfer -spnClientId $spnClientId -spnClientSecret $spnClientSecret -spnTenantId $spnTenantId -SourceSqlEndpoint $lakehouse.properties.sqlEndpointProperties.connectionString -TargetSqlEndpoint $targetLakehouseSqlEndpoint -WarehouseName $lakehouse.displayName -ScratchDirectory "./local/$scratchWorkspaceName/" -SourceType 'Lakehouse'
         }
+    
+        # Set the ACLs for the new workspace
+        # This will loop all permissions and add them to the new workspace
+        foreach ($acl in $CurrentWorkspaceAcl) {
+            fab acl set "$scratchWorkspaceName.Workspace" -I $acl.principal.id -R $acl.workspaceAccessDetails.workspaceRole.ToLower() -f
+        }
+
     }
 }
 
