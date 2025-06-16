@@ -28,6 +28,9 @@ function ReplaceAllOccurances {
     return $originalString
 }
 
+Import-Module Az.Accounts
+Import-Module SqlServer
+
 . "$PSScriptRoot/DataTransferCopyJob.ps1"
 . "$PSScriptRoot/KqlCrossClusterDataMovement.ps1"
 . "$PSScriptRoot/DacFxSchemaTransfer.ps1"
@@ -82,7 +85,7 @@ if ($capExists -eq $trueString) {
             $currentWorkspace.id = $newWorkspace.id
         }
         
-        $eventhouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/eventhouses" | ConvertFrom-Json
+        <# $eventhouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/eventhouses" | ConvertFrom-Json
         $eventhouses = $eventhouseResponse.text.value
         foreach ($eventhouse in $eventhouses) {
             #fab auth login -u $spnClientId -p $spnClientSecret -t $spnTenantId
@@ -139,6 +142,7 @@ if ($capExists -eq $trueString) {
             }
         } #>
 
+        <#
         $lakehouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/lakehouses" | ConvertFrom-Json
         $lakehouses = $lakehouseResponse.text.value
         foreach ($lakehouse in $lakehouses) {
@@ -173,7 +177,7 @@ if ($capExists -eq $trueString) {
 
             # Transfer Lakehouse File Data via AzCopy
             AzCopyOneLakeFiles -source $sourceLakehouseFilesPath -destination $targetLakehouseFilesPath -ScratchDirectory "./local/$scratchWorkspaceName/$($lakehouse.displayName)/"
-        }
+        } #>
 
         $warehouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/warehouses" | ConvertFrom-Json
 

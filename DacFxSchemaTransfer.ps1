@@ -30,7 +30,7 @@ function Test-SQLConnection
     try
     {
         Connect-AzAccount -ServicePrincipal -TenantId $spnTenantId -Credential (New-Object System.Management.Automation.PSCredential($spnClientId, (ConvertTo-SecureString $spnClientSecret -AsPlainText -Force)))
-        $token = ConvertFrom-SecureStringToPlainText (Get-AzAccessToken -ResourceUrl "https://database.windows.net").Token
+        $token = ConvertFrom-SecureStringToPlainText (Get-AzAccessToken -ResourceUrl "https://database.windows.net" -AsSecureString).Token
         Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -AccessToken $token -Query "select COUNT(*) from sys.dm_exec_requests" -ErrorAction Stop -Verbose 4>&1
         Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -AccessToken $token -Query "select COUNT(*) from sys.dm_exec_requests" -ErrorAction Stop -Verbose 4>&1
 
@@ -65,10 +65,6 @@ function DacFxSchemaTransfer {
     $dotnetToolsDir = "$env:HOME/.dotnet/tools/"
     $sqlpackage = "$dotnetToolsDir/sqlpackage"
     & $sqlpackage /Action:Extract /TargetFile:"$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" /SourceConnectionString:"Server=$SourceSqlEndpoint;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication=Active Directory Service Principal;User Id=$spnClientId; Password=$spnClientSecret"
-    #sqlpackage /Action:Extract /TargetFile:"$ScratchDirectory/Test-$WarehouseName-$TransferGuid.dacpac" /SourceConnectionString:"Server=$TargetSqlEndpoint;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication=Active Directory Service Principal;User Id=$spnClientId; Password=$spnClientSecret"
-    #if ($LASTEXITCODE -ne 0) {
-    #    Write-Error "DacFx Schema Extract failed with exit code $LASTEXITCODE"
-    #}
 
     $unpackdacpac = "$dotnetToolsDir/unpackdacpac"
     if ($SourceType -eq 'Lakehouse') {
@@ -82,10 +78,7 @@ function DacFxSchemaTransfer {
     Connect-AzAccount -ServicePrincipal -TenantId $spnTenantId -Credential (New-Object System.Management.Automation.PSCredential($spnClientId, (ConvertTo-SecureString $spnClientSecret -AsPlainText -Force)))
     $token = ConvertFrom-SecureStringToPlainText (Get-AzAccessToken -ResourceUrl "https://database.windows.net").Token
     Invoke-Sqlcmd -DisableCommands -DisableVariables -ServerInstance $TargetSqlEndpoint -Database $WarehouseName -AccessToken $token -InputFile "$ScratchDirectory/$WarehouseName-$TransferGuid/Deploy.sql"
-    #sqlpackage /Action:Publish /SourceFile:"$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" /TargetConnectionString:"Server=$TargetSqlEndpoint;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=240;Authentication=Active Directory Service Principal;User Id=$spnClientId; Password=$spnClientSecret" /Diagnostics:True /p:IgnoreFileAndLogFilePath=True /p:VerifyDeployment=False /p:ScriptDatabaseOptions=False
-    #Invoke-Sqlcmd -ServerInstance localhost -Database master -Query "CREATE DATABASE [$WarehouseName]" -ErrorAction Stop -UserName sa -Password 'MyPass@word'
-    #sqlpackage /Action:Script /SourceFile:"$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" /TargetConnectionString:"Server=localhost;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;User Id=sa; Password=MyPass@word" /op:"$ScratchDirectory/sqlscripts/$WarehouseName-$TransferGuid.sql" /Diagnostics:True /p:IgnoreFileAndLogFilePath=True 
-    
+
     if ($LASTEXITCODE -ne 0) {
         Write-Error "DacFx Schema Publish failed with exit code $LASTEXITCODE"
     }
