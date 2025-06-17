@@ -24,7 +24,8 @@ RUN pwsh -Command "Install-Package -Name Microsoft.IdentityModel.Abstractions -R
 
 WORKDIR /app
 COPY CopyJobTemplates CopyJobTemplates/
-COPY *.ps1 .
+COPY lib lib/
+COPY fab-shuffle.ps1 .
 COPY run.sh .
 RUN chmod +x run.sh
 RUN mkdir ./local/
