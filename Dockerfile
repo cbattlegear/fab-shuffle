@@ -30,4 +30,4 @@ COPY run.sh .
 RUN chmod +x run.sh
 RUN mkdir ./local/
 
-ENTRYPOINT [ "bash", "/app/run.sh" ]
+CMD [ "bash", "/app/run.sh" ]
