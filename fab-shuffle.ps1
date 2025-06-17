@@ -13,8 +13,14 @@ param (
 
 
 #TODO Workspace folder support needs to be added
-#TODO Research KQL Database cross db copy/powershell connectivity
+#TODO ACL info for connections, I see this getting more important with pipelines, dataflows, and seeing it now with shortcuts
+#TODO Allow for parallel Copy Jobs to be run and monitored
+#TODO Add support for Dataflows, Pipelines, and other items that are not currently supported
+#TODO Allow Prefix/Postfix to Workspace
+#TODO Better error handling and logging
+#TODO Full permissions precheck or precheck without run 
 
+# Basic replacement function to replace all occurrences of keys in a string with their corresponding values from a hashtable
 function ReplaceAllOccurances {
     [OutputType([string])]
     Param
@@ -29,338 +35,20 @@ function ReplaceAllOccurances {
     return $originalString
 }
 
-
-function ConvertFrom-SecureStringToPlainText {
-    param (
-        [Parameter(Mandatory = $true)]
-        [System.Security.SecureString]$SecureString
-    )
-
-    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    try {
-        return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
-    }
-    finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
-    }
-}
-
-
-function Test-SQLConnection
-{
-    [OutputType([bool])]
-    Param
-    (
-        [string]$ServerName,
-        [string]$DatabaseName,
-        [string]$spnClientId,
-        [string]$spnClientSecret,
-        [string]$spnTenantId
-    )
-    try
-    {
-        Connect-AzAccount -ServicePrincipal -TenantId $spnTenantId -Credential (New-Object System.Management.Automation.PSCredential($spnClientId, (ConvertTo-SecureString $spnClientSecret -AsPlainText -Force)))
-        $token = ConvertFrom-SecureStringToPlainText (Get-AzAccessToken -ResourceUrl "https://database.windows.net").Token
-        Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -AccessToken $token -Query "select COUNT(*) from sys.dm_exec_requests" -ErrorAction Stop -Verbose 4>&1
-        Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -AccessToken $token -Query "select COUNT(*) from sys.dm_exec_requests" -ErrorAction Stop -Verbose 4>&1
-
-        return $true;
-    }
-    catch
-    {
-        Write-Host "SQL Connection failed: $($_.Exception.Message)"
-        return $false;
-    }
-}
-
-function AzCopyOneLakeFiles {
-    param (
-        [string]$source,
-        [string]$destination,
-        [string]$ScratchDirectory
-    )
-    # AzCopy fails on files when doing direct copy from one lake to another
-    # Current workaround is to stage locally first then copy to new onelake
-    New-Item -ItemType Directory -Path $ScratchDirectory -Force | Out-Null
-    azcopy copy --trusted-microsoft-suffixes=onelake.dfs.fabric.microsoft.com $source $ScratchDirectory --recursive
-    azcopy copy --trusted-microsoft-suffixes=onelake.dfs.fabric.microsoft.com "$ScratchDirectory/*" $destination --recursive
-    rm -rf $ScratchDirectory
-}
-
-function DacFxSchemaTransfer {
-    param (
-        [string]$spnClientId,
-        [string]$spnClientSecret,
-        [string]$spnTenantId,
-        [string]$SourceSqlEndpoint,
-        [string]$TargetSqlEndpoint,
-        [string]$WarehouseName,
-        [string]$ScratchDirectory,
-        [string]$SourceType
-    )
-    # Verify target SQL Endpoint is deployed and available 
-    $sqlConnected = Test-SQLConnection -ServerName $TargetSqlEndpoint -DatabaseName $WarehouseName -spnClientId $spnClientId -spnClientSecret $spnClientSecret -spnTenantId $spnTenantId
-    while ($sqlConnected -eq $false) {
-        Write-Host "Waiting for SQL Endpoint to be available..."
-        Start-Sleep -Seconds 15
-        $sqlConnected = Test-SQLConnection -ServerName $TargetSqlEndpoint -DatabaseName $WarehouseName -spnClientId $spnClientId -spnClientSecret $spnClientSecret -spnTenantId $spnTenantId
-    }
-    $TransferGuid = [guid]::NewGuid().ToString()
-    $dotnetToolsDir = "$env:HOME/.dotnet/tools/"
-    $sqlpackage = "$dotnetToolsDir/sqlpackage"
-    & $sqlpackage /Action:Extract /TargetFile:"$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" /SourceConnectionString:"Server=$SourceSqlEndpoint;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication=Active Directory Service Principal;User Id=$spnClientId; Password=$spnClientSecret"
-    #sqlpackage /Action:Extract /TargetFile:"$ScratchDirectory/Test-$WarehouseName-$TransferGuid.dacpac" /SourceConnectionString:"Server=$TargetSqlEndpoint;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication=Active Directory Service Principal;User Id=$spnClientId; Password=$spnClientSecret"
-    #if ($LASTEXITCODE -ne 0) {
-    #    Write-Error "DacFx Schema Extract failed with exit code $LASTEXITCODE"
-    #}
-
-    $unpackdacpac = "$dotnetToolsDir/unpackdacpac"
-    if ($SourceType -eq 'Lakehouse') {
-        & $unpackdacpac unpack "$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" "$ScratchDirectory/$WarehouseName-$TransferGuid/" --deploy-script-exclude-object-type Tables --deploy-script-exclude-object-type Schemas
-    } else {
-        & $unpackdacpac unpack "$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" "$ScratchDirectory/$WarehouseName-$TransferGuid/"
-    }
-
-    (Get-Content "$ScratchDirectory/$WarehouseName-$TransferGuid/Deploy.sql" | Select-Object -Skip 44) | Set-Content "$ScratchDirectory/$WarehouseName-$TransferGuid/Deploy.sql"
-
-    Connect-AzAccount -ServicePrincipal -TenantId $spnTenantId -Credential (New-Object System.Management.Automation.PSCredential($spnClientId, (ConvertTo-SecureString $spnClientSecret -AsPlainText -Force)))
-    $token = ConvertFrom-SecureStringToPlainText (Get-AzAccessToken -ResourceUrl "https://database.windows.net").Token
-    Invoke-Sqlcmd -DisableCommands -DisableVariables -ServerInstance $TargetSqlEndpoint -Database $WarehouseName -AccessToken $token -InputFile "$ScratchDirectory/$WarehouseName-$TransferGuid/Deploy.sql"
-    #sqlpackage /Action:Publish /SourceFile:"$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" /TargetConnectionString:"Server=$TargetSqlEndpoint;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=240;Authentication=Active Directory Service Principal;User Id=$spnClientId; Password=$spnClientSecret" /Diagnostics:True /p:IgnoreFileAndLogFilePath=True /p:VerifyDeployment=False /p:ScriptDatabaseOptions=False
-    #Invoke-Sqlcmd -ServerInstance localhost -Database master -Query "CREATE DATABASE [$WarehouseName]" -ErrorAction Stop -UserName sa -Password 'MyPass@word'
-    #sqlpackage /Action:Script /SourceFile:"$ScratchDirectory/$WarehouseName-$TransferGuid.dacpac" /TargetConnectionString:"Server=localhost;Initial Catalog=$WarehouseName;MultipleActiveResultSets=False;User Id=sa; Password=MyPass@word" /op:"$ScratchDirectory/sqlscripts/$WarehouseName-$TransferGuid.sql" /Diagnostics:True /p:IgnoreFileAndLogFilePath=True 
-    
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "DacFx Schema Publish failed with exit code $LASTEXITCODE"
-    }
-}
-
-function KqlCrossClusterDataMovement {
-    param (
-        [string]$sourceClusterQueryUri,
-        [string]$targetClusterIngestUri,
-        [string]$databaseName,
-        [string]$spnClientId,
-        [string]$spnClientSecret,
-        [string]$spnTenantId
-    )
-    Write-Host "Moving data from $sourceClusterQueryUri $databaseName to $targetClusterIngestUri $databaseName"
-    
-    # Create a connection string builder for AAD application authentication
-    $kqlQuery = New-Object Kusto.Data.KustoConnectionStringBuilder($sourceClusterQueryUri, $databaseName)
-    $kqlQuery = $kqlQuery.WithAadApplicationKeyAuthentication($spnClientId, $spnClientSecret, $spnTenantId)
-
-    $kqlIngest = New-Object Kusto.Data.KustoConnectionStringBuilder($targetClusterIngestUri, $databaseName)
-    $kqlIngest = $kqlIngest.WithAadApplicationKeyAuthentication($spnClientId, $spnClientSecret, $spnTenantId)
-
-    # Create a Kusto query provider
-    $queryClient = [Kusto.Data.Net.Client.KustoClientFactory]::CreateCslQueryProvider($kqlQuery)
-    $ingestClient = [Kusto.Data.Net.Client.KustoClientFactory]::CreateCslAdminProvider($kqlIngest)
-
-    # Run a query
-    $query = ".show tables | project TableName"
-    $reader = $queryClient.ExecuteQuery($query)
-
-    # Read results
-    while ($reader.Read()) {
-        $table = $reader[0]  # Output first column of each row
-        $ingestQuery = ".set-or-replace $table with(distributed=true) <| cluster('$sourceClusterQueryUri').database('$databaseName').$table"
-        
-        $tryCount = 0
-        while ($tryCount -lt 5) {
-            try {
-                $ingestReader = $ingestClient.ExecuteControlCommand($ingestQuery)
-
-                Write-Host "Ingested data for table: $table"
-                while ($ingestReader.Read()) {
-                    Write-Host "Rows moved: $($ingestReader[5])"  # Output first column of each row
-                }
-                $tryCount = 6 # Exit loop on success
-            } catch {
-                Write-Host "Failed to set or replace table $table $($_.Exception.Message)"
-                $tryCount++
-                if ($tryCount -ge 5) {
-                    Write-Error "Failed to set or replace table $table after 5 attempts."
-                    return
-                }
-                Write-Host "Retrying in $(5*$tryCount) seconds... Attempt $tryCount"
-                Sleep -Seconds 5*$tryCount
-            }
-        }
-    }    
-}
-
-function DataTransferCopyJob {
-    param (
-        [string]$itemName,
-        [string]$itemType,
-        [PSCustomObject]$sourceWorkspace,
-        [PSCustomObject]$targetWorkspace,
-        [PSCustomObject]$scratchWorkspace
-    )
-    # Item Types: Warehouse, Lakehouse, SchemaEnabledLakehouse
-    $sourceWorkspaceId = $sourceWorkspace.id
-    $targetWorkspaceId = $targetWorkspace.id
-    $scratchWorkspaceId = $scratchWorkspace.id
-
-    $sourceWorkspaceName = $sourceWorkspace.displayName
-    $targetWorkspaceName = $targetWorkspace.displayName
-    $scratchWorkspaceName = $scratchWorkspace.displayName
-
-    # Check if the item is a Lakehouse or SchemaEnabledLakehouse
-
-    $copyJobName = "CopyJob_$($itemType)_$($itemName)"
-    $activities = [System.Collections.ArrayList]::new()
-    $CopyJobObject = [PSCustomObject]@{}
-    if ($itemType -eq 'Lakehouse' -or $itemType -eq 'SchemaEnabledLakehouse') {
-        $sourceLakehouseId = fab get "$sourceWorkspaceName.Workspace/$itemName.Lakehouse" -q id
-        $targetLakehouseId = fab get "$targetWorkspaceName.Workspace/$itemName.Lakehouse" -q id
-        $templateContent = Get-Content CopyJobTemplates/lakehouseJobTemplate.json
-        $templateContent = $templateContent -replace 'SOURCE_WORKSPACE_ID', $sourceWorkspaceId
-        $templateContent = $templateContent -replace 'TARGET_WORKSPACE_ID', $targetWorkspaceId
-        $templateContent = $templateContent -replace 'SOURCE_LAKEHOUSE_ID', $sourceLakehouseId
-        $templateContent = $templateContent -replace 'TARGET_LAKEHOUSE_ID', $targetLakehouseId
-        $CopyJobObject = $templateContent | ConvertFrom-Json
-        $activityTemplate = Get-Content CopyJobTemplates/lakehouseActivityTemplate.json | ConvertFrom-Json
-        if ($itemType -eq 'SchemaEnabledLakehouse') {
-            $activityTemplate.properties.source | Add-Member -MemberType NoteProperty -Name "datasetSettings" -Value $null
-            $activityTemplate.properties.destination | Add-Member -MemberType NoteProperty -Name "datasetSettings" -Value $null
-            $activityTemplate.properties.source.datasetSettings = [PSCustomObject]@{}
-            $activityTemplate.properties.destination.datasetSettings = [PSCustomObject]@{}
-            $activityTemplate.properties.source.datasetSettings | Add-Member -MemberType NoteProperty -Name "table" -Value ''
-            $activityTemplate.properties.destination.datasetSettings | Add-Member -MemberType NoteProperty -Name "table" -Value ''
-            $activityTemplate.properties.source.datasetSettings | Add-Member -MemberType NoteProperty -Name "schema" -Value ''
-            $activityTemplate.properties.destination.datasetSettings | Add-Member -MemberType NoteProperty -Name "schema" -Value ''
-            # Example Activity datasetSettings
-            
-            #"datasetSettings": {
-            #    "schema": "year_2017",
-            #    "table": "green_tripdata_2017"
-            #}
-            # Where-Object { $_ -notlike '*.Shortcut' } filtering all shortcuts from copy jobs
-            $schemas = @(fab ls "$sourceWorkspaceName.Workspace/$itemName.Lakehouse/Tables") | Where-Object { $_ -notlike '*.Shortcut' }
-            foreach ($schema in $schemas) {
-                $tables = @(fab ls "$sourceWorkspaceName.Workspace/$itemName.Lakehouse/Tables/$schema") | Where-Object { $_ -notlike '*.Shortcut' }
-                foreach ($table in $tables) {
-                    $activityItem = $activityTemplate | ConvertTo-Json -Depth 10 | ConvertFrom-Json
-                    $activityItem.properties.source.datasetSettings.schema = $schema.ToString()
-                    $activityItem.properties.source.datasetSettings.table = $table.ToString()
-                    $activityItem.properties.destination.datasetSettings.schema = $schema.ToString()
-                    $activityItem.properties.destination.datasetSettings.table = $table.ToString()
-                    $activityItem.id = [guid]::NewGuid().ToString()
-                    if($table.ToString() -ne '[]') {
-                        $activities.Add($activityItem) | Out-Null
-                    }
-                    
-                } 
-            }
-        } else {
-            $activityTemplate.properties.source | Add-Member -MemberType NoteProperty -Name "datasetSettings" -Value $null
-            $activityTemplate.properties.destination | Add-Member -MemberType NoteProperty -Name "datasetSettings" -Value $null
-            $activityTemplate.properties.source.datasetSettings = [PSCustomObject]@{}.PSObject.Copy()
-            $activityTemplate.properties.destination.datasetSettings = [PSCustomObject]@{}.PSObject.Copy()
-            $activityTemplate.properties.source.datasetSettings | Add-Member -MemberType NoteProperty -Name "table" -Value ''
-            $activityTemplate.properties.destination.datasetSettings | Add-Member -MemberType NoteProperty -Name "table" -Value ''
-
-            # Where-Object { $_ -notlike '*.Shortcut' } filtering all shortcuts from copy jobs
-            $tables = @(fab ls "$sourceWorkspaceName.Workspace/$itemName.Lakehouse/Tables") | Where-Object { $_ -notlike '*.Shortcut' }
-
-            foreach ($table in $tables) {
-
-                $activityItem = $activityTemplate | ConvertTo-Json -Depth 10 | ConvertFrom-Json
-                $activityItem.properties.source.datasetSettings.table = $table.ToString()
-                $activityItem.properties.destination.datasetSettings.table = $table.ToString()
-                $activityItem.id = [guid]::NewGuid().ToString()
-                $activities.Add($activityItem) | Out-Null
-            } 
-        }
-    } elseif ($itemType -eq 'Warehouse') {
-        $sourceWarehouseId = fab get "$sourceWorkspaceName.Workspace/$itemName.Warehouse" -q id
-        $targetWarehouseId = fab get "$targetWorkspaceName.Workspace/$itemName.Warehouse" -q id
-        $sourceWarehouseEndpoint = fab get "$sourceWorkspaceName.Workspace/$itemName.Warehouse" -q properties.connectionInfo
-        $targetWarehouseEndpoint = fab get "$targetWorkspaceName.Workspace/$itemName.Warehouse" -q properties.connectionInfo
-        $templateContent = Get-Content CopyJobTemplates/warehouseJobTemplate.json
-        $templateContent = $templateContent -replace 'SOURCE_WORKSPACE_ID', $sourceWorkspaceId
-        $templateContent = $templateContent -replace 'TARGET_WORKSPACE_ID', $targetWorkspaceId
-        $templateContent = $templateContent -replace 'SOURCE_WAREHOUSE_ID', $sourceWarehouseId
-        $templateContent = $templateContent -replace 'TARGET_WAREHOUSE_ID', $targetWarehouseId
-        $templateContent = $templateContent -replace 'SOURCE_WAREHOUSE_ENDPOINT', $sourceWarehouseEndpoint
-        $templateContent = $templateContent -replace 'TARGET_WAREHOUSE_ENDPOINT', $targetWarehouseEndpoint
-        $CopyJobObject = $templateContent | ConvertFrom-Json
-        
-        $activityTemplate = Get-Content CopyJobTemplates/warehouseActivityTemplate.json | ConvertFrom-Json
-
-        $activityTemplate.properties.source | Add-Member -MemberType NoteProperty -Name "datasetSettings" -Value $null
-        $activityTemplate.properties.destination | Add-Member -MemberType NoteProperty -Name "datasetSettings" -Value $null
-        $activityTemplate.properties.source.datasetSettings = [PSCustomObject]@{}
-        $activityTemplate.properties.destination.datasetSettings = [PSCustomObject]@{}
-        $activityTemplate.properties.source.datasetSettings | Add-Member -MemberType NoteProperty -Name "table" -Value ''
-        $activityTemplate.properties.destination.datasetSettings | Add-Member -MemberType NoteProperty -Name "table" -Value ''
-        $activityTemplate.properties.source.datasetSettings | Add-Member -MemberType NoteProperty -Name "schema" -Value ''
-        $activityTemplate.properties.destination.datasetSettings | Add-Member -MemberType NoteProperty -Name "schema" -Value ''
-
-        $schemas = @(fab ls "$sourceWorkspaceName.Workspace/$itemName.Warehouse/Tables") | Where-Object { $_ -notlike '*.Shortcut' }
-        foreach ($schema in $schemas) {
-            $tables = @(fab ls "$sourceWorkspaceName.Workspace/$itemName.Warehouse/Tables/$schema") | Where-Object { $_ -notlike '*.Shortcut' }
-            foreach ($table in $tables) {
-                $activityItem = $activityTemplate | ConvertTo-Json -Depth 10 | ConvertFrom-Json
-                $activityItem.properties.source.datasetSettings.schema = $schema.ToString()
-                $activityItem.properties.source.datasetSettings.table = $table.ToString()
-                $activityItem.properties.destination.datasetSettings.schema = $schema.ToString()
-                $activityItem.properties.destination.datasetSettings.table = $table.ToString()
-                $activityItem.id = [guid]::NewGuid().ToString()
-                if($table.ToString() -ne '[]') {
-                    $activities.Add($activityItem) | Out-Null
-                }
-            } 
-        }
-
-    }
-
-    if ($activities.Count -gt 0) {
-        
-        $CopyJobObject | Add-Member -MemberType NoteProperty -Name "activities" -Value $activities
-        New-Item -ItemType Directory -Path "./local/$scratchWorkspaceName/$copyJobName.CopyJob/" -Force | Out-Null
-        $CopyJobObject | ConvertTo-Json -Depth 10 | Set-Content -Path "./local/$scratchWorkspaceName/$copyJobName.CopyJob/copyjob-content.json"
-        
-        # .platform hidden file required for copy job schema
-        $platformFile = Get-Content CopyJobTemplates/template.copyjob.platform
-        $platformFile = $platformFile -replace 'REPLACE-COPY-JOB-NAME', $copyJobName
-        Set-Content -Path "./local/$scratchWorkspaceName/$copyJobName.CopyJob/.platform" -Value $platformFile
-        # Create the copy job
-        fab import "$scratchWorkspaceName.Workspace/$copyJobName.CopyJob" -i "./local/$scratchWorkspaceName/$copyJobName.CopyJob" -f
-        $copyJobId = fab get "$scratchWorkspaceName.Workspace/$copyJobName.CopyJob" -q id
-        fab api -X post "workspaces/$scratchWorkspaceId/items/$copyJobId/jobs/instances?jobType=CopyJob"
-        $copyJobStatus = fab api -X get "workspaces/$scratchWorkspaceId/items/$copyJobId/jobs/instances" | ConvertFrom-Json
-        $copyJobStatusValue = $copyJobStatus.text.value[0].status
-        while ($copyJobStatusValue -ne 'Completed' -and $copyJobStatusValue -ne 'Failed') {
-            Write-Host "Copy job $copyJobName is in progress. Status: $copyJobStatusValue"
-            Start-Sleep -Seconds 5
-            $copyJobStatus = fab api -X get "workspaces/$scratchWorkspaceId/items/$copyJobId/jobs/instances" | ConvertFrom-Json
-            $copyJobStatusValue = $copyJobStatus.text.value[0].status
-        }
-        if ($copyJobStatusValue -eq 'Completed') {
-            Write-Host "Copy job $copyJobName completed successfully."
-        } else {
-            Write-Host "Copy job $copyJobName failed."
-        }
-    }
-}
-
+# Importing these modules for 
 Import-Module Az.Accounts
 Import-Module SqlServer
 
-# Manual dependency loading for KQL querying and ingestion
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Microsoft.Azure.Kusto.Ingest.13.0.2/lib/net8.0/Kusto.Ingest.dll"
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Microsoft.Azure.Kusto.Data.13.0.2/lib/net8.0/Kusto.Data.dll"
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Microsoft.Azure.Kusto.Cloud.Platform.13.0.2/lib/net8.0/Kusto.Cloud.Platform.dll"
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Microsoft.Azure.Kusto.Cloud.Platform.Msal.13.0.2/lib/net8.0/Kusto.Cloud.Platform.Msal.dll"
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Azure.Core.1.46.1/lib/net8.0/Azure.Core.dll"
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Microsoft.Identity.Client.4.72.1/lib/net8.0/Microsoft.Identity.Client.dll"
-Add-Type -Path "/usr/local/share/PackageManagement/NuGet/Packages/Microsoft.IdentityModel.Abstractions.8.9.0/lib/net8.0/Microsoft.IdentityModel.Abstractions.dll"
+# Import extra functions, moved to lib folder for better organization
+. "$PSScriptRoot/lib/DataTransferCopyJob.ps1"
+. "$PSScriptRoot/lib/KqlCrossClusterDataMovement.ps1"
+. "$PSScriptRoot/lib/DacFxSchemaTransfer.ps1"
+. "$PSScriptRoot/lib/AzCopyOneLakeFiles.ps1"
 
+# Magic string to handle the output from the `fab exists` command
 $trueString = '* true'
 
+# Adding environment variables for AzCopy and Fabric authentication
 $env:AZCOPY_AUTO_LOGIN_TYPE="SPN"
 $env:AZCOPY_SPA_APPLICATION_ID=$spnClientId
 $env:AZCOPY_SPA_CLIENT_SECRET=$spnClientSecret
@@ -373,6 +61,7 @@ $env:FAB_TENANT_ID=$spnTenantId
 # Check if capacity exists
 $capExists = fab exists ".capacities/$capacityName.Capacity"
 
+# I should break this logic out in a "prereq" function that can be called independently via CLI
 if ($capExists -eq $trueString) {
     Write-Host "Capacity $capacityName exists."
     $capacityRegion = fab get ".capacities/$capacityName.Capacity" -q location
@@ -380,46 +69,75 @@ if ($capExists -eq $trueString) {
     if ($workspaceExists -eq $trueString) {
         Write-Host "Workspace $workspaceName exists."
         fab create "$workspaceName-$capacityRegion.Workspace" -P "capacityname=$capacityName"
-        
-        $scratchWorkspaceName = "scratch"
+
+        # Using GUID for scratch workspace name to avoid conflicts
+        $scratchWorkspaceName = [guid]::NewGuid().ToString()
         Write-Host "Creating scratch workspace $scratchWorkspaceName and Lakehouse for CopyJobs."
+
+        # Create local directory for temporary storage
         New-Item -ItemType Directory -Path "./local/$scratchWorkspaceName/" -Force | Out-Null
+        
         #Create scratch workspace for CopyJobs
         fab create "$scratchWorkspaceName.Workspace" -P "capacityname=$capacityName"
+
+        # IMPORTANT: We need to create a Lakehouse in the scratch workspace or we cannot create CopyJobs
+        # I haven't determined the exact mechanism yet, but it seems like the workspace isn't fully initialized until a Lakehouse is created
         fab create "$scratchWorkspaceName.Workspace/hold.Lakehouse"
 
+        # Get the current workspace and new workspace details
+        # Learned it was easier to get the workspace details via API than using the CLI
         $workspaces = fab api workspaces | ConvertFrom-Json
         $currentWorkspace = $workspaces.text.value | Where-Object { $_.displayName -eq "$workspaceName" }
         $newWorkspace = $workspaces.text.value | Where-Object { $_.displayName -eq "$workspaceName-$capacityRegion" }
         $scratchWorkspace = $workspaces.text.value | Where-Object { $_.displayName -eq "$scratchWorkspaceName" }
 
+        $CurrentWorkspaceAclRespose = fab api -X get "/admin/workspaces/$($currentWorkspace.id)/users" | ConvertFrom-Json
+        $CurrentWorkspaceAcl = $CurrentWorkspaceAclRespose.text.accessDetails
+
+        #Add all workspace Admins to the scratch workspace
+        foreach ($acl in $CurrentWorkspaceAcl) {
+            if (($acl.principal.type -eq 'User' -or $acl.principal.type -eq 'Group') -and $acl.workspaceAccessDetails.workspaceRole -eq 'Admin') {
+                fab acl set "$scratchWorkspaceName.Workspace" -I $acl.principal.id -R $acl.workspaceAccessDetails.workspaceRole.ToLower() -f
+            }
+        }
+
+        # Here we track all string replacements in the hash table, eventually I'll need to figure out how to handle this better
+        # or at least how to determine order of creation for items that are dependent on each other
         $replacements = @{
             $currentWorkspace.id = $newWorkspace.id
         }
         
+        # Here we start with the creation of the Eventhouses for KQL Databases
         $eventhouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/eventhouses" | ConvertFrom-Json
         $eventhouses = $eventhouseResponse.text.value
-        <# foreach ($eventhouse in $eventhouses) {
-            #fab auth login -u $spnClientId -p $spnClientSecret -t $spnTenantId
+        foreach ($eventhouse in $eventhouses) {
+            # Skip the Monitoring Eventhouse as it is a system eventhouse and cannot be created via CLI
             if($eventhouse.displayName -eq 'Monitoring Eventhouse') {
                 Write-Warning "Skipping Monitoring Eventhouse as it can only be created via Monitoring Settings."
                 continue
             }
+            # Eventhouses can be exported/imported so we use this to get all the details instead of manually creating them
             fab export "$workspaceName.Workspace/$($eventhouse.displayName).Eventhouse" -o "./local/$scratchWorkspaceName" -f
             fab import "$workspaceName-$capacityRegion.Workspace/$($eventhouse.displayName).Eventhouse" -i "./local/$scratchWorkspaceName/$($eventhouse.displayName).Eventhouse/" -f
 
+            # Standard process to get the new Item ID and properties
             $newEventhouseId = fab get "$workspaceName-$capacityRegion.Workspace/$($eventhouse.displayName).Eventhouse" -q id
             $newEventhouseResponse = fab api -X get "workspaces/$($newWorkspace.id)/eventhouses/$newEventhouseId" | ConvertFrom-Json
             $newEventhouse = $newEventhouseResponse.text
 
+            # Add the new Eventhouse ID and properties to the replacements hash table
             $replacements[$eventhouse.id] = $newEventhouseId
             $replacements[$eventhouse.properties.queryServiceUri] = $newEventhouse.properties.queryServiceUri
             $replacements[$eventhouse.properties.ingestionServiceUri] = $newEventhouse.properties.ingestionServiceUri
 
+            # Loop through each KQL Database in the Eventhouse
             foreach($kqldbId in $eventhouse.properties.databasesItemIds) {
                 $kqldbResponse = fab api -X get "workspaces/$($currentWorkspace.id)/kqldatabases/$kqldbId" | ConvertFrom-Json
                 $kqldb = $kqldbResponse.text
+                # If the KQL Database is a ReadWrite database, we can export and import it, shortcut/follower databases
+                # don't have a way to get their connection properties via API yet so we skip them for now
                 if($kqldb.properties.databaseType -eq 'ReadWrite') {
+                    # Via the export process we can get the full KQL DB schema and properties for creation
                     fab export "$workspaceName.Workspace/$($kqldb.displayName).KQLDatabase" -o "./local/$scratchWorkspaceName" -f
                     $kqlProperties = Get-Content "./local/$scratchWorkspaceName/$($kqldb.displayName).KQLDatabase/DatabaseProperties.json" | ConvertFrom-Json
                     $kqlProperties.parentEventhouseItemId = $newEventhouseId
@@ -427,16 +145,17 @@ if ($capExists -eq $trueString) {
                     fab import "$workspaceName-$capacityRegion.Workspace/$($kqldb.displayName).KQLDatabase" -i "./local/$scratchWorkspaceName/$($kqldb.displayName).KQLDatabase" -f
                     $newKqlDbId = fab get "$workspaceName-$capacityRegion.Workspace/$($kqldb.displayName).KQLDatabase" -q id
                     $replacements[$kqldb.id] = $newKqlDbId
-
+                    
+                    # Once the schema is transferred we can do full data transfer
                     KqlCrossClusterDataMovement -sourceClusterQueryUri $eventhouse.properties.queryServiceUri -targetClusterIngestUri $newEventhouse.properties.queryServiceUri -databaseName $kqldb.displayName -spnClientId $spnClientId -spnClientSecret $spnClientSecret -spnTenantId $spnTenantId
                 } else {
                     Write-Warning "Skipping shortcut KQL database $($kqldb.displayName) as it is not a read-write database and is currently not supported for automated creation."
-                    #fab create "$($kqldb.displayName).KQLDatabase" -P "dbtype=shortcut,eventhouseid=$newEventhouseId"
                 }
             }
         }
 
         # Currently cannot get KQL shortcut data so we are unable to create them
+        # holding this code for potential future use....because that's a smart way to do things...
         <# foreach ($eventhouse in $eventhouses) {
             fab auth login -u $spnClientId -p $spnClientSecret -t $spnTenantId
 
@@ -454,15 +173,18 @@ if ($capExists -eq $trueString) {
             }
         } #>
 
+        # Lakehouses are complex as we need to handle Tables, Files, and SQL Endpoints all differently. 
         $lakehouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/lakehouses" | ConvertFrom-Json
         $lakehouses = $lakehouseResponse.text.value
         foreach ($lakehouse in $lakehouses) {
+            # Skip the DataflowsStagingLakehouse as it is a system lakehouse and breaks things if we try to create it
             if ($lakehouse.displayName -eq 'DataflowsStagingLakehouse') {
                 Write-Warning "Skipping DataflowsStagingLakehouse as it is a system lakehouse."
                 continue
             }
-            #fab auth login -u $spnClientId -p $spnClientSecret -t $spnTenantId
+            
             $itemType = 'Lakehouse'
+            # Check if the lakehouse is schema enabled via the defaultSchema property
             $schemaEnabled = [bool](Get-Member -inputobject $lakehouse.properties -name "defaultSchema" -Membertype Properties)
             if($schemaEnabled) {
                 $itemType = 'SchemaEnabledLakehouse'
@@ -481,14 +203,19 @@ if ($capExists -eq $trueString) {
             $targetLakehouseFilesPath = $newLakehouse.properties.oneLakeFilesPath
             $targetLakehouseSqlEndpoint = $newLakehouse.properties.sqlEndpointProperties.connectionString
             $replacements[$lakehouse.properties.sqlEndpointProperties.connectionString] = $targetLakehouseSqlEndpoint
-            #Write-Host "Source Lakehouse Files Path: $sourceLakehouseFilesPath"
-            #Write-Host "Target Lakehouse Files Path: $targetLakehouseFilesPath"
+            
             # Transfer Lakehouse Table Data   
+            # This strictly moves table data, I learned that AzCopy tends to fail on tables for various reasons while 
+            # copyjobs honor table structure and efficiently write delta tables
             DataTransferCopyJob -itemName $lakehouse.displayName -itemType $itemType -sourceWorkspace $currentWorkspace -targetWorkspace $newWorkspace -scratchWorkspace $scratchWorkspace
 
             # Transfer Lakehouse File Data via AzCopy
+            # This uses AzCopy to do the file transfer, currently using this to prevent issues with Shortcuts
+            # as copyjobs do not distinguish between real files and shortcuts
+            # This stages the files locally first so you need enough drive space on your machine to handle the transfer
+            # I will look further into handling this via copyjobs in the future to prevent the data pulldown
             AzCopyOneLakeFiles -source $sourceLakehouseFilesPath -destination $targetLakehouseFilesPath -ScratchDirectory "./local/$scratchWorkspaceName/$($lakehouse.displayName)/"
-        }
+        } #>
 
         $warehouseResponse = fab api -X get "workspaces/$($currentWorkspace.id)/warehouses" | ConvertFrom-Json
 
@@ -546,6 +273,13 @@ if ($capExists -eq $trueString) {
 
             DacFxSchemaTransfer -spnClientId $spnClientId -spnClientSecret $spnClientSecret -spnTenantId $spnTenantId -SourceSqlEndpoint $lakehouse.properties.sqlEndpointProperties.connectionString -TargetSqlEndpoint $targetLakehouseSqlEndpoint -WarehouseName $lakehouse.displayName -ScratchDirectory "./local/$scratchWorkspaceName/" -SourceType 'Lakehouse'
         }
+    
+        # Set the ACLs for the new workspace
+        # This will loop all permissions and add them to the new workspace
+        foreach ($acl in $CurrentWorkspaceAcl) {
+            fab acl set "$scratchWorkspaceName.Workspace" -I $acl.principal.id -R $acl.workspaceAccessDetails.workspaceRole.ToLower() -f
+        }
+
     }
 }
 

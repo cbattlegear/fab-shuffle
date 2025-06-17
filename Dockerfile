@@ -10,8 +10,8 @@ RUN apt update && apt install -y wget && \
     apt update && \
     apt install -y dotnet-sdk-8.0 powershell azcopy
 
-RUN pwsh -Command "Install-Module -Name Az.Accounts -Repository PSGallery -Force"
-RUN pwsh -Command "Install-Module -Name SqlServer -Repository PSGallery -Force"
+RUN pwsh -Command "Install-Module -Name Az.Accounts -Repository PSGallery -RequiredVersion 5.1.0 -Force"
+RUN pwsh -Command "Install-Module -Name SqlServer -Repository PSGallery -RequiredVersion 22.3.0 -Force"
 RUN dotnet tool install --global UnpackDacPac --no-cache && dotnet tool install --global microsoft.sqlpackage --no-cache
 
 RUN pwsh -Command "Install-Package -Name Microsoft.Azure.Kusto.Ingest -RequiredVersion 13.0.2 -Source 'nuget.org' -SkipDependencies -Force"
@@ -24,9 +24,10 @@ RUN pwsh -Command "Install-Package -Name Microsoft.IdentityModel.Abstractions -R
 
 WORKDIR /app
 COPY CopyJobTemplates CopyJobTemplates/
+COPY lib lib/
 COPY fab-shuffle.ps1 .
 COPY run.sh .
 RUN chmod +x run.sh
 RUN mkdir ./local/
 
-ENTRYPOINT [ "bash", "/app/run.sh" ]
+CMD [ "bash", "/app/run.sh" ]
