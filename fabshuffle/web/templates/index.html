@@ -58,6 +58,12 @@
     <section class="panel" data-stage="capacity" hidden>
       <h2>Pick the target capacity</h2>
       <p class="hint">The new workspace is created on this capacity, which determines the target region.</p>
+      <div id="leftovers" class="warnings" hidden>
+        <h3>Leftover scratch workspaces</h3>
+        <p class="hint">Earlier runs did not finish cleaning up. These hold only temporary Copy Jobs.</p>
+        <ul></ul>
+        <button class="secondary" id="delete-leftovers">Delete them</button>
+      </div>
       <div id="capacity-list" class="choice-list" role="radiogroup" aria-label="Capacities"></div>
       <div class="actions">
         <button class="secondary" data-back="login">Back</button>

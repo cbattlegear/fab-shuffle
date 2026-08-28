@@ -108,6 +108,7 @@ $("#login-form").addEventListener("submit", async (event) => {
     form.reset();
     $("#sign-out").hidden = false;
     await loadCapacities();
+    loadLeftovers();
     goTo("capacity");
   } catch (error) {
     showError(error.message);
@@ -158,6 +159,41 @@ $("#capacity-next").addEventListener("click", async () => {
   try {
     await loadWorkspaces();
     goTo("workspace");
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    busy(button, false);
+  }
+});
+
+// Run state lives in memory, so a restarted container loses track of a scratch workspace
+// that was never cleaned up. Surface any leftovers right after sign-in.
+async function loadLeftovers() {
+  try {
+    const { workspaces } = await api("/api/scratch-workspaces");
+    const container = $("#leftovers");
+    container.hidden = !workspaces.length;
+    if (!workspaces.length) return;
+
+    const list = container.querySelector("ul");
+    list.innerHTML = "";
+    workspaces.forEach((workspace) => {
+      const item = document.createElement("li");
+      item.textContent = workspace.displayName;
+      list.appendChild(item);
+    });
+  } catch (_) {
+    // Discovering leftovers is a convenience; never block sign-in on it.
+  }
+}
+
+$("#delete-leftovers").addEventListener("click", async () => {
+  const button = $("#delete-leftovers");
+  busy(button, true, "Deleting…");
+  try {
+    const result = await api("/api/scratch-workspaces/cleanup", { method: "POST" });
+    if (result.warnings.length) showError(result.warnings.join(" "));
+    await loadLeftovers();
   } catch (error) {
     showError(error.message);
   } finally {

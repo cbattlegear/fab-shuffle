@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
+
+# Scratch workspaces are named with this prefix so leftovers from an interrupted run can be
+# found again later, for example after the container has restarted.
+SCRATCH_WORKSPACE_PREFIX = "fab-shuffle-scratch-"
 
 # ------------------------------------------------------------------- capacities
 
@@ -74,6 +79,39 @@ def assign_to_capacity(client: FabricClient, workspace_id: str, capacity_id: str
         f"workspaces/{workspace_id}/assignToCapacity",
         json={"capacityId": capacity_id},
     )
+
+
+def scratch_workspace_name() -> str:
+    return f"{SCRATCH_WORKSPACE_PREFIX}{uuid.uuid4().hex[:12]}"
+
+
+def list_scratch_workspaces(client: FabricClient) -> list[dict[str, Any]]:
+    """Find scratch workspaces left behind by interrupted runs.
+
+    Run state lives in memory, so a restart loses the link to a scratch workspace that was
+    never cleaned up. Matching on the reserved name prefix makes them recoverable.
+    """
+    return [
+        workspace
+        for workspace in list_workspaces(client)
+        if (workspace.get("displayName") or "").startswith(SCRATCH_WORKSPACE_PREFIX)
+    ]
+
+
+def delete_scratch_workspaces(client: FabricClient) -> tuple[int, list[str]]:
+    """Delete every leftover scratch workspace. Returns how many went, plus any failures."""
+    deleted = 0
+    warnings: list[str] = []
+    for workspace in list_scratch_workspaces(client):
+        try:
+            delete_workspace(client, workspace["id"])
+            deleted += 1
+        except FabricApiError as error:
+            warnings.append(
+                f"Could not delete '{workspace.get('displayName')}' "
+                f"({workspace['id']}): HTTP {error.status_code}"
+            )
+    return deleted, warnings
 
 
 # ------------------------------------------------------------- role assignments
@@ -202,6 +240,7 @@ def clone_folder_tree(
 
 
 __all__ = [
+    "SCRATCH_WORKSPACE_PREFIX",
     "add_role_assignment",
     "assign_to_capacity",
     "capacity_region",
@@ -209,6 +248,7 @@ __all__ = [
     "copy_role_assignments",
     "create_folder",
     "create_workspace",
+    "delete_scratch_workspaces",
     "delete_workspace",
     "find_workspace_by_name",
     "get_capacity",
@@ -216,5 +256,7 @@ __all__ = [
     "list_capacities",
     "list_folders",
     "list_role_assignments",
+    "list_scratch_workspaces",
     "list_workspaces",
+    "scratch_workspace_name",
 ]

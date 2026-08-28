@@ -270,6 +270,28 @@ def create_app() -> FastAPI:
 
         return {"runId": run.id, "plan": _plan_dict(plan)}
 
+    @app.get("/api/scratch-workspaces")
+    async def list_scratch(session: Session = Depends(require_session)) -> dict[str, Any]:
+        """Scratch workspaces left behind by runs this process no longer knows about."""
+
+        def work() -> list[dict[str, Any]]:
+            with FabricClient(session.tokens) as client:
+                return [
+                    {"id": workspace["id"], "displayName": workspace.get("displayName")}
+                    for workspace in workspaces.list_scratch_workspaces(client)
+                ]
+
+        return {"workspaces": await _run_fabric(work)}
+
+    @app.post("/api/scratch-workspaces/cleanup")
+    async def cleanup_scratch(session: Session = Depends(require_session)) -> dict[str, Any]:
+        def work() -> tuple[int, list[str]]:
+            with FabricClient(session.tokens) as client:
+                return workspaces.delete_scratch_workspaces(client)
+
+        deleted, warnings = await _run_fabric(work)
+        return {"deleted": deleted, "warnings": warnings}
+
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:
         return _require_run(run_id).snapshot()

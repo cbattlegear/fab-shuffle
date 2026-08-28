@@ -255,6 +255,8 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .warnings h3 { margin: 0 0 0.5rem; font-size: 0.9rem; color: var(--warning); }
 .warnings ul { margin: 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--text-dim); }
 .warnings .hint { margin: 0 0 0.5rem; }
+.warnings button { margin-top: 0.75rem; }
+#leftovers { margin-top: 0; margin-bottom: 1.25rem; }
 
 .warnings.danger { border-color: rgba(229, 100, 107, 0.5); background: rgba(229, 100, 107, 0.1); }
 .warnings.danger h3 { color: var(--danger); }

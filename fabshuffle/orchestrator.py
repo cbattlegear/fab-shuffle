@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,7 +42,7 @@ from fabshuffle.fabric import (
     workspaces,
 )
 from fabshuffle.fabric.client import FabricClient
-from fabshuffle.fabric.items import delete_item, list_items
+from fabshuffle.fabric.items import list_items
 from fabshuffle.fabric.support import (
     Strategy,
     WorkspaceAssessment,
@@ -289,7 +288,7 @@ def _create_workspaces(ctx: _Context) -> None:
 
     # Copy Jobs must live somewhere that is not the workspace being built, otherwise they
     # show up as leftover items in the migrated workspace.
-    scratch_name = f"fab-shuffle-scratch-{uuid.uuid4().hex[:12]}"
+    scratch_name = workspaces.scratch_workspace_name()
     ctx.run.update_step(step, "Creating scratch workspace for Copy Jobs")
     scratch = workspaces.create_workspace(ctx.client, scratch_name, ctx.plan.capacity_id)
     ctx.scratch_workspace_id = scratch["id"]
@@ -860,8 +859,9 @@ def cleanup_run(run: MigrationRun, client: FabricClient, scratch_dir: Path | Non
     if scratch and scratch.get("id"):
         run.update_step(step, "Deleting scratch workspace")
         try:
-            for item in list_items(client, scratch["id"]):
-                delete_item(client, scratch["id"], item["id"])
+            # Deleting the workspace removes the items under it. They must not be deleted
+            # individually first: derived items such as a lakehouse SQL analytics endpoint
+            # reject a direct delete with OperationNotSupportedForItem.
             workspaces.delete_workspace(client, scratch["id"])
             run.scratch_workspace = None
         except Exception as error:
