@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import timedelta
 
 from azure.kusto.data import ClientRequestProperties, KustoClient, KustoConnectionStringBuilder
@@ -38,7 +38,14 @@ def _client(cluster_uri: str, principal: ServicePrincipal) -> KustoClient:
     return KustoClient(connection)
 
 
-def list_tables(cluster_uri: str, database: str, principal: ServicePrincipal) -> list[str]:
+def list_tables(
+    cluster_uri: str,
+    database: str,
+    principal: ServicePrincipal,
+    *,
+    exclude: Collection[str] = (),
+) -> list[str]:
+    excluded = {name.casefold() for name in exclude}
     with _client(cluster_uri, principal) as client:
         response = client.execute_mgmt(database, ".show tables | project TableName")
         rows = response.primary_results[0]
@@ -46,6 +53,7 @@ def list_tables(cluster_uri: str, database: str, principal: ServicePrincipal) ->
             str(row["TableName"])
             for row in rows
             if not str(row["TableName"]).startswith(SYSTEM_TABLE_PREFIXES)
+            and str(row["TableName"]).casefold() not in excluded
         ]
 
 
@@ -55,6 +63,7 @@ def copy_database(
     target_cluster_uri: str,
     database: str,
     principal: ServicePrincipal,
+    exclude: Collection[str] = (),
     on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
     """Copy every table from the source database into the same-named target database.
@@ -62,8 +71,11 @@ def copy_database(
     Both URIs must be *query* endpoints: cross-cluster ``.set-or-replace`` is executed on the
     target's query endpoint and reads through ``cluster(...).database(...)``, so the ingestion
     endpoint is not involved.
+
+    ``exclude`` names tables that must not be copied, which is how table shortcuts are kept
+    out: their data belongs to the shortcut target, and the shortcut is recreated separately.
     """
-    tables = list_tables(source_cluster_uri, database, principal)
+    tables = list_tables(source_cluster_uri, database, principal, exclude=exclude)
     if not tables:
         return {"tables": 0, "rows": 0}
 

@@ -42,7 +42,7 @@ copies everything it supports.
 | Lakehouse SQL analytics endpoint | ✅ | n/a | Views, procedures, and functions |
 | Warehouse | ✅ | ✅ | Collation preserved |
 | Eventhouse | ✅ | n/a | |
-| KQL database (`ReadWrite`) | ✅ | ✅ | |
+| KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
 | Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |
 | Report | ✅ | n/a | Rebound to the migrated semantic model |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
@@ -70,8 +70,9 @@ reference items created by an earlier one:
    tables through the SQL analytics endpoint.
 4. **Warehouses** — schema before data, so Copy Job activities have tables to land in.
 5. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
-   The SQL analytics endpoint is refreshed only now, so it sees both the copied tables and
-   the new shortcuts, and only then is its schema copied.
+   This covers lakehouse shortcuts and KQL database table shortcuts. The SQL analytics
+   endpoint is refreshed only now, so it sees both the copied tables and the new shortcuts,
+   and only then is its schema copied.
 6. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
    report embeds its model's GUID, so it runs after the models.
@@ -183,7 +184,8 @@ On the rebuild path:
    eventhouse, and copy table data with a cross-cluster `.set-or-replace`.
 4. Recreate lakehouses, copy table data with Copy Jobs, and copy `Files/` with azcopy.
 5. Recreate warehouses, transfer their T-SQL schema, and copy table data with Copy Jobs.
-6. Recreate shortcuts, refresh the SQL analytics endpoints, then copy their schema.
+6. Recreate shortcuts, both lakehouse and KQL table shortcuts, refresh the SQL analytics
+   endpoints, then copy their schema.
 7. Recreate semantic models and then reports, rewriting their definitions so they bind to
    the items just created rather than the ones in the old region.
 8. Replay workspace role assignments.

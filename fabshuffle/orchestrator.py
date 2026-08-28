@@ -14,8 +14,9 @@ items created by an *earlier* phase:
    tables through the SQL analytics endpoint.
 4. ``warehouses``   schema before data, so Copy Job activities have tables to land in.
 5. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
-   them. The SQL analytics endpoint is refreshed only now, so it picks up both the copied
-   tables and the new shortcuts, and only then is its schema copied.
+   them. This covers both lakehouse shortcuts and KQL database table shortcuts. The SQL
+   analytics endpoint is refreshed only now, so it picks up both the copied tables and the
+   new shortcuts, and only then is its schema copied.
 6. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
    SQL endpoints, so they need step 5 finished; reports bind to models, so they run after.
 7. ``permissions``  role assignments last, so nothing is visible half built.
@@ -87,6 +88,11 @@ class _Context:
     warnings: list[str] = field(default_factory=list)
     assessment: WorkspaceAssessment | None = None
     source_role_assignments: list[dict[str, Any]] = field(default_factory=list)
+    # KQL databases that were migrated, and the table shortcuts each one had. Shortcuts can
+    # target any item in the workspace, so they are recreated in the shortcut phase rather
+    # than while the eventhouses are being built.
+    kql_databases: list[tuple[str, str, str]] = field(default_factory=list)
+    kql_table_shortcuts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -450,10 +456,19 @@ def _migrate_kql_database(
         existing=existing_databases,
     )
     ctx.id_map[database_id] = target["id"]
+    ctx.kql_databases.append((database_id, target["id"], name))
     if adopted:
         logger.info("Applied schema to the default KQL database '%s'", name)
 
     adopted_name = name if adopted else None
+
+    # Table shortcuts point at other items, which may not exist yet, so they are created in
+    # the shortcut phase. Their names are still needed now to keep them out of the copy.
+    table_shortcuts = shortcuts.list_table_shortcuts(
+        ctx.client, ctx.plan.source_workspace_id, database_id
+    )
+    ctx.kql_table_shortcuts[database_id] = table_shortcuts
+    shortcut_names = {s["name"] for s in table_shortcuts if s.get("name")}
 
     if not ctx.plan.include_data:
         return True, [], adopted_name
@@ -466,6 +481,7 @@ def _migrate_kql_database(
         target_cluster_uri=target_query_uri,
         database=name,
         principal=ctx.principal,
+        exclude=shortcut_names,
         on_progress=lambda message: ctx.run.update_step(step, message),
     )
     logger.info("KQL database %s: copied %s table(s)", name, result["tables"])
@@ -711,12 +727,33 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     ctx.run.raise_if_cancelled()
 
     source_lakehouses = data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id)
-    if not source_lakehouses:
-        ctx.run.finish_step(step, StepStatus.SKIPPED, "No lakehouses to process")
+    if not source_lakehouses and not ctx.kql_databases:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing references other items")
         return
 
     warnings: list[str] = []
     shortcuts_created = 0
+
+    # KQL table shortcuts can target lakehouses, warehouses, or other KQL databases, so they
+    # are only safe to create now that every one of those exists.
+    for source_db_id, target_db_id, database_name in ctx.kql_databases:
+        ctx.run.raise_if_cancelled()
+        table_shortcuts = ctx.kql_table_shortcuts.get(source_db_id) or []
+        if not table_shortcuts:
+            continue
+
+        ctx.run.update_step(step, f"Recreating table shortcuts for KQL database '{database_name}'")
+        created, shortcut_warnings = shortcuts.copy_table_shortcuts(
+            ctx.client,
+            ctx.plan.source_workspace_id,
+            source_db_id,
+            ctx.target_workspace_id,
+            target_db_id,
+            ctx.id_map,
+            shortcuts=table_shortcuts,
+        )
+        shortcuts_created += created
+        warnings.extend(f"KQL database '{database_name}': {w}" for w in shortcut_warnings)
 
     for lakehouse in source_lakehouses:
         ctx.run.raise_if_cancelled()
