@@ -64,6 +64,23 @@
         <ul></ul>
         <button class="secondary" id="delete-leftovers">Delete them</button>
       </div>
+
+      <details class="tool">
+        <summary>Locked out of a workspace Fab Shuffle created?</summary>
+        <p class="hint">
+          A run that failed before its permissions step leaves a workspace only the service
+          principal can see. Copy the admins of the source workspace onto it to get back in.
+          This only grants access, never removes it.
+        </p>
+        <label>Copy admins from
+          <select id="restore-source"></select>
+        </label>
+        <label>Grant access to
+          <select id="restore-target"></select>
+        </label>
+        <button class="secondary" id="restore-access">Restore access</button>
+      </details>
+
       <div id="capacity-list" class="choice-list" role="radiogroup" aria-label="Capacities"></div>
       <div class="actions">
         <button class="secondary" data-back="login">Back</button>

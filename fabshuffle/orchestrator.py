@@ -86,6 +86,7 @@ class _Context:
     copy_job_ids: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     assessment: WorkspaceAssessment | None = None
+    source_role_assignments: list[dict[str, Any]] = field(default_factory=list)
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -280,19 +281,47 @@ def _create_workspaces(ctx: _Context) -> None:
     ctx.run.raise_if_cancelled()
 
     target = workspaces.create_workspace(
-        ctx.client, ctx.plan.target_workspace_name, ctx.plan.capacity_id
+        ctx.client,
+        ctx.plan.target_workspace_name,
+        ctx.plan.capacity_id,
+        description=(
+            f"Created by Fab Shuffle from '{ctx.plan.source_workspace_name}' "
+            f"in {ctx.plan.capacity_region}."
+        ),
     )
     ctx.target_workspace_id = target["id"]
     ctx.run.target_workspace = {"id": target["id"], "displayName": ctx.plan.target_workspace_name}
     ctx.id_map[ctx.plan.source_workspace_id] = target["id"]
 
+    # Grant the source workspace's admins straight away rather than waiting for the final
+    # permissions phase. A run that fails before then would otherwise leave a workspace only
+    # this service principal can see, which nobody else can inspect or delete.
+    ctx.run.update_step(step, "Granting workspace admins access")
+    ctx.source_role_assignments = workspaces.list_role_assignments(
+        ctx.client, ctx.plan.source_workspace_id
+    )
+    admin_warnings = workspaces.copy_role_assignments(
+        ctx.client, ctx.source_role_assignments, ctx.target_workspace_id, roles={"Admin"}
+    )
+    ctx.warnings.extend(admin_warnings)
+
     # Copy Jobs must live somewhere that is not the workspace being built, otherwise they
     # show up as leftover items in the migrated workspace.
     scratch_name = workspaces.scratch_workspace_name()
     ctx.run.update_step(step, "Creating scratch workspace for Copy Jobs")
-    scratch = workspaces.create_workspace(ctx.client, scratch_name, ctx.plan.capacity_id)
+    scratch = workspaces.create_workspace(
+        ctx.client,
+        scratch_name,
+        ctx.plan.capacity_id,
+        description="Temporary Fab Shuffle workspace for Copy Jobs. Safe to delete.",
+    )
     ctx.scratch_workspace_id = scratch["id"]
     ctx.run.scratch_workspace = {"id": scratch["id"], "displayName": scratch_name}
+
+    # The scratch workspace needs the same treatment so a stranded one stays deletable.
+    workspaces.copy_role_assignments(
+        ctx.client, ctx.source_role_assignments, ctx.scratch_workspace_id, roles={"Admin"}
+    )
 
     # A workspace is not fully initialised for Copy Jobs until it holds a lakehouse.
     data_stores.create_lakehouse(ctx.client, ctx.scratch_workspace_id, "hold")
@@ -835,7 +864,10 @@ def _copy_permissions(ctx: _Context) -> None:
     ctx.run.start_step(step, "Copying workspace permissions")
     ctx.run.raise_if_cancelled()
 
-    assignments = workspaces.list_role_assignments(ctx.client, ctx.plan.source_workspace_id)
+    # Admins were granted when the workspace was created; this pass adds everyone else.
+    assignments = ctx.source_role_assignments or workspaces.list_role_assignments(
+        ctx.client, ctx.plan.source_workspace_id
+    )
     warnings = workspaces.copy_role_assignments(ctx.client, assignments, ctx.target_workspace_id)
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(

@@ -101,6 +101,13 @@ class LoginRequest(BaseModel):
     client_secret: str = Field(min_length=1)
 
 
+class RestoreAccessRequest(BaseModel):
+    """Copy the admins of one workspace onto another."""
+
+    source_workspace_id: str = Field(min_length=1)
+    target_workspace_id: str = Field(min_length=1)
+
+
 class StartRunRequest(BaseModel):
     capacity_id: str = Field(min_length=1)
     source_workspace_id: str = Field(min_length=1)
@@ -292,6 +299,29 @@ def create_app() -> FastAPI:
 
         deleted, warnings = await _run_fabric(work)
         return {"deleted": deleted, "warnings": warnings}
+
+    @app.post("/api/workspaces/restore-access")
+    async def restore_access(
+        body: RestoreAccessRequest,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        """Grant a workspace's admins access to another workspace.
+
+        A workspace this service principal created is only visible to the service principal
+        until its permissions are copied, so an interrupted run can leave one that nobody
+        else can open or delete. This grants access without ever revoking any.
+        """
+
+        def work() -> dict[str, Any]:
+            with FabricClient(session.tokens) as client:
+                assignments = workspaces.list_role_assignments(client, body.source_workspace_id)
+                admins = [a for a in assignments if a.get("role") == "Admin"]
+                warnings = workspaces.copy_role_assignments(
+                    client, admins, body.target_workspace_id, roles={"Admin"}
+                )
+                return {"granted": len(admins) - len(warnings), "warnings": warnings}
+
+        return await _run_fabric(work)
 
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:

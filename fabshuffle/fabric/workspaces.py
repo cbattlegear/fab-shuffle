@@ -183,6 +183,10 @@ def copy_role_assignments(
         try:
             add_role_assignment(client, target_workspace_id, principal_id, principal_type, role)
         except FabricApiError as error:
+            # Admins are granted up front and again in the final pass, so an existing
+            # assignment is expected rather than a problem.
+            if error.status_code == 409:
+                continue
             name = principal.get("displayName") or principal_id
             warnings.append(f"Could not grant {role} to {name}: HTTP {error.status_code}")
     return warnings

@@ -277,6 +277,29 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .callout strong { display: block; margin-bottom: 0.2rem; font-size: 0.95rem; }
 .callout p { margin: 0; color: var(--text-dim); font-size: 0.87rem; }
 
+.tool {
+  margin-bottom: 1.25rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.tool summary { cursor: pointer; font-size: 0.88rem; color: var(--text-dim); }
+.tool summary:hover { color: var(--text); }
+.tool[open] summary { margin-bottom: 0.75rem; color: var(--text); }
+.tool label { margin-bottom: 0.6rem; max-width: 28rem; }
+
+.tool select {
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.88rem;
+}
+
 .alert {
   margin-bottom: 1rem;
   padding: 0.75rem 1rem;

@@ -109,6 +109,8 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#sign-out").hidden = false;
     await loadCapacities();
     loadLeftovers();
+    // Needed by the restore-access control on this same step.
+    loadWorkspaces().then(fillWorkspaceSelects).catch(() => {});
     goTo("capacity");
   } catch (error) {
     showError(error.message);
@@ -194,6 +196,47 @@ $("#delete-leftovers").addEventListener("click", async () => {
     const result = await api("/api/scratch-workspaces/cleanup", { method: "POST" });
     if (result.warnings.length) showError(result.warnings.join(" "));
     await loadLeftovers();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    busy(button, false);
+  }
+});
+
+function fillWorkspaceSelects() {
+  ["#restore-source", "#restore-target"].forEach((selector) => {
+    const select = $(selector);
+    select.innerHTML = "";
+    state.workspaces.forEach((workspace) => {
+      const option = document.createElement("option");
+      option.value = workspace.id;
+      option.textContent = workspace.displayName || workspace.id;
+      select.appendChild(option);
+    });
+  });
+}
+
+$("#restore-access").addEventListener("click", async () => {
+  const button = $("#restore-access");
+  const source = $("#restore-source").value;
+  const target = $("#restore-target").value;
+
+  if (!source || !target || source === target) {
+    showError("Pick two different workspaces.");
+    return;
+  }
+
+  busy(button, true, "Restoring…");
+  try {
+    const result = await api("/api/workspaces/restore-access", {
+      method: "POST",
+      body: { source_workspace_id: source, target_workspace_id: target },
+    });
+    showError(result.warnings.length ? result.warnings.join(" ") : "");
+    if (!result.warnings.length) {
+      button.textContent = `Granted ${result.granted} admin(s)`;
+      setTimeout(() => (button.textContent = "Restore access"), 4000);
+    }
   } catch (error) {
     showError(error.message);
   } finally {
