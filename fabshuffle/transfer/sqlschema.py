@@ -205,7 +205,13 @@ def transfer_schema(
 
 def _run(command: list[str], *, what: str) -> None:
     logger.debug("Running %s", command[0])
-    result = subprocess.run(command, capture_output=True, text=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError as error:
+        raise SchemaTransferError(
+            f"{what} could not run because '{command[0]}' is not installed in this image. "
+            "T-SQL schema transfer needs sqlpackage and unpackdacpac."
+        ) from error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1500:]
         raise SchemaTransferError(f"{what} failed with exit code {result.returncode}: {detail}")

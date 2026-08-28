@@ -130,6 +130,31 @@ must be able to update those models.
 > Lakehouse file transfer stages files on local disk inside the container. Mount a volume at
 > `/app/local` if you are moving more data than the container's writable layer can hold.
 
+### Building the image yourself
+
+```bash
+docker build -t fab-shuffle .
+docker run --rm -p 8080:8080 fab-shuffle
+```
+
+The image builds natively on `linux/amd64` and `linux/arm64`. Two build args exist for
+networks that block the public package feeds:
+
+| Build arg | Default | Purpose |
+| --- | --- | --- |
+| `NUGET_SOURCE` | `https://api.nuget.org/v3/index.json` | Feed for `sqlpackage` and `unpackdacpac` |
+| `PIP_INDEX_URL` | `https://pypi.org/simple/` | Index for the Python dependencies |
+
+```bash
+docker build \
+  --build-arg NUGET_SOURCE=https://your-proxy.example/nuget/v3/index.json \
+  --build-arg PIP_INDEX_URL=https://your-proxy.example/pypi/simple/ \
+  -t fab-shuffle .
+```
+
+If `sqlpackage`, `unpackdacpac`, or `azcopy` are missing at runtime, the affected item is
+reported as a warning and the rest of the migration continues.
+
 ### Configuration
 
 Every setting has a sensible default; override with environment variables when needed.

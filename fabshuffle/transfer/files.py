@@ -70,7 +70,15 @@ def copy_files(
 
 def _azcopy(args: list[str], principal: ServicePrincipal) -> None:
     command = [SETTINGS.azcopy_path, *args, f"--trusted-microsoft-suffixes={TRUSTED_SUFFIXES}"]
-    result = subprocess.run(command, capture_output=True, text=True, env=_azcopy_env(principal))
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, env=_azcopy_env(principal)
+        )
+    except FileNotFoundError as error:
+        raise FileTransferError(
+            f"OneLake file transfer needs azcopy, but '{SETTINGS.azcopy_path}' is not installed "
+            "in this image."
+        ) from error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1500:]
         raise FileTransferError(f"azcopy {args[0]} failed with exit code {result.returncode}: {detail}")
