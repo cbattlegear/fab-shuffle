@@ -1,15 +1,25 @@
 """The migration orchestrator.
 
-This is the Python replacement for ``fab-shuffle.ps1``. It drives the whole region move:
+This is the Python replacement for ``fab-shuffle.ps1``. It drives the whole region move.
 
-1. resolve the target capacity and source workspace,
-2. create the target workspace on that capacity plus a scratch workspace for Copy Jobs,
-3. recreate eventhouses and KQL databases, then move their data cross-cluster,
-4. recreate lakehouses, move table data with Copy Jobs and file data with azcopy,
-5. recreate warehouses, transfer their T-SQL schema, and move their table data,
-6. recreate shortcuts, refresh SQL analytics endpoints, and copy lakehouse endpoint schema,
-7. replay workspace role assignments,
-8. delete the scratch workspace and local staging.
+Phase order is load bearing, and matches v1's. Each phase records the source-to-target ids
+it created in ``_Context.id_map`` (v1's ``$replacements`` hash table), and later phases
+rewrite their exported definitions through that map. A phase can therefore only reference
+items created by an *earlier* phase:
+
+1. ``workspaces``   create the target and scratch workspaces, and the folder tree.
+2. ``eventhouses``  eventhouses before their KQL databases, since a database is created
+   against ``parentEventhouseItemId``; data is copied once the schema exists.
+3. ``lakehouses``   before warehouses, because warehouse views can reference lakehouse
+   tables through the SQL analytics endpoint.
+4. ``warehouses``   schema before data, so Copy Job activities have tables to land in.
+5. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
+   them. The SQL analytics endpoint is refreshed only now, so it picks up both the copied
+   tables and the new shortcuts, and only then is its schema copied.
+6. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
+   SQL endpoints, so they need step 5 finished; reports bind to models, so they run after.
+7. ``permissions``  role assignments last, so nothing is visible half built.
+8. ``cleanup``      drop the scratch workspace and local staging.
 """
 
 from __future__ import annotations
@@ -23,7 +33,15 @@ from typing import Any
 
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric import copyjobs, data_stores, eventhouses, powerbi, shortcuts, workspaces
+from fabshuffle.fabric import (
+    analytics,
+    copyjobs,
+    data_stores,
+    eventhouses,
+    powerbi,
+    shortcuts,
+    workspaces,
+)
 from fabshuffle.fabric.client import FabricClient
 from fabshuffle.fabric.items import delete_item, list_items
 from fabshuffle.fabric.support import (
@@ -110,6 +128,7 @@ def run_migration(
             _migrate_lakehouses(context)
             _migrate_warehouses(context)
             _migrate_shortcuts_and_endpoints(context)
+            _migrate_reports_and_models(context)
             _copy_permissions(context)
             if cleanup:
                 cleanup_run(context.run, context.client, scratch_dir)
@@ -691,6 +710,85 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 6
+
+
+def _migrate_reports_and_models(ctx: _Context) -> None:
+    """Recreate semantic models and reports, rebound to the items in the new workspace.
+
+    Runs last of the content phases because it is entirely driven by ``id_map``: a semantic
+    model's exported definition embeds the SQL analytics endpoint and GUID of the lakehouse
+    or warehouse it reads, and a report's ``definition.pbir`` embeds its model's GUID. Both
+    are only resolvable once those items exist.
+    """
+    step = "analytics"
+    ctx.run.start_step(step, "Migrating semantic models and reports")
+    ctx.run.raise_if_cancelled()
+
+    source_id = ctx.plan.source_workspace_id
+    models = analytics.list_of_type(ctx.client, source_id, analytics.SEMANTIC_MODEL)
+    reports = analytics.list_of_type(ctx.client, source_id, analytics.REPORT)
+
+    # Lakehouses and warehouses bring their own default semantic model, so the target
+    # workspace already has one under the same name.
+    default_names = analytics.default_semantic_model_names(ctx.client, source_id)
+    skipped = [model for model in models if model["displayName"] in default_names]
+    models = [model for model in models if model["displayName"] not in default_names]
+
+    if not models and not reports:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No semantic models or reports to migrate")
+        return
+
+    warnings: list[str] = []
+
+    def progress(message: str) -> None:
+        ctx.run.update_step(step, message)
+
+    migrated_models, model_warnings = analytics.migrate_items(
+        ctx.client,
+        source_workspace_id=source_id,
+        target_workspace_id=ctx.target_workspace_id,
+        items=models,
+        item_type=analytics.SEMANTIC_MODEL,
+        id_map=ctx.id_map,
+        folder_map=ctx.id_map,
+        on_progress=progress,
+    )
+    warnings.extend(model_warnings)
+
+    ctx.run.raise_if_cancelled()
+
+    # Reports run in a second pass so every model id is already in the map above.
+    migrated_reports, report_warnings = analytics.migrate_items(
+        ctx.client,
+        source_workspace_id=source_id,
+        target_workspace_id=ctx.target_workspace_id,
+        items=reports,
+        item_type=analytics.REPORT,
+        id_map=ctx.id_map,
+        folder_map=ctx.id_map,
+        on_progress=progress,
+    )
+    warnings.extend(report_warnings)
+
+    unbound = [item.name for item in migrated_reports if item.rebound_parts == 0]
+    if unbound:
+        warnings.append(
+            "These reports had no reference to rewrite, so they still point at their original "
+            "semantic model: " + ", ".join(unbound)
+        )
+    if skipped:
+        logger.info("Skipped %s default semantic model(s)", len(skipped))
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"Migrated {len(migrated_models)} semantic model(s) and {len(migrated_reports)} report(s)",
+        warnings,
+    )
+
+
+# --------------------------------------------------------------------- phase 7
 
 
 def _copy_permissions(ctx: _Context) -> None:

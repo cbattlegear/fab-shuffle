@@ -130,6 +130,7 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
         [
             {"displayName": "bronze", "type": "Lakehouse"},
             {"displayName": "Nightly", "type": "DataPipeline"},
+            {"displayName": "Exec", "type": "Dashboard"},
             {"displayName": "Sales", "type": "Report"},
         ],
     )
@@ -138,8 +139,9 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
     assert result["strategy"] == "rebuild"
     assert result["targetWorkspaceName"] == "Sales-westeurope"
     assert result["counts"]["lakehouses"] == 1
-    assert result["unsupportedItemTypes"] == ["DataPipeline", "Report"]
+    # The report is migrated and rebound, so it is not reported as left behind.
+    assert result["unsupportedItemTypes"] == ["Dashboard", "DataPipeline"]
 
     names = {item["name"]: item for item in result["unsupported"]}
-    assert set(names) == {"Nightly", "Sales"}
-    assert names["Sales"]["reason"].startswith("Power BI content")
+    assert set(names) == {"Nightly", "Exec"}
+    assert "Power BI item type" in names["Exec"]["reason"]

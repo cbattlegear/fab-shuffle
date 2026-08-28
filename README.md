@@ -43,16 +43,40 @@ copies everything it supports.
 | Warehouse | ✅ | ✅ | Collation preserved |
 | Eventhouse | ✅ | n/a | |
 | KQL database (`ReadWrite`) | ✅ | ✅ | |
+| Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |
+| Report | ✅ | n/a | Rebound to the migrated semantic model |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
 | Workspace folders | ✅ | n/a | Hierarchy recreated |
 | Workspace permissions | ✅ | n/a | Role assignments replayed |
 
 On a rebuild, anything not in that table is reported by name and type — on the review screen
 before you commit, and again as a warning on the run itself — so you know exactly what stays
-behind in the source workspace. That includes Power BI content, which a rebuild cannot move.
+behind in the source workspace.
 
 KQL *shortcut* (follower) databases are skipped, because Fabric does not expose the follower
-source through the API.
+source through the API. The default semantic model that Fabric creates alongside each
+lakehouse and warehouse is skipped too, since the target workspace gets its own.
+
+### Dependency order
+
+Phase order is load bearing. Each phase records the source-to-target ids it created in an id
+map, and later phases rewrite their exported definitions through it, so a phase can only
+reference items created by an earlier one:
+
+1. **Workspaces** — target and scratch workspaces, and the folder tree.
+2. **Eventhouses** — before their KQL databases, which are created against
+   `parentEventhouseItemId`.
+3. **Lakehouses** — before warehouses, because warehouse views can reference lakehouse
+   tables through the SQL analytics endpoint.
+4. **Warehouses** — schema before data, so Copy Job activities have tables to land in.
+5. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
+   The SQL analytics endpoint is refreshed only now, so it sees both the copied tables and
+   the new shortcuts, and only then is its schema copied.
+6. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
+   endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
+   report embeds its model's GUID, so it runs after the models.
+7. **Permissions** — last, so nothing is visible half built.
+8. **Cleanup** — drop the scratch workspace and local staging.
 
 ## Usage
 
@@ -135,8 +159,12 @@ On the rebuild path:
 4. Recreate lakehouses, copy table data with Copy Jobs, and copy `Files/` with azcopy.
 5. Recreate warehouses, transfer their T-SQL schema, and copy table data with Copy Jobs.
 6. Recreate shortcuts, refresh the SQL analytics endpoints, then copy their schema.
-7. Replay workspace role assignments.
-8. Delete the scratch workspace and local staging.
+7. Recreate semantic models and then reports, rewriting their definitions so they bind to
+   the items just created rather than the ones in the old region.
+8. Replay workspace role assignments.
+9. Delete the scratch workspace and local staging.
+
+See [Dependency order](#dependency-order) for why the sequence is what it is.
 
 ### Why some things are not pure REST
 

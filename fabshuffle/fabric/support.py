@@ -12,12 +12,16 @@ from enum import StrEnum
 from typing import Any
 
 # Item types Fab Shuffle rebuilds in the target workspace, with data where applicable.
+# Semantic models and reports appear here *and* in POWER_BI_TYPES: they do not force a
+# rebuild, but they are recreated and rebound when one happens for another reason.
 REBUILT_TYPES = frozenset(
     {
         "Lakehouse",
         "Warehouse",
         "Eventhouse",
         "KQLDatabase",
+        "SemanticModel",
+        "Report",
     }
 )
 
@@ -101,8 +105,8 @@ class WorkspaceAssessment:
 def _reason_for(item_type: str) -> str:
     if item_type in POWER_BI_TYPES:
         return (
-            "Power BI content cannot be recreated by this tool. Rebind it manually, or use "
-            "a deployment pipeline, after the Fabric items have moved"
+            "Fab Shuffle cannot recreate this Power BI item type yet. Recreate it in the new "
+            "workspace and point it at the migrated semantic model"
         )
     return "Fab Shuffle does not migrate this item type yet"
 
@@ -119,15 +123,16 @@ def assess_workspace(items: Iterable[Mapping[str, Any]]) -> WorkspaceAssessment:
 
         if item_type in DERIVED_TYPES:
             continue
-        if item_type in REBUILT_TYPES:
-            has_fabric_item = True
-            migrated.append(dict(item))
-            continue
+
+        # Anything that is not Power BI content is a Fabric item, and a single one of those
+        # pins the workspace to the rebuild strategy. Unknown future types count as Fabric.
         if item_type not in POWER_BI_TYPES:
-            # Anything that is neither Power BI content nor a type we rebuild is still a
-            # Fabric item, so it pins the workspace to the rebuild strategy.
             has_fabric_item = True
-        unsupported.append(UnsupportedItem(name=name, type=item_type, reason=_reason_for(item_type)))
+
+        if item_type in REBUILT_TYPES:
+            migrated.append(dict(item))
+        else:
+            unsupported.append(UnsupportedItem(name=name, type=item_type, reason=_reason_for(item_type)))
 
     if has_fabric_item:
         return WorkspaceAssessment(Strategy.REBUILD, migrated, unsupported)

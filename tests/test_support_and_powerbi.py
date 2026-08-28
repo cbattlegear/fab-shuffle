@@ -38,16 +38,17 @@ def test_rebuild_warns_about_every_item_it_leaves_behind():
         items(
             ("bronze", "Lakehouse"),
             ("Nightly load", "DataPipeline"),
+            ("Exec", "Dashboard"),
             ("Sales", "Report"),
-            ("Sales Model", "SemanticModel"),
         )
     )
     assert assessment.strategy is Strategy.REBUILD
-    assert assessment.unsupported_types == ["DataPipeline", "Report", "SemanticModel"]
+    # Reports are rebuilt and rebound, so only the pipeline and dashboard are left behind.
+    assert assessment.unsupported_types == ["Dashboard", "DataPipeline"]
 
     by_name = {item.name: item for item in assessment.unsupported}
     assert "does not migrate this item type yet" in by_name["Nightly load"].reason
-    assert "Power BI content" in by_name["Sales"].reason
+    assert "cannot recreate this Power BI item type yet" in by_name["Exec"].reason
     assert by_name["Nightly load"].message().startswith("DataPipeline 'Nightly load' was not migrated")
 
 
