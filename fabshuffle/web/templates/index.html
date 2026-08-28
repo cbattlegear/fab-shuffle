@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fab Shuffle</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">⇄</span>
+      <div>
+        <h1>Fab Shuffle</h1>
+        <p>Move a Microsoft Fabric workspace to another region</p>
+      </div>
+    </div>
+    <button id="sign-out" class="link-button" hidden>Sign out</button>
+  </header>
+
+  <nav class="wizard-nav" aria-label="Migration steps">
+    <ol>
+      <li data-stage="login" class="current"><span>1</span>Sign in</li>
+      <li data-stage="capacity"><span>2</span>Target capacity</li>
+      <li data-stage="workspace"><span>3</span>Source workspace</li>
+      <li data-stage="review"><span>4</span>Review</li>
+      <li data-stage="progress"><span>5</span>Migrate</li>
+    </ol>
+  </nav>
+
+  <main>
+    <div id="alert" class="alert" role="alert" hidden></div>
+
+    <!-- 1. Sign in -->
+    <section class="panel" data-stage="login">
+      <h2>Sign in with a service principal</h2>
+      <p class="hint">
+        Credentials stay in this container's memory and are never written to disk. The service
+        principal needs Reader on the target capacity and Admin on the source workspace.
+      </p>
+      <form id="login-form" class="form">
+        <label>Tenant ID
+          <input name="tenant_id" autocomplete="off" spellcheck="false" required
+                 placeholder="00000000-1111-2222-3333-444444444444" />
+        </label>
+        <label>Client ID
+          <input name="client_id" autocomplete="off" spellcheck="false" required
+                 placeholder="00000000-1111-2222-3333-444444444444" />
+        </label>
+        <label>Client secret
+          <input name="client_secret" type="password" autocomplete="off" required />
+        </label>
+        <button type="submit" class="primary">Sign in</button>
+      </form>
+    </section>
+
+    <!-- 2. Capacity -->
+    <section class="panel" data-stage="capacity" hidden>
+      <h2>Pick the target capacity</h2>
+      <p class="hint">The new workspace is created on this capacity, which determines the target region.</p>
+      <div id="capacity-list" class="choice-list" role="radiogroup" aria-label="Capacities"></div>
+      <div class="actions">
+        <button class="secondary" data-back="login">Back</button>
+        <button class="primary" id="capacity-next" disabled>Continue</button>
+      </div>
+    </section>
+
+    <!-- 3. Workspace -->
+    <section class="panel" data-stage="workspace" hidden>
+      <h2>Pick the source workspace</h2>
+      <p class="hint">Everything Fab Shuffle supports is recreated in a brand new workspace. The source is left untouched.</p>
+      <input id="workspace-filter" class="filter" type="search" placeholder="Filter workspaces" />
+      <div id="workspace-list" class="choice-list" role="radiogroup" aria-label="Workspaces"></div>
+      <div class="actions">
+        <button class="secondary" data-back="capacity">Back</button>
+        <button class="primary" id="workspace-next" disabled>Continue</button>
+      </div>
+    </section>
+
+    <!-- 4. Review -->
+    <section class="panel" data-stage="review" hidden>
+      <h2>Review the move</h2>
+      <div id="review-summary" class="summary"></div>
+      <label class="field">New workspace name
+        <input id="target-name" autocomplete="off" spellcheck="false" />
+      </label>
+      <fieldset class="options">
+        <legend>Options</legend>
+        <label><input type="checkbox" id="opt-data" checked /> Copy table data</label>
+        <label><input type="checkbox" id="opt-files" checked /> Copy lakehouse files</label>
+        <label><input type="checkbox" id="opt-permissions" checked /> Copy workspace permissions</label>
+        <label><input type="checkbox" id="opt-cleanup" checked /> Delete temporary artifacts when finished</label>
+      </fieldset>
+      <div class="actions">
+        <button class="secondary" data-back="workspace">Back</button>
+        <button class="primary" id="start-run">Start migration</button>
+      </div>
+    </section>
+
+    <!-- 5. Progress -->
+    <section class="panel" data-stage="progress" hidden>
+      <h2>Migration progress</h2>
+      <div id="run-banner" class="run-banner"></div>
+      <ol id="step-list" class="steps"></ol>
+      <div id="run-warnings" class="warnings" hidden>
+        <h3>Warnings</h3>
+        <ul></ul>
+      </div>
+      <div class="actions">
+        <button class="secondary" id="cancel-run" hidden>Cancel</button>
+        <button class="secondary" id="cleanup-run" hidden>Delete temporary artifacts</button>
+        <button class="primary" id="start-over" hidden>Start another migration</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

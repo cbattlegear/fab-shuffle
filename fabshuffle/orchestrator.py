@@ -1,0 +1,639 @@
+"""The migration orchestrator.
+
+This is the Python replacement for ``fab-shuffle.ps1``. It drives the whole region move:
+
+1. resolve the target capacity and source workspace,
+2. create the target workspace on that capacity plus a scratch workspace for Copy Jobs,
+3. recreate eventhouses and KQL databases, then move their data cross-cluster,
+4. recreate lakehouses, move table data with Copy Jobs and file data with azcopy,
+5. recreate warehouses, transfer their T-SQL schema, and move their table data,
+6. recreate shortcuts, refresh SQL analytics endpoints, and copy lakehouse endpoint schema,
+7. replay workspace role assignments,
+8. delete the scratch workspace and local staging.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.config import SETTINGS
+from fabshuffle.fabric import copyjobs, data_stores, eventhouses, shortcuts, workspaces
+from fabshuffle.fabric.client import FabricClient
+from fabshuffle.fabric.items import delete_item, list_items
+from fabshuffle.run import CancelledError, MigrationRun, RunStatus, StepStatus
+from fabshuffle.transfer import files as file_transfer
+from fabshuffle.transfer import kql, sqlschema
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MigrationPlan:
+    capacity_id: str
+    capacity_name: str
+    capacity_region: str
+    source_workspace_id: str
+    source_workspace_name: str
+    target_workspace_name: str
+    include_files: bool = True
+    include_data: bool = True
+    copy_permissions: bool = True
+
+
+@dataclass
+class _Context:
+    client: FabricClient
+    tokens: TokenProvider
+    principal: ServicePrincipal
+    plan: MigrationPlan
+    run: MigrationRun
+    scratch_dir: Path
+    target_workspace_id: str = ""
+    scratch_workspace_id: str = ""
+    # Maps every source identifier (workspace, item, endpoint, cluster URI) to its target
+    # equivalent so shortcuts and definitions can be rewritten before import.
+    id_map: dict[str, str] = field(default_factory=dict)
+    copy_job_ids: list[tuple[str, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def default_target_name(source_name: str, region: str) -> str:
+    return f"{source_name}-{region}" if region else f"{source_name}-copy"
+
+
+def run_migration(
+    run: MigrationRun,
+    principal: ServicePrincipal,
+    plan: MigrationPlan,
+    *,
+    cleanup: bool = True,
+) -> None:
+    """Execute a migration, recording every phase on ``run``."""
+    tokens = TokenProvider(principal)
+    scratch_dir = SETTINGS.scratch_dir_for(run.id)
+    run.mark_running()
+
+    with FabricClient(tokens) as client:
+        context = _Context(
+            client=client,
+            tokens=tokens,
+            principal=principal,
+            plan=plan,
+            run=run,
+            scratch_dir=scratch_dir,
+        )
+        try:
+            _create_workspaces(context)
+            _migrate_eventhouses(context)
+            _migrate_lakehouses(context)
+            _migrate_warehouses(context)
+            _migrate_shortcuts_and_endpoints(context)
+            _copy_permissions(context)
+            if cleanup:
+                cleanup_run(context.run, context.client, scratch_dir)
+            run.summary["warnings"] = context.warnings
+            run.mark_finished(RunStatus.SUCCEEDED)
+        except CancelledError as error:
+            run.mark_finished(RunStatus.CANCELLED, str(error))
+        except Exception as error:
+            logger.exception("Migration %s failed", run.id)
+            run.mark_finished(RunStatus.FAILED, str(error))
+
+
+# --------------------------------------------------------------------- phase 1
+
+
+def _create_workspaces(ctx: _Context) -> None:
+    step = "workspaces"
+    ctx.run.start_step(step, "Creating target and scratch workspaces")
+    ctx.run.raise_if_cancelled()
+
+    target = workspaces.create_workspace(
+        ctx.client, ctx.plan.target_workspace_name, ctx.plan.capacity_id
+    )
+    ctx.target_workspace_id = target["id"]
+    ctx.run.target_workspace = {"id": target["id"], "displayName": ctx.plan.target_workspace_name}
+    ctx.id_map[ctx.plan.source_workspace_id] = target["id"]
+
+    # Copy Jobs must live somewhere that is not the workspace being built, otherwise they
+    # show up as leftover items in the migrated workspace.
+    scratch_name = f"fab-shuffle-scratch-{uuid.uuid4().hex[:12]}"
+    ctx.run.update_step(step, "Creating scratch workspace for Copy Jobs")
+    scratch = workspaces.create_workspace(ctx.client, scratch_name, ctx.plan.capacity_id)
+    ctx.scratch_workspace_id = scratch["id"]
+    ctx.run.scratch_workspace = {"id": scratch["id"], "displayName": scratch_name}
+
+    # A workspace is not fully initialised for Copy Jobs until it holds a lakehouse.
+    data_stores.create_lakehouse(ctx.client, ctx.scratch_workspace_id, "hold")
+
+    ctx.run.update_step(step, "Recreating workspace folders")
+    folder_map = workspaces.clone_folder_tree(
+        ctx.client, ctx.plan.source_workspace_id, ctx.target_workspace_id
+    )
+    ctx.id_map.update(folder_map)
+
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Created '{ctx.plan.target_workspace_name}'")
+
+
+# --------------------------------------------------------------------- phase 2
+
+
+def _migrate_eventhouses(ctx: _Context) -> None:
+    step = "eventhouses"
+    ctx.run.start_step(step, "Migrating eventhouses and KQL databases")
+    ctx.run.raise_if_cancelled()
+
+    source_eventhouses = eventhouses.list_eventhouses(ctx.client, ctx.plan.source_workspace_id)
+    if not source_eventhouses:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No eventhouses in the source workspace")
+        return
+
+    warnings: list[str] = []
+    databases_moved = 0
+
+    for eventhouse in source_eventhouses:
+        ctx.run.raise_if_cancelled()
+        name = eventhouse["displayName"]
+        ctx.run.update_step(step, f"Creating eventhouse '{name}'")
+
+        created = eventhouses.create_eventhouse(ctx.client, ctx.target_workspace_id, name)
+        new_eventhouse = eventhouses.get_eventhouse(ctx.client, ctx.target_workspace_id, created["id"])
+
+        source_properties = eventhouse.get("properties") or {}
+        target_properties = new_eventhouse.get("properties") or {}
+        ctx.id_map[eventhouse["id"]] = created["id"]
+        for key in ("queryServiceUri", "ingestionServiceUri"):
+            if source_properties.get(key) and target_properties.get(key):
+                ctx.id_map[source_properties[key]] = target_properties[key]
+
+        for database_id in source_properties.get("databasesItemIds") or []:
+            ctx.run.raise_if_cancelled()
+            moved, database_warnings = _migrate_kql_database(
+                ctx,
+                step,
+                database_id=database_id,
+                target_eventhouse_id=created["id"],
+                source_query_uri=source_properties.get("queryServiceUri", ""),
+                target_query_uri=target_properties.get("queryServiceUri", ""),
+            )
+            databases_moved += 1 if moved else 0
+            warnings.extend(database_warnings)
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"Migrated {len(source_eventhouses)} eventhouse(s) and {databases_moved} KQL database(s)",
+        warnings,
+    )
+
+
+def _migrate_kql_database(
+    ctx: _Context,
+    step: str,
+    *,
+    database_id: str,
+    target_eventhouse_id: str,
+    source_query_uri: str,
+    target_query_uri: str,
+) -> tuple[bool, list[str]]:
+    database = eventhouses.get_kql_database(ctx.client, ctx.plan.source_workspace_id, database_id)
+    name = database["displayName"]
+
+    if eventhouses.database_type(database) != "ReadWrite":
+        payload = eventhouses.shortcut_creation_payload(database, target_eventhouse_id)
+        if not payload:
+            return False, [
+                f"KQL database '{name}' is a shortcut/follower database and Fabric does not "
+                "expose its source, so it was skipped"
+            ]
+        eventhouses.create_kql_database(
+            ctx.client, ctx.target_workspace_id, name, creation_payload=payload
+        )
+        return True, []
+
+    ctx.run.update_step(step, f"Recreating KQL database '{name}'")
+    parts = eventhouses.kql_database_definition_parts(
+        ctx.client, ctx.plan.source_workspace_id, database_id
+    )
+    parts = eventhouses.retarget_database_definition(parts, target_eventhouse_id)
+    created = eventhouses.create_kql_database(ctx.client, ctx.target_workspace_id, name, parts=parts)
+    ctx.id_map[database_id] = created["id"]
+
+    if not ctx.plan.include_data:
+        return True, []
+    if not source_query_uri or not target_query_uri:
+        return True, [f"KQL database '{name}' has no query endpoint, data was not copied"]
+
+    ctx.run.update_step(step, f"Copying data for KQL database '{name}'")
+    result = kql.copy_database(
+        source_cluster_uri=source_query_uri,
+        target_cluster_uri=target_query_uri,
+        database=name,
+        principal=ctx.principal,
+        on_progress=lambda message: ctx.run.update_step(step, message),
+    )
+    logger.info("KQL database %s: copied %s table(s)", name, result["tables"])
+    return True, []
+
+
+# --------------------------------------------------------------------- phase 3
+
+
+def _migrate_lakehouses(ctx: _Context) -> None:
+    step = "lakehouses"
+    ctx.run.start_step(step, "Migrating lakehouses")
+    ctx.run.raise_if_cancelled()
+
+    source_lakehouses = data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id)
+    if not source_lakehouses:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No lakehouses in the source workspace")
+        return
+
+    warnings: list[str] = []
+    for lakehouse in source_lakehouses:
+        ctx.run.raise_if_cancelled()
+        name = lakehouse["displayName"]
+        schema_enabled = data_stores.is_schema_enabled(lakehouse)
+
+        ctx.run.update_step(step, f"Creating lakehouse '{name}'")
+        created = data_stores.create_lakehouse(
+            ctx.client,
+            ctx.target_workspace_id,
+            name,
+            schema_enabled=schema_enabled,
+            folder_id=ctx.id_map.get(lakehouse.get("folderId", "")),
+        )
+        target = data_stores.get_lakehouse(ctx.client, ctx.target_workspace_id, created["id"])
+        ctx.id_map[lakehouse["id"]] = created["id"]
+
+        source_endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
+        target_endpoint = data_stores.lakehouse_sql_endpoint(target)
+        if source_endpoint.get("connectionString") and target_endpoint.get("connectionString"):
+            ctx.id_map[source_endpoint["connectionString"]] = target_endpoint["connectionString"]
+
+        if ctx.plan.include_data:
+            warnings.extend(_copy_lakehouse_tables(ctx, step, lakehouse, created["id"], schema_enabled))
+
+        if ctx.plan.include_files:
+            warnings.extend(_copy_lakehouse_files(ctx, step, lakehouse, target))
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, f"Migrated {len(source_lakehouses)} lakehouse(s)", warnings
+    )
+
+
+def _copy_lakehouse_tables(
+    ctx: _Context,
+    step: str,
+    lakehouse: dict[str, Any],
+    target_id: str,
+    schema_enabled: bool,
+) -> list[str]:
+    name = lakehouse["displayName"]
+    tables = data_stores.managed_tables(
+        ctx.client,
+        ctx.plan.source_workspace_id,
+        lakehouse["id"],
+        schema_enabled=schema_enabled,
+    )
+    if not tables:
+        return []
+
+    ctx.run.update_step(step, f"Copying {len(tables)} table(s) from lakehouse '{name}'")
+    content = copyjobs.build_lakehouse_copy_job(
+        source_workspace_id=ctx.plan.source_workspace_id,
+        source_item_id=lakehouse["id"],
+        target_workspace_id=ctx.target_workspace_id,
+        target_item_id=target_id,
+        tables=tables,
+    )
+    try:
+        copy_job_id = copyjobs.run_copy_job(
+            ctx.client,
+            ctx.scratch_workspace_id,
+            f"CopyJob_Lakehouse_{name}",
+            content,
+            on_status=lambda status: ctx.run.update_step(step, f"Lakehouse '{name}' copy job: {status}"),
+        )
+        ctx.copy_job_ids.append((ctx.scratch_workspace_id, copy_job_id))
+        return []
+    except copyjobs.CopyJobFailed as error:
+        return [f"Table data for lakehouse '{name}' did not copy: {error}"]
+
+
+def _copy_lakehouse_files(
+    ctx: _Context,
+    step: str,
+    lakehouse: dict[str, Any],
+    target: dict[str, Any],
+) -> list[str]:
+    name = lakehouse["displayName"]
+    source_files = (lakehouse.get("properties") or {}).get("oneLakeFilesPath")
+    target_files = (target.get("properties") or {}).get("oneLakeFilesPath")
+    if not source_files or not target_files:
+        return []
+
+    ctx.run.update_step(step, f"Copying files for lakehouse '{name}'")
+    try:
+        file_transfer.copy_files(
+            source_files_path=source_files,
+            target_files_path=target_files,
+            principal=ctx.principal,
+            scratch_dir=ctx.scratch_dir / f"lakehouse-{lakehouse['id']}",
+            on_progress=lambda message: ctx.run.update_step(step, f"{name}: {message}"),
+        )
+        return []
+    except file_transfer.FileTransferError as error:
+        return [f"Files for lakehouse '{name}' did not copy: {error}"]
+
+
+# --------------------------------------------------------------------- phase 4
+
+
+def _migrate_warehouses(ctx: _Context) -> None:
+    step = "warehouses"
+    ctx.run.start_step(step, "Migrating warehouses")
+    ctx.run.raise_if_cancelled()
+
+    source_warehouses = data_stores.list_warehouses(ctx.client, ctx.plan.source_workspace_id)
+    if not source_warehouses:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No warehouses in the source workspace")
+        return
+
+    warnings: list[str] = []
+    for warehouse in source_warehouses:
+        ctx.run.raise_if_cancelled()
+        name = warehouse["displayName"]
+        collation = (warehouse.get("properties") or {}).get("collationType")
+
+        ctx.run.update_step(step, f"Creating warehouse '{name}'")
+        created = data_stores.create_warehouse(
+            ctx.client,
+            ctx.target_workspace_id,
+            name,
+            collation_type=collation,
+            folder_id=ctx.id_map.get(warehouse.get("folderId", "")),
+        )
+        target = data_stores.get_warehouse(ctx.client, ctx.target_workspace_id, created["id"])
+
+        source_endpoint = data_stores.warehouse_connection_string(warehouse)
+        target_endpoint = data_stores.warehouse_connection_string(target)
+        ctx.id_map[warehouse["id"]] = created["id"]
+        if source_endpoint and target_endpoint:
+            ctx.id_map[source_endpoint] = target_endpoint
+
+        ctx.run.update_step(step, f"Transferring schema for warehouse '{name}'")
+        try:
+            schema_warnings = sqlschema.transfer_schema(
+                source_server=source_endpoint,
+                target_server=target_endpoint,
+                database=name,
+                principal=ctx.principal,
+                tokens=ctx.tokens,
+                scratch_dir=ctx.scratch_dir / "sql",
+                source_type="Warehouse",
+                on_progress=lambda message: ctx.run.update_step(step, message),
+            )
+            warnings.extend(f"Warehouse '{name}': {w}" for w in schema_warnings)
+        except sqlschema.SchemaTransferError as error:
+            warnings.append(f"Schema for warehouse '{name}' did not transfer: {error}")
+            continue
+
+        if ctx.plan.include_data:
+            warnings.extend(
+                _copy_warehouse_tables(ctx, step, warehouse, created["id"], source_endpoint, target_endpoint)
+            )
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, f"Migrated {len(source_warehouses)} warehouse(s)", warnings
+    )
+
+
+def _copy_warehouse_tables(
+    ctx: _Context,
+    step: str,
+    warehouse: dict[str, Any],
+    target_id: str,
+    source_endpoint: str,
+    target_endpoint: str,
+) -> list[str]:
+    name = warehouse["displayName"]
+    try:
+        tables = _warehouse_tables(ctx, source_endpoint, name)
+    except sqlschema.SchemaTransferError as error:
+        return [f"Could not enumerate tables in warehouse '{name}': {error}"]
+
+    if not tables:
+        return []
+
+    ctx.run.update_step(step, f"Copying {len(tables)} table(s) from warehouse '{name}'")
+    content = copyjobs.build_warehouse_copy_job(
+        source_workspace_id=ctx.plan.source_workspace_id,
+        source_item_id=warehouse["id"],
+        source_endpoint=source_endpoint,
+        target_workspace_id=ctx.target_workspace_id,
+        target_item_id=target_id,
+        target_endpoint=target_endpoint,
+        tables=tables,
+    )
+    try:
+        copy_job_id = copyjobs.run_copy_job(
+            ctx.client,
+            ctx.scratch_workspace_id,
+            f"CopyJob_Warehouse_{name}",
+            content,
+            on_status=lambda status: ctx.run.update_step(step, f"Warehouse '{name}' copy job: {status}"),
+        )
+        ctx.copy_job_ids.append((ctx.scratch_workspace_id, copy_job_id))
+        return []
+    except copyjobs.CopyJobFailed as error:
+        return [f"Table data for warehouse '{name}' did not copy: {error}"]
+
+
+def _warehouse_tables(ctx: _Context, endpoint: str, database: str) -> list[data_stores.TableRef]:
+    """Enumerate base tables over TDS; warehouses have no REST table listing API."""
+    with sqlschema.connect(endpoint, database, ctx.tokens) as connection:
+        rows = (
+            connection.cursor()
+            .execute(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE = 'BASE TABLE'"
+            )
+            .fetchall()
+        )
+    return [data_stores.TableRef(name=row[1], schema=row[0]) for row in rows]
+
+
+# --------------------------------------------------------------------- phase 5
+
+
+def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
+    step = "shortcuts"
+    ctx.run.start_step(step, "Recreating shortcuts and syncing SQL endpoints")
+    ctx.run.raise_if_cancelled()
+
+    source_lakehouses = data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id)
+    if not source_lakehouses:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No lakehouses to process")
+        return
+
+    warnings: list[str] = []
+    shortcuts_created = 0
+
+    for lakehouse in source_lakehouses:
+        ctx.run.raise_if_cancelled()
+        name = lakehouse["displayName"]
+        target_id = ctx.id_map.get(lakehouse["id"])
+        if not target_id:
+            continue
+
+        ctx.run.update_step(step, f"Recreating shortcuts for '{name}'")
+        created, shortcut_warnings = shortcuts.copy_shortcuts(
+            ctx.client,
+            ctx.plan.source_workspace_id,
+            lakehouse["id"],
+            ctx.target_workspace_id,
+            target_id,
+            ctx.id_map,
+        )
+        shortcuts_created += created
+        warnings.extend(f"Lakehouse '{name}': {w}" for w in shortcut_warnings)
+
+        # The endpoint must re-read OneLake after tables and shortcuts land, otherwise the
+        # schema copy below sees an empty database.
+        ctx.run.update_step(step, f"Refreshing SQL endpoint for '{name}'")
+        target = data_stores.get_lakehouse(ctx.client, ctx.target_workspace_id, target_id)
+        endpoint = data_stores.lakehouse_sql_endpoint(target)
+        if endpoint.get("id"):
+            data_stores.refresh_sql_endpoint_metadata(ctx.client, ctx.target_workspace_id, endpoint["id"])
+
+        source_endpoint = data_stores.lakehouse_sql_endpoint(lakehouse).get("connectionString")
+        target_endpoint = endpoint.get("connectionString")
+        if not source_endpoint or not target_endpoint:
+            continue
+
+        ctx.run.update_step(step, f"Transferring SQL endpoint schema for '{name}'")
+        try:
+            schema_warnings = sqlschema.transfer_schema(
+                source_server=source_endpoint,
+                target_server=target_endpoint,
+                database=name,
+                principal=ctx.principal,
+                tokens=ctx.tokens,
+                scratch_dir=ctx.scratch_dir / "sql",
+                source_type="Lakehouse",
+                on_progress=lambda message: ctx.run.update_step(step, message),
+            )
+            warnings.extend(f"Lakehouse '{name}' SQL endpoint: {w}" for w in schema_warnings)
+        except sqlschema.SchemaTransferError as error:
+            warnings.append(f"SQL endpoint schema for '{name}' did not transfer: {error}")
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, f"Created {shortcuts_created} shortcut(s)", warnings
+    )
+
+
+# --------------------------------------------------------------------- phase 6
+
+
+def _copy_permissions(ctx: _Context) -> None:
+    step = "permissions"
+    if not ctx.plan.copy_permissions:
+        ctx.run.add_step(step, "Copying workspace permissions")
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "Disabled for this run")
+        return
+
+    ctx.run.start_step(step, "Copying workspace permissions")
+    ctx.run.raise_if_cancelled()
+
+    assignments = workspaces.list_role_assignments(ctx.client, ctx.plan.source_workspace_id)
+    warnings = workspaces.copy_role_assignments(ctx.client, assignments, ctx.target_workspace_id)
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"Replayed {len(assignments) - len(warnings)} of {len(assignments)} role assignment(s)",
+        warnings,
+    )
+
+
+# --------------------------------------------------------------------- cleanup
+
+
+def cleanup_run(run: MigrationRun, client: FabricClient, scratch_dir: Path | None = None) -> list[str]:
+    """Delete the scratch workspace and local staging created for a run."""
+    step = "cleanup"
+    run.start_step(step, "Removing temporary artifacts")
+    warnings: list[str] = []
+
+    scratch = run.scratch_workspace
+    if scratch and scratch.get("id"):
+        run.update_step(step, "Deleting scratch workspace")
+        try:
+            for item in list_items(client, scratch["id"]):
+                delete_item(client, scratch["id"], item["id"])
+            workspaces.delete_workspace(client, scratch["id"])
+            run.scratch_workspace = None
+        except Exception as error:
+            warnings.append(f"Scratch workspace {scratch['id']} could not be deleted: {error}")
+
+    directory = scratch_dir or (SETTINGS.scratch_root / run.id)
+    if directory.exists():
+        run.update_step(step, "Deleting local staging directory")
+        shutil.rmtree(directory, ignore_errors=True)
+
+    run.cleanup_done = not warnings
+    run.finish_step(
+        step,
+        StepStatus.SUCCEEDED if not warnings else StepStatus.FAILED,
+        "Temporary artifacts removed" if not warnings else "Some artifacts remain",
+        warnings,
+    )
+    return warnings
+
+
+def build_plan(
+    client: FabricClient,
+    *,
+    capacity_id: str,
+    source_workspace_id: str,
+    target_workspace_name: str | None = None,
+    include_files: bool = True,
+    include_data: bool = True,
+    copy_permissions: bool = True,
+) -> MigrationPlan:
+    capacity = workspaces.get_capacity(client, capacity_id)
+    workspace = workspaces.get_workspace(client, source_workspace_id)
+    region = workspaces.capacity_region(capacity)
+    source_name = workspace["displayName"]
+
+    return MigrationPlan(
+        capacity_id=capacity_id,
+        capacity_name=capacity.get("displayName", capacity_id),
+        capacity_region=region,
+        source_workspace_id=source_workspace_id,
+        source_workspace_name=source_name,
+        target_workspace_name=target_workspace_name or default_target_name(source_name, region),
+        include_files=include_files,
+        include_data=include_data,
+        copy_permissions=copy_permissions,
+    )
+
+
+__all__ = [
+    "MigrationPlan",
+    "build_plan",
+    "cleanup_run",
+    "default_target_name",
+    "run_migration",
+]

@@ -1,3 +1,12 @@
-clear-scratch.sh
-kqltest.ps1
 local/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
