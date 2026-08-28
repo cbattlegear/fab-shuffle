@@ -338,18 +338,36 @@ def _migrate_eventhouses(ctx: _Context) -> None:
             if source_properties.get(key) and target_properties.get(key):
                 ctx.id_map[source_properties[key]] = target_properties[key]
 
+        # Creating an eventhouse also creates a child KQL database named after it, so the
+        # target already holds a database that the source is about to ask us to create.
+        auto_created = eventhouses.eventhouse_databases(
+            ctx.client, ctx.target_workspace_id, new_eventhouse
+        )
+        adopted_names: set[str] = set()
+
         for database_id in source_properties.get("databasesItemIds") or []:
             ctx.run.raise_if_cancelled()
-            moved, database_warnings = _migrate_kql_database(
+            moved, database_warnings, adopted = _migrate_kql_database(
                 ctx,
                 step,
                 database_id=database_id,
                 target_eventhouse_id=created["id"],
                 source_query_uri=source_properties.get("queryServiceUri", ""),
                 target_query_uri=target_properties.get("queryServiceUri", ""),
+                existing_databases=auto_created,
             )
             databases_moved += 1 if moved else 0
             warnings.extend(database_warnings)
+            if adopted:
+                adopted_names.add(adopted)
+
+        # A default database whose name no source database matched is left behind empty,
+        # which happens when the source default database was renamed.
+        for leftover in sorted(set(auto_created) - adopted_names):
+            warnings.append(
+                f"Eventhouse '{name}' came with an empty default KQL database '{leftover}' that "
+                "no source database matched. Delete it if you do not want it."
+            )
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
@@ -368,34 +386,51 @@ def _migrate_kql_database(
     target_eventhouse_id: str,
     source_query_uri: str,
     target_query_uri: str,
-) -> tuple[bool, list[str]]:
+    existing_databases: dict[str, Any],
+) -> tuple[bool, list[str], str | None]:
+    """Migrate one KQL database. Returns (moved, warnings, adopted name if any)."""
     database = eventhouses.get_kql_database(ctx.client, ctx.plan.source_workspace_id, database_id)
     name = database["displayName"]
 
     if eventhouses.database_type(database) != "ReadWrite":
         payload = eventhouses.shortcut_creation_payload(database, target_eventhouse_id)
         if not payload:
-            return False, [
-                f"KQL database '{name}' is a shortcut/follower database and Fabric does not "
-                "expose its source, so it was skipped"
-            ]
+            return (
+                False,
+                [
+                    f"KQL database '{name}' is a shortcut/follower database and Fabric does not "
+                    "expose its source, so it was skipped"
+                ],
+                None,
+            )
         eventhouses.create_kql_database(
             ctx.client, ctx.target_workspace_id, name, creation_payload=payload
         )
-        return True, []
+        return True, [], None
 
     ctx.run.update_step(step, f"Recreating KQL database '{name}'")
     parts = eventhouses.kql_database_definition_parts(
         ctx.client, ctx.plan.source_workspace_id, database_id
     )
     parts = eventhouses.retarget_database_definition(parts, target_eventhouse_id)
-    created = eventhouses.create_kql_database(ctx.client, ctx.target_workspace_id, name, parts=parts)
-    ctx.id_map[database_id] = created["id"]
+
+    target, adopted = eventhouses.create_or_adopt_kql_database(
+        ctx.client,
+        ctx.target_workspace_id,
+        name,
+        parts=parts,
+        existing=existing_databases,
+    )
+    ctx.id_map[database_id] = target["id"]
+    if adopted:
+        logger.info("Applied schema to the default KQL database '%s'", name)
+
+    adopted_name = name if adopted else None
 
     if not ctx.plan.include_data:
-        return True, []
+        return True, [], adopted_name
     if not source_query_uri or not target_query_uri:
-        return True, [f"KQL database '{name}' has no query endpoint, data was not copied"]
+        return True, [f"KQL database '{name}' has no query endpoint, data was not copied"], adopted_name
 
     ctx.run.update_step(step, f"Copying data for KQL database '{name}'")
     result = kql.copy_database(
@@ -406,7 +441,7 @@ def _migrate_kql_database(
         on_progress=lambda message: ctx.run.update_step(step, message),
     )
     logger.info("KQL database %s: copied %s table(s)", name, result["tables"])
-    return True, []
+    return True, [], adopted_name
 
 
 # --------------------------------------------------------------------- phase 3
