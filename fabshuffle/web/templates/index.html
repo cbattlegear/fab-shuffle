@@ -80,11 +80,24 @@
     <!-- 4. Review -->
     <section class="panel" data-stage="review" hidden>
       <h2>Review the move</h2>
+      <div id="strategy-callout" class="callout"></div>
       <div id="review-summary" class="summary"></div>
-      <label class="field">New workspace name
+
+      <div id="blockers" class="warnings danger" hidden>
+        <h3>Blockers</h3>
+        <ul></ul>
+      </div>
+
+      <div id="unsupported" class="warnings" hidden>
+        <h3>Not migrated</h3>
+        <p class="hint">These stay in the source workspace and need to be moved by hand.</p>
+        <ul></ul>
+      </div>
+
+      <label class="field" id="target-name-field">New workspace name
         <input id="target-name" autocomplete="off" spellcheck="false" />
       </label>
-      <fieldset class="options">
+      <fieldset class="options" id="rebuild-options">
         <legend>Options</legend>
         <label><input type="checkbox" id="opt-data" checked /> Copy table data</label>
         <label><input type="checkbox" id="opt-files" checked /> Copy lakehouse files</label>

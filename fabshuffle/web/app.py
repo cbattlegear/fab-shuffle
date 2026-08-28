@@ -19,8 +19,15 @@ from pydantic import BaseModel, Field
 
 from fabshuffle import __version__
 from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
-from fabshuffle.fabric import workspaces
+from fabshuffle.fabric import data_stores, eventhouses, workspaces
 from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.items import list_items
+from fabshuffle.fabric.powerbi import PowerBiClient, PowerBiError
+from fabshuffle.fabric.support import (
+    Strategy,
+    assess_workspace,
+    supports_large_semantic_models,
+)
 from fabshuffle.orchestrator import (
     MigrationPlan,
     build_plan,
@@ -98,6 +105,9 @@ class StartRunRequest(BaseModel):
     capacity_id: str = Field(min_length=1)
     source_workspace_id: str = Field(min_length=1)
     target_workspace_name: str | None = None
+    # Omit to let Fab Shuffle choose; send "rebuild" to force a full rebuild of a
+    # Power BI only workspace instead of reassigning it.
+    strategy: Strategy | None = None
     include_data: bool = True
     include_files: bool = True
     copy_permissions: bool = True
@@ -187,37 +197,37 @@ def create_app() -> FastAPI:
         """Summarise what the migration would create before the operator commits."""
 
         def work() -> dict[str, Any]:
-            from fabshuffle.fabric import data_stores, eventhouses
-            from fabshuffle.fabric.items import list_items
-
             with FabricClient(session.tokens) as client:
                 plan = build_plan(
                     client,
                     capacity_id=capacity_id,
                     source_workspace_id=source_workspace_id,
                 )
-                lakehouses = data_stores.list_lakehouses(client, source_workspace_id)
-                warehouses = data_stores.list_warehouses(client, source_workspace_id)
-                houses = eventhouses.list_eventhouses(client, source_workspace_id)
-                all_items = list_items(client, source_workspace_id)
+                assessment = assess_workspace(list_items(client, source_workspace_id))
 
-                supported = {"Lakehouse", "Warehouse", "Eventhouse", "KQLDatabase", "SQLEndpoint"}
-                unsupported = sorted(
-                    {item.get("type", "Unknown") for item in all_items if item.get("type") not in supported}
-                )
-
-                return {
+                result: dict[str, Any] = {
                     "targetWorkspaceName": plan.target_workspace_name,
                     "capacityRegion": plan.capacity_region,
                     "capacityName": plan.capacity_name,
                     "sourceWorkspaceName": plan.source_workspace_name,
-                    "counts": {
-                        "lakehouses": len(lakehouses),
-                        "warehouses": len(warehouses),
-                        "eventhouses": len(houses),
-                    },
-                    "unsupportedItemTypes": unsupported,
+                    "strategy": assessment.strategy.value,
+                    "unsupported": [item.as_dict() for item in assessment.unsupported],
+                    "unsupportedItemTypes": assessment.unsupported_types,
+                    "largeSemanticModels": [],
+                    "blockers": [],
                 }
+
+                if assessment.strategy is Strategy.REASSIGN:
+                    result["counts"] = {"lakehouses": 0, "warehouses": 0, "eventhouses": 0}
+                    result.update(_semantic_model_preview(session, source_workspace_id, plan))
+                    return result
+
+                result["counts"] = {
+                    "lakehouses": len(data_stores.list_lakehouses(client, source_workspace_id)),
+                    "warehouses": len(data_stores.list_warehouses(client, source_workspace_id)),
+                    "eventhouses": len(eventhouses.list_eventhouses(client, source_workspace_id)),
+                }
+                return result
 
         return await _run_fabric(work)
 
@@ -238,6 +248,7 @@ def create_app() -> FastAPI:
                     include_files=body.include_files,
                     include_data=body.include_data,
                     copy_permissions=body.copy_permissions,
+                    strategy=body.strategy,
                 )
 
         plan = await _run_fabric(prepare)
@@ -335,9 +346,52 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
         "capacityRegion": plan.capacity_region,
         "sourceWorkspaceName": plan.source_workspace_name,
         "targetWorkspaceName": plan.target_workspace_name,
+        "strategy": plan.strategy.value,
         "includeData": plan.include_data,
         "includeFiles": plan.include_files,
         "copyPermissions": plan.copy_permissions,
+    }
+
+
+def _semantic_model_preview(
+    session: Session,
+    workspace_id: str,
+    plan: MigrationPlan,
+) -> dict[str, Any]:
+    """Report which semantic models would have to be converted, and anything that blocks it.
+
+    Surfaced before the run so the operator learns about a blocker at review time rather
+    than after the models have already been touched.
+    """
+    try:
+        with PowerBiClient(session.tokens) as pbi:
+            models = pbi.list_semantic_models(workspace_id)
+    except PowerBiError as error:
+        return {
+            "blockers": [
+                "Could not read semantic model storage settings. The service principal needs "
+                f"access to the Power BI APIs: {error}"
+            ]
+        }
+
+    large = [model for model in models if model.is_large]
+    blockers: list[str] = []
+
+    if large and not supports_large_semantic_models(plan.capacity_region):
+        blockers.append(
+            f"Region '{plan.capacity_region}' does not support large semantic model storage, "
+            f"so {len(large)} model(s) could not be restored after the move."
+        )
+
+    blocked = [model.name for model in large if not model.convertible]
+    if blocked:
+        blockers.append(
+            "These semantic models cannot leave the large storage format: " + ", ".join(blocked)
+        )
+
+    return {
+        "largeSemanticModels": [{"id": m.id, "name": m.name} for m in large],
+        "blockers": blockers,
     }
 
 

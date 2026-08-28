@@ -14,6 +14,26 @@ v2 is a Python application driven almost entirely by the
 small web UI that walks you through the move. (v1 was a PowerShell script around the `fab`
 CLI; it still lives on the `main` branch's history.)
 
+### Two ways to move a workspace
+
+Fab Shuffle inspects the workspace and picks the cheaper of two strategies.
+
+**Reassign** — if the workspace holds only Power BI content (reports, paginated reports,
+semantic models, dashboards), there is nothing to rebuild. The cross-region restriction on
+`assignToCapacity` only applies to Fabric items, so Fab Shuffle simply assigns the existing
+workspace to a capacity in the target region. Nothing is copied and no new workspace appears.
+
+Large semantic models are the wrinkle: they are backed by Azure Premium Files, which pins the
+workspace to its region. Fab Shuffle converts each large model to the small storage format,
+performs the reassignment, then switches them back. If a model can't be converted, or the
+target region [doesn't support large models](https://learn.microsoft.com/en-us/power-bi/enterprise/service-premium-large-models#region-availability),
+the move is refused up front — and if a conversion fails midway, the models already converted
+are restored before anything else happens.
+
+**Rebuild** — as soon as a single Fabric item is present, the workspace cannot be reassigned
+across regions. Fab Shuffle creates a new workspace in the target region and recreates and
+copies everything it supports.
+
 ### What gets migrated
 
 | Item | Schema | Data | Notes |
@@ -27,7 +47,10 @@ CLI; it still lives on the `main` branch's history.)
 | Workspace folders | ✅ | n/a | Hierarchy recreated |
 | Workspace permissions | ✅ | n/a | Role assignments replayed |
 
-Anything else in the source workspace is reported on the review screen as not yet migrated.
+On a rebuild, anything not in that table is reported by name and type — on the review screen
+before you commit, and again as a warning on the run itself — so you know exactly what stays
+behind in the source workspace. That includes Power BI content, which a rebuild cannot move.
+
 KQL *shortcut* (follower) databases are skipped, because Fabric does not expose the follower
 source through the API.
 
@@ -68,11 +91,17 @@ Open <http://localhost:8080> and follow the wizard:
 1. **Sign in** with the service principal's tenant ID, client ID, and secret.
 2. **Pick the target capacity** — its region is the destination region.
 3. **Pick the source workspace.**
-4. **Review** the plan, adjust the new workspace name, and choose what to copy.
+4. **Review** the plan. Fab Shuffle tells you whether the workspace can simply be reassigned
+   or has to be rebuilt, lists anything it cannot move, and refuses to start if there is a
+   blocker.
 5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
 
 Credentials are held in the container's memory for the life of the session and are never
 written to disk.
+
+The service principal also needs the **"Service principals can use Fabric APIs"** tenant
+setting for Power BI, since the reassignment path calls the Power BI semantic model APIs and
+must be able to update those models.
 
 > Lakehouse file transfer stages files on local disk inside the container. Mount a volume at
 > `/app/local` if you are moving more data than the container's writable layer can hold.
@@ -93,15 +122,21 @@ Every setting has a sensible default; override with environment variables when n
 
 ## How it works
 
-1. Create the target workspace on the chosen capacity, plus a short-lived scratch workspace
+On the reassign path, the whole migration is: convert large semantic models to the small
+storage format, `assignToCapacity`, convert them back.
+
+On the rebuild path:
+
+1. Assess the workspace and warn about every item that will be left behind.
+2. Create the target workspace on the chosen capacity, plus a short-lived scratch workspace
    that holds the Copy Jobs (so they never pollute the migrated workspace).
-2. Recreate eventhouses, then import each KQL database definition retargeted at the new
+3. Recreate eventhouses, then import each KQL database definition retargeted at the new
    eventhouse, and copy table data with a cross-cluster `.set-or-replace`.
-3. Recreate lakehouses, copy table data with Copy Jobs, and copy `Files/` with azcopy.
-4. Recreate warehouses, transfer their T-SQL schema, and copy table data with Copy Jobs.
-5. Recreate shortcuts, refresh the SQL analytics endpoints, then copy their schema.
-6. Replay workspace role assignments.
-7. Delete the scratch workspace and local staging.
+4. Recreate lakehouses, copy table data with Copy Jobs, and copy `Files/` with azcopy.
+5. Recreate warehouses, transfer their T-SQL schema, and copy table data with Copy Jobs.
+6. Recreate shortcuts, refresh the SQL analytics endpoints, then copy their schema.
+7. Replay workspace role assignments.
+8. Delete the scratch workspace and local staging.
 
 ### Why some things are not pure REST
 

@@ -10,3 +10,6 @@ build/
 dist/
 .pytest_cache/
 .ruff_cache/
+
+# Design review hook cache
+.impeccable/

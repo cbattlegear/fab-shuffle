@@ -23,9 +23,15 @@ from typing import Any
 
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric import copyjobs, data_stores, eventhouses, shortcuts, workspaces
+from fabshuffle.fabric import copyjobs, data_stores, eventhouses, powerbi, shortcuts, workspaces
 from fabshuffle.fabric.client import FabricClient
 from fabshuffle.fabric.items import delete_item, list_items
+from fabshuffle.fabric.support import (
+    Strategy,
+    WorkspaceAssessment,
+    assess_workspace,
+    supports_large_semantic_models,
+)
 from fabshuffle.run import CancelledError, MigrationRun, RunStatus, StepStatus
 from fabshuffle.transfer import files as file_transfer
 from fabshuffle.transfer import kql, sqlschema
@@ -41,6 +47,7 @@ class MigrationPlan:
     source_workspace_id: str
     source_workspace_name: str
     target_workspace_name: str
+    strategy: Strategy = Strategy.REBUILD
     include_files: bool = True
     include_data: bool = True
     copy_permissions: bool = True
@@ -61,6 +68,7 @@ class _Context:
     id_map: dict[str, str] = field(default_factory=dict)
     copy_job_ids: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    assessment: WorkspaceAssessment | None = None
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -89,6 +97,14 @@ def run_migration(
             scratch_dir=scratch_dir,
         )
         try:
+            if plan.strategy is Strategy.REASSIGN:
+                _reassign_capacity(context)
+                run.summary["strategy"] = Strategy.REASSIGN.value
+                run.summary["warnings"] = context.warnings
+                run.mark_finished(RunStatus.SUCCEEDED)
+                return
+
+            _report_unsupported_items(context)
             _create_workspaces(context)
             _migrate_eventhouses(context)
             _migrate_lakehouses(context)
@@ -97,6 +113,7 @@ def run_migration(
             _copy_permissions(context)
             if cleanup:
                 cleanup_run(context.run, context.client, scratch_dir)
+            run.summary["strategy"] = Strategy.REBUILD.value
             run.summary["warnings"] = context.warnings
             run.mark_finished(RunStatus.SUCCEEDED)
         except CancelledError as error:
@@ -104,6 +121,136 @@ def run_migration(
         except Exception as error:
             logger.exception("Migration %s failed", run.id)
             run.mark_finished(RunStatus.FAILED, str(error))
+
+
+# --------------------------------------------------------------- reassign path
+
+
+def _reassign_capacity(ctx: _Context) -> None:
+    """Move a Power BI only workspace by pointing it at a capacity in the target region.
+
+    Large semantic models are backed by Azure Premium Files, which pins their workspace to
+    its region, so each one is converted to the small format first and restored afterwards.
+    If any conversion or the assignment itself fails, the models that were already converted
+    are put back rather than leaving the workspace half changed.
+    """
+    step = "reassign"
+    ctx.run.start_step(step, "Reassigning the workspace to the target capacity")
+    ctx.run.raise_if_cancelled()
+
+    workspace_id = ctx.plan.source_workspace_id
+    warnings: list[str] = []
+    converted: list[powerbi.SemanticModel] = []
+
+    with powerbi.PowerBiClient(ctx.tokens) as pbi:
+        ctx.run.update_step(step, "Checking semantic model storage format")
+        models = pbi.list_semantic_models(workspace_id)
+        large_models = [model for model in models if model.is_large]
+
+        if large_models and not supports_large_semantic_models(ctx.plan.capacity_region):
+            raise RuntimeError(
+                f"{len(large_models)} semantic model(s) use the large storage format, but region "
+                f"'{ctx.plan.capacity_region}' does not support it, so they could not be "
+                "restored after the move."
+            )
+
+        blocked = [model for model in large_models if not model.convertible]
+        if blocked:
+            names = ", ".join(f"'{model.name}'" for model in blocked)
+            raise RuntimeError(
+                "These semantic models cannot leave the large storage format, so the workspace "
+                f"cannot be reassigned: {names}"
+            )
+
+        try:
+            for model in large_models:
+                ctx.run.raise_if_cancelled()
+                pbi.convert(
+                    workspace_id,
+                    model,
+                    powerbi.SMALL,
+                    on_progress=lambda message: ctx.run.update_step(step, message),
+                )
+                converted.append(model)
+        except (powerbi.PowerBiError, CancelledError) as error:
+            ctx.run.update_step(step, "Conversion failed, restoring large semantic model storage")
+            warnings.extend(_restore_large_models(ctx, pbi, converted))
+            ctx.warnings.extend(warnings)
+            ctx.run.finish_step(step, StepStatus.FAILED, "Could not convert every model", warnings)
+            raise RuntimeError(
+                f"Semantic models could not be converted to the small storage format: {error}"
+            ) from error
+
+        ctx.run.update_step(step, f"Assigning workspace to '{ctx.plan.capacity_name}'")
+        try:
+            workspaces.assign_to_capacity(ctx.client, workspace_id, ctx.plan.capacity_id)
+        except Exception:
+            ctx.run.update_step(step, "Assignment failed, restoring large semantic model storage")
+            warnings.extend(_restore_large_models(ctx, pbi, converted))
+            ctx.warnings.extend(warnings)
+            ctx.run.finish_step(step, StepStatus.FAILED, "Capacity assignment failed", warnings)
+            raise
+
+        if converted:
+            ctx.run.update_step(step, "Restoring large semantic model storage")
+            warnings.extend(_restore_large_models(ctx, pbi, converted))
+
+    ctx.run.target_workspace = {"id": workspace_id, "displayName": ctx.plan.source_workspace_name}
+    ctx.warnings.extend(warnings)
+
+    detail = f"Workspace now runs on '{ctx.plan.capacity_name}' in {ctx.plan.capacity_region}"
+    if converted:
+        detail += f", {len(converted)} semantic model(s) restored to large storage"
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, detail, warnings)
+
+
+def _restore_large_models(
+    ctx: _Context,
+    pbi: powerbi.PowerBiClient,
+    models: list[powerbi.SemanticModel],
+) -> list[str]:
+    """Put models back on the large storage format, collecting failures instead of raising."""
+    warnings: list[str] = []
+    for model in models:
+        try:
+            pbi.convert(
+                ctx.plan.source_workspace_id,
+                model,
+                powerbi.LARGE,
+                on_progress=lambda message: ctx.run.update_step("reassign", message),
+            )
+        except powerbi.PowerBiError as error:
+            warnings.append(
+                f"Semantic model '{model.name}' is still on the small storage format; "
+                f"re-enable large storage manually: {error}"
+            )
+    return warnings
+
+
+# ----------------------------------------------------------- unsupported items
+
+
+def _report_unsupported_items(ctx: _Context) -> None:
+    step = "assessment"
+    ctx.run.start_step(step, "Checking the workspace for unsupported items")
+    ctx.run.raise_if_cancelled()
+
+    assessment = assess_workspace(list_items(ctx.client, ctx.plan.source_workspace_id))
+    ctx.assessment = assessment
+    ctx.run.summary["unsupported"] = [item.as_dict() for item in assessment.unsupported]
+
+    if not assessment.unsupported:
+        ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Everything in this workspace is supported")
+        return
+
+    warnings = [item.message() for item in assessment.unsupported]
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"{len(assessment.unsupported)} item(s) will be left behind in the source workspace",
+        warnings,
+    )
 
 
 # --------------------------------------------------------------------- phase 1
@@ -611,11 +758,15 @@ def build_plan(
     include_files: bool = True,
     include_data: bool = True,
     copy_permissions: bool = True,
+    strategy: Strategy | None = None,
 ) -> MigrationPlan:
     capacity = workspaces.get_capacity(client, capacity_id)
     workspace = workspaces.get_workspace(client, source_workspace_id)
     region = workspaces.capacity_region(capacity)
     source_name = workspace["displayName"]
+
+    if strategy is None:
+        strategy = assess_workspace(list_items(client, source_workspace_id)).strategy
 
     return MigrationPlan(
         capacity_id=capacity_id,
@@ -623,7 +774,13 @@ def build_plan(
         capacity_region=region,
         source_workspace_id=source_workspace_id,
         source_workspace_name=source_name,
-        target_workspace_name=target_workspace_name or default_target_name(source_name, region),
+        # Reassignment moves the workspace itself, so its name never changes.
+        target_workspace_name=(
+            source_name
+            if strategy is Strategy.REASSIGN
+            else (target_workspace_name or default_target_name(source_name, region))
+        ),
+        strategy=strategy,
         include_files=include_files,
         include_data=include_data,
         copy_permissions=copy_permissions,

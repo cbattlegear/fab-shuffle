@@ -254,6 +254,22 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .warnings h3 { margin: 0 0 0.5rem; font-size: 0.9rem; color: var(--warning); }
 .warnings ul { margin: 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--text-dim); }
+.warnings .hint { margin: 0 0 0.5rem; }
+
+.warnings.danger { border-color: rgba(229, 100, 107, 0.5); background: rgba(229, 100, 107, 0.1); }
+.warnings.danger h3 { color: var(--danger); }
+
+.callout {
+  margin-bottom: 1.25rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(76, 154, 255, 0.1);
+}
+
+.callout.good { border-color: var(--success); background: rgba(53, 196, 139, 0.1); }
+.callout strong { display: block; margin-bottom: 0.2rem; font-size: 0.95rem; }
+.callout p { margin: 0; color: var(--text-dim); font-size: 0.87rem; }
 
 .alert {
   margin-bottom: 1rem;

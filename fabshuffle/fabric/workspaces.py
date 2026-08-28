@@ -64,6 +64,18 @@ def delete_workspace(client: FabricClient, workspace_id: str) -> None:
     client.delete(f"workspaces/{workspace_id}")
 
 
+def assign_to_capacity(client: FabricClient, workspace_id: str, capacity_id: str) -> dict[str, Any]:
+    """Move an existing workspace onto another capacity.
+
+    Fabric rejects this across regions when the workspace holds non-Power BI items, so only
+    call it once the workspace has been assessed as Power BI only.
+    """
+    return client.post(
+        f"workspaces/{workspace_id}/assignToCapacity",
+        json={"capacityId": capacity_id},
+    )
+
+
 # ------------------------------------------------------------- role assignments
 
 
@@ -191,6 +203,7 @@ def clone_folder_tree(
 
 __all__ = [
     "add_role_assignment",
+    "assign_to_capacity",
     "capacity_region",
     "clone_folder_tree",
     "copy_role_assignments",

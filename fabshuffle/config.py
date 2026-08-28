@@ -14,6 +14,9 @@ SCOPE_FABRIC = "https://api.fabric.microsoft.com/.default"
 SCOPE_STORAGE = "https://storage.azure.com/.default"
 SCOPE_KUSTO = "https://kusto.kusto.windows.net/.default"
 SCOPE_SQL = "https://database.windows.net/.default"
+# Power BI rejects tokens issued for any other audience, so its endpoints cannot reuse
+# the Fabric token even though the two services overlap.
+SCOPE_POWERBI = "https://analysis.windows.net/powerbi/api/.default"
 
 AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
 

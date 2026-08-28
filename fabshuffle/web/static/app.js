@@ -218,38 +218,83 @@ $("#workspace-next").addEventListener("click", async () => {
 
 function renderReview() {
   const preview = state.preview;
+  const reassign = preview.strategy === "reassign";
+
+  const callout = $("#strategy-callout");
+  callout.className = `callout ${reassign ? "good" : ""}`;
+  callout.innerHTML = "<strong></strong><p></p>";
+  callout.querySelector("strong").textContent = reassign
+    ? "This workspace can just be reassigned"
+    : "This workspace has to be rebuilt";
+  callout.querySelector("p").textContent = reassign
+    ? "It only holds Power BI content, so Fab Shuffle moves the existing workspace onto the " +
+      "target capacity instead of recreating it. Nothing is copied and no new workspace is made." +
+      (preview.largeSemanticModels.length
+        ? ` ${preview.largeSemanticModels.length} semantic model(s) use large storage format and will be ` +
+          "converted to small for the move, then switched back afterwards."
+        : "")
+    : "It contains Fabric items, which cannot move across regions on a capacity reassignment. " +
+      "Fab Shuffle creates a new workspace in the target region and copies everything it supports.";
+
   const rows = [
     ["Source workspace", preview.sourceWorkspaceName],
     ["Target capacity", `${preview.capacityName} (${preview.capacityRegion || "unknown region"})`],
-    ["Lakehouses", String(preview.counts.lakehouses)],
-    ["Warehouses", String(preview.counts.warehouses)],
-    ["Eventhouses", String(preview.counts.eventhouses)],
   ];
-  if (preview.unsupportedItemTypes.length) {
-    rows.push(["Not migrated yet", preview.unsupportedItemTypes.join(", ")]);
+  if (reassign) {
+    rows.push(["Large semantic models", String(preview.largeSemanticModels.length)]);
+  } else {
+    rows.push(
+      ["Lakehouses", String(preview.counts.lakehouses)],
+      ["Warehouses", String(preview.counts.warehouses)],
+      ["Eventhouses", String(preview.counts.eventhouses)]
+    );
   }
 
-  $("#review-summary").innerHTML = rows
-    .map(([key, value]) => `<div><span class="k"></span><span class="v"></span></div>`)
-    .join("");
+  $("#review-summary").innerHTML = rows.map(() => `<div><span class="k"></span><span class="v"></span></div>`).join("");
   $$("#review-summary div").forEach((row, index) => {
     row.querySelector(".k").textContent = rows[index][0];
     row.querySelector(".v").textContent = rows[index][1];
   });
 
+  fillList($("#blockers"), preview.blockers);
+  fillList(
+    $("#unsupported"),
+    preview.unsupported.map((item) => `${item.type} “${item.name}” — ${item.reason}`)
+  );
+
+  // A reassignment keeps the workspace and its name, and copies nothing.
+  $("#target-name-field").hidden = reassign;
+  $("#rebuild-options").hidden = reassign;
   $("#target-name").value = preview.targetWorkspaceName;
+
+  $("#start-run").disabled = preview.blockers.length > 0;
+  $("#start-run").textContent = reassign ? "Reassign workspace" : "Start migration";
+}
+
+function fillList(container, entries) {
+  container.hidden = !entries.length;
+  if (!entries.length) return;
+  const list = container.querySelector("ul");
+  list.innerHTML = "";
+  entries.forEach((entry) => {
+    const item = document.createElement("li");
+    item.textContent = entry;
+    list.appendChild(item);
+  });
 }
 
 $("#start-run").addEventListener("click", async () => {
   const button = $("#start-run");
-  busy(button, true, "Starting…");
+  const reassign = state.preview.strategy === "reassign";
+  busy(button, true, reassign ? "Reassigning…" : "Starting…");
   try {
     const result = await api("/api/runs", {
       method: "POST",
       body: {
         capacity_id: state.capacity.id,
         source_workspace_id: state.workspace.id,
-        target_workspace_name: $("#target-name").value.trim() || null,
+        strategy: state.preview.strategy,
+        target_workspace_name: reassign ? null : $("#target-name").value.trim() || null,
         include_data: $("#opt-data").checked,
         include_files: $("#opt-files").checked,
         copy_permissions: $("#opt-permissions").checked,

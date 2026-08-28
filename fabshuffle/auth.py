@@ -12,6 +12,7 @@ from fabshuffle.config import (
     AUTHORITY_TEMPLATE,
     SCOPE_FABRIC,
     SCOPE_KUSTO,
+    SCOPE_POWERBI,
     SCOPE_SQL,
     SCOPE_STORAGE,
 )
@@ -82,6 +83,9 @@ class TokenProvider:
     def sql_token(self) -> str:
         return self.token(SCOPE_SQL)
 
+    def powerbi_token(self) -> str:
+        return self.token(SCOPE_POWERBI)
+
     def verify(self) -> None:
         """Fail fast at login time rather than midway through a migration."""
         self.fabric_token()
@@ -100,6 +104,7 @@ def wait_backoff(attempt: int, base_seconds: float = 2.0, cap_seconds: float = 6
 __all__ = [
     "SCOPE_FABRIC",
     "SCOPE_KUSTO",
+    "SCOPE_POWERBI",
     "SCOPE_SQL",
     "SCOPE_STORAGE",
     "AuthError",
