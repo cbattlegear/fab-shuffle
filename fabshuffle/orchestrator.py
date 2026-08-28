@@ -261,7 +261,7 @@ def _report_unsupported_items(ctx: _Context) -> None:
         ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Everything in this workspace is supported")
         return
 
-    warnings = [item.message() for item in assessment.unsupported]
+    warnings = assessment.grouped_messages()
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
         step,

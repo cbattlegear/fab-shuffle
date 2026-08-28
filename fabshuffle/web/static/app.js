@@ -293,10 +293,7 @@ function renderReview() {
   });
 
   fillList($("#blockers"), preview.blockers);
-  fillList(
-    $("#unsupported"),
-    preview.unsupported.map((item) => `${item.type} “${item.name}” — ${item.reason}`)
-  );
+  fillList($("#unsupported"), preview.unsupportedSummary);
 
   // A reassignment keeps the workspace and its name, and copies nothing.
   $("#target-name-field").hidden = reassign;
@@ -402,7 +399,7 @@ function renderRun(run) {
     item.className = step.status;
     item.innerHTML = `
       <span class="icon"></span>
-      <div>
+      <div class="step-body">
         <div class="title"></div>
         <div class="detail"></div>
       </div>`;
@@ -418,7 +415,7 @@ function renderRun(run) {
         entry.textContent = warning;
         warnings.appendChild(entry);
       });
-      item.querySelector("div:last-child").appendChild(warnings);
+      item.querySelector(".step-body").appendChild(warnings);
     }
     list.appendChild(item);
   });

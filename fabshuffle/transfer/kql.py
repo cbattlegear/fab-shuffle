@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from datetime import timedelta
 
 from azure.kusto.data import ClientRequestProperties, KustoClient, KustoConnectionStringBuilder
 from azure.kusto.data.exceptions import KustoServiceError
@@ -19,6 +20,10 @@ from fabshuffle.auth import ServicePrincipal
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5
+# Cross-cluster ingestion of a large table can run long, so the server timeout is raised
+# from the default. The Kusto SDK adds a client/server delta to this value, so it has to be
+# a timedelta rather than the "hh:mm:ss" string the KQL language itself uses.
+INGEST_TIMEOUT = timedelta(hours=1)
 # Tables Fabric manages itself; re-ingesting them corrupts the target database.
 SYSTEM_TABLE_PREFIXES = ("$",)
 
@@ -65,7 +70,7 @@ def copy_database(
     total_rows = 0
     with _client(target_cluster_uri, principal) as target:
         properties = ClientRequestProperties()
-        properties.set_option(ClientRequestProperties.request_timeout_option_name, "01:00:00")
+        properties.set_option(ClientRequestProperties.request_timeout_option_name, INGEST_TIMEOUT)
 
         for table in tables:
             if on_progress:

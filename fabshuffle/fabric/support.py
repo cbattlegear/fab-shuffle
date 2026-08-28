@@ -94,11 +94,29 @@ class WorkspaceAssessment:
     def unsupported_types(self) -> list[str]:
         return sorted({item.type for item in self.unsupported})
 
+    def grouped_messages(self) -> list[str]:
+        """One message per item type rather than per item.
+
+        A workspace can easily hold dozens of unmigrated items that share a single reason,
+        and repeating that reason for each one buries the information.
+        """
+        groups: dict[str, list[UnsupportedItem]] = {}
+        for item in self.unsupported:
+            groups.setdefault(item.type, []).append(item)
+
+        messages: list[str] = []
+        for item_type in sorted(groups):
+            items = groups[item_type]
+            names = ", ".join(sorted(f"'{item.name}'" for item in items))
+            messages.append(f"{item_type} ({len(items)}) not migrated: {names}. {items[0].reason}.")
+        return messages
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "strategy": self.strategy.value,
             "unsupported": [item.as_dict() for item in self.unsupported],
             "unsupportedTypes": self.unsupported_types,
+            "unsupportedSummary": self.grouped_messages(),
         }
 
 

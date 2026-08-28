@@ -217,7 +217,9 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
 
-.steps li {
+/* Direct children only: the nested warning list must not inherit the two-column grid,
+   which would squeeze its text into a 1.5rem column and wrap it one word per line. */
+.steps > li {
   display: grid;
   grid-template-columns: 1.5rem 1fr;
   gap: 0.75rem;
@@ -231,11 +233,11 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .steps .icon { font-size: 1rem; line-height: 1.4; }
 .steps .title { font-weight: 500; }
 .steps .detail { color: var(--text-dim); font-size: 0.85rem; }
-.steps li.running { border-color: var(--accent); }
-.steps li.succeeded .icon { color: var(--success); }
-.steps li.failed { border-color: var(--danger); }
-.steps li.failed .icon { color: var(--danger); }
-.steps li.skipped { opacity: 0.65; }
+.steps > li.running { border-color: var(--accent); }
+.steps > li.succeeded .icon { color: var(--success); }
+.steps > li.failed { border-color: var(--danger); }
+.steps > li.failed .icon { color: var(--danger); }
+.steps > li.skipped { opacity: 0.65; }
 
 .steps .step-warnings {
   margin: 0.4rem 0 0;
@@ -243,6 +245,8 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   color: var(--warning);
   font-size: 0.82rem;
 }
+
+.steps .step-warnings li { margin-bottom: 0.2rem; }
 
 .warnings {
   margin-top: 1.25rem;

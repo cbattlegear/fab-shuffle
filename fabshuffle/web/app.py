@@ -213,6 +213,7 @@ def create_app() -> FastAPI:
                     "strategy": assessment.strategy.value,
                     "unsupported": [item.as_dict() for item in assessment.unsupported],
                     "unsupportedItemTypes": assessment.unsupported_types,
+                    "unsupportedSummary": assessment.grouped_messages(),
                     "largeSemanticModels": [],
                     "blockers": [],
                 }
