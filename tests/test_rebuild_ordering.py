@@ -46,10 +46,12 @@ REPORT_PBIR = json.dumps(
 class FakeFabric:
     """Records every create call in order and serves the reads each phase makes."""
 
-    def __init__(self) -> None:
+    def __init__(self, relations: dict[str, list[dict]] | None = None) -> None:
         self.created: list[tuple[str, str, str]] = []
         self.definitions: dict[str, list[dict]] = {}
         self.next_id = 0
+        # source item id -> upstream relation edges
+        self.relations = relations or {}
 
     # -- lifecycle used by the orchestrator -------------------------------------------
 
@@ -69,6 +71,13 @@ class FakeFabric:
     # -- reads -----------------------------------------------------------------------
 
     def get(self, path, params=None):
+        if path.endswith("/relations/upstream"):
+            item_id = path.split("/items/")[1].split("/")[0]
+            return {
+                "items": [],
+                "relations": self.relations.get(item_id, []),
+                "workspaces": [],
+            }
         if path == f"workspaces/{TARGET_WS}/lakehouses/lh-new":
             return {
                 "id": "lh-new",
@@ -181,6 +190,7 @@ def test_phases_run_in_dependency_order(fabric):
 
     assert [step["id"] for step in migration.snapshot()["steps"]] == [
         "assessment",
+        "dependencies",
         "workspaces",
         "eventhouses",
         "lakehouses",
@@ -241,3 +251,45 @@ def test_default_semantic_model_of_a_lakehouse_is_not_recreated(fabric, monkeypa
     run(fabric)
 
     assert not any(kind == "SemanticModel" for kind, _, _ in fabric.created)
+
+
+def test_a_composite_model_is_created_after_the_model_it_reads(monkeypatch):
+    """The relations graph, not source order, decides how semantic models are sequenced."""
+    base, composite = "sm-base", "sm-composite"
+
+    fabric = FakeFabric(
+        relations={
+            composite: [
+                {"itemId": composite, "dependentOnItemId": base, "relationType": "Datasource"}
+            ]
+        }
+    )
+    fabric.definitions[base] = [part("model.bim", "{}")]
+    fabric.definitions[composite] = [part("model.bim", "{}")]
+
+    def list_all(path, params=None, value_key="value"):
+        if path == f"workspaces/{SOURCE_WS}/items":
+            # Listed composite-first, so source order alone would create it too early.
+            items = [
+                {"id": composite, "displayName": "Composite", "type": "SemanticModel"},
+                {"id": base, "displayName": "Base", "type": "SemanticModel"},
+                {"id": LAKEHOUSE, "displayName": "bronze", "type": "Lakehouse"},
+            ]
+            item_type = (params or {}).get("type")
+            return [i for i in items if not item_type or i["type"] == item_type]
+        return FakeFabric.list_all(fabric, path, params, value_key)
+
+    monkeypatch.setattr(fabric, "list_all", list_all)
+    monkeypatch.setattr(orchestrator, "FabricClient", fabric)
+    monkeypatch.setattr(orchestrator, "TokenProvider", lambda principal: object())
+    monkeypatch.setattr(orchestrator.workspaces, "clone_folder_tree", lambda c, s, t: {})
+    monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda c, w: [])
+    monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
+    monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
+    monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
+
+    run(fabric)
+
+    models = [name for kind, name, _ in fabric.created if kind == "SemanticModel"]
+    assert models == ["Base", "Composite"]

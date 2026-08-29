@@ -7,6 +7,8 @@ it created in ``_Context.id_map`` (v1's ``$replacements`` hash table), and later
 rewrite their exported definitions through that map. A phase can therefore only reference
 items created by an *earlier* phase:
 
+0. ``assessment`` and ``dependencies`` run before anything is created, so a workspace that
+   cannot migrate cleanly can be abandoned before it is half built.
 1. ``workspaces``   create the target and scratch workspaces, and the folder tree.
 2. ``eventhouses``  eventhouses before their KQL databases, since a database is created
    against ``parentEventhouseItemId``; data is copied once the schema exists.
@@ -39,6 +41,7 @@ from fabshuffle.fabric import (
     data_stores,
     eventhouses,
     powerbi,
+    relations,
     shortcuts,
     workspaces,
 )
@@ -93,6 +96,7 @@ class _Context:
     # than while the eventhouses are being built.
     kql_databases: list[tuple[str, str, str]] = field(default_factory=list)
     kql_table_shortcuts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    graph: relations.DependencyGraph = field(default_factory=relations.DependencyGraph)
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -129,6 +133,7 @@ def run_migration(
                 return
 
             _report_unsupported_items(context)
+            _check_dependencies(context)
             _create_workspaces(context)
             _migrate_eventhouses(context)
             _migrate_lakehouses(context)
@@ -274,6 +279,54 @@ def _report_unsupported_items(ctx: _Context) -> None:
         step,
         StepStatus.SUCCEEDED,
         f"{len(assessment.unsupported)} item(s) will be left behind in the source workspace",
+        warnings,
+    )
+
+
+def _check_dependencies(ctx: _Context) -> None:
+    """Report dependencies that will not survive the move, before anything is created.
+
+    References are rewritten through an id map covering only the items this run creates, so a
+    dependency on another workspace, or on an item type Fab Shuffle does not migrate, leaves
+    the copy pointing somewhere it should not. That is invisible in the item definitions.
+    """
+    step = "dependencies"
+    ctx.run.start_step(step, "Checking dependencies between items")
+    ctx.run.raise_if_cancelled()
+
+    migrated = (ctx.assessment.migrated if ctx.assessment else []) or []
+    if not migrated:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to check")
+        return
+
+    ctx.run.update_step(step, f"Reading relations for {len(migrated)} item(s)")
+    ctx.graph = relations.build_graph(ctx.client, ctx.plan.source_workspace_id, migrated)
+
+    if not ctx.graph.available:
+        ctx.run.finish_step(
+            step,
+            StepStatus.SKIPPED,
+            "The relations API is unavailable to this service principal, so dependencies "
+            "could not be checked",
+        )
+        return
+
+    issues = relations.analyse(
+        ctx.graph,
+        migrated_ids={item["id"] for item in migrated if item.get("id")},
+        source_workspace_id=ctx.plan.source_workspace_id,
+    )
+    if not issues:
+        ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Every dependency is inside this migration")
+        return
+
+    warnings = [issue.message() for issue in issues]
+    ctx.warnings.extend(warnings)
+    ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in issues]
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"{len(issues)} dependency reference(s) will not be rewritten",
         warnings,
     )
 
@@ -522,6 +575,10 @@ def _migrate_lakehouses(ctx: _Context) -> None:
         target_endpoint = data_stores.lakehouse_sql_endpoint(target)
         if source_endpoint.get("connectionString") and target_endpoint.get("connectionString"):
             ctx.id_map[source_endpoint["connectionString"]] = target_endpoint["connectionString"]
+        # A semantic model can reference the SQL analytics endpoint by item id rather than by
+        # connection string, so that mapping is needed too.
+        if source_endpoint.get("id") and target_endpoint.get("id"):
+            ctx.id_map[source_endpoint["id"]] = target_endpoint["id"]
 
         if ctx.plan.include_data:
             warnings.extend(_copy_lakehouse_tables(ctx, step, lakehouse, created["id"], schema_enabled))
@@ -842,6 +899,12 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
 
     def progress(message: str) -> None:
         ctx.run.update_step(step, message)
+
+    # A composite semantic model can read another semantic model, so they cannot be created
+    # in arbitrary order. The relations graph gives the real order; without it, source order.
+    ordered_ids = relations.topological_order([model["id"] for model in models], ctx.graph)
+    by_id = {model["id"]: model for model in models}
+    models = [by_id[model_id] for model_id in ordered_ids if model_id in by_id]
 
     migrated_models, model_warnings = analytics.migrate_items(
         ctx.client,

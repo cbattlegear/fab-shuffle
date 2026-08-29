@@ -63,6 +63,8 @@ Phase order is load bearing. Each phase records the source-to-target ids it crea
 map, and later phases rewrite their exported definitions through it, so a phase can only
 reference items created by an earlier one:
 
+0. **Assessment and dependency check** — both run before anything is created, so a workspace
+   that cannot migrate cleanly can be abandoned rather than left half built.
 1. **Workspaces** — target and scratch workspaces, and the folder tree.
 2. **Eventhouses** — before their KQL databases, which are created against
    `parentEventhouseItemId`.
@@ -75,9 +77,27 @@ reference items created by an earlier one:
    and only then is its schema copied.
 6. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
-   report embeds its model's GUID, so it runs after the models.
-7. **Permissions** — last, so nothing is visible half built.
+   report embeds its model's GUID, so it runs after the models. Models are ordered among
+   themselves using the relations graph, so a composite model follows what it reads.
+7. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+   created, so a failed run never leaves a workspace nobody can open. The remaining roles
+   are replayed here, last, so nothing is visible half built.
 8. **Cleanup** — drop the scratch workspace and local staging.
+
+### Dependency checking
+
+Before creating anything, Fab Shuffle reads the [relations
+APIs](https://learn.microsoft.com/en-us/rest/api/fabric/core/items/get-upstream-relations(beta))
+for every item it plans to migrate and reports references that will not survive the move:
+
+- a dependency in **another workspace**, which is not part of the migration, so the copy
+  keeps reading from the original region;
+- a dependency on an item **Fab Shuffle does not migrate**, which leaves the copy without
+  its source.
+
+Neither is visible by inspecting item definitions, and both otherwise fail silently. These
+APIs are in beta and must be called with `?beta=true`; if they are unavailable to the service
+principal, the step is skipped and the migration continues.
 
 ## Usage
 
