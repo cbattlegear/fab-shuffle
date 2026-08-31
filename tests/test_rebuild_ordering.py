@@ -197,6 +197,7 @@ def test_phases_run_in_dependency_order(fabric):
         "warehouses",
         "shortcuts",
         "connections",
+        "engineering",
         "analytics",
         "orchestration",
         "permissions",

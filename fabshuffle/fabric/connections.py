@@ -12,6 +12,7 @@ reports the cases that will not work in the new workspace.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,8 @@ from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import decode_payload, is_text_part
 
 logger = logging.getLogger(__name__)
+
+_GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
 # Connectivity types that are bound to a gateway rather than reachable from anywhere. A
 # virtual network gateway in particular is provisioned into one Azure region.
@@ -126,8 +129,11 @@ def _walk(node: Any, found: set[str]) -> None:
         external = node.get("externalReferences")
         if isinstance(external, Mapping) and isinstance(external.get("connection"), str):
             found.add(external["connection"])
-        if isinstance(node.get("connectionId"), str):
-            found.add(node["connectionId"])
+        # A dataflow stores connectionId as an embedded JSON document rather than a GUID, so
+        # only take values that actually look like a connection id.
+        candidate = node.get("connectionId")
+        if isinstance(candidate, str) and _GUID.match(candidate.strip()):
+            found.add(candidate.strip())
         for value in node.values():
             _walk(value, found)
     elif isinstance(node, list):

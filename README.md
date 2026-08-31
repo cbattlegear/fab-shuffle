@@ -45,6 +45,9 @@ copies everything it supports.
 | KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
 | Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |
 | Report | ✅ | n/a | Rebound to the migrated semantic model |
+| Notebook | ✅ | n/a | Default lakehouse and environment attachment rebound |
+| Environment | ✅ | n/a | Libraries and Spark settings; needs publishing afterwards |
+| Dataflow Gen2 (CI/CD) | ✅ | n/a | Rebound to migrated items |
 | Data pipeline | ✅ | n/a | Rebound to migrated items; connections reused and checked |
 | Copy Job | ✅ | n/a | Rebound to migrated items; connections reused and checked |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
@@ -58,6 +61,16 @@ behind in the source workspace.
 KQL *shortcut* (follower) databases are skipped, because Fabric does not expose the follower
 source through the API. The default semantic model that Fabric creates alongside each
 lakehouse and warehouse is skipped too, since the target workspace gets its own.
+
+**Dataflows only migrate when they are Gen2 (CI/CD).** The item definition APIs do not
+support Dataflow Gen1 or classic Gen2, so each dataflow is classified by probing its
+definition — Fabric documents that filtering the item list by dataflow type does not return
+reliable information. Anything that is not CI/CD-enabled is reported by name, telling you to
+upgrade it with the upgrade wizard or Save As and migrate again.
+
+**Environments arrive unpublished.** Publish them in the new workspace before running
+anything that depends on them. An environment pinned to a custom Spark pool is also reported,
+because a pool belongs to the workspace it was created in and will not follow.
 
 ### Dependency order
 
@@ -80,17 +93,19 @@ reference items created by an earlier one:
 6. **Connections** — recreate connections that point into the source workspace, aimed at the
    items just created, and put their new ids in the id map so everything after this binds to
    them.
-7. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
+7. **Environments, notebooks, then dataflows** — a notebook attaches to an environment and
+   reads a lakehouse, and a semantic model can read a dataflow, so all three come first.
+8. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
    report embeds its model's GUID, so it runs after the models. Models are ordered among
    themselves using the relations graph, so a composite model follows what it reads.
-8. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
+9. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
    refreshing models, and invoking each other, so they go last and are ordered among
    themselves by the relations graph.
-9. **Permissions** — the source workspace's admins are granted as soon as the workspace is
-   created, so a failed run never leaves a workspace nobody can open. The remaining roles
-   are replayed here, last, so nothing is visible half built.
-10. **Cleanup** — drop the scratch workspace and local staging.
+10. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+    created, so a failed run never leaves a workspace nobody can open. The remaining roles
+    are replayed here, last, so nothing is visible half built.
+11. **Cleanup** — drop the scratch workspace and local staging.
 
 ### Connections
 

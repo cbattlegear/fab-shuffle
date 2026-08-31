@@ -22,12 +22,15 @@ items created by an *earlier* phase:
 6. ``connections``  recreate connections that point into the source workspace, aimed at the
    items just created. Their new ids go into the id map, so everything after this binds to
    them. A connection's target cannot be changed in place, so this is a replacement.
-7. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
+7. ``engineering``  environments, then notebooks, then dataflows. A notebook attaches to an
+   environment and reads a lakehouse; a semantic model can read a dataflow, so all three
+   come before the analytics phase.
+8. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
    SQL endpoints, so they need step 5 finished; reports bind to models, so they run after.
-8. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
+9. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
    above, so they go last.
-9. ``permissions``  remaining role assignments. Admins were granted back in step 1.
-10. ``cleanup``     drop the scratch workspace and local staging.
+10. ``permissions`` remaining role assignments. Admins were granted back in step 1.
+11. ``cleanup``     drop the scratch workspace and local staging.
 """
 
 from __future__ import annotations
@@ -147,6 +150,7 @@ def run_migration(
             _migrate_warehouses(context)
             _migrate_shortcuts_and_endpoints(context)
             _replace_connections(context)
+            _migrate_engineering(context)
             _migrate_reports_and_models(context)
             _migrate_orchestration(context)
             _copy_permissions(context)
@@ -1027,6 +1031,115 @@ def _replace_connections(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 7
+
+
+def _migrate_engineering(ctx: _Context) -> None:
+    """Recreate environments, notebooks, and dataflows.
+
+    Ordered environments first, because a notebook attaches to one; then notebooks and
+    dataflows, which read the lakehouses and warehouses built earlier. All of them run before
+    semantic models, since a model can source from a dataflow.
+    """
+    step = "engineering"
+    ctx.run.start_step(step, "Migrating environments, notebooks, and dataflows")
+    ctx.run.raise_if_cancelled()
+
+    source_id = ctx.plan.source_workspace_id
+    environments = analytics.list_of_type(ctx.client, source_id, analytics.ENVIRONMENT)
+    notebooks = analytics.list_of_type(ctx.client, source_id, analytics.NOTEBOOK)
+    dataflows = analytics.list_of_type(ctx.client, source_id, analytics.DATAFLOW)
+
+    if not environments and not notebooks and not dataflows:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to migrate in this phase")
+        return
+
+    warnings: list[str] = []
+    counts: dict[str, int] = {}
+
+    def progress(message: str) -> None:
+        ctx.run.update_step(step, message)
+
+    for item_type, items in (
+        (analytics.ENVIRONMENT, environments),
+        (analytics.NOTEBOOK, notebooks),
+    ):
+        if not items:
+            continue
+        results, item_warnings = analytics.migrate_items(
+            ctx.client,
+            source_workspace_id=source_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=items,
+            item_type=item_type,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            on_progress=progress,
+        )
+        counts[item_type] = len(results)
+        warnings.extend(item_warnings)
+
+        if item_type == analytics.ENVIRONMENT:
+            for result in results:
+                warnings.extend(analytics.environment_warnings(result.name, result.parts))
+            if results:
+                warnings.append(
+                    f"{len(results)} environment(s) were created but not published. Publish "
+                    "them in the new workspace before running anything that depends on them."
+                )
+
+    if dataflows:
+        counts[analytics.DATAFLOW] = _migrate_dataflows(ctx, step, dataflows, warnings, progress)
+
+    ctx.warnings.extend(warnings)
+    summary = ", ".join(f"{count} {name}" for name, count in counts.items()) or "nothing"
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Migrated {summary}", warnings)
+
+
+def _migrate_dataflows(
+    ctx: _Context,
+    step: str,
+    dataflows: list[dict[str, Any]],
+    warnings: list[str],
+    progress: Any,
+) -> int:
+    """Migrate the dataflows that can move, and explain the ones that cannot.
+
+    Only Dataflow Gen2 (CI/CD) items work with the definition APIs, so each one is classified
+    by probing its definition rather than trusting the item listing, which Fabric documents
+    as unreliable for this type.
+    """
+    movable: list[dict[str, Any]] = []
+    parts_by_id: dict[str, list[dict[str, Any]]] = {}
+
+    for dataflow in dataflows:
+        ctx.run.raise_if_cancelled()
+        progress(f"Checking dataflow '{dataflow.get('displayName')}'")
+        parts, reason = analytics.classify_dataflow(ctx.client, ctx.plan.source_workspace_id, dataflow)
+        if reason:
+            warnings.append(reason)
+            continue
+        movable.append(dataflow)
+        parts_by_id[dataflow["id"]] = parts or []
+
+    if not movable:
+        return 0
+
+    results, item_warnings = analytics.migrate_items(
+        ctx.client,
+        source_workspace_id=ctx.plan.source_workspace_id,
+        target_workspace_id=ctx.target_workspace_id,
+        items=movable,
+        item_type=analytics.DATAFLOW,
+        id_map=ctx.id_map,
+        folder_map=ctx.id_map,
+        parts_by_id=parts_by_id,
+        on_progress=progress,
+    )
+    warnings.extend(item_warnings)
+    return len(results)
+
+
+# --------------------------------------------------------------------- phase 8
 
 
 def _migrate_reports_and_models(ctx: _Context) -> None:

@@ -21,8 +21,19 @@ from dataclasses import dataclass
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
-from fabshuffle.fabric.definitions import rewrite_parts, strip_part
-from fabshuffle.fabric.items import create_item, get_item_definition, list_items
+from fabshuffle.fabric.definitions import (
+    decode_json_part,
+    decode_payload,
+    find_part,
+    rewrite_parts,
+    strip_part,
+)
+from fabshuffle.fabric.items import (
+    create_item,
+    get_item_definition,
+    list_items,
+    try_get_item_definition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +41,18 @@ SEMANTIC_MODEL = "SemanticModel"
 REPORT = "Report"
 DATA_PIPELINE = "DataPipeline"
 COPY_JOB = "CopyJob"
+NOTEBOOK = "Notebook"
+ENVIRONMENT = "Environment"
+DATAFLOW = "Dataflow"
 
 PBIR_PART = "definition.pbir"
 PLATFORM_PART = ".platform"
+SPARK_COMPUTE_PART = "Setting/Sparkcompute.yml"
+QUERY_METADATA_PART = "queryMetadata.json"
+
+# The definition format a Dataflow Gen2 (CI/CD) item uses. Anything else is a Gen1 dataflow
+# or a classic Gen2, neither of which the item definition APIs can move.
+CICD_DATAFLOW_FORMAT_VERSION = "202502"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +87,90 @@ def list_of_type(
     workspace_id: str,
     item_type: str,
 ) -> list[dict[str, Any]]:
-    return [item for item in list_items(client, workspace_id, item_type) if item.get("id")]
+    """List items of one type.
+
+    Filtering is done here rather than through the ``type`` query parameter, because Fabric
+    documents that filtering by the dataflow item type does not return correct information.
+    """
+    return [
+        item
+        for item in list_items(client, workspace_id)
+        if item.get("type") == item_type and item.get("id")
+    ]
+
+
+def classify_dataflow(
+    client: FabricClient,
+    workspace_id: str,
+    item: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Decide whether a dataflow can be migrated, and return its definition if so.
+
+    Only Dataflow Gen2 (CI/CD) items work with the item definition APIs. A Gen1 dataflow, or
+    a classic Gen2, either refuses ``getDefinition`` outright or comes back without the
+    CI/CD format marker. Both are reported rather than half-migrated.
+
+    Returns ``(parts, None)`` when it can move, or ``(None, reason)`` when it cannot.
+    """
+    name = item.get("displayName") or item.get("id")
+    upgrade = (
+        "Upgrade it to a Dataflow Gen2 (CI/CD) first, with the upgrade wizard or Save As, "
+        "then migrate again"
+    )
+
+    definition = try_get_item_definition(client, workspace_id, item["id"])
+    if definition is None:
+        return None, (
+            f"Dataflow '{name}' does not support the definition APIs, so it is a Gen1 "
+            f"dataflow or a classic Gen2. {upgrade}."
+        )
+
+    parts = list(definition.get("parts") or [])
+    metadata_part = find_part(parts, QUERY_METADATA_PART)
+    if metadata_part is None:
+        return None, (
+            f"Dataflow '{name}' returned no {QUERY_METADATA_PART}, so it is not a Dataflow "
+            f"Gen2 (CI/CD). {upgrade}."
+        )
+
+    try:
+        metadata = decode_json_part(metadata_part["payload"])
+    except (ValueError, KeyError):
+        return None, f"Dataflow '{name}' has unreadable metadata, so it was left behind."
+
+    version = str(metadata.get("formatVersion") or "")
+    if version != CICD_DATAFLOW_FORMAT_VERSION:
+        return None, (
+            f"Dataflow '{name}' reports format version '{version or 'none'}' rather than "
+            f"{CICD_DATAFLOW_FORMAT_VERSION}, so it is not a Dataflow Gen2 (CI/CD). {upgrade}."
+        )
+
+    return parts, None
+
+
+def environment_warnings(name: str, parts: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Report environment settings that will not carry across.
+
+    A custom Spark pool belongs to the workspace it was created in, so an environment that
+    pins one lands in the new workspace referencing a pool that does not exist there.
+    """
+    warnings: list[str] = []
+    compute = find_part(parts, SPARK_COMPUTE_PART)
+    if compute:
+        try:
+            text = decode_payload(compute["payload"]).decode("utf-8")
+        except (UnicodeDecodeError, KeyError):
+            text = ""
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "instance_pool_id" and value.strip() and value.strip() != "null":
+                warnings.append(
+                    f"Environment '{name}' pins the custom Spark pool "
+                    f"'{value.strip()}', which belongs to the source workspace. Recreate the "
+                    "pool in the new workspace and repoint the environment, or it will fall "
+                    "back to the starter pool."
+                )
+    return warnings
 
 
 def migrate_definition_item(
@@ -79,11 +182,20 @@ def migrate_definition_item(
     item_type: str,
     id_map: Mapping[str, str],
     folder_id: str | None = None,
+    parts: list[dict[str, Any]] | None = None,
 ) -> MigratedItem:
-    """Export one item, repoint its references, and recreate it in the target workspace."""
+    """Export one item, repoint its references, and recreate it in the target workspace.
+
+    ``parts`` lets a caller reuse a definition it has already fetched, which avoids a second
+    export for item types that have to be inspected before they can be migrated.
+    """
     name = item["displayName"]
-    definition = get_item_definition(client, source_workspace_id, item["id"])
-    parts = list(definition.get("parts") or [])
+    definition_format: str | None = None
+
+    if parts is None:
+        definition = get_item_definition(client, source_workspace_id, item["id"])
+        parts = list(definition.get("parts") or [])
+        definition_format = definition.get("format")
 
     rewritten, changed = rewrite_parts(parts, id_map)
     # The source platform file carries the original logical id, and Fabric respects it when
@@ -97,7 +209,7 @@ def migrate_definition_item(
         item_type,
         description=item.get("description") or None,
         parts=rewritten,
-        definition_format=definition.get("format"),
+        definition_format=definition_format,
         folder_id=folder_id,
     )
     return MigratedItem(
@@ -118,6 +230,7 @@ def migrate_items(
     item_type: str,
     id_map: dict[str, str],
     folder_map: Mapping[str, str] | None = None,
+    parts_by_id: Mapping[str, list[dict[str, Any]]] | None = None,
     on_progress: Any = None,
 ) -> tuple[list[MigratedItem], list[str]]:
     """Migrate a batch of definition-backed items, collecting per-item failures.
@@ -141,6 +254,7 @@ def migrate_items(
                 item_type=item_type,
                 id_map=id_map,
                 folder_id=(folder_map or {}).get(item.get("folderId", "")),
+                parts=(parts_by_id or {}).get(item.get("id", "")),
             )
         except FabricApiError as error:
             warnings.append(
@@ -156,12 +270,18 @@ def migrate_items(
 
 
 __all__ = [
+    "CICD_DATAFLOW_FORMAT_VERSION",
     "COPY_JOB",
+    "DATAFLOW",
     "DATA_PIPELINE",
+    "ENVIRONMENT",
+    "NOTEBOOK",
     "REPORT",
     "SEMANTIC_MODEL",
     "MigratedItem",
+    "classify_dataflow",
     "default_semantic_model_names",
+    "environment_warnings",
     "list_of_type",
     "migrate_definition_item",
     "migrate_items",

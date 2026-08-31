@@ -24,6 +24,9 @@ REBUILT_TYPES = frozenset(
         "Report",
         "DataPipeline",
         "CopyJob",
+        "Notebook",
+        "Environment",
+        "Dataflow",
     }
 )
 

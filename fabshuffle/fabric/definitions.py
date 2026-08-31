@@ -18,20 +18,29 @@ PLATFORM_SCHEMA = (
 EMPTY_LOGICAL_ID = "00000000-0000-0000-0000-000000000000"
 
 # Definition parts Fab Shuffle rewrites references inside. Anything else (images, custom
-# visuals, other binary resources under StaticResources/) is copied through untouched.
+# visuals, packaged libraries such as .whl/.jar/.tar.gz, other binary resources) is copied
+# through untouched.
 TEXT_SUFFIXES = frozenset(
     {
         ".bim",
+        ".ipynb",
         ".json",
         ".kql",
         ".m",
         ".md",
+        ".mdf",
         ".pbir",
         ".pbism",
         ".pq",
+        ".py",
+        ".r",
+        ".scala",
+        ".sql",
         ".tmdl",
         ".txt",
         ".xml",
+        ".yaml",
+        ".yml",
     }
 )
 
