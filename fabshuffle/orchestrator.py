@@ -320,19 +320,63 @@ def _check_dependencies(ctx: _Context) -> None:
         migrated_ids={item["id"] for item in migrated if item.get("id")},
         source_workspace_id=ctx.plan.source_workspace_id,
     )
-    if not issues:
+    warnings = [issue.message() for issue in issues]
+    if issues:
+        ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in issues]
+
+    warnings.extend(_scan_connection_prerequisites(ctx, step, migrated))
+
+    if not warnings:
         ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Every dependency is inside this migration")
         return
 
-    warnings = [issue.message() for issue in issues]
     ctx.warnings.extend(warnings)
-    ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in issues]
     ctx.run.finish_step(
         step,
         StepStatus.SUCCEEDED,
-        f"{len(issues)} dependency reference(s) will not be rewritten",
+        f"{len(warnings)} reference(s) need attention before this workspace is usable",
         warnings,
     )
+
+
+def _scan_connection_prerequisites(
+    ctx: _Context,
+    step: str,
+    migrated: list[dict[str, Any]],
+) -> list[str]:
+    """Report connections that point at items in the workspace being migrated.
+
+    Fabric does not let a connection's target change, so these cannot be repointed at the
+    migrated items. Surfacing them before anything is created means the operator learns what
+    they will have to rebuild by hand while it is still cheap to stop.
+    """
+    ctx.run.update_step(step, "Scanning connections that point into this workspace")
+
+    endpoints: list[str] = []
+    for lakehouse in data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id):
+        endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
+        endpoints.extend(filter(None, [endpoint.get("connectionString"), endpoint.get("id")]))
+    for warehouse in data_stores.list_warehouses(ctx.client, ctx.plan.source_workspace_id):
+        endpoints.append(data_stores.warehouse_connection_string(warehouse))
+    for eventhouse in eventhouses.list_eventhouses(ctx.client, ctx.plan.source_workspace_id):
+        properties = eventhouse.get("properties") or {}
+        endpoints.extend(
+            filter(None, [properties.get("queryServiceUri"), properties.get("ingestionServiceUri")])
+        )
+
+    identifiers = connections.source_identifiers(
+        ctx.plan.source_workspace_id, migrated, endpoints
+    )
+    prerequisites = connections.scan_prerequisites(
+        ctx.client,
+        identifiers=identifiers,
+        client_id=ctx.principal.client_id,
+    )
+    if not prerequisites:
+        return []
+
+    ctx.run.summary["connectionPrerequisites"] = [p.as_dict() for p in prerequisites]
+    return [prerequisite.message() for prerequisite in prerequisites]
 
 
 # --------------------------------------------------------------------- phase 1

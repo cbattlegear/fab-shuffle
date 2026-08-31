@@ -54,6 +54,53 @@ class ConnectionIssue:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectionPrerequisite:
+    """A connection that points into the workspace being migrated.
+
+    Its target cannot be repointed: no Update Connection request accepts
+    ``connectionDetails``, so the path is fixed for the life of the connection. It has to be
+    replaced by a new connection aimed at the migrated item, and doing that needs the
+    credentials, which the API never returns.
+    """
+
+    connection_id: str
+    connection_name: str
+    path: str
+    matched: str
+    credential_type: str
+    connectivity_type: str
+    manageable: bool
+
+    def message(self) -> str:
+        access = (
+            ""
+            if self.manageable
+            else (
+                " The service principal also has no Owner role on it, so grant that first if "
+                "you want it managed programmatically."
+            )
+        )
+        return (
+            f"Connection '{self.connection_name}' points at '{self.matched}' in the source "
+            f"workspace (path '{self.path}'). Fabric does not allow a connection's target to "
+            f"be changed, so create a replacement {self.credential_type} connection against "
+            f"the migrated item and repoint the items that use it.{access}"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "connectionId": self.connection_id,
+            "connectionName": self.connection_name,
+            "path": self.path,
+            "matched": self.matched,
+            "credentialType": self.credential_type,
+            "connectivityType": self.connectivity_type,
+            "manageable": self.manageable,
+            "message": self.message(),
+        }
+
+
 def list_connections(client: FabricClient) -> list[dict[str, Any]]:
     try:
         return client.list_all("connections")
@@ -177,12 +224,114 @@ def check(
     return issues
 
 
+# ------------------------------------------------- workspace bound connections
+
+
+def list_role_assignments(client: FabricClient, connection_id: str) -> list[dict[str, Any]] | None:
+    """Role assignments on a connection, or ``None`` when the caller may not read them."""
+    try:
+        return client.list_all(f"connections/{connection_id}/roleAssignments")
+    except FabricApiError as error:
+        if error.status_code in (401, 403, 404):
+            return None
+        raise
+
+
+def is_owned_by(assignments: Iterable[Mapping[str, Any]] | None, client_id: str) -> bool:
+    """Whether the service principal holds Owner on the connection.
+
+    Owner is the role that allows a connection to be managed; the other two, User and
+    UserWithReshare, only allow it to be used.
+    """
+    if not assignments:
+        return False
+    for assignment in assignments:
+        if assignment.get("role") != "Owner":
+            continue
+        principal = assignment.get("principal") or {}
+        details = principal.get("servicePrincipalDetails") or {}
+        if details.get("aadAppId") == client_id or principal.get("id") == client_id:
+            return True
+    return False
+
+
+def source_identifiers(
+    workspace_id: str,
+    items: Iterable[Mapping[str, Any]],
+    endpoints: Iterable[str] = (),
+) -> dict[str, str]:
+    """Strings that, if they appear in a connection path, mean it points into this workspace.
+
+    Maps the identifier to a human readable name for it.
+    """
+    identifiers: dict[str, str] = {workspace_id: "this workspace"}
+    for item in items:
+        item_id = item.get("id")
+        if item_id:
+            identifiers[item_id] = f"{item.get('type') or 'item'} '{item.get('displayName')}'"
+    for endpoint in endpoints:
+        if endpoint:
+            identifiers[endpoint] = endpoint
+    return identifiers
+
+
+def scan_prerequisites(
+    client: FabricClient,
+    *,
+    identifiers: Mapping[str, str],
+    client_id: str,
+    known: Iterable[Mapping[str, Any]] | None = None,
+) -> list[ConnectionPrerequisite]:
+    """Find connections that point into the workspace being migrated.
+
+    These are the ones a migration cannot fix by itself, so they are surfaced before anything
+    is created, together with what has to change.
+    """
+    candidates = list(known) if known is not None else list_connections(client)
+    found: list[ConnectionPrerequisite] = []
+
+    for connection in candidates:
+        details = connection.get("connectionDetails") or {}
+        path = details.get("path") or ""
+        if not path:
+            continue
+
+        lowered = path.casefold()
+        matched = next(
+            (label for key, label in identifiers.items() if key and key.casefold() in lowered),
+            None,
+        )
+        if matched is None:
+            continue
+
+        connection_id = connection.get("id") or ""
+        credentials = connection.get("credentialDetails") or {}
+        found.append(
+            ConnectionPrerequisite(
+                connection_id=connection_id,
+                connection_name=connection.get("displayName") or connection_id,
+                path=path,
+                matched=matched,
+                credential_type=credentials.get("credentialType") or "unknown",
+                connectivity_type=connection.get("connectivityType") or "",
+                manageable=is_owned_by(list_role_assignments(client, connection_id), client_id),
+            )
+        )
+
+    return found
+
+
 __all__ = [
     "GATEWAY_TYPES",
     "REGIONAL_GATEWAY_TYPES",
     "ConnectionIssue",
+    "ConnectionPrerequisite",
     "check",
     "connections_by_id",
+    "is_owned_by",
     "list_connections",
+    "list_role_assignments",
     "referenced_connection_ids",
+    "scan_prerequisites",
+    "source_identifiers",
 ]
