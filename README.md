@@ -77,25 +77,42 @@ reference items created by an earlier one:
    This covers lakehouse shortcuts and KQL database table shortcuts. The SQL analytics
    endpoint is refreshed only now, so it sees both the copied tables and the new shortcuts,
    and only then is its schema copied.
-6. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
+6. **Connections** — recreate connections that point into the source workspace, aimed at the
+   items just created, and put their new ids in the id map so everything after this binds to
+   them.
+7. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
    report embeds its model's GUID, so it runs after the models. Models are ordered among
    themselves using the relations graph, so a composite model follows what it reads.
-7. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
+8. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
    refreshing models, and invoking each other, so they go last and are ordered among
    themselves by the relations graph.
-8. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+9. **Permissions** — the source workspace's admins are granted as soon as the workspace is
    created, so a failed run never leaves a workspace nobody can open. The remaining roles
    are replayed here, last, so nothing is visible half built.
-9. **Cleanup** — drop the scratch workspace and local staging.
+10. **Cleanup** — drop the scratch workspace and local staging.
 
 ### Connections
 
-Connections are **not** copied. They are tenant scoped, so the same connection id resolves
-from the new workspace in any region, and the API never returns credentials, so a faithful
-copy is impossible anyway. Migrated pipelines and Copy Jobs keep their existing bindings.
+A connection's **target cannot be changed**: none of the six `Update Connection` request
+variants accepts `connectionDetails`, so the path is fixed for the life of the connection.
+Connections are also tenant scoped, so one that points at something *outside* the workspace
+keeps working from the new region untouched.
 
-What Fab Shuffle does instead is check every connection a migrated item binds, and report:
+That leaves connections pointing *into* the workspace being migrated. They are found before
+anything is created, by scanning every connection path for the source workspace, its item
+GUIDs, or their SQL and Kusto endpoints. Each hit also reports whether the service principal
+holds **Owner** on it, which is the only one of the three connection roles (`User`,
+`UserWithReshare`, `Owner`) that permits management.
+
+Once the migrated items exist, Fab Shuffle recreates those connections against them and puts
+the new connection id in the id map, so every item migrated afterwards binds to the
+replacement. This is only automatic when the credential type needs no secret —
+`WorkspaceIdentity` or `Anonymous` — because Fabric never returns an existing connection's
+credentials. Anything else, including every gateway connection, is reported with the target
+to build it against.
+
+Connections that migrated items merely *use* are left alone and checked instead, reporting:
 
 - connections the service principal **cannot see**, which will make the item fail to run;
 - **personal cloud** connections, which cannot be shared;

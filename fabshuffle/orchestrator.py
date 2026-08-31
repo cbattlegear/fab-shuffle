@@ -19,12 +19,15 @@ items created by an *earlier* phase:
    them. This covers both lakehouse shortcuts and KQL database table shortcuts. The SQL
    analytics endpoint is refreshed only now, so it picks up both the copied tables and the
    new shortcuts, and only then is its schema copied.
-6. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
+6. ``connections``  recreate connections that point into the source workspace, aimed at the
+   items just created. Their new ids go into the id map, so everything after this binds to
+   them. A connection's target cannot be changed in place, so this is a replacement.
+7. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
    SQL endpoints, so they need step 5 finished; reports bind to models, so they run after.
-7. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
-   above, so they go last. Connections are checked here, never recreated.
-8. ``permissions``  remaining role assignments. Admins were granted back in step 1.
-9. ``cleanup``      drop the scratch workspace and local staging.
+8. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
+   above, so they go last.
+9. ``permissions``  remaining role assignments. Admins were granted back in step 1.
+10. ``cleanup``     drop the scratch workspace and local staging.
 """
 
 from __future__ import annotations
@@ -48,7 +51,8 @@ from fabshuffle.fabric import (
     shortcuts,
     workspaces,
 )
-from fabshuffle.fabric.client import FabricClient
+from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.definitions import build_rewriter
 from fabshuffle.fabric.items import list_items
 from fabshuffle.fabric.support import (
     Strategy,
@@ -142,6 +146,7 @@ def run_migration(
             _migrate_lakehouses(context)
             _migrate_warehouses(context)
             _migrate_shortcuts_and_endpoints(context)
+            _replace_connections(context)
             _migrate_reports_and_models(context)
             _migrate_orchestration(context)
             _copy_permissions(context)
@@ -915,6 +920,113 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 6
+
+
+def _replace_connections(ctx: _Context) -> None:
+    """Recreate connections that point into the source workspace, aimed at the new items.
+
+    A connection's target cannot be changed, so the only way to repoint one is to build a
+    replacement. That is only possible unattended when the credential type needs no secret
+    from us, since Fabric never returns an existing connection's credentials.
+
+    Runs after the data items and their SQL endpoints exist, and before anything that binds a
+    connection is migrated, so the new connection id is already in the id map by then.
+    """
+    step = "connections"
+    ctx.run.start_step(step, "Repointing connections at the migrated items")
+    ctx.run.raise_if_cancelled()
+
+    prerequisites = [
+        p for p in (ctx.run.summary.get("connectionPrerequisites") or []) if p.get("connectionId")
+    ]
+    if not prerequisites:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No connections point into this workspace")
+        return
+
+    rewrite = build_rewriter(ctx.id_map)
+    known = connections.connections_by_id(ctx.client)
+    metadata = connections.supported_types(ctx.client)
+
+    replaced: list[connections.Replacement] = []
+    warnings: list[str] = []
+
+    for prerequisite in prerequisites:
+        ctx.run.raise_if_cancelled()
+        connection = known.get(prerequisite["connectionId"])
+        if not connection:
+            continue
+
+        name = connection.get("displayName") or prerequisite["connectionId"]
+        old_path = (connection.get("connectionDetails") or {}).get("path") or ""
+        new_path = rewrite(old_path) if rewrite else old_path
+
+        if new_path == old_path:
+            warnings.append(
+                f"Connection '{name}' points into this workspace but nothing in its path "
+                f"('{old_path}') matched a migrated item, so it was left alone."
+            )
+            continue
+
+        connection_type = (connection.get("connectionDetails") or {}).get("type") or ""
+        refusal = connections.can_recreate(connection, metadata.get(connection_type))
+        if refusal:
+            warnings.append(
+                f"Connection '{name}' {refusal}. Create one against '{new_path}' and repoint "
+                "the items that use it."
+            )
+            continue
+
+        payload = connections.build_creation_payload(
+            connection,
+            new_path,
+            metadata[connection_type],
+            display_name=f"{name} ({ctx.plan.capacity_region})",
+        )
+        if not payload:
+            warnings.append(
+                f"Connection '{name}' could not be rebuilt automatically because its path "
+                f"('{old_path}') does not line up with the parameters Fabric declares for "
+                f"{connection_type}. Create one against '{new_path}' by hand."
+            )
+            continue
+
+        ctx.run.update_step(step, f"Recreating connection '{name}'")
+        try:
+            created = connections.create_connection(ctx.client, payload)
+        except FabricApiError as error:
+            warnings.append(
+                f"Connection '{name}' could not be recreated (HTTP {error.status_code}). "
+                f"Create one against '{new_path}' by hand."
+            )
+            continue
+
+        # Feeding the map here is what makes later phases rebind to the new connection.
+        ctx.id_map[prerequisite["connectionId"]] = created["id"]
+        replaced.append(
+            connections.Replacement(
+                old_id=prerequisite["connectionId"],
+                new_id=created["id"],
+                name=name,
+                old_path=old_path,
+                new_path=new_path,
+            )
+        )
+
+    ctx.warnings.extend(warnings)
+    if replaced:
+        ctx.run.summary["replacedConnections"] = [
+            {"name": r.name, "oldId": r.old_id, "newId": r.new_id, "newPath": r.new_path}
+            for r in replaced
+        ]
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"Recreated {len(replaced)} of {len(prerequisites)} connection(s)",
+        warnings,
+    )
+
+
+# --------------------------------------------------------------------- phase 7
 
 
 def _migrate_reports_and_models(ctx: _Context) -> None:
