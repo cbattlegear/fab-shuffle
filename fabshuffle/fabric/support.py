@@ -22,6 +22,8 @@ REBUILT_TYPES = frozenset(
         "KQLDatabase",
         "SemanticModel",
         "Report",
+        "DataPipeline",
+        "CopyJob",
     }
 )
 

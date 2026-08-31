@@ -197,6 +197,7 @@ def test_phases_run_in_dependency_order(fabric):
         "warehouses",
         "shortcuts",
         "analytics",
+        "orchestration",
         "permissions",
     ]
 
@@ -293,3 +294,80 @@ def test_a_composite_model_is_created_after_the_model_it_reads(monkeypatch):
 
     models = [name for kind, name, _ in fabric.created if kind == "SemanticModel"]
     assert models == ["Base", "Composite"]
+
+
+PIPELINE = "dp-1"
+CONNECTION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+PIPELINE_CONTENT = json.dumps(
+    {
+        "properties": {
+            "activities": [
+                {
+                    "name": "Load bronze",
+                    "typeProperties": {
+                        "sink": {
+                            "datasetSettings": {
+                                "linkedService": {
+                                    "properties": {
+                                        "typeProperties": {
+                                            "workspaceId": SOURCE_WS,
+                                            "artifactId": LAKEHOUSE,
+                                        }
+                                    }
+                                }
+                            },
+                            "externalReferences": {"connection": CONNECTION},
+                        }
+                    },
+                }
+            ]
+        }
+    }
+)
+
+
+def test_pipelines_are_rebound_and_their_connections_checked(monkeypatch):
+    fabric = FakeFabric()
+    fabric.definitions[PIPELINE] = [part("pipeline-content.json", PIPELINE_CONTENT)]
+
+    def list_all(path, params=None, value_key="value"):
+        if path == "connections":
+            # A personal connection cannot be shared, so it must be reported.
+            return [
+                {"id": CONNECTION, "displayName": "My Files", "connectivityType": "PersonalCloud"}
+            ]
+        if path == f"workspaces/{SOURCE_WS}/items":
+            items = [
+                {"id": LAKEHOUSE, "displayName": "bronze", "type": "Lakehouse"},
+                {"id": PIPELINE, "displayName": "Nightly", "type": "DataPipeline"},
+            ]
+            item_type = (params or {}).get("type")
+            return [i for i in items if not item_type or i["type"] == item_type]
+        return FakeFabric.list_all(fabric, path, params, value_key)
+
+    monkeypatch.setattr(fabric, "list_all", list_all)
+    monkeypatch.setattr(orchestrator, "FabricClient", fabric)
+    monkeypatch.setattr(orchestrator, "TokenProvider", lambda principal: object())
+    monkeypatch.setattr(orchestrator.workspaces, "clone_folder_tree", lambda c, s, t: {})
+    monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda c, w: [])
+    monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
+    monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
+    monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
+
+    migration = run(fabric)
+    assert migration.status == RunStatus.SUCCEEDED, migration.error
+
+    # The pipeline was created after the lakehouse it loads.
+    order = [kind for kind, _, _ in fabric.created]
+    assert order.index("Lakehouse") < order.index("DataPipeline")
+
+    pipeline_id = next(new_id for kind, _, new_id in fabric.created if kind == "DataPipeline")
+    content = decode_payload(fabric.definitions[pipeline_id][0]["payload"]).decode()
+    assert TARGET_WS in content and "lh-new" in content
+    assert LAKEHOUSE not in content
+    # The connection id is deliberately left alone: connections are tenant scoped.
+    assert CONNECTION in content
+
+    step = next(s for s in migration.snapshot()["steps"] if s["id"] == "orchestration")
+    assert any("cannot be shared" in warning for warning in step["warnings"])

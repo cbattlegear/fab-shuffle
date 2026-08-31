@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 SEMANTIC_MODEL = "SemanticModel"
 REPORT = "Report"
+DATA_PIPELINE = "DataPipeline"
+COPY_JOB = "CopyJob"
 
 PBIR_PART = "definition.pbir"
 PLATFORM_PART = ".platform"
@@ -39,6 +41,8 @@ class MigratedItem:
     target_id: str
     name: str
     rebound_parts: int
+    # Kept so the caller can inspect what the item binds without exporting it again.
+    parts: tuple[dict[str, Any], ...] = ()
 
 
 def default_semantic_model_names(client: FabricClient, workspace_id: str) -> set[str]:
@@ -101,6 +105,7 @@ def migrate_definition_item(
         target_id=created["id"],
         name=name,
         rebound_parts=changed,
+        parts=tuple(rewritten),
     )
 
 
@@ -151,6 +156,8 @@ def migrate_items(
 
 
 __all__ = [
+    "COPY_JOB",
+    "DATA_PIPELINE",
     "REPORT",
     "SEMANTIC_MODEL",
     "MigratedItem",

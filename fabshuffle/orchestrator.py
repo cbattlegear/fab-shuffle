@@ -21,8 +21,10 @@ items created by an *earlier* phase:
    new shortcuts, and only then is its schema copied.
 6. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
    SQL endpoints, so they need step 5 finished; reports bind to models, so they run after.
-7. ``permissions``  role assignments last, so nothing is visible half built.
-8. ``cleanup``      drop the scratch workspace and local staging.
+7. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
+   above, so they go last. Connections are checked here, never recreated.
+8. ``permissions``  remaining role assignments. Admins were granted back in step 1.
+9. ``cleanup``      drop the scratch workspace and local staging.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
     analytics,
+    connections,
     copyjobs,
     data_stores,
     eventhouses,
@@ -140,6 +143,7 @@ def run_migration(
             _migrate_warehouses(context)
             _migrate_shortcuts_and_endpoints(context)
             _migrate_reports_and_models(context)
+            _migrate_orchestration(context)
             _copy_permissions(context)
             if cleanup:
                 cleanup_run(context.run, context.client, scratch_dir)
@@ -952,6 +956,104 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 7
+
+
+def _migrate_orchestration(ctx: _Context) -> None:
+    """Recreate data pipelines and Copy Jobs.
+
+    These run last of the content phases because they orchestrate everything else: a pipeline
+    can read a lakehouse, refresh a semantic model, or invoke another pipeline, so every one
+    of those has to exist and be in the id map first.
+
+    Connections are deliberately not recreated. They are tenant scoped, so the same
+    connection id resolves from the new workspace, and the API never returns credentials so a
+    faithful copy is impossible anyway. Instead the ones each item binds are checked.
+    """
+    step = "orchestration"
+    ctx.run.start_step(step, "Migrating data pipelines and Copy Jobs")
+    ctx.run.raise_if_cancelled()
+
+    source_id = ctx.plan.source_workspace_id
+    pipelines = analytics.list_of_type(ctx.client, source_id, analytics.DATA_PIPELINE)
+    jobs = analytics.list_of_type(ctx.client, source_id, analytics.COPY_JOB)
+
+    if not pipelines and not jobs:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No data pipelines or Copy Jobs to migrate")
+        return
+
+    warnings: list[str] = []
+
+    def progress(message: str) -> None:
+        ctx.run.update_step(step, message)
+
+    migrated: list[analytics.MigratedItem] = []
+    for item_type, items in ((analytics.DATA_PIPELINE, pipelines), (analytics.COPY_JOB, jobs)):
+        if not items:
+            continue
+        # A pipeline can invoke another pipeline, so order them by their real dependencies.
+        by_id = {item["id"]: item for item in items}
+        ordered_ids = relations.topological_order(list(by_id), ctx.graph)
+        ordered = [by_id[item_id] for item_id in ordered_ids if item_id in by_id]
+
+        results, item_warnings = analytics.migrate_items(
+            ctx.client,
+            source_workspace_id=source_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=ordered,
+            item_type=item_type,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            on_progress=progress,
+        )
+        migrated.extend(results)
+        warnings.extend(item_warnings)
+
+    warnings.extend(_check_connections(ctx, step, migrated))
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step,
+        StepStatus.SUCCEEDED,
+        f"Migrated {len(pipelines)} data pipeline(s) and {len(jobs)} Copy Job(s)",
+        warnings,
+    )
+
+
+def _check_connections(
+    ctx: _Context,
+    step: str,
+    migrated: list[analytics.MigratedItem],
+) -> list[str]:
+    """Report bound connections that will not work from the new workspace."""
+    bound = [(item.name, connections.referenced_connection_ids(item.parts)) for item in migrated]
+    if not any(ids for _, ids in bound):
+        return []
+
+    ctx.run.update_step(step, "Checking bound connections")
+    known = connections.connections_by_id(ctx.client)
+    if not known:
+        return [
+            "Could not read the tenant's connections, so the ones bound by pipelines and Copy "
+            "Jobs were not checked. Grant the service principal Connection.Read.All."
+        ]
+
+    issues: list[connections.ConnectionIssue] = []
+    for name, connection_ids in bound:
+        issues.extend(
+            connections.check(
+                f"'{name}'",
+                connection_ids,
+                known,
+                target_region=ctx.plan.capacity_region,
+            )
+        )
+
+    if issues:
+        ctx.run.summary["connectionIssues"] = [issue.as_dict() for issue in issues]
+    return [issue.message() for issue in issues]
+
+
+# --------------------------------------------------------------------- phase 8
 
 
 def _copy_permissions(ctx: _Context) -> None:

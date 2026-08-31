@@ -45,6 +45,8 @@ copies everything it supports.
 | KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
 | Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |
 | Report | ✅ | n/a | Rebound to the migrated semantic model |
+| Data pipeline | ✅ | n/a | Rebound to migrated items; connections reused and checked |
+| Copy Job | ✅ | n/a | Rebound to migrated items; connections reused and checked |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
 | Workspace folders | ✅ | n/a | Hierarchy recreated |
 | Workspace permissions | ✅ | n/a | Role assignments replayed |
@@ -79,10 +81,26 @@ reference items created by an earlier one:
    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
    report embeds its model's GUID, so it runs after the models. Models are ordered among
    themselves using the relations graph, so a composite model follows what it reads.
-7. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+7. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
+   refreshing models, and invoking each other, so they go last and are ordered among
+   themselves by the relations graph.
+8. **Permissions** — the source workspace's admins are granted as soon as the workspace is
    created, so a failed run never leaves a workspace nobody can open. The remaining roles
    are replayed here, last, so nothing is visible half built.
-8. **Cleanup** — drop the scratch workspace and local staging.
+9. **Cleanup** — drop the scratch workspace and local staging.
+
+### Connections
+
+Connections are **not** copied. They are tenant scoped, so the same connection id resolves
+from the new workspace in any region, and the API never returns credentials, so a faithful
+copy is impossible anyway. Migrated pipelines and Copy Jobs keep their existing bindings.
+
+What Fab Shuffle does instead is check every connection a migrated item binds, and report:
+
+- connections the service principal **cannot see**, which will make the item fail to run;
+- **personal cloud** connections, which cannot be shared;
+- connections routed through a **gateway**. A virtual network gateway in particular stays in
+  its original region, so it may no longer be the right path to the data.
 
 ### Dependency checking
 
@@ -208,8 +226,9 @@ On the rebuild path:
    endpoints, then copy their schema.
 7. Recreate semantic models and then reports, rewriting their definitions so they bind to
    the items just created rather than the ones in the old region.
-8. Replay workspace role assignments.
-9. Delete the scratch workspace and local staging.
+8. Recreate data pipelines and Copy Jobs, and check the connections they bind.
+9. Replay workspace role assignments.
+10. Delete the scratch workspace and local staging.
 
 See [Dependency order](#dependency-order) for why the sequence is what it is.
 
