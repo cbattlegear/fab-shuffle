@@ -31,6 +31,25 @@ CONNECT_WAIT_SECONDS = 15
 _HEADER_END = re.compile(r"^GO\s*$", re.IGNORECASE | re.MULTILINE)
 _BATCH_SEPARATOR = re.compile(r"^\s*GO\s*$", re.IGNORECASE | re.MULTILINE)
 
+# SQLCMD directives. These are interpreted by the sqlcmd utility, not by the server, so a
+# plain TDS connection reports them as syntax errors.
+_SQLCMD_DIRECTIVE = re.compile(r"^\s*:[A-Za-z!].*$", re.MULTILINE)
+_SETVAR = re.compile(
+    r"""^\s*:setvar\s+(?P<name>\w+)\s+(?:"(?P<quoted>[^"]*)"|(?P<bare>\S*))\s*$""",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SQLCMD_VARIABLE = re.compile(r"\$\((\w+)\)")
+# The deployment script switches into its own database. We are already connected to the
+# target, whose database is named after the *target* item, so this can only ever be wrong.
+_USE_STATEMENT = re.compile(r"^\s*USE\s+[\[\"]?[^\]\"\r\n]*[\]\"]?\s*;?\s*$", re.IGNORECASE)
+# DacFx guards its script with a SQLCMD-mode check that turns execution off for the rest of
+# the session. It must never reach the server: NOEXEC is connection scoped, so one stray
+# batch silently turns every later batch into a no-op and the schema is never applied.
+_NOEXEC = re.compile(r"\bSET\s+NOEXEC\s+ON\b", re.IGNORECASE)
+# Comments, so a batch left holding nothing but commentary can be recognised as empty.
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT = re.compile(r"--[^\r\n]*")
+
 
 class SchemaTransferError(RuntimeError):
     """Schema extraction or deployment failed."""
@@ -131,8 +150,44 @@ def _strip_sqlcmd_header(script: str) -> str:
     return script[match.end() :] if match else script
 
 
+def resolve_sqlcmd(script: str) -> str:
+    """Turn a sqlpackage deployment script into something a plain TDS connection can run.
+
+    sqlpackage writes for the sqlcmd utility: ``:setvar`` directives define variables, and the
+    body references them as ``$(Name)``. Sent over ODBC the directives are syntax errors and
+    the references are never substituted, which is how ``$(__IsSqlCmdEnabled)`` ends up
+    failing DacFx's own SQLCMD-mode check and switching NOEXEC on for the whole session.
+
+    This mirrors what ``Invoke-Sqlcmd -DisableCommands`` did in v1: read the variables, drop
+    the directives, and substitute the references so the guard evaluates the way it would
+    under real sqlcmd.
+    """
+    variables = {
+        match.group("name"): (match.group("quoted") or match.group("bare") or "")
+        for match in _SETVAR.finditer(script)
+    }
+    script = _SQLCMD_DIRECTIVE.sub("", script)
+    return _SQLCMD_VARIABLE.sub(lambda m: variables.get(m.group(1), m.group(0)), script)
+
+
+def _is_noise(batch: str) -> bool:
+    """Whether a batch is deployment scaffolding rather than schema.
+
+    Removing the SQLCMD directives can leave a batch holding only the comment that introduced
+    them, which is not worth a round trip and reads as a failure if the endpoint rejects it.
+    """
+    if _USE_STATEMENT.match(batch) or _NOEXEC.search(batch):
+        return True
+    without_comments = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", batch))
+    return not without_comments.strip()
+
+
 def _batches(script: str) -> list[str]:
-    return [batch.strip() for batch in _BATCH_SEPARATOR.split(script) if batch.strip()]
+    return [
+        batch.strip()
+        for batch in _BATCH_SEPARATOR.split(script)
+        if batch.strip() and not _is_noise(batch.strip())
+    ]
 
 
 def apply_script(
@@ -144,7 +199,7 @@ def apply_script(
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Execute a deployment script batch by batch, collecting per-batch failures."""
-    script = _strip_sqlcmd_header(script_path.read_text(encoding="utf-8-sig"))
+    script = resolve_sqlcmd(_strip_sqlcmd_header(script_path.read_text(encoding="utf-8-sig")))
     batches = _batches(script)
     if not batches:
         return []
