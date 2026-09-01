@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
@@ -32,6 +32,64 @@ def capacity_region(capacity: dict[str, Any]) -> str:
     """Normalise a capacity region such as ``West Central US`` into ``westcentralus``."""
     region = capacity.get("region") or capacity.get("location") or ""
     return region.replace(" ", "").lower()
+
+
+def _sku_size(sku: str) -> int | None:
+    """Relative size of an F SKU, so two capacities can be compared.
+
+    Only the F series is ordered numerically. P, A, EM, and trial SKUs are returned as
+    unknown rather than guessed at, so they are reported as "different" without a direction.
+    """
+    text = (sku or "").strip().upper()
+    if text.startswith("F") and text[1:].isdigit():
+        return int(text[1:])
+    return None
+
+
+def compare_capacities(source_sku: str, target_sku: str) -> str | None:
+    """Warn when the target capacity is not the same size as the source's.
+
+    Capacity size caps Spark pool node counts, starter pool sizing, and the memory a semantic
+    model can use, so moving to a smaller capacity can leave items that no longer fit.
+    """
+    if not source_sku or not target_sku:
+        return None
+    if source_sku.strip().upper() == target_sku.strip().upper():
+        return None
+
+    source_size = _sku_size(source_sku)
+    target_size = _sku_size(target_sku)
+
+    if source_size is not None and target_size is not None:
+        if target_size < source_size:
+            return (
+                f"The target capacity is {target_sku}, smaller than the source's {source_sku}. "
+                "Spark pool and starter pool sizes, and the memory available to semantic "
+                "models, are capped by capacity, so some items may not fit."
+            )
+        return (
+            f"The target capacity is {target_sku}, larger than the source's {source_sku}. "
+            "Nothing should fail, but the new workspace will bill at the larger size."
+        )
+
+    return (
+        f"The target capacity is {target_sku} and the source's is {source_sku}. Check that the "
+        "target is at least as large, since capacity size caps Spark pools and semantic model "
+        "memory."
+    )
+
+
+def workspace_capacity_sku(client: FabricClient, workspace: Mapping[str, Any]) -> str:
+    """The SKU of the capacity a workspace runs on, or empty when it cannot be read."""
+    capacity_id = workspace.get("capacityId")
+    if not capacity_id:
+        return ""
+    try:
+        return get_capacity(client, capacity_id).get("sku") or ""
+    except FabricApiError:
+        # The service principal only needs access to the target capacity, so the source's
+        # may well be unreadable. That is not worth failing over.
+        return ""
 
 
 # ------------------------------------------------------------------- workspaces
@@ -249,6 +307,7 @@ __all__ = [
     "assign_to_capacity",
     "capacity_region",
     "clone_folder_tree",
+    "compare_capacities",
     "copy_role_assignments",
     "create_folder",
     "create_workspace",
@@ -263,4 +322,5 @@ __all__ = [
     "list_scratch_workspaces",
     "list_workspaces",
     "scratch_workspace_name",
+    "workspace_capacity_sku",
 ]

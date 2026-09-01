@@ -78,6 +78,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class DependencyReport:
+    """What a dependency check found, whether it ran for a preview or for a real run."""
+
+    graph: relations.DependencyGraph
+    available: bool = True
+    issues: list[relations.DependencyIssue] = field(default_factory=list)
+    prerequisites: list[connections.Prerequisite] = field(default_factory=list)
+
+    def messages(self) -> list[str]:
+        return [issue.message() for issue in self.issues] + [
+            prerequisite.message() for prerequisite in self.prerequisites
+        ]
+
+
+@dataclass
 class MigrationPlan:
     capacity_id: str
     capacity_name: str
@@ -86,6 +101,7 @@ class MigrationPlan:
     source_workspace_name: str
     target_workspace_name: str
     strategy: Strategy = Strategy.REBUILD
+    capacity_warning: str | None = None
     include_files: bool = True
     include_data: bool = True
     copy_permissions: bool = True
@@ -195,6 +211,9 @@ def _reassign_capacity(ctx: _Context) -> None:
     warnings: list[str] = []
     converted: list[powerbi.SemanticModel] = []
 
+    if ctx.plan.capacity_warning:
+        warnings.append(ctx.plan.capacity_warning)
+
     with powerbi.PowerBiClient(ctx.tokens) as pbi:
         ctx.run.update_step(step, "Checking semantic model storage format")
         models = pbi.list_semantic_models(workspace_id)
@@ -297,6 +316,8 @@ def _report_unsupported_items(ctx: _Context) -> None:
     ctx.run.summary["unsupported"] = [item.as_dict() for item in assessment.unsupported]
 
     warnings = assessment.grouped_messages()
+    if ctx.plan.capacity_warning:
+        warnings.append(ctx.plan.capacity_warning)
     if monitoring:
         warnings.append(
             "Workspace monitoring is on in the source workspace. Its eventhouse and KQL "
@@ -310,12 +331,73 @@ def _report_unsupported_items(ctx: _Context) -> None:
         return
 
     ctx.warnings.extend(warnings)
-    detail = (
-        f"{len(assessment.unsupported)} item(s) will be left behind in the source workspace"
-        if assessment.unsupported
-        else "Workspace monitoring is not migrated"
-    )
+    if assessment.unsupported:
+        detail = f"{len(assessment.unsupported)} item(s) will be left behind in the source workspace"
+    elif monitoring:
+        detail = "Workspace monitoring is not migrated"
+    else:
+        detail = "Everything in this workspace is supported, with warnings"
     ctx.run.finish_step(step, StepStatus.SUCCEEDED, detail, warnings)
+
+
+def dependency_warnings(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    migrated: list[dict[str, Any]],
+    client_id: str,
+) -> DependencyReport:
+    """Work out which references will not survive the move.
+
+    Kept free of run state so the review screen and the migration itself reach exactly the
+    same conclusions — a warning the operator was shown before starting should not reappear
+    as a surprise, or worse, appear only once the workspace is half built.
+    """
+    graph = relations.build_graph(client, source_workspace_id, migrated)
+    if not graph.available:
+        return DependencyReport(graph=graph, available=False)
+
+    issues = relations.analyse(
+        graph,
+        migrated_ids={item["id"] for item in migrated if item.get("id")},
+        source_workspace_id=source_workspace_id,
+    )
+    prerequisites = connection_prerequisites(
+        client,
+        source_workspace_id=source_workspace_id,
+        migrated=migrated,
+        client_id=client_id,
+    )
+    return DependencyReport(graph=graph, issues=issues, prerequisites=prerequisites)
+
+
+def connection_prerequisites(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    migrated: list[dict[str, Any]],
+    client_id: str,
+) -> list[connections.Prerequisite]:
+    """Find connections that point at items in the workspace being migrated.
+
+    Fabric does not let a connection's target change, so these cannot be repointed at the
+    migrated items. Surfacing them before anything is created means the operator learns what
+    they will have to rebuild by hand while it is still cheap to stop.
+    """
+    endpoints: list[str] = []
+    for lakehouse in data_stores.list_lakehouses(client, source_workspace_id):
+        endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
+        endpoints.extend(filter(None, [endpoint.get("connectionString"), endpoint.get("id")]))
+    for warehouse in data_stores.list_warehouses(client, source_workspace_id):
+        endpoints.append(data_stores.warehouse_connection_string(warehouse))
+    for eventhouse in eventhouses.list_eventhouses(client, source_workspace_id):
+        properties = eventhouse.get("properties") or {}
+        endpoints.extend(
+            filter(None, [properties.get("queryServiceUri"), properties.get("ingestionServiceUri")])
+        )
+
+    identifiers = connections.source_identifiers(source_workspace_id, migrated, endpoints)
+    return connections.scan_prerequisites(client, identifiers=identifiers, client_id=client_id)
 
 
 def _check_dependencies(ctx: _Context) -> None:
@@ -335,9 +417,15 @@ def _check_dependencies(ctx: _Context) -> None:
         return
 
     ctx.run.update_step(step, f"Reading relations for {len(migrated)} item(s)")
-    ctx.graph = relations.build_graph(ctx.client, ctx.plan.source_workspace_id, migrated)
+    report = dependency_warnings(
+        ctx.client,
+        source_workspace_id=ctx.plan.source_workspace_id,
+        migrated=migrated,
+        client_id=ctx.principal.client_id,
+    )
+    ctx.graph = report.graph
 
-    if not ctx.graph.available:
+    if not report.available:
         ctx.run.finish_step(
             step,
             StepStatus.SKIPPED,
@@ -346,17 +434,12 @@ def _check_dependencies(ctx: _Context) -> None:
         )
         return
 
-    issues = relations.analyse(
-        ctx.graph,
-        migrated_ids={item["id"] for item in migrated if item.get("id")},
-        source_workspace_id=ctx.plan.source_workspace_id,
-    )
-    warnings = [issue.message() for issue in issues]
-    if issues:
-        ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in issues]
+    if report.issues:
+        ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in report.issues]
+    if report.prerequisites:
+        ctx.run.summary["connectionPrerequisites"] = [p.as_dict() for p in report.prerequisites]
 
-    warnings.extend(_scan_connection_prerequisites(ctx, step, migrated))
-
+    warnings = report.messages()
     if not warnings:
         ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Every dependency is inside this migration")
         return
@@ -369,45 +452,6 @@ def _check_dependencies(ctx: _Context) -> None:
         warnings,
     )
 
-
-def _scan_connection_prerequisites(
-    ctx: _Context,
-    step: str,
-    migrated: list[dict[str, Any]],
-) -> list[str]:
-    """Report connections that point at items in the workspace being migrated.
-
-    Fabric does not let a connection's target change, so these cannot be repointed at the
-    migrated items. Surfacing them before anything is created means the operator learns what
-    they will have to rebuild by hand while it is still cheap to stop.
-    """
-    ctx.run.update_step(step, "Scanning connections that point into this workspace")
-
-    endpoints: list[str] = []
-    for lakehouse in data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id):
-        endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
-        endpoints.extend(filter(None, [endpoint.get("connectionString"), endpoint.get("id")]))
-    for warehouse in data_stores.list_warehouses(ctx.client, ctx.plan.source_workspace_id):
-        endpoints.append(data_stores.warehouse_connection_string(warehouse))
-    for eventhouse in eventhouses.list_eventhouses(ctx.client, ctx.plan.source_workspace_id):
-        properties = eventhouse.get("properties") or {}
-        endpoints.extend(
-            filter(None, [properties.get("queryServiceUri"), properties.get("ingestionServiceUri")])
-        )
-
-    identifiers = connections.source_identifiers(
-        ctx.plan.source_workspace_id, migrated, endpoints
-    )
-    prerequisites = connections.scan_prerequisites(
-        ctx.client,
-        identifiers=identifiers,
-        client_id=ctx.principal.client_id,
-    )
-    if not prerequisites:
-        return []
-
-    ctx.run.summary["connectionPrerequisites"] = [p.as_dict() for p in prerequisites]
-    return [prerequisite.message() for prerequisite in prerequisites]
 
 
 # --------------------------------------------------------------------- phase 1
@@ -495,7 +539,10 @@ def _copy_spark_configuration(ctx: _Context, step: str) -> list[str]:
     if settings:
         ctx.spark_settings = settings
         ctx.run.update_step(step, "Applying workspace Spark settings")
-        patches, settings_warnings = spark.build_settings_payload(settings, pool_map)
+        # The new workspace already carries Fabric's defaults for its capacity, so only the
+        # settings that actually differ are worth sending.
+        target = spark.get_settings(ctx.client, ctx.target_workspace_id)
+        patches, settings_warnings = spark.build_settings_payload(settings, pool_map, target=target)
         warnings.extend(settings_warnings)
         warnings.extend(_apply_spark_patches(ctx, patches))
 
@@ -516,10 +563,17 @@ def _apply_spark_patches(
         try:
             spark.update_settings(ctx.client, ctx.target_workspace_id, payload)
         except FabricApiError as error:
-            warnings.append(
-                f"Could not apply {label} (HTTP {error.status_code}: {error.body[:200]}). "
-                "Check them in the new workspace."
-            )
+            if "SparkSettingsInvalidNodeCount" in error.body:
+                warnings.append(
+                    f"The source workspace's starter pool is larger than capacity "
+                    f"'{ctx.plan.capacity_name}' allows, so the new workspace keeps its own "
+                    "starter pool sizing."
+                )
+            else:
+                warnings.append(
+                    f"Could not apply {label} (HTTP {error.status_code}: {error.body[:200]}). "
+                    "Check them in the new workspace."
+                )
     return warnings
 
 
@@ -1655,6 +1709,12 @@ def build_plan(
     region = workspaces.capacity_region(capacity)
     source_name = workspace["displayName"]
 
+    # Capacity size caps Spark pools, starter pool sizing, and semantic model memory, so a
+    # mismatch is worth knowing about before anything is created.
+    capacity_warning = workspaces.compare_capacities(
+        workspaces.workspace_capacity_sku(client, workspace), capacity.get("sku") or ""
+    )
+
     if strategy is None:
         strategy = assess_workspace(list_items(client, source_workspace_id)).strategy
 
@@ -1671,6 +1731,7 @@ def build_plan(
             else (target_workspace_name or default_target_name(source_name, region))
         ),
         strategy=strategy,
+        capacity_warning=capacity_warning,
         include_files=include_files,
         include_data=include_data,
         copy_permissions=copy_permissions,
@@ -1678,9 +1739,12 @@ def build_plan(
 
 
 __all__ = [
+    "DependencyReport",
     "MigrationPlan",
     "build_plan",
     "cleanup_run",
+    "connection_prerequisites",
     "default_target_name",
+    "dependency_warnings",
     "run_migration",
 ]

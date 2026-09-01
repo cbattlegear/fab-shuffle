@@ -107,9 +107,24 @@ def copy_pools(
     return id_map, created, warnings
 
 
+def _differs(source: Any, target: Any) -> bool:
+    """Whether a settings section is worth sending.
+
+    A brand new workspace already carries Fabric's defaults for its capacity, so a section
+    that matches them is not worth a request. Starter pool sizing in particular is capped by
+    the capacity SKU, and resending the default is the usual cause of
+    ``SparkSettingsInvalidNodeCount``.
+    """
+    if target is None:
+        return True
+    return dict(source) != dict(target)
+
+
 def build_settings_payload(
     settings: Mapping[str, Any],
     pool_id_map: Mapping[str, str],
+    *,
+    target: Mapping[str, Any] | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
     """Build the settings patches for the new workspace, repointing the default pool.
 
@@ -117,31 +132,47 @@ def build_settings_payload(
     request with a bare 400, so sending them together means one unsupported value, such as a
     starter pool larger than the target capacity allows, silently loses all the others.
 
+    ``target`` is the new workspace's current settings. Sections that already match it are
+    skipped, so a workspace that only ever used defaults is left alone entirely.
+
     The default environment is deliberately excluded here: it is referenced by name, and the
     environment does not exist in the new workspace until the engineering phase.
     """
     patches: list[tuple[str, dict[str, Any]]] = []
     warnings: list[str] = []
+    target_settings = target or {}
 
     general: dict[str, Any] = {}
     for key in ("automaticLog", "highConcurrency", "job"):
-        if isinstance(settings.get(key), Mapping):
-            general[key] = dict(settings[key])
+        section = settings.get(key)
+        if isinstance(section, Mapping) and _differs(section, target_settings.get(key)):
+            general[key] = dict(section)
     if general:
         patches.append(("general Spark settings", general))
 
     pool = settings.get("pool")
     if isinstance(pool, Mapping):
+        target_pool = target_settings.get("pool") or {}
         pool_payload: dict[str, Any] = {}
-        if "customizeComputeEnabled" in pool:
+
+        if (
+            "customizeComputeEnabled" in pool
+            and pool["customizeComputeEnabled"] != target_pool.get("customizeComputeEnabled")
+        ):
             pool_payload["customizeComputeEnabled"] = pool["customizeComputeEnabled"]
 
         default_pool = pool.get("defaultPool")
         if isinstance(default_pool, Mapping):
             name = default_pool.get("name")
             old_id = default_pool.get("id")
+            target_default = (target_pool.get("defaultPool") or {}).get("name")
             if name == STARTER_POOL:
-                pool_payload["defaultPool"] = {"name": STARTER_POOL, "type": WORKSPACE_POOL_TYPE}
+                # A new workspace already defaults to the starter pool.
+                if target_default != STARTER_POOL:
+                    pool_payload["defaultPool"] = {
+                        "name": STARTER_POOL,
+                        "type": WORKSPACE_POOL_TYPE,
+                    }
             elif old_id and old_id in pool_id_map:
                 pool_payload["defaultPool"] = {"id": pool_id_map[old_id]}
             elif name:
@@ -153,12 +184,11 @@ def build_settings_payload(
         if pool_payload:
             patches.append(("Spark pool settings", {"pool": pool_payload}))
 
-        # Starter pool sizing is capped by the capacity SKU, so it is sent on its own; a
-        # target capacity smaller than the source rejects it.
-        if isinstance(pool.get("starterPool"), Mapping):
-            patches.append(
-                ("starter pool sizing", {"pool": {"starterPool": dict(pool["starterPool"])}})
-            )
+        # Starter pool sizing is capped by the capacity SKU, so it is sent on its own and
+        # only when the source actually customised it.
+        starter = pool.get("starterPool")
+        if isinstance(starter, Mapping) and _differs(starter, target_pool.get("starterPool")):
+            patches.append(("starter pool sizing", {"pool": {"starterPool": dict(starter)}}))
 
     return patches, warnings
 

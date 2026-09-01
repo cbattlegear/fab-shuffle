@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fabshuffle.auth import ServicePrincipal
-from fabshuffle.fabric import powerbi
+from fabshuffle.fabric import powerbi, relations
 from fabshuffle.web import app as web
 from tests.test_web_api import StubTokens, auth
 
@@ -145,3 +145,57 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
     names = {item["name"]: item for item in result["unsupported"]}
     assert set(names) == {"Nightly", "Exec"}
     assert "Power BI item type" in names["Exec"]["reason"]
+
+
+def test_dependency_problems_are_reported_before_the_run_starts(client, session_id, monkeypatch):
+    """The check is read only, so there is no reason to make the operator start a run for it."""
+    install(monkeypatch, [{"id": "lh", "displayName": "bronze", "type": "Lakehouse"}])
+
+    graph = relations.DependencyGraph(
+        dependencies={"lh": {"outside"}},
+        items={
+            "lh": {"id": "lh", "displayName": "bronze", "type": "Lakehouse", "workspaceId": "ws-1"},
+            "outside": {
+                "id": "outside",
+                "displayName": "shared",
+                "type": "Warehouse",
+                "workspaceId": "ws-other",
+            },
+        },
+        workspaces={"ws-other": "Finance"},
+    )
+    monkeypatch.setattr(relations, "build_graph", lambda *a, **k: graph)
+    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
+
+    result = preview(client, session_id)
+
+    assert result["dependencies"]
+    assert any("Finance" in message for message in result["dependencies"])
+
+
+def test_the_review_says_so_when_dependencies_cannot_be_checked(client, session_id, monkeypatch):
+    install(monkeypatch, [{"id": "lh", "displayName": "bronze", "type": "Lakehouse"}])
+    monkeypatch.setattr(
+        relations,
+        "build_graph",
+        lambda *a, **k: relations.DependencyGraph(available=False),
+    )
+
+    result = preview(client, session_id)
+
+    assert result["dependencies"] == [
+        "The relations API is unavailable to this service principal, so dependencies "
+        "between items could not be checked."
+    ]
+
+
+def test_a_clean_workspace_reports_no_dependency_problems(client, session_id, monkeypatch):
+    install(monkeypatch, [{"id": "lh", "displayName": "bronze", "type": "Lakehouse"}])
+    monkeypatch.setattr(
+        relations,
+        "build_graph",
+        lambda *a, **k: relations.DependencyGraph(dependencies={"lh": set()}),
+    )
+    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
+
+    assert preview(client, session_id)["dependencies"] == []

@@ -173,3 +173,77 @@ def test_an_empty_default_environment_is_not_sent():
 def test_empty_settings_produce_no_patch():
     patches, warnings = spark.build_settings_payload({}, {})
     assert patches == [] and warnings == []
+
+
+# ------------------------------------------- skipping what already matches
+
+
+DEFAULTS = {
+    "automaticLog": {"enabled": True},
+    "highConcurrency": {"notebookInteractiveRunEnabled": True},
+    "pool": {
+        "customizeComputeEnabled": True,
+        "defaultPool": {"name": "Starter Pool", "type": "Workspace", "id": "0" * 8},
+        "starterPool": {"maxNodeCount": 10, "maxExecutors": 9},
+    },
+}
+
+
+def test_a_workspace_on_defaults_is_left_completely_alone():
+    """The new workspace already has Fabric's defaults, so nothing needs sending."""
+    patches, warnings = spark.build_settings_payload(DEFAULTS, {}, target=DEFAULTS)
+    assert patches == [] and warnings == []
+
+
+def test_starter_pool_sizing_is_skipped_when_it_already_matches():
+    # Resending the default is what produced SparkSettingsInvalidNodeCount.
+    source = {"pool": {"starterPool": {"maxNodeCount": 10, "maxExecutors": 9}}}
+    target = {"pool": {"starterPool": {"maxNodeCount": 10, "maxExecutors": 9}}}
+
+    patches, _ = spark.build_settings_payload(source, {}, target=target)
+    assert patch_named(patches, "starter pool sizing") is None
+
+
+def test_a_customised_starter_pool_is_still_sent():
+    source = {"pool": {"starterPool": {"maxNodeCount": 3, "maxExecutors": 2}}}
+    target = {"pool": {"starterPool": {"maxNodeCount": 10, "maxExecutors": 9}}}
+
+    patches, _ = spark.build_settings_payload(source, {}, target=target)
+    assert patch_named(patches, "starter pool sizing") == {
+        "pool": {"starterPool": {"maxNodeCount": 3, "maxExecutors": 2}}
+    }
+
+
+def test_only_the_sections_that_differ_are_sent():
+    source = {
+        "automaticLog": {"enabled": False},
+        "highConcurrency": {"notebookInteractiveRunEnabled": True},
+    }
+    target = {
+        "automaticLog": {"enabled": True},
+        "highConcurrency": {"notebookInteractiveRunEnabled": True},
+    }
+
+    patches, _ = spark.build_settings_payload(source, {}, target=target)
+    general = patch_named(patches, "general Spark settings")
+
+    assert general == {"automaticLog": {"enabled": False}}
+    assert "highConcurrency" not in general
+
+
+def test_the_starter_pool_default_is_not_resent_when_already_default():
+    source = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace"}}}
+    target = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace"}}}
+
+    patches, warnings = spark.build_settings_payload(source, {}, target=target)
+    assert patches == [] and warnings == []
+
+
+def test_a_recreated_custom_pool_is_still_set_as_default():
+    source = {"pool": {"defaultPool": {"name": "pool1", "type": "Workspace", "id": "old-pool"}}}
+    target = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace"}}}
+
+    patches, warnings = spark.build_settings_payload(source, {"old-pool": "new"}, target=target)
+
+    assert patch_named(patches, "Spark pool settings")["pool"]["defaultPool"] == {"id": "new"}
+    assert warnings == []

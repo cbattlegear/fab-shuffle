@@ -33,6 +33,7 @@ from fabshuffle.orchestrator import (
     build_plan,
     cleanup_run,
     default_target_name,
+    dependency_warnings,
     run_migration,
 )
 from fabshuffle.run import REGISTRY, MigrationRun, RunStatus
@@ -221,6 +222,7 @@ def create_app() -> FastAPI:
                     "unsupported": [item.as_dict() for item in assessment.unsupported],
                     "unsupportedItemTypes": assessment.unsupported_types,
                     "unsupportedSummary": assessment.grouped_messages(),
+                    "capacityWarning": plan.capacity_warning,
                     "largeSemanticModels": [],
                     "blockers": [],
                 }
@@ -235,6 +237,12 @@ def create_app() -> FastAPI:
                     "warehouses": len(data_stores.list_warehouses(client, source_workspace_id)),
                     "eventhouses": len(eventhouses.list_eventhouses(client, source_workspace_id)),
                 }
+                result["dependencies"] = _dependency_preview(
+                    client,
+                    source_workspace_id=source_workspace_id,
+                    migrated=assessment.migrated,
+                    client_id=session.principal.client_id,
+                )
                 return result
 
         return await _run_fabric(work)
@@ -400,10 +408,43 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
         "sourceWorkspaceName": plan.source_workspace_name,
         "targetWorkspaceName": plan.target_workspace_name,
         "strategy": plan.strategy.value,
+        "capacityWarning": plan.capacity_warning,
         "includeData": plan.include_data,
         "includeFiles": plan.include_files,
         "copyPermissions": plan.copy_permissions,
     }
+
+
+def _dependency_preview(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    migrated: list[dict[str, Any]],
+    client_id: str,
+) -> list[str]:
+    """Run the same dependency check the migration runs, before anything is created.
+
+    The check is read only, so there is no reason to make the operator start a run to find
+    out that a semantic model points somewhere the migration cannot follow.
+    """
+    if not migrated:
+        return []
+    try:
+        report = dependency_warnings(
+            client,
+            source_workspace_id=source_workspace_id,
+            migrated=migrated,
+            client_id=client_id,
+        )
+    except FabricApiError as error:
+        return [f"Dependencies could not be checked: {error}"]
+
+    if not report.available:
+        return [
+            "The relations API is unavailable to this service principal, so dependencies "
+            "between items could not be checked."
+        ]
+    return report.messages()
 
 
 def _semantic_model_preview(

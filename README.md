@@ -85,6 +85,14 @@ anything that depends on them. Custom Spark pools are recreated with the workspa
 environment that pins one is repointed automatically; a *capacity* level pool belongs to the
 capacity rather than the workspace and is reported instead.
 
+**The target capacity should be the same size as the source's.** Capacity SKU caps Spark pool
+and starter pool node counts, and the memory a semantic model may use, so moving to a smaller
+capacity succeeds right up until something no longer fits. Fab Shuffle compares the two SKUs
+while it builds the plan and warns on the review screen if they differ. Workspace Spark
+settings are only patched where they actually differ from the new workspace's own defaults,
+so a workspace that never customised them is left alone and never trips the capacity's node
+count limits.
+
 ### Dependency order
 
 Phase order is load bearing. Each phase records the source-to-target ids it created in an id

@@ -337,6 +337,8 @@ function renderReview() {
 
   fillList($("#blockers"), preview.blockers);
   fillList($("#unsupported"), preview.unsupportedSummary);
+  fillList($("#dependencies"), preview.dependencies || []);
+  fillList($("#review-warnings"), preview.capacityWarning ? [preview.capacityWarning] : []);
 
   // A reassignment keeps the workspace and its name, and copies nothing.
   $("#target-name-field").hidden = reassign;
