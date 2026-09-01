@@ -601,7 +601,12 @@ def _migrate_eventhouses(ctx: _Context) -> None:
         name = eventhouse["displayName"]
         ctx.run.update_step(step, f"Creating eventhouse '{name}'")
 
-        created = eventhouses.create_eventhouse(ctx.client, ctx.target_workspace_id, name)
+        created = eventhouses.create_eventhouse(
+            ctx.client,
+            ctx.target_workspace_id,
+            name,
+            folder_id=ctx.id_map.get(eventhouse.get("folderId", "")),
+        )
         new_eventhouse = eventhouses.get_eventhouse(ctx.client, ctx.target_workspace_id, created["id"])
 
         source_properties = eventhouse.get("properties") or {}
@@ -733,7 +738,11 @@ def _migrate_follower_database(
         )
 
     target = eventhouses.create_kql_database(
-        ctx.client, ctx.target_workspace_id, name, creation_payload=payload
+        ctx.client,
+        ctx.target_workspace_id,
+        name,
+        creation_payload=payload,
+        folder_id=ctx.id_map.get(database.get("folderId", "")),
     )
     ctx.id_map[database["id"]] = target["id"]
     return True, []
@@ -765,6 +774,7 @@ def _migrate_kql_database(
         name,
         parts=parts,
         existing=existing_databases,
+        folder_id=ctx.id_map.get(database.get("folderId", "")),
     )
     ctx.id_map[database_id] = target["id"]
     ctx.kql_databases.append((database_id, target["id"], name))

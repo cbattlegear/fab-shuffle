@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import decode_json_part, find_part, replace_part
 from fabshuffle.fabric.items import get_item_definition, is_system_item, update_item_definition
+
+logger = logging.getLogger(__name__)
 
 DATABASE_PROPERTIES_PART = "DatabaseProperties.json"
 DATABASE_SCHEMA_PART = "DatabaseSchema.kql"
@@ -74,7 +77,21 @@ def create_kql_database(
         body["creationPayload"] = creation_payload
     if parts:
         body["definition"] = {"parts": parts}
-    return client.post(f"workspaces/{workspace_id}/kqlDatabases", json=body)
+
+    try:
+        return client.post(f"workspaces/{workspace_id}/kqlDatabases", json=body)
+    except FabricApiError as error:
+        # A KQL database belongs to its eventhouse, so Fabric may not accept it being placed
+        # in a folder of its own. Losing the folder is a much smaller loss than losing the
+        # database, so the request is retried without it.
+        if not folder_id or error.status_code != 400:
+            raise
+        logger.info(
+            "KQL database '%s' could not be created in a folder, retrying at the workspace root",
+            display_name,
+        )
+        body.pop("folderId")
+        return client.post(f"workspaces/{workspace_id}/kqlDatabases", json=body)
 
 
 def kql_database_definition_parts(

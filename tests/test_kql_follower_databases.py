@@ -287,7 +287,7 @@ def test_followers_are_created_after_every_leader_in_the_workspace(monkeypatch) 
         lambda *a, **k: [follower_house, leader_house],
     )
     monkeypatch.setattr(
-        orchestrator.eventhouses, "create_eventhouse", lambda c, w, name: {"id": f"new-{name}"}
+        orchestrator.eventhouses, "create_eventhouse", lambda c, w, name, **kwargs: {"id": f"new-{name}"}
     )
     monkeypatch.setattr(
         orchestrator.eventhouses, "get_eventhouse", lambda c, w, id_: {"id": id_, "properties": {}}
