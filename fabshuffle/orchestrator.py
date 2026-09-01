@@ -114,6 +114,7 @@ class _Context:
     kql_databases: list[tuple[str, str, str]] = field(default_factory=list)
     kql_table_shortcuts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     graph: relations.DependencyGraph = field(default_factory=relations.DependencyGraph)
+    spark_settings: dict[str, Any] | None = None
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -492,18 +493,33 @@ def _copy_spark_configuration(ctx: _Context, step: str) -> list[str]:
 
     settings = spark.get_settings(ctx.client, ctx.plan.source_workspace_id)
     if settings:
+        ctx.spark_settings = settings
         ctx.run.update_step(step, "Applying workspace Spark settings")
-        payload, settings_warnings = spark.build_settings_payload(settings, pool_map)
+        patches, settings_warnings = spark.build_settings_payload(settings, pool_map)
         warnings.extend(settings_warnings)
-        if payload:
-            try:
-                spark.update_settings(ctx.client, ctx.target_workspace_id, payload)
-            except FabricApiError as error:
-                warnings.append(
-                    f"Workspace Spark settings could not be applied (HTTP {error.status_code}). "
-                    "Check them in the new workspace."
-                )
+        warnings.extend(_apply_spark_patches(ctx, patches))
 
+    return warnings
+
+
+def _apply_spark_patches(
+    ctx: _Context,
+    patches: list[tuple[str, dict[str, Any]]],
+) -> list[str]:
+    """Apply Spark settings one section at a time.
+
+    Fabric answers a rejected settings body with a bare 400, so sending them separately keeps
+    one unsupported value from discarding the rest, and names the section that failed.
+    """
+    warnings: list[str] = []
+    for label, payload in patches:
+        try:
+            spark.update_settings(ctx.client, ctx.target_workspace_id, payload)
+        except FabricApiError as error:
+            warnings.append(
+                f"Could not apply {label} (HTTP {error.status_code}: {error.body[:200]}). "
+                "Check them in the new workspace."
+            )
     return warnings
 
 
@@ -713,12 +729,11 @@ def _copy_lakehouse_tables(
     schema_enabled: bool,
 ) -> list[str]:
     name = lakehouse["displayName"]
-    tables = data_stores.managed_tables(
-        ctx.client,
-        ctx.plan.source_workspace_id,
-        lakehouse["id"],
-        schema_enabled=schema_enabled,
-    )
+    try:
+        tables = _lakehouse_tables(ctx, lakehouse, schema_enabled=schema_enabled)
+    except (sqlschema.SchemaTransferError, FabricApiError) as error:
+        return [f"Could not list tables in lakehouse '{name}', so its data was not copied: {error}"]
+
     if not tables:
         return []
 
@@ -742,6 +757,45 @@ def _copy_lakehouse_tables(
         return []
     except copyjobs.CopyJobFailed as error:
         return [f"Table data for lakehouse '{name}' did not copy: {error}"]
+
+
+def _lakehouse_tables(
+    ctx: _Context,
+    lakehouse: dict[str, Any],
+    *,
+    schema_enabled: bool,
+) -> list[data_stores.TableRef]:
+    """List the copyable tables in a lakehouse.
+
+    The lakehouse tables API rejects schema-enabled lakehouses with
+    ``UnsupportedOperationForSchemasEnabledLakehouse``, so those are enumerated over TDS
+    through the SQL analytics endpoint instead. Either way shortcuts are excluded: their data
+    belongs to the shortcut target, and they are recreated separately.
+    """
+    workspace_id = ctx.plan.source_workspace_id
+    if not schema_enabled:
+        return data_stores.managed_tables(
+            ctx.client, workspace_id, lakehouse["id"], schema_enabled=False
+        )
+
+    endpoint = data_stores.lakehouse_sql_endpoint(lakehouse).get("connectionString")
+    if not endpoint:
+        raise sqlschema.SchemaTransferError(
+            "the lakehouse has no SQL analytics endpoint, which is the only way to list the "
+            "tables of a schema-enabled lakehouse"
+        )
+
+    shortcut_keys = {
+        (s.get("path", "").rsplit("/", 1)[-1].casefold(), (s.get("name") or "").casefold())
+        for s in shortcuts.list_shortcuts(ctx.client, workspace_id, lakehouse["id"])
+    }
+
+    refs: list[data_stores.TableRef] = []
+    for schema, table in sqlschema.list_base_tables(endpoint, lakehouse["displayName"], ctx.tokens):
+        if (schema.casefold(), table.casefold()) in shortcut_keys:
+            continue
+        refs.append(data_stores.TableRef(name=table, schema=schema))
+    return refs
 
 
 def _copy_lakehouse_files(
@@ -876,16 +930,10 @@ def _copy_warehouse_tables(
 
 def _warehouse_tables(ctx: _Context, endpoint: str, database: str) -> list[data_stores.TableRef]:
     """Enumerate base tables over TDS; warehouses have no REST table listing API."""
-    with sqlschema.connect(endpoint, database, ctx.tokens) as connection:
-        rows = (
-            connection.cursor()
-            .execute(
-                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_TYPE = 'BASE TABLE'"
-            )
-            .fetchall()
-        )
-    return [data_stores.TableRef(name=row[1], schema=row[0]) for row in rows]
+    return [
+        data_stores.TableRef(name=table, schema=schema)
+        for schema, table in sqlschema.list_base_tables(endpoint, database, ctx.tokens)
+    ]
 
 
 # --------------------------------------------------------------------- phase 5
@@ -1287,6 +1335,14 @@ def _migrate_engineering(ctx: _Context) -> None:
 
     if dataflows:
         counts[analytics.DATAFLOW] = _migrate_dataflows(ctx, step, dataflows, warnings, progress)
+
+    # The workspace default environment is referenced by name, so it can only be set once the
+    # environment it names exists here.
+    if ctx.spark_settings:
+        patch = spark.default_environment_patch(ctx.spark_settings)
+        if patch:
+            progress("Setting the workspace default environment")
+            warnings.extend(_apply_spark_patches(ctx, [("the default Spark environment", patch)]))
 
     ctx.warnings.extend(warnings)
     summary = ", ".join(f"{count} {name}" for name, count in counts.items()) or "nothing"

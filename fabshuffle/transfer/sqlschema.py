@@ -203,6 +203,28 @@ def transfer_schema(
     )
 
 
+def list_base_tables(
+    server: str,
+    database: str,
+    tokens: TokenProvider,
+) -> list[tuple[str, str]]:
+    """Return ``(schema, table)`` for every base table, over TDS.
+
+    Used where no REST listing is available: warehouses have none at all, and the lakehouse
+    tables API rejects schema-enabled lakehouses outright.
+    """
+    with connect(server, database, tokens) as connection:
+        rows = (
+            connection.cursor()
+            .execute(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE = 'BASE TABLE'"
+            )
+            .fetchall()
+        )
+    return [(row[0], row[1]) for row in rows]
+
+
 def _run(command: list[str], *, what: str) -> None:
     logger.debug("Running %s", command[0])
     try:
@@ -222,6 +244,7 @@ __all__ = [
     "apply_script",
     "connect",
     "extract_dacpac",
+    "list_base_tables",
     "transfer_schema",
     "unpack_dacpac",
     "wait_for_database",

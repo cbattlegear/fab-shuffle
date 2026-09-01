@@ -105,6 +105,10 @@ def test_unreadable_pools_are_not_fatal():
 # ------------------------------------------------------------------ settings
 
 
+def patch_named(patches, label):
+    return next((body for name, body in patches if name == label), None)
+
+
 def test_the_default_pool_is_repointed_at_the_recreated_pool():
     settings = {
         "pool": {
@@ -115,44 +119,57 @@ def test_the_default_pool_is_repointed_at_the_recreated_pool():
         "automaticLog": {"enabled": True},
         "job": {"sessionTimeoutInMinutes": 20},
     }
-    payload, warnings = spark.build_settings_payload(settings, {"old-pool": "new-pool"})
+    patches, warnings = spark.build_settings_payload(settings, {"old-pool": "new-pool"})
 
     assert warnings == []
-    assert payload["pool"]["defaultPool"] == {"id": "new-pool"}
-    assert payload["pool"]["starterPool"] == {"maxNodeCount": 3, "maxExecutors": 1}
-    assert payload["automaticLog"] == {"enabled": True}
-    assert payload["job"] == {"sessionTimeoutInMinutes": 20}
+    assert patch_named(patches, "Spark pool settings")["pool"]["defaultPool"] == {"id": "new-pool"}
+
+    general = patch_named(patches, "general Spark settings")
+    assert general["automaticLog"] == {"enabled": True}
+    assert general["job"] == {"sessionTimeoutInMinutes": 20}
+
+    # Starter pool sizing is capped by the capacity SKU, so it is sent on its own.
+    starter = patch_named(patches, "starter pool sizing")
+    assert starter == {"pool": {"starterPool": {"maxNodeCount": 3, "maxExecutors": 1}}}
 
 
 def test_a_default_pool_that_did_not_transfer_is_dropped_and_reported():
     settings = {"pool": {"defaultPool": {"name": "pool1", "type": "Workspace", "id": "old-pool"}}}
-    payload, warnings = spark.build_settings_payload(settings, {})
+    patches, warnings = spark.build_settings_payload(settings, {})
 
     # Better to fall back to the starter pool than to point at the old region.
-    assert "defaultPool" not in payload.get("pool", {})
+    pool_patch = patch_named(patches, "Spark pool settings")
+    assert pool_patch is None or "defaultPool" not in pool_patch.get("pool", {})
     assert len(warnings) == 1 and "falls back to the starter pool" in warnings[0]
 
 
 def test_the_starter_pool_default_is_carried_across_by_name():
     settings = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace", "id": "x"}}}
-    payload, warnings = spark.build_settings_payload(settings, {})
+    patches, warnings = spark.build_settings_payload(settings, {})
 
-    assert payload["pool"]["defaultPool"] == {"name": "Starter Pool", "type": "Workspace"}
+    assert patch_named(patches, "Spark pool settings")["pool"]["defaultPool"] == {
+        "name": "Starter Pool",
+        "type": "Workspace",
+    }
     assert warnings == []
 
 
-def test_the_default_environment_is_carried_by_name():
-    # The migrated environment keeps its name, so the reference still resolves.
+def test_the_default_environment_is_deferred_not_sent_with_the_pools():
+    """The environment is referenced by name and does not exist until the engineering phase."""
     settings = {"environment": {"name": "environment1", "runtimeVersion": "1.3"}}
-    payload, _ = spark.build_settings_payload(settings, {})
-    assert payload["environment"] == {"name": "environment1", "runtimeVersion": "1.3"}
+    patches, _ = spark.build_settings_payload(settings, {})
+
+    assert all("environment" not in body for _, body in patches)
+    assert spark.default_environment_patch(settings) == {
+        "environment": {"name": "environment1", "runtimeVersion": "1.3"}
+    }
 
 
 def test_an_empty_default_environment_is_not_sent():
-    payload, _ = spark.build_settings_payload({"environment": {"name": ""}}, {})
-    assert "environment" not in payload
+    assert spark.default_environment_patch({"environment": {"name": ""}}) is None
+    assert spark.default_environment_patch({}) is None
 
 
 def test_empty_settings_produce_no_patch():
-    payload, warnings = spark.build_settings_payload({}, {})
-    assert payload == {} and warnings == []
+    patches, warnings = spark.build_settings_payload({}, {})
+    assert patches == [] and warnings == []

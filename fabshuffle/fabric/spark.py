@@ -110,27 +110,31 @@ def copy_pools(
 def build_settings_payload(
     settings: Mapping[str, Any],
     pool_id_map: Mapping[str, str],
-) -> tuple[dict[str, Any], list[str]]:
-    """Build the settings patch for the new workspace, repointing the default pool.
+) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    """Build the settings patches for the new workspace, repointing the default pool.
 
-    Only the parts that carry a real choice are copied. A default pool that was a custom pool
-    is remapped to its recreated counterpart; if that pool could not be recreated, the setting
-    is dropped rather than pointing at a pool in the old region.
+    Returned as separate labelled patches rather than one body. Fabric answers a bad settings
+    request with a bare 400, so sending them together means one unsupported value, such as a
+    starter pool larger than the target capacity allows, silently loses all the others.
+
+    The default environment is deliberately excluded here: it is referenced by name, and the
+    environment does not exist in the new workspace until the engineering phase.
     """
-    payload: dict[str, Any] = {}
+    patches: list[tuple[str, dict[str, Any]]] = []
     warnings: list[str] = []
 
+    general: dict[str, Any] = {}
     for key in ("automaticLog", "highConcurrency", "job"):
         if isinstance(settings.get(key), Mapping):
-            payload[key] = dict(settings[key])
+            general[key] = dict(settings[key])
+    if general:
+        patches.append(("general Spark settings", general))
 
     pool = settings.get("pool")
     if isinstance(pool, Mapping):
         pool_payload: dict[str, Any] = {}
         if "customizeComputeEnabled" in pool:
             pool_payload["customizeComputeEnabled"] = pool["customizeComputeEnabled"]
-        if isinstance(pool.get("starterPool"), Mapping):
-            pool_payload["starterPool"] = dict(pool["starterPool"])
 
         default_pool = pool.get("defaultPool")
         if isinstance(default_pool, Mapping):
@@ -147,14 +151,24 @@ def build_settings_payload(
                 )
 
         if pool_payload:
-            payload["pool"] = pool_payload
+            patches.append(("Spark pool settings", {"pool": pool_payload}))
 
-    # The default environment is referenced by name, and the migrated one keeps its name.
+        # Starter pool sizing is capped by the capacity SKU, so it is sent on its own; a
+        # target capacity smaller than the source rejects it.
+        if isinstance(pool.get("starterPool"), Mapping):
+            patches.append(
+                ("starter pool sizing", {"pool": {"starterPool": dict(pool["starterPool"])}})
+            )
+
+    return patches, warnings
+
+
+def default_environment_patch(settings: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The default environment setting, applied only once environments have been migrated."""
     environment = settings.get("environment")
     if isinstance(environment, Mapping) and environment.get("name"):
-        payload["environment"] = dict(environment)
-
-    return payload, warnings
+        return {"environment": dict(environment)}
+    return None
 
 
 __all__ = [
@@ -163,6 +177,7 @@ __all__ = [
     "build_settings_payload",
     "copy_pools",
     "create_pool",
+    "default_environment_patch",
     "get_settings",
     "list_pools",
     "update_settings",
