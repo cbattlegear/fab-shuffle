@@ -17,22 +17,26 @@ items created by an *earlier* phase:
 3. ``lakehouses``   before warehouses, because warehouse views can reference lakehouse
    tables through the SQL analytics endpoint.
 4. ``warehouses``   schema before data, so Copy Job activities have tables to land in.
-5. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
+5. ``mirrored``     mirrored databases, which are data stores with their own SQL analytics
+   endpoint, so they belong with the others and before anything that reads them.
+6. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
    them. This covers both lakehouse shortcuts and KQL database table shortcuts. The SQL
    analytics endpoint is refreshed only now, so it picks up both the copied tables and the
    new shortcuts, and only then is its schema copied.
-6. ``connections``  recreate connections that point into the source workspace, aimed at the
+7. ``connections``  recreate connections that point into the source workspace, aimed at the
    items just created. Their new ids go into the id map, so everything after this binds to
    them. A connection's target cannot be changed in place, so this is a replacement.
-7. ``engineering``  environments, then notebooks, then dataflows. A notebook attaches to an
+8. ``realtime``     eventstreams, KQL querysets, and KQL dashboards. They read the
+   eventhouses and data stores above, and an eventstream sources from connections.
+9. ``engineering``  environments, then notebooks, then dataflows. A notebook attaches to an
    environment and reads a lakehouse; a semantic model can read a dataflow, so all three
    come before the analytics phase.
-8. ``analytics``    semantic models, then reports. Models bind to lakehouse and warehouse
-   SQL endpoints, so they need step 5 finished; reports bind to models, so they run after.
-9. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
-   above, so they go last.
-10. ``permissions`` remaining role assignments. Admins were granted back in step 1.
-11. ``cleanup``     drop the scratch workspace and local staging.
+10. ``analytics``   semantic models, then reports. Models bind to lakehouse and warehouse
+    SQL endpoints, so they need step 6 finished; reports bind to models, so they run after.
+11. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
+    above, so they go last.
+12. ``permissions`` remaining role assignments. Admins were granted back in step 1.
+13. ``cleanup``     drop the scratch workspace and local staging.
 """
 
 from __future__ import annotations
@@ -151,8 +155,10 @@ def run_migration(
             _migrate_eventhouses(context)
             _migrate_lakehouses(context)
             _migrate_warehouses(context)
+            _migrate_mirrored_databases(context)
             _migrate_shortcuts_and_endpoints(context)
             _replace_connections(context)
+            _migrate_realtime(context)
             _migrate_engineering(context)
             _migrate_reports_and_models(context)
             _migrate_orchestration(context)
@@ -873,6 +879,81 @@ def _warehouse_tables(ctx: _Context, endpoint: str, database: str) -> list[data_
 # --------------------------------------------------------------------- phase 5
 
 
+# --------------------------------------------------------------------- phase 5
+
+
+def _migrate_mirrored_databases(ctx: _Context) -> None:
+    """Recreate mirrored databases.
+
+    A mirrored database is a data store with its own SQL analytics endpoint, so it goes with
+    the other data stores: a semantic model can read it, and its endpoint has to be in the id
+    map before the analytics phase.
+
+    Mirroring is deliberately not started. Creating the item does not start replication, and
+    starting it would add a second live mirror against the same source database while the
+    original is presumably still running. That is the operator's call.
+    """
+    step = "mirrored"
+    ctx.run.start_step(step, "Migrating mirrored databases")
+    ctx.run.raise_if_cancelled()
+
+    source_id = ctx.plan.source_workspace_id
+    databases = data_stores.list_mirrored_databases(ctx.client, source_id)
+    if not databases:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No mirrored databases in the source workspace")
+        return
+
+    warnings: list[str] = []
+
+    def progress(message: str) -> None:
+        ctx.run.update_step(step, message)
+
+    # Record what was running before the move, so the warning can say whether replication
+    # actually needs restarting in the new region.
+    running = {
+        db["id"]: data_stores.mirroring_status(ctx.client, source_id, db["id"]) for db in databases
+    }
+
+    migrated, item_warnings = analytics.migrate_items(
+        ctx.client,
+        source_workspace_id=source_id,
+        target_workspace_id=ctx.target_workspace_id,
+        items=databases,
+        item_type=analytics.MIRRORED_DATABASE,
+        id_map=ctx.id_map,
+        folder_map=ctx.id_map,
+        on_progress=progress,
+    )
+    warnings.extend(item_warnings)
+
+    for result in migrated:
+        target = ctx.client.get(
+            f"workspaces/{ctx.target_workspace_id}/mirroredDatabases/{result.target_id}"
+        )
+        source = next((db for db in databases if db["id"] == result.source_id), {})
+        source_endpoint = data_stores.mirrored_database_sql_endpoint(source)
+        target_endpoint = data_stores.mirrored_database_sql_endpoint(target)
+        for key in ("connectionString", "id"):
+            if source_endpoint.get(key) and target_endpoint.get(key):
+                ctx.id_map[source_endpoint[key]] = target_endpoint[key]
+
+        was = running.get(result.source_id)
+        state = f"was {was} in the source workspace" if was else "could not be read"
+        warnings.append(
+            f"Mirrored database '{result.name}' was created but its mirroring is not started "
+            f"(replication {state}). Start it from the new workspace once you are ready for a "
+            "second mirror to read the source database."
+        )
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, f"Migrated {len(migrated)} mirrored database(s)", warnings
+    )
+
+
+# --------------------------------------------------------------------- phase 6
+
+
 def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     step = "shortcuts"
     ctx.run.start_step(step, "Recreating shortcuts and syncing SQL endpoints")
@@ -1069,6 +1150,66 @@ def _replace_connections(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 7
+
+
+# --------------------------------------------------------------------- phase 8
+
+
+def _migrate_realtime(ctx: _Context) -> None:
+    """Recreate eventstreams, KQL querysets, and KQL dashboards.
+
+    All three read from the real-time items built earlier: a queryset and a dashboard target
+    an eventhouse cluster URI, and an eventstream routes into lakehouses, eventhouses, and
+    other items while sourcing from connections. So this runs after the data stores, the
+    eventhouses, and the connection replacements.
+    """
+    step = "realtime"
+    ctx.run.start_step(step, "Migrating eventstreams, querysets, and dashboards")
+    ctx.run.raise_if_cancelled()
+
+    source_id = ctx.plan.source_workspace_id
+    groups = [
+        (analytics.EVENTSTREAM, analytics.list_of_type(ctx.client, source_id, analytics.EVENTSTREAM)),
+        (analytics.KQL_QUERYSET, analytics.list_of_type(ctx.client, source_id, analytics.KQL_QUERYSET)),
+        (analytics.KQL_DASHBOARD, analytics.list_of_type(ctx.client, source_id, analytics.KQL_DASHBOARD)),
+    ]
+    if not any(items for _, items in groups):
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to migrate in this phase")
+        return
+
+    warnings: list[str] = []
+    counts: dict[str, int] = {}
+    migrated: list[analytics.MigratedItem] = []
+
+    def progress(message: str) -> None:
+        ctx.run.update_step(step, message)
+
+    for item_type, items in groups:
+        if not items:
+            continue
+        results, item_warnings = analytics.migrate_items(
+            ctx.client,
+            source_workspace_id=source_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=items,
+            item_type=item_type,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            on_progress=progress,
+        )
+        counts[item_type] = len(results)
+        migrated.extend(results)
+        warnings.extend(item_warnings)
+
+    # An eventstream sources from connections, which are checked the same way pipelines are.
+    warnings.extend(_check_connections(ctx, step, migrated))
+
+    ctx.warnings.extend(warnings)
+    summary = ", ".join(f"{count} {name}" for name, count in counts.items()) or "nothing"
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Migrated {summary}", warnings)
+
+
+# --------------------------------------------------------------------- phase 9
 
 
 def _migrate_engineering(ctx: _Context) -> None:

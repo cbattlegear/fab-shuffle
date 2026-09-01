@@ -129,7 +129,7 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
         monkeypatch,
         [
             {"displayName": "bronze", "type": "Lakehouse"},
-            {"displayName": "Nightly", "type": "KQLDashboard"},
+            {"displayName": "Nightly", "type": "MLModel"},
             {"displayName": "Exec", "type": "Dashboard"},
             {"displayName": "Sales", "type": "Report"},
         ],
@@ -140,7 +140,7 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
     assert result["targetWorkspaceName"] == "Sales-westeurope"
     assert result["counts"]["lakehouses"] == 1
     # The report is migrated and rebound, so it is not reported as left behind.
-    assert result["unsupportedItemTypes"] == ["Dashboard", "KQLDashboard"]
+    assert result["unsupportedItemTypes"] == ["Dashboard", "MLModel"]
 
     names = {item["name"]: item for item in result["unsupported"]}
     assert set(names) == {"Nightly", "Exec"}

@@ -37,19 +37,19 @@ def test_rebuild_warns_about_every_item_it_leaves_behind():
     assessment = assess_workspace(
         items(
             ("bronze", "Lakehouse"),
-            ("Nightly load", "KQLDashboard"),
+            ("Nightly load", "MLModel"),
             ("Exec", "Dashboard"),
             ("Sales", "Report"),
         )
     )
     assert assessment.strategy is Strategy.REBUILD
     # Reports are rebuilt and rebound, so only the notebook and dashboard are left behind.
-    assert assessment.unsupported_types == ["Dashboard", "KQLDashboard"]
+    assert assessment.unsupported_types == ["Dashboard", "MLModel"]
 
     by_name = {item.name: item for item in assessment.unsupported}
     assert "does not migrate this item type yet" in by_name["Nightly load"].reason
     assert "cannot recreate this Power BI item type yet" in by_name["Exec"].reason
-    assert by_name["Nightly load"].message().startswith("KQLDashboard 'Nightly load' was not migrated")
+    assert by_name["Nightly load"].message().startswith("MLModel 'Nightly load' was not migrated")
 
 
 def test_derived_items_are_neither_migrated_nor_reported():

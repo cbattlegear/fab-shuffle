@@ -50,7 +50,7 @@ def test_unsupported_items_are_grouped_by_type():
         {"displayName": "bronze", "type": "Lakehouse"},
         {"displayName": "AlertAgain", "type": "Dashboard"},
         {"displayName": "AlertOnce", "type": "Dashboard"},
-        {"displayName": "BattleCabbageReplTest", "type": "MirroredDatabase"},
+        {"displayName": "ChurnModel", "type": "MLModel"},
     ]
     assessment = assess_workspace(items)
     assert assessment.strategy is Strategy.REBUILD
@@ -60,7 +60,7 @@ def test_unsupported_items_are_grouped_by_type():
     # One line per type, not one per item.
     assert len(messages) == 2
     assert messages[0].startswith("Dashboard (2) not migrated: 'AlertAgain', 'AlertOnce'.")
-    assert messages[1].startswith("MirroredDatabase (1) not migrated: 'BattleCabbageReplTest'.")
+    assert messages[1].startswith("MLModel (1) not migrated: 'ChurnModel'.")
     assert all(message.endswith(".") for message in messages)
 
 

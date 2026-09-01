@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 _GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
+# The keys different item types use to bind a connection.
+CONNECTION_KEYS = ("connection", "connectionId", "dataConnectionId")
+
 # Connectivity types that are bound to a gateway rather than reachable from anywhere. A
 # virtual network gateway in particular is provisioned into one Azure region.
 GATEWAY_TYPES = frozenset(
@@ -121,19 +124,17 @@ def connections_by_id(client: FabricClient) -> dict[str, dict[str, Any]]:
 def _walk(node: Any, found: set[str]) -> None:
     """Collect connection ids from a parsed definition.
 
-    Pipelines and Copy Jobs both bind a connection through
-    ``"externalReferences": {"connection": "<guid>"}``; shortcut-style payloads use a
-    ``connectionId`` key instead.
+    Item types spell the binding differently: pipelines and Copy Jobs use
+    ``externalReferences.connection``, eventstreams use ``dataConnectionId``, mirrored
+    databases use a bare ``connection`` under ``typeProperties``, and shortcut-style payloads
+    use ``connectionId``. Only values that actually look like a connection id are taken,
+    because a dataflow stores ``connectionId`` as an embedded JSON document instead.
     """
     if isinstance(node, Mapping):
-        external = node.get("externalReferences")
-        if isinstance(external, Mapping) and isinstance(external.get("connection"), str):
-            found.add(external["connection"])
-        # A dataflow stores connectionId as an embedded JSON document rather than a GUID, so
-        # only take values that actually look like a connection id.
-        candidate = node.get("connectionId")
-        if isinstance(candidate, str) and _GUID.match(candidate.strip()):
-            found.add(candidate.strip())
+        for key in CONNECTION_KEYS:
+            value = node.get(key)
+            if isinstance(value, str) and _GUID.match(value.strip()):
+                found.add(value.strip())
         for value in node.values():
             _walk(value, found)
     elif isinstance(node, list):

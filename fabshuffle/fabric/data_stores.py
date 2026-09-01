@@ -197,9 +197,44 @@ def wait_for_sql_endpoint(
         time.sleep(15)
 
 
+# ------------------------------------------------------------ mirrored databases
+
+# Mirroring does not start on its own when a mirrored database is created from a definition,
+# and Fabric rejects startMirroring while the item is still Initializing.
+MIRRORING_INACTIVE = frozenset({"Stopped", "Stopping", "Initializing"})
+
+
+def list_mirrored_databases(client: FabricClient, workspace_id: str) -> list[dict[str, Any]]:
+    try:
+        databases = client.list_all(f"workspaces/{workspace_id}/mirroredDatabases")
+    except FabricApiError as error:
+        if error.status_code in (401, 403, 404):
+            return []
+        raise
+    return [db for db in databases if not is_system_item(db)]
+
+
+def mirroring_status(client: FabricClient, workspace_id: str, database_id: str) -> str | None:
+    """Current mirroring status, or ``None`` when it cannot be read."""
+    try:
+        result = client.post(
+            f"workspaces/{workspace_id}/mirroredDatabases/{database_id}/getMirroringStatus"
+        )
+    except FabricApiError as error:
+        if error.status_code in (400, 401, 403, 404):
+            return None
+        raise
+    return result.get("status")
+
+
+def mirrored_database_sql_endpoint(database: dict[str, Any]) -> dict[str, Any]:
+    return (database.get("properties") or {}).get("sqlEndpointProperties") or {}
+
+
 __all__ = [
     "CASE_INSENSITIVE_COLLATION",
     "CASE_SENSITIVE_COLLATION",
+    "MIRRORING_INACTIVE",
     "TableRef",
     "create_lakehouse",
     "create_warehouse",
@@ -209,8 +244,11 @@ __all__ = [
     "lakehouse_sql_endpoint",
     "list_lakehouse_tables",
     "list_lakehouses",
+    "list_mirrored_databases",
     "list_warehouses",
     "managed_tables",
+    "mirrored_database_sql_endpoint",
+    "mirroring_status",
     "refresh_sql_endpoint_metadata",
     "wait_for_sql_endpoint",
     "warehouse_connection_string",

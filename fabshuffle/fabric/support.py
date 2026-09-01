@@ -20,6 +20,7 @@ REBUILT_TYPES = frozenset(
         "Warehouse",
         "Eventhouse",
         "KQLDatabase",
+        "MirroredDatabase",
         "SemanticModel",
         "Report",
         "DataPipeline",
@@ -27,6 +28,9 @@ REBUILT_TYPES = frozenset(
         "Notebook",
         "Environment",
         "Dataflow",
+        "Eventstream",
+        "KQLDashboard",
+        "KQLQueryset",
     }
 )
 

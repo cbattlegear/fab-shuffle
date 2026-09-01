@@ -43,6 +43,10 @@ copies everything it supports.
 | Warehouse | ✅ | ✅ | Collation preserved |
 | Eventhouse | ✅ | n/a | |
 | KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
+| Mirrored database | ✅ | n/a | Mirroring must be started by hand afterwards |
+| Eventstream | ✅ | n/a | Sources, destinations, and operators rebound |
+| KQL queryset | ✅ | n/a | Rebound to the migrated eventhouse |
+| KQL dashboard | ✅ | n/a | Rebound to the migrated eventhouse |
 | Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |
 | Report | ✅ | n/a | Rebound to the migrated semantic model |
 | Notebook | ✅ | n/a | Default lakehouse and environment attachment rebound |
@@ -70,6 +74,12 @@ definition — Fabric documents that filtering the item list by dataflow type do
 reliable information. Anything that is not CI/CD-enabled is reported by name, telling you to
 upgrade it with the upgrade wizard or Save As and migrate again.
 
+**Mirrored databases arrive with mirroring stopped.** Creating the item does not start
+replication, and Fabric rejects a start while the item is still initializing. Fab Shuffle
+reports what the source mirror's status was and leaves the decision to you, because starting
+it adds a *second* live mirror reading the same source database while the original is
+presumably still running.
+
 **Environments arrive unpublished.** Publish them in the new workspace before running
 anything that depends on them. Custom Spark pools are recreated with the workspace, so an
 environment that pins one is repointed automatically; a *capacity* level pool belongs to the
@@ -91,26 +101,30 @@ reference items created by an earlier one:
 3. **Lakehouses** — before warehouses, because warehouse views can reference lakehouse
    tables through the SQL analytics endpoint.
 4. **Warehouses** — schema before data, so Copy Job activities have tables to land in.
-5. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
+5. **Mirrored databases** — data stores with their own SQL analytics endpoint, so they go
+   with the others and before anything that reads them.
+6. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
    This covers lakehouse shortcuts and KQL database table shortcuts. The SQL analytics
    endpoint is refreshed only now, so it sees both the copied tables and the new shortcuts,
    and only then is its schema copied.
-6. **Connections** — recreate connections that point into the source workspace, aimed at the
+7. **Connections** — recreate connections that point into the source workspace, aimed at the
    items just created, and put their new ids in the id map so everything after this binds to
    them.
-7. **Environments, notebooks, then dataflows** — a notebook attaches to an environment and
+8. **Eventstreams, KQL querysets, and KQL dashboards** — all three read the eventhouses and
+   data stores above, and an eventstream sources from connections.
+9. **Environments, notebooks, then dataflows** — a notebook attaches to an environment and
    reads a lakehouse, and a semantic model can read a dataflow, so all three come first.
-8. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
-   endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 5 finished; a
-   report embeds its model's GUID, so it runs after the models. Models are ordered among
-   themselves using the relations graph, so a composite model follows what it reads.
-9. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
-   refreshing models, and invoking each other, so they go last and are ordered among
-   themselves by the relations graph.
-10. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+10. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
+    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 6 finished; a
+    report embeds its model's GUID, so it runs after the models. Models are ordered among
+    themselves using the relations graph, so a composite model follows what it reads.
+11. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
+    refreshing models, and invoking each other, so they go last and are ordered among
+    themselves by the relations graph.
+12. **Permissions** — the source workspace's admins are granted as soon as the workspace is
     created, so a failed run never leaves a workspace nobody can open. The remaining roles
     are replayed here, last, so nothing is visible half built.
-11. **Cleanup** — drop the scratch workspace and local staging.
+13. **Cleanup** — drop the scratch workspace and local staging.
 
 ### Connections
 

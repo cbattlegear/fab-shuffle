@@ -44,6 +44,10 @@ COPY_JOB = "CopyJob"
 NOTEBOOK = "Notebook"
 ENVIRONMENT = "Environment"
 DATAFLOW = "Dataflow"
+EVENTSTREAM = "Eventstream"
+KQL_DASHBOARD = "KQLDashboard"
+KQL_QUERYSET = "KQLQueryset"
+MIRRORED_DATABASE = "MirroredDatabase"
 
 PBIR_PART = "definition.pbir"
 PLATFORM_PART = ".platform"
@@ -287,6 +291,10 @@ __all__ = [
     "DATAFLOW",
     "DATA_PIPELINE",
     "ENVIRONMENT",
+    "EVENTSTREAM",
+    "KQL_DASHBOARD",
+    "KQL_QUERYSET",
+    "MIRRORED_DATABASE",
     "NOTEBOOK",
     "REPORT",
     "SEMANTIC_MODEL",
