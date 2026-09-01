@@ -78,6 +78,8 @@ class FakeFabric:
                 "relations": self.relations.get(item_id, []),
                 "workspaces": [],
             }
+        if path.endswith("/spark/settings"):
+            return {}
         if path == f"workspaces/{TARGET_WS}/lakehouses/lh-new":
             return {
                 "id": "lh-new",
@@ -116,6 +118,8 @@ class FakeFabric:
                 }
             ]
         if path.endswith("/tables"):
+            return []
+        if path.endswith("/spark/pools"):
             return []
         return []
 

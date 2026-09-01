@@ -52,6 +52,8 @@ copies everything it supports.
 | Copy Job | ✅ | n/a | Rebound to migrated items; connections reused and checked |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
 | Workspace folders | ✅ | n/a | Hierarchy recreated |
+| Custom Spark pools | ✅ | n/a | Recreated, and environments repointed at them |
+| Workspace Spark settings | ✅ | n/a | Default pool, starter pool, and job settings |
 | Workspace permissions | ✅ | n/a | Role assignments replayed |
 
 On a rebuild, anything not in that table is reported by name and type — on the review screen
@@ -69,8 +71,9 @@ reliable information. Anything that is not CI/CD-enabled is reported by name, te
 upgrade it with the upgrade wizard or Save As and migrate again.
 
 **Environments arrive unpublished.** Publish them in the new workspace before running
-anything that depends on them. An environment pinned to a custom Spark pool is also reported,
-because a pool belongs to the workspace it was created in and will not follow.
+anything that depends on them. Custom Spark pools are recreated with the workspace, so an
+environment that pins one is repointed automatically; a *capacity* level pool belongs to the
+capacity rather than the workspace and is reported instead.
 
 ### Dependency order
 
@@ -80,7 +83,9 @@ reference items created by an earlier one:
 
 0. **Assessment and dependency check** — both run before anything is created, so a workspace
    that cannot migrate cleanly can be abandoned rather than left half built.
-1. **Workspaces** — target and scratch workspaces, and the folder tree.
+1. **Workspaces** — target and scratch workspaces, the folder tree, and the custom Spark
+   pools plus workspace Spark settings. Pools come first because an environment pins one by
+   id, so it has to exist before the engineering phase runs.
 2. **Eventhouses** — before their KQL databases, which are created against
    `parentEventhouseItemId`.
 3. **Lakehouses** — before warehouses, because warehouse views can reference lakehouse

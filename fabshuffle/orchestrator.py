@@ -9,7 +9,9 @@ items created by an *earlier* phase:
 
 0. ``assessment`` and ``dependencies`` run before anything is created, so a workspace that
    cannot migrate cleanly can be abandoned before it is half built.
-1. ``workspaces``   create the target and scratch workspaces, and the folder tree.
+1. ``workspaces``   create the target and scratch workspaces, the folder tree, and the custom
+   Spark pools plus workspace Spark settings. Pools go here because an environment pins one
+   by id, so it must exist and be in the id map before the engineering phase.
 2. ``eventhouses``  eventhouses before their KQL databases, since a database is created
    against ``parentEventhouseItemId``; data is copied once the schema exists.
 3. ``lakehouses``   before warehouses, because warehouse views can reference lakehouse
@@ -52,6 +54,7 @@ from fabshuffle.fabric import (
     powerbi,
     relations,
     shortcuts,
+    spark,
     workspaces,
 )
 from fabshuffle.fabric.client import FabricApiError, FabricClient
@@ -448,7 +451,42 @@ def _create_workspaces(ctx: _Context) -> None:
     )
     ctx.id_map.update(folder_map)
 
-    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Created '{ctx.plan.target_workspace_name}'")
+    warnings = _copy_spark_configuration(ctx, step)
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, f"Created '{ctx.plan.target_workspace_name}'", warnings
+    )
+
+
+def _copy_spark_configuration(ctx: _Context, step: str) -> list[str]:
+    """Recreate custom Spark pools and workspace Spark settings.
+
+    Runs here rather than in the engineering phase because an environment pins a pool by id,
+    so the pool has to exist, and be in the id map, before any environment is migrated.
+    """
+    ctx.run.update_step(step, "Recreating custom Spark pools")
+    pool_map, created, warnings = spark.copy_pools(
+        ctx.client, ctx.plan.source_workspace_id, ctx.target_workspace_id
+    )
+    ctx.id_map.update(pool_map)
+    if created:
+        logger.info("Recreated %s custom Spark pool(s)", len(created))
+
+    settings = spark.get_settings(ctx.client, ctx.plan.source_workspace_id)
+    if settings:
+        ctx.run.update_step(step, "Applying workspace Spark settings")
+        payload, settings_warnings = spark.build_settings_payload(settings, pool_map)
+        warnings.extend(settings_warnings)
+        if payload:
+            try:
+                spark.update_settings(ctx.client, ctx.target_workspace_id, payload)
+            except FabricApiError as error:
+                warnings.append(
+                    f"Workspace Spark settings could not be applied (HTTP {error.status_code}). "
+                    "Check them in the new workspace."
+                )
+
+    return warnings
 
 
 # --------------------------------------------------------------------- phase 2
@@ -1079,8 +1117,15 @@ def _migrate_engineering(ctx: _Context) -> None:
         warnings.extend(item_warnings)
 
         if item_type == analytics.ENVIRONMENT:
+            # The rewriter has already repointed pool ids that were recreated, so only a pool
+            # that did not transfer is worth warning about.
+            recreated_pools = set(ctx.id_map.values())
             for result in results:
-                warnings.extend(analytics.environment_warnings(result.name, result.parts))
+                warnings.extend(
+                    analytics.environment_warnings(
+                        result.name, result.parts, known_pool_ids=recreated_pools
+                    )
+                )
             if results:
                 warnings.append(
                     f"{len(results)} environment(s) were created but not published. Publish "

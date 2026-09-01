@@ -130,7 +130,7 @@ def test_packaged_libraries_are_left_alone():
 # ------------------------------------------------------- environment warnings
 
 
-def test_a_custom_spark_pool_is_reported():
+def test_a_custom_spark_pool_that_did_not_transfer_is_reported():
     compute = (
         "enable_native_execution_engine: false\n"
         "instance_pool_id: 655fc33c-2712-45a3-864a-b2a00429a8aa\n"
@@ -140,7 +140,17 @@ def test_a_custom_spark_pool_is_reported():
 
     assert len(warnings) == 1
     assert "655fc33c" in warnings[0]
-    assert "belongs to the source workspace" in warnings[0]
+    assert "was not recreated" in warnings[0]
+
+
+def test_a_recreated_spark_pool_is_not_reported():
+    # Pools are recreated before environments migrate, so the id has already been rewritten.
+    pool_id = "999fc33c-2712-45a3-864a-b2a00429a8aa"
+    compute = f"instance_pool_id: {pool_id}\ndriver_cores: 4\n"
+    warnings = analytics.environment_warnings(
+        "Prod", [part("Setting/Sparkcompute.yml", compute)], known_pool_ids={pool_id}
+    )
+    assert warnings == []
 
 
 def test_a_starter_pool_environment_is_not_reported():

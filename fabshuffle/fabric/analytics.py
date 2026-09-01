@@ -16,7 +16,7 @@ Because the rewrite is driven by the accumulated source-to-target id map, these 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -148,28 +148,40 @@ def classify_dataflow(
     return parts, None
 
 
-def environment_warnings(name: str, parts: Iterable[Mapping[str, Any]]) -> list[str]:
+def environment_warnings(
+    name: str,
+    parts: Iterable[Mapping[str, Any]],
+    *,
+    known_pool_ids: Collection[str] = (),
+) -> list[str]:
     """Report environment settings that will not carry across.
 
-    A custom Spark pool belongs to the workspace it was created in, so an environment that
-    pins one lands in the new workspace referencing a pool that does not exist there.
+    A custom Spark pool belongs to the workspace it was created in. Pools are recreated
+    before environments are migrated, so this only fires for a pool that did not transfer and
+    therefore still points at the source workspace.
     """
     warnings: list[str] = []
     compute = find_part(parts, SPARK_COMPUTE_PART)
-    if compute:
-        try:
-            text = decode_payload(compute["payload"]).decode("utf-8")
-        except (UnicodeDecodeError, KeyError):
-            text = ""
-        for line in text.splitlines():
-            key, _, value = line.partition(":")
-            if key.strip() == "instance_pool_id" and value.strip() and value.strip() != "null":
-                warnings.append(
-                    f"Environment '{name}' pins the custom Spark pool "
-                    f"'{value.strip()}', which belongs to the source workspace. Recreate the "
-                    "pool in the new workspace and repoint the environment, or it will fall "
-                    "back to the starter pool."
-                )
+    if not compute:
+        return warnings
+
+    try:
+        text = decode_payload(compute["payload"]).decode("utf-8")
+    except (UnicodeDecodeError, KeyError):
+        return warnings
+
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        pool_id = value.strip()
+        if key.strip() != "instance_pool_id" or not pool_id or pool_id == "null":
+            continue
+        if pool_id in known_pool_ids:
+            continue
+        warnings.append(
+            f"Environment '{name}' pins the custom Spark pool '{pool_id}', which was not "
+            "recreated in the new workspace. Create the pool there and repoint the "
+            "environment, or it will fall back to the starter pool."
+        )
     return warnings
 
 
