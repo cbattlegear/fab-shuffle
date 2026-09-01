@@ -20,7 +20,13 @@ from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.client import (
+    FabricApiError,
+    FabricClient,
+    FabricError,
+    OperationFailed,
+    OperationTimeout,
+)
 from fabshuffle.fabric.definitions import (
     decode_json_part,
     decode_payload,
@@ -237,6 +243,36 @@ def migrate_definition_item(
     )
 
 
+def describe_failure(item_type: str, name: str, error: FabricError) -> str:
+    """Explain why one item could not be created.
+
+    Creation is a long running operation for several item types, so the interesting failure
+    usually arrives from the operation rather than from the request that started it, carrying
+    an error code worth repeating back.
+    """
+    if isinstance(error, OperationFailed) and error.error_code == "DataSourcesValidationError":
+        return (
+            f"{item_type} '{name}' was not migrated: one of its sources uses a connection "
+            "this service principal cannot reach. Connections are tenant wide, so grant it "
+            "access to the connection in Manage Connections and Gateways, then recreate the "
+            f"{item_type.lower()}."
+        )
+    if isinstance(error, OperationFailed):
+        detail = error.detail or error.error_code or "the operation failed"
+        return f"{item_type} '{name}' was not migrated: {detail}"
+    if isinstance(error, OperationTimeout):
+        return (
+            f"{item_type} '{name}' was still being created when we stopped waiting. Check the "
+            "new workspace before recreating it, in case it arrived late."
+        )
+    if isinstance(error, FabricApiError):
+        return (
+            f"{item_type} '{name}' was not migrated (HTTP {error.status_code}). "
+            "Recreate it manually and check its data source bindings."
+        )
+    return f"{item_type} '{name}' was not migrated: {error}"
+
+
 def migrate_items(
     client: FabricClient,
     *,
@@ -272,11 +308,8 @@ def migrate_items(
                 folder_id=(folder_map or {}).get(item.get("folderId", "")),
                 parts=(parts_by_id or {}).get(item.get("id", "")),
             )
-        except FabricApiError as error:
-            warnings.append(
-                f"{item_type} '{name}' was not migrated (HTTP {error.status_code}). "
-                "Recreate it manually and check its data source bindings."
-            )
+        except FabricError as error:
+            warnings.append(describe_failure(item_type, str(name), error))
             continue
 
         id_map[result.source_id] = result.target_id
@@ -301,6 +334,7 @@ __all__ = [
     "MigratedItem",
     "classify_dataflow",
     "default_semantic_model_names",
+    "describe_failure",
     "environment_warnings",
     "list_of_type",
     "migrate_definition_item",

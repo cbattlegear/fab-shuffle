@@ -26,7 +26,16 @@ RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _TERMINAL_OPERATION_STATES = frozenset({"Succeeded", "Failed", "Undefined"})
 
 
-class FabricApiError(RuntimeError):
+class FabricError(RuntimeError):
+    """Anything that went wrong talking to Fabric.
+
+    Creating an item can fail two ways: the request itself is rejected, or it is accepted and
+    the long running operation behind it fails later. Callers that handle one item at a time
+    almost always want to treat those the same, so they share a base.
+    """
+
+
+class FabricApiError(FabricError):
     """A Fabric REST call returned an error response."""
 
     def __init__(self, method: str, url: str, status_code: int, body: str) -> None:
@@ -37,11 +46,21 @@ class FabricApiError(RuntimeError):
         super().__init__(f"{method} {url} failed with HTTP {status_code}: {body}")
 
 
-class OperationFailed(RuntimeError):
+class OperationFailed(FabricError):
     """A long running operation finished in a non-success state."""
 
+    def __init__(self, operation_id: str, status: str, error: Mapping[str, Any] | None) -> None:
+        self.operation_id = operation_id
+        self.status = status
+        self.error_code = str((error or {}).get("errorCode") or "")
+        self.detail = str((error or {}).get("message") or "")
+        super().__init__(
+            f"Operation {operation_id} ended as {status}"
+            + (f": {self.error_code} {self.detail}".rstrip() if self.error_code or self.detail else "")
+        )
 
-class OperationTimeout(RuntimeError):
+
+class OperationTimeout(FabricError):
     """A long running operation did not finish inside the configured budget."""
 
 
@@ -275,7 +294,7 @@ class FabricClient:
                         return state
                     raise
             if status in _TERMINAL_OPERATION_STATES:
-                raise OperationFailed(f"Operation {operation_id} ended as {status}: {state.get('error')}")
+                raise OperationFailed(operation_id, status, state.get("error"))
 
             if time.monotonic() > deadline:
                 raise OperationTimeout(
@@ -298,6 +317,7 @@ class FabricClient:
 __all__ = [
     "FabricApiError",
     "FabricClient",
+    "FabricError",
     "OperationFailed",
     "OperationTimeout",
 ]
