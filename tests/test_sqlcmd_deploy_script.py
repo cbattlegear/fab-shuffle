@@ -97,7 +97,7 @@ def test_comment_only_batches_are_dropped() -> None:
 
 def test_use_statements_are_dropped() -> None:
     # We are already connected to the target database, and Fabric rejects USE (08004).
-    assert not any(batch.upper().startswith("USE ") for batch in resolved())
+    assert not any("USE " in batch.upper() for batch in resolved())
 
 
 def test_the_actual_schema_survives() -> None:
@@ -189,11 +189,47 @@ def test_the_whole_preamble_costs_no_warnings(tmp_path: Path, monkeypatch) -> No
 
 @pytest.mark.parametrize(
     "statement",
-    ["USE [$(DatabaseName)];", "USE [DacTest-7cbd3c3d];", "  use MyDb  ", 'USE "Quoted";'],
+    [
+        "USE [$(DatabaseName)];",
+        "USE [DacTest-7cbd3c3d];",
+        "  use MyDb  ",
+        'USE "Quoted";',
+        "USE MyDb",
+        "\tUSE\t[Tabbed]\t;\t",
+    ],
 )
-def test_use_statement_shapes_are_all_recognised(statement: str) -> None:
-    assert sqlschema._is_noise(statement)
+def test_use_statement_shapes_are_all_removed(statement: str) -> None:
+    assert sqlschema.resolve_sqlcmd(statement).strip() == ""
 
 
-def test_a_create_statement_is_not_treated_as_noise() -> None:
+def test_a_use_sharing_a_batch_with_real_schema_is_still_removed() -> None:
+    """The whole point: a USE that is not alone in its batch must not survive."""
+    script = "USE [Target];\nCREATE TABLE [dbo].[T] ([Id] INT);\n"
+
+    resolved_script = sqlschema.resolve_sqlcmd(script)
+
+    assert "USE" not in resolved_script.upper()
+    assert "CREATE TABLE [dbo].[T]" in resolved_script
+
+
+def test_every_use_in_a_script_is_removed_not_just_the_first() -> None:
+    script = "USE [A];\nGO\nCREATE TABLE [dbo].[T] ([Id] INT);\nGO\nUSE [B];\nGO\n"
+
+    assert "USE" not in sqlschema.resolve_sqlcmd(script).upper()
+
+
+def test_a_table_named_like_a_keyword_is_not_mangled() -> None:
     assert not sqlschema._is_noise("CREATE TABLE [dbo].[Uses] ([Id] INT);")
+
+
+def test_use_inside_a_string_literal_is_left_alone() -> None:
+    # Removal is line anchored, so only a statement on its own line is taken.
+    script = "INSERT INTO [dbo].[T] ([Note]) VALUES (N'USE [Something];');\n"
+
+    assert sqlschema.resolve_sqlcmd(script) == script
+
+
+def test_a_column_default_mentioning_use_survives() -> None:
+    script = "ALTER TABLE [dbo].[T] ADD CONSTRAINT [D] DEFAULT N'use me' FOR [Note];\n"
+
+    assert sqlschema.resolve_sqlcmd(script) == script

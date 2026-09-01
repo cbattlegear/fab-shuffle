@@ -40,8 +40,13 @@ _SETVAR = re.compile(
 )
 _SQLCMD_VARIABLE = re.compile(r"\$\((\w+)\)")
 # The deployment script switches into its own database. We are already connected to the
-# target, whose database is named after the *target* item, so this can only ever be wrong.
-_USE_STATEMENT = re.compile(r"^\s*USE\s+[\[\"]?[^\]\"\r\n]*[\]\"]?\s*;?\s*$", re.IGNORECASE)
+# target, whose database is named after the *target* item, so this can only ever be wrong,
+# and Fabric rejects it outright (08004). Matched line by line, which is how every generated
+# script writes it, so a string literal mentioning USE elsewhere is left alone.
+_USE_STATEMENT = re.compile(
+    r"^[ \t]*USE\s+(?:\[[^\]\r\n]*\]|\"[^\"\r\n]*\"|[^\s;]+)[ \t]*;?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 # DacFx guards its script with a SQLCMD-mode check that turns execution off for the rest of
 # the session. It must never reach the server: NOEXEC is connection scoped, so one stray
 # batch silently turns every later batch into a no-op and the schema is never applied.
@@ -167,16 +172,18 @@ def resolve_sqlcmd(script: str) -> str:
         for match in _SETVAR.finditer(script)
     }
     script = _SQLCMD_DIRECTIVE.sub("", script)
+    script = _USE_STATEMENT.sub("", script)
     return _SQLCMD_VARIABLE.sub(lambda m: variables.get(m.group(1), m.group(0)), script)
 
 
 def _is_noise(batch: str) -> bool:
     """Whether a batch is deployment scaffolding rather than schema.
 
-    Removing the SQLCMD directives can leave a batch holding only the comment that introduced
-    them, which is not worth a round trip and reads as a failure if the endpoint rejects it.
+    Removing the SQLCMD directives and USE statements can leave a batch holding only the
+    comment that introduced them, which is not worth a round trip and reads as a failure if
+    the endpoint rejects it.
     """
-    if _USE_STATEMENT.match(batch) or _NOEXEC.search(batch):
+    if _NOEXEC.search(batch):
         return True
     without_comments = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", batch))
     return not without_comments.strip()
