@@ -131,17 +131,17 @@ def unpack_dacpac(dacpac: Path, destination: Path, *, exclude_tables: bool) -> P
     """Turn a DACPAC into a deployable script, optionally without table DDL.
 
     Lakehouse SQL analytics endpoints materialise their own tables from the delta files, so
-    replaying table and schema DDL there would conflict with the endpoint's own metadata.
+    replaying table DDL there would conflict with the endpoint's own metadata.
+
+    Only ``Tables`` is excluded. DacFx's ``ObjectType`` enum has no ``Schemas`` member, and
+    asking for one fails the whole command during argument binding, taking the schema
+    transfer with it. Custom schemas are wanted anyway, since views on the endpoint live in
+    them.
     """
     destination.mkdir(parents=True, exist_ok=True)
     command = [SETTINGS.unpackdacpac_path, "unpack", str(dacpac), str(destination)]
     if exclude_tables:
-        command += [
-            "--deploy-script-exclude-object-type",
-            "Tables",
-            "--deploy-script-exclude-object-type",
-            "Schemas",
-        ]
+        command += ["--deploy-script-exclude-object-type", "Tables"]
     _run(command, what=f"unpackdacpac of {dacpac.name}")
 
     script = destination / "Deploy.sql"
@@ -240,8 +240,12 @@ def transfer_schema(
     """Copy the T-SQL schema of ``database`` from one endpoint to another.
 
     ``source_type`` is ``"Lakehouse"`` or ``"Warehouse"``; lakehouse endpoints skip table
-    and schema objects because the endpoint derives those from OneLake itself.
+    objects because the endpoint derives those from OneLake itself.
     """
+    # Both ends are waited for. The target may still be provisioning, and a source SQL
+    # analytics endpoint can be cold enough that sqlpackage's own connection attempt times
+    # out before it has answered once.
+    wait_for_database(source_server, database, tokens, on_progress=on_progress)
     wait_for_database(target_server, database, tokens, on_progress=on_progress)
 
     transfer_id = uuid.uuid4().hex[:8]

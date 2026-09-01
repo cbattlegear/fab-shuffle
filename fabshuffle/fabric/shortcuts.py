@@ -71,6 +71,54 @@ def _remap_target(target: Mapping[str, Any], id_map: Mapping[str, str]) -> dict[
     return result
 
 
+def _target_kind(target: Mapping[str, Any]) -> str:
+    """The single target key a shortcut carries, such as ``oneLake`` or ``adlsGen2``."""
+    return next((key for key in target if key != "type"), "")
+
+
+def describe_failure(
+    name: str,
+    target: Mapping[str, Any],
+    status_code: int,
+    *,
+    label: str = "Shortcut",
+) -> str:
+    """Explain why a shortcut could not be created.
+
+    The status says which of three quite different things went wrong, and the fix differs for
+    an internal OneLake target and an external one, so the message is built from both rather
+    than blaming the connection for everything.
+    """
+    internal = _target_kind(target) == "oneLake"
+
+    if status_code == 409:
+        reason = (
+            "a shortcut of that name already exists there. Delete it if you are re-running "
+            "into a workspace that was already partly migrated"
+        )
+    elif status_code == 404 and internal:
+        reason = (
+            "the item it points at does not exist in the new workspace, so it was probably "
+            "not migrated. Recreate the shortcut once that item is there"
+        )
+    elif status_code == 404:
+        reason = "the path it points at was not found. Check the target still exists"
+    elif status_code == 403 and internal:
+        reason = (
+            "this service principal cannot reach the item it points at. Grant it access to "
+            "that workspace"
+        )
+    elif status_code == 403:
+        reason = (
+            "its connection denied access. The connection is tenant wide, so check the "
+            "service principal is allowed to use it and its credentials are still valid"
+        )
+    else:
+        reason = "the request was rejected. Recreate it by hand"
+
+    return f"{label} '{name}' could not be created (HTTP {status_code}): {reason}."
+
+
 def copy_shortcuts(
     client: FabricClient,
     source_workspace_id: str,
@@ -93,8 +141,9 @@ def copy_shortcuts(
             created += 1
         except FabricApiError as error:
             warnings.append(
-                f"Shortcut '{shortcut.get('name')}' could not be created "
-                f"(HTTP {error.status_code}); its connection may not exist in the target region"
+                describe_failure(
+                    str(shortcut.get("name")), remapped["target"], error.status_code
+                )
             )
     return created, warnings
 
@@ -193,8 +242,12 @@ def copy_table_shortcuts(
             created += 1
         except FabricApiError as error:
             warnings.append(
-                f"KQL table shortcut '{shortcut.get('name')}' could not be created "
-                f"(HTTP {error.status_code}); its connection may not exist in the target region"
+                describe_failure(
+                    str(shortcut.get("name")),
+                    target,
+                    error.status_code,
+                    label="KQL table shortcut",
+                )
             )
     return created, warnings
 
@@ -204,6 +257,7 @@ __all__ = [
     "copy_table_shortcuts",
     "create_shortcut",
     "create_table_shortcut",
+    "describe_failure",
     "list_shortcuts",
     "list_table_shortcuts",
     "remap_shortcut_target",
