@@ -592,6 +592,9 @@ def _migrate_eventhouses(ctx: _Context) -> None:
 
     warnings: list[str] = []
     databases_moved = 0
+    # (database, target eventhouse id, source query URI) for shortcut databases, which are
+    # created once every leader they might follow exists.
+    deferred_followers: list[tuple[dict[str, Any], str, str]] = []
 
     for eventhouse in source_eventhouses:
         ctx.run.raise_if_cancelled()
@@ -617,10 +620,21 @@ def _migrate_eventhouses(ctx: _Context) -> None:
 
         for database_id in source_properties.get("databasesItemIds") or []:
             ctx.run.raise_if_cancelled()
+            database = eventhouses.get_kql_database(
+                ctx.client, ctx.plan.source_workspace_id, database_id
+            )
+            if eventhouses.database_type(database) != "ReadWrite":
+                # A follower may point at a leader elsewhere in this same workspace, which
+                # might not exist yet, so every follower waits until the leaders are done.
+                deferred_followers.append(
+                    (database, created["id"], source_properties.get("queryServiceUri", ""))
+                )
+                continue
+
             moved, database_warnings, adopted = _migrate_kql_database(
                 ctx,
                 step,
-                database_id=database_id,
+                database=database,
                 target_eventhouse_id=created["id"],
                 source_query_uri=source_properties.get("queryServiceUri", ""),
                 target_query_uri=target_properties.get("queryServiceUri", ""),
@@ -639,6 +653,18 @@ def _migrate_eventhouses(ctx: _Context) -> None:
                 "no source database matched. Delete it if you do not want it."
             )
 
+    for database, target_eventhouse_id, source_query_uri in deferred_followers:
+        ctx.run.raise_if_cancelled()
+        ctx.run.update_step(step, f"Recreating shortcut database '{database['displayName']}'")
+        moved, database_warnings = _migrate_follower_database(
+            ctx,
+            database=database,
+            target_eventhouse_id=target_eventhouse_id,
+            source_query_uri=source_query_uri,
+        )
+        databases_moved += 1 if moved else 0
+        warnings.extend(database_warnings)
+
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
         step,
@@ -648,35 +674,84 @@ def _migrate_eventhouses(ctx: _Context) -> None:
     )
 
 
+def _migrate_follower_database(
+    ctx: _Context,
+    *,
+    database: dict[str, Any],
+    target_eventhouse_id: str,
+    source_query_uri: str,
+) -> tuple[bool, list[str]]:
+    """Recreate a shortcut (follower) KQL database against the same leader.
+
+    A follower holds no data of its own, so it is recreated rather than copied. The source is
+    not in the item's properties; it comes from asking the follower's own cluster with
+    ``.show follower database``, whose ``OriginalDatabaseName`` is the leader's KQL Database
+    item id when the leader is a Fabric eventhouse.
+    """
+    name = database["displayName"]
+    kusto_name = database.get("id") or name
+
+    source: kql.FollowerSource | None = None
+    if source_query_uri:
+        try:
+            source = kql.follower_source(source_query_uri, kusto_name, ctx.principal)
+        except Exception as error:  # any Kusto failure just means the source is unknown
+            logger.info("Could not read the follower source for '%s': %s", name, error)
+
+    source_database_name = ""
+    if source:
+        source_database_name = source.database_name
+        if source.is_fabric_source:
+            # Fabric resolves a leader by item id within the tenant, so no cluster URI is
+            # needed. The leader may be in this very workspace, in which case the copy has to
+            # follow the copy rather than reaching back across the region boundary.
+            source_database_name = ctx.id_map.get(source.database_name, source.database_name)
+        elif not (database.get("properties") or {}).get("sourceClusterUri"):
+            # An Azure Data Explorer leader is identified by name, which means nothing without
+            # its cluster URI, and that is not recoverable from what the follower reports.
+            return (
+                False,
+                [
+                    f"KQL database '{name}' follows the Azure Data Explorer database "
+                    f"'{source.database_name}', but its cluster URI is not exposed by the "
+                    "API, so it was skipped. Recreate the shortcut by hand."
+                ],
+            )
+
+    payload = eventhouses.shortcut_creation_payload(
+        database,
+        target_eventhouse_id,
+        source_database_name=source_database_name,
+    )
+    if not payload:
+        return (
+            False,
+            [
+                f"KQL database '{name}' is a shortcut/follower database and its source could "
+                "not be determined, so it was skipped. Recreate the shortcut by hand."
+            ],
+        )
+
+    target = eventhouses.create_kql_database(
+        ctx.client, ctx.target_workspace_id, name, creation_payload=payload
+    )
+    ctx.id_map[database["id"]] = target["id"]
+    return True, []
+
+
 def _migrate_kql_database(
     ctx: _Context,
     step: str,
     *,
-    database_id: str,
+    database: dict[str, Any],
     target_eventhouse_id: str,
     source_query_uri: str,
     target_query_uri: str,
     existing_databases: dict[str, Any],
 ) -> tuple[bool, list[str], str | None]:
-    """Migrate one KQL database. Returns (moved, warnings, adopted name if any)."""
-    database = eventhouses.get_kql_database(ctx.client, ctx.plan.source_workspace_id, database_id)
+    """Migrate one ReadWrite KQL database. Returns (moved, warnings, adopted name if any)."""
+    database_id = database["id"]
     name = database["displayName"]
-
-    if eventhouses.database_type(database) != "ReadWrite":
-        payload = eventhouses.shortcut_creation_payload(database, target_eventhouse_id)
-        if not payload:
-            return (
-                False,
-                [
-                    f"KQL database '{name}' is a shortcut/follower database and Fabric does not "
-                    "expose its source, so it was skipped"
-                ],
-                None,
-            )
-        eventhouses.create_kql_database(
-            ctx.client, ctx.target_workspace_id, name, creation_payload=payload
-        )
-        return True, [], None
 
     ctx.run.update_step(step, f"Recreating KQL database '{name}'")
     parts = eventhouses.kql_database_definition_parts(

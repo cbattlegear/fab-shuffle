@@ -64,9 +64,15 @@ On a rebuild, anything not in that table is reported by name and type — on the
 before you commit, and again as a warning on the run itself — so you know exactly what stays
 behind in the source workspace.
 
-KQL *shortcut* (follower) databases are skipped, because Fabric does not expose the follower
-source through the API. The default semantic model that Fabric creates alongside each
-lakehouse and warehouse is skipped too, since the target workspace gets its own.
+KQL *shortcut* (follower) databases are recreated pointing at the same leader. The item's
+properties do not name that leader, so it is read from the follower's own cluster with
+`.show follower database`, whose `OriginalDatabaseName` is the leader's KQL Database item id
+when the leader is another Fabric eventhouse. If the leader is in the workspace being
+migrated the copy follows the copy, otherwise it keeps following the original. A follower of
+an *Azure Data Explorer* database is reported instead, because the leader is identified by
+name and its cluster URI is not exposed anywhere. The default semantic model that Fabric
+creates alongside each lakehouse and warehouse is skipped too, since the target workspace
+gets its own.
 
 **Dataflows only migrate when they are Gen2 (CI/CD).** The item definition APIs do not
 support Dataflow Gen1 or classic Gen2, so each dataflow is classified by probing its

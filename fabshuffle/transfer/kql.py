@@ -8,8 +8,10 @@ table from the source cluster into the target.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from datetime import timedelta
 
 from azure.kusto.data import ClientRequestProperties, KustoClient, KustoConnectionStringBuilder
@@ -18,6 +20,8 @@ from azure.kusto.data.exceptions import KustoServiceError
 from fabshuffle.auth import ServicePrincipal
 
 logger = logging.getLogger(__name__)
+
+_GUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 MAX_ATTEMPTS = 5
 # Cross-cluster ingestion of a large table can run long, so the server timeout is raised
@@ -28,6 +32,24 @@ INGEST_TIMEOUT = timedelta(hours=1)
 SYSTEM_TABLE_PREFIXES = ("$",)
 
 
+@dataclass(frozen=True, slots=True)
+class FollowerSource:
+    """Where a shortcut (follower) KQL database gets its data from."""
+
+    database_name: str
+    leader_metadata_path: str = ""
+
+    @property
+    def is_fabric_source(self) -> bool:
+        """Whether the leader is a Fabric eventhouse rather than an Azure Data Explorer cluster.
+
+        Fabric names a KQL database after its item id, so a GUID means the leader is another
+        Fabric database and can be followed by id alone. Anything else is an ADX database
+        name, which is only meaningful alongside its cluster URI.
+        """
+        return _GUID.fullmatch(self.database_name) is not None
+
+
 def _client(cluster_uri: str, principal: ServicePrincipal) -> KustoClient:
     connection = KustoConnectionStringBuilder.with_aad_application_key_authentication(
         cluster_uri,
@@ -36,6 +58,45 @@ def _client(cluster_uri: str, principal: ServicePrincipal) -> KustoClient:
         principal.tenant_id,
     )
     return KustoClient(connection)
+
+
+def follower_source(
+    cluster_uri: str,
+    database: str,
+    principal: ServicePrincipal,
+) -> FollowerSource | None:
+    """Resolve what a shortcut (follower) KQL database actually follows.
+
+    ``Get KQL Database`` reports ``databaseType: Shortcut`` but not the source, so the only
+    way to recover it is to ask the follower's own cluster. ``.show follower database``
+    returns ``OriginalDatabaseName`` — the leader's KQL Database *item id* when the leader is
+    a Fabric eventhouse — and ``LeaderClusterMetadataPath``, which identifies the leader
+    cluster's storage container.
+    """
+    with _client(cluster_uri, principal) as client:
+        response = client.execute_mgmt(database, f".show follower database {_ident(database)}")
+        rows = list(response.primary_results[0])
+
+    if not rows:
+        return None
+
+    row = rows[0]
+    original = str(row["OriginalDatabaseName"] or "").strip()
+    if not original:
+        return None
+    return FollowerSource(
+        database_name=original,
+        leader_metadata_path=str(row["LeaderClusterMetadataPath"] or "").strip(),
+    )
+
+
+def _ident(name: str) -> str:
+    """Quote a database name for a control command.
+
+    Fabric names its KQL databases after the item GUID, which starts with a digit often
+    enough that an unquoted identifier is a parse error.
+    """
+    return "[" + '"' + name.replace('"', '\\"') + '"' + "]"
 
 
 def list_tables(
@@ -123,4 +184,4 @@ def _execute_with_retry(
     return 0
 
 
-__all__ = ["copy_database", "list_tables"]
+__all__ = ["FollowerSource", "copy_database", "follower_source", "list_tables"]

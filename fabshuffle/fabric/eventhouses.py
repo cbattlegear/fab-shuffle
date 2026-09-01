@@ -177,15 +177,21 @@ def retarget_database_definition(
 def shortcut_creation_payload(
     database: dict[str, Any],
     new_eventhouse_id: str,
+    *,
+    source_database_name: str = "",
 ) -> dict[str, Any] | None:
-    """Build a Shortcut (follower) KQL database payload if the source exposes enough detail.
+    """Build a Shortcut (follower) KQL database payload.
 
-    ``Get KQL Database`` does not return the follower source for shortcut databases, so this
-    only succeeds when the exported definition happens to carry the source coordinates.
+    ``Get KQL Database`` does not return the follower source, so the leader normally comes
+    from asking the follower's own cluster with ``.show follower database``. Anything the
+    exported properties happen to carry is used as a fallback.
+
+    A Fabric leader is followed by item id alone, since Fabric resolves it within the tenant.
+    A cluster URI is only sent when the item exposes one, which is the Azure Data Explorer case.
     """
     properties = database.get("properties") or {}
-    source_cluster = properties.get("sourceClusterUri")
-    source_database = properties.get("sourceDatabaseName")
+    source_cluster = properties.get("sourceClusterUri") or ""
+    source_database = source_database_name or properties.get("sourceDatabaseName") or ""
     if not source_cluster and not source_database:
         return None
 
