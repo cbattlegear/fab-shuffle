@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
-from fabshuffle.fabric.support import DERIVED_TYPES
+from fabshuffle.fabric.items import is_monitoring_item
+from fabshuffle.fabric.support import is_derived_type, normalise_type
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,14 @@ class DependencyGraph:
         return (self.items.get(item_id) or {}).get("displayName") or item_id
 
     def type_of(self, item_id: str) -> str:
+        raw = (self.items.get(item_id) or {}).get("type") or "Unknown"
+        return normalise_type(raw)
+
+    def raw_type_of(self, item_id: str) -> str:
         return (self.items.get(item_id) or {}).get("type") or "Unknown"
+
+    def is_monitoring(self, item_id: str) -> bool:
+        return is_monitoring_item(self.items.get(item_id) or {})
 
     def workspace_of(self, item_id: str) -> str | None:
         return (self.items.get(item_id) or {}).get("workspaceId")
@@ -162,9 +170,19 @@ def analyse(
     issues: list[DependencyIssue] = []
 
     for item_id in sorted(migrated_ids):
+        # Workspace monitoring items are turned on as a feature rather than created, so
+        # nothing about them is actionable here; they get their own single warning.
+        if graph.is_monitoring(item_id):
+            continue
+
         for dependency_id in sorted(graph.dependencies.get(item_id, set())):
             dependency_type = graph.type_of(dependency_id)
-            if dependency_type in DERIVED_TYPES:
+
+            # A SQL analytics endpoint is created with its lakehouse, warehouse, or mirrored
+            # database, so it arrives on its own and never needs reporting.
+            if is_derived_type(graph.raw_type_of(dependency_id)):
+                continue
+            if graph.is_monitoring(dependency_id):
                 continue
 
             dependency_workspace = graph.workspace_of(dependency_id)

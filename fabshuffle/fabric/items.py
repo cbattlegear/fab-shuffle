@@ -9,19 +9,28 @@ from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import definition as build_definition
 
 # Items Fabric provisions for its own use. Recreating them either fails outright or
-# corrupts the target workspace, so they are skipped during migration.
+# corrupts the target workspace, so they are skipped during migration. Matched case
+# insensitively, because Fabric is not consistent about how it capitalises them.
 SYSTEM_ITEM_NAMES = frozenset(
     {
-        "DataflowsStagingLakehouse",
-        "DataflowsStagingWarehouse",
-        "Monitoring Eventhouse",
-        "Monitoring KQL Database",
+        "dataflowsstaginglakehouse",
+        "dataflowsstagingwarehouse",
+        "monitoring eventhouse",
+        "monitoring kql database",
     }
 )
 
+# The monitoring eventhouse and its database are created by turning on workspace monitoring,
+# not by creating an eventhouse, so they cannot be migrated as items at all.
+MONITORING_ITEM_NAMES = frozenset({"monitoring eventhouse", "monitoring kql database"})
+
 
 def is_system_item(item: Mapping[str, Any]) -> bool:
-    return (item.get("displayName") or "") in SYSTEM_ITEM_NAMES
+    return (item.get("displayName") or "").casefold() in SYSTEM_ITEM_NAMES
+
+
+def is_monitoring_item(item: Mapping[str, Any]) -> bool:
+    return (item.get("displayName") or "").casefold() in MONITORING_ITEM_NAMES
 
 
 def list_items(
@@ -131,12 +140,14 @@ def try_get_item_definition(
 
 
 __all__ = [
+    "MONITORING_ITEM_NAMES",
     "SYSTEM_ITEM_NAMES",
     "create_item",
     "delete_item",
     "find_item_by_name",
     "get_item",
     "get_item_definition",
+    "is_monitoring_item",
     "is_system_item",
     "list_items",
     "try_get_item_definition",

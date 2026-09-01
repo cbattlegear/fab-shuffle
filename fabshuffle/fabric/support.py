@@ -36,7 +36,42 @@ REBUILT_TYPES = frozenset(
 
 # Types Fabric derives from another item. They appear in the item list but are never
 # created directly, so they are neither migrated nor worth warning about.
-DERIVED_TYPES = frozenset({"SQLEndpoint", "MirroredWarehouse"})
+#
+# The relations APIs report several types under different, internal names than the item APIs
+# do, so both spellings are listed. Everything here is compared case insensitively.
+DERIVED_TYPES = frozenset(
+    {
+        "SQLEndpoint",
+        "SqlAnalyticsEndpoint",
+        "MirroredWarehouse",
+    }
+)
+
+# Type names the relations APIs use, mapped to the item API names they correspond to. Only
+# used to make dependency messages read the way the portal does.
+RELATION_TYPE_ALIASES = {
+    "model": "SemanticModel",
+    "sqlanalyticsendpoint": "SQLEndpoint",
+    "kustoeventhouse": "Eventhouse",
+    "kustodatabase": "KQLDatabase",
+    "datamart": "Datamart",
+}
+
+
+def normalise_type(item_type: str) -> str:
+    """Map a relations API type name onto the item API name for the same thing."""
+    return RELATION_TYPE_ALIASES.get((item_type or "").casefold(), item_type)
+
+
+def is_derived_type(item_type: str) -> bool:
+    """Whether Fabric creates this type as a side effect of creating something else.
+
+    A lakehouse, warehouse, and mirrored database each come with a SQL analytics endpoint, so
+    the endpoint arrives on its own once its parent is migrated.
+    """
+    folded = (item_type or "").casefold()
+    return any(folded == derived.casefold() for derived in DERIVED_TYPES)
+
 
 # Pure Power BI content. A workspace holding only these can be moved by reassigning it to a
 # capacity in the target region, because the cross-region restriction on assignToCapacity
@@ -148,9 +183,8 @@ def assess_workspace(items: Iterable[Mapping[str, Any]]) -> WorkspaceAssessment:
         item_type = item.get("type") or "Unknown"
         name = item.get("displayName") or item.get("id") or "(unnamed)"
 
-        if item_type in DERIVED_TYPES:
+        if is_derived_type(item_type):
             continue
-
         # Anything that is not Power BI content is a Fabric item, and a single one of those
         # pins the workspace to the rebuild strategy. Unknown future types count as Fabric.
         if item_type not in POWER_BI_TYPES:
@@ -177,9 +211,12 @@ __all__ = [
     "LARGE_MODEL_REGIONS",
     "POWER_BI_TYPES",
     "REBUILT_TYPES",
+    "RELATION_TYPE_ALIASES",
     "Strategy",
     "UnsupportedItem",
     "WorkspaceAssessment",
     "assess_workspace",
+    "is_derived_type",
+    "normalise_type",
     "supports_large_semantic_models",
 ]

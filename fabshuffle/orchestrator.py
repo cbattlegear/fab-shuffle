@@ -63,7 +63,7 @@ from fabshuffle.fabric import (
 )
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import build_rewriter
-from fabshuffle.fabric.items import list_items
+from fabshuffle.fabric.items import is_monitoring_item, list_items
 from fabshuffle.fabric.support import (
     Strategy,
     WorkspaceAssessment,
@@ -287,22 +287,34 @@ def _report_unsupported_items(ctx: _Context) -> None:
     ctx.run.start_step(step, "Checking the workspace for unsupported items")
     ctx.run.raise_if_cancelled()
 
+    # list_items already filters system items out, so monitoring is detected separately.
+    all_items = ctx.client.list_all(f"workspaces/{ctx.plan.source_workspace_id}/items")
+    monitoring = [item for item in all_items if is_monitoring_item(item)]
+
     assessment = assess_workspace(list_items(ctx.client, ctx.plan.source_workspace_id))
     ctx.assessment = assessment
     ctx.run.summary["unsupported"] = [item.as_dict() for item in assessment.unsupported]
 
-    if not assessment.unsupported:
+    warnings = assessment.grouped_messages()
+    if monitoring:
+        warnings.append(
+            "Workspace monitoring is on in the source workspace. Its eventhouse and KQL "
+            "database are created by enabling the feature rather than as normal items, so "
+            "they are not migrated. Turn workspace monitoring on in the new workspace's "
+            "settings if you want it there."
+        )
+
+    if not warnings:
         ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Everything in this workspace is supported")
         return
 
-    warnings = assessment.grouped_messages()
     ctx.warnings.extend(warnings)
-    ctx.run.finish_step(
-        step,
-        StepStatus.SUCCEEDED,
-        f"{len(assessment.unsupported)} item(s) will be left behind in the source workspace",
-        warnings,
+    detail = (
+        f"{len(assessment.unsupported)} item(s) will be left behind in the source workspace"
+        if assessment.unsupported
+        else "Workspace monitoring is not migrated"
     )
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, detail, warnings)
 
 
 def _check_dependencies(ctx: _Context) -> None:
