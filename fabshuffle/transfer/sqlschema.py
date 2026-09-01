@@ -26,6 +26,19 @@ SQL_COPT_SS_ACCESS_TOKEN = 1256
 CONNECT_ATTEMPTS = 40
 CONNECT_WAIT_SECONDS = 15
 
+# SQLSTATE prefixes worth retrying. 08 is the connection class (link failure, server
+# rejected, unable to establish) and HYT is timeouts, both of which a SQL analytics endpoint
+# produces freely while it is still waking up.
+_TRANSIENT_SQLSTATES = ("08", "HYT")
+# Messages the endpoint returns while a database exists but is not yet servable. These do not
+# come back under a connection-class SQLSTATE, so they are matched on text.
+_TRANSIENT_MESSAGES = (
+    "not currently available",
+    "is not available",
+    "try the connection later",
+    "please retry",
+)
+
 # sqlpackage emits a SQLCMD preamble that Fabric's endpoint cannot parse. Everything up to
 # the first GO after the header block is boilerplate, so the script is trimmed there.
 _HEADER_END = re.compile(r"^GO\s*$", re.IGNORECASE | re.MULTILINE)
@@ -69,13 +82,62 @@ def _driver() -> str:
     return sorted(drivers)[-1]
 
 
-def connect(server: str, database: str, tokens: TokenProvider) -> pyodbc.Connection:
+def is_transient(error: pyodbc.Error) -> bool:
+    """Whether a failure is worth waiting out rather than giving up on.
+
+    A SQL analytics endpoint is created asynchronously and stays unreachable for minutes, so
+    almost every connection failure here is the endpoint not being ready. Authentication and
+    permission failures are not, and retrying those just turns a clear error into a ten
+    minute hang.
+    """
+    state = str(error.args[0]) if error.args else ""
+    if state.startswith(_TRANSIENT_SQLSTATES):
+        return True
+    text = str(error).lower()
+    return any(message in text for message in _TRANSIENT_MESSAGES)
+
+
+def connect(
+    server: str,
+    database: str,
+    tokens: TokenProvider,
+    *,
+    attempts: int = CONNECT_ATTEMPTS,
+    on_progress: Callable[[str], None] | None = None,
+) -> pyodbc.Connection:
+    """Open a connection, waiting out the endpoint if it is not answering yet.
+
+    Every caller goes through here, so the waiting belongs here rather than in each of them.
+    Failures are raised as ``SchemaTransferError`` so that a caller which already treats a
+    schema transfer as best effort does not have to know about pyodbc as well.
+    """
     connection_string = (
         f"Driver={{{_driver()}}};Server={server},1433;Database={database};"
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
-    token = sql_access_token_struct(tokens.sql_token())
-    return pyodbc.connect(connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token})
+
+    last_error: pyodbc.Error | None = None
+    for attempt in range(1, attempts + 1):
+        # The token is fetched per attempt: waiting out a cold endpoint can outlast it.
+        token = sql_access_token_struct(tokens.sql_token())
+        try:
+            return pyodbc.connect(connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token})
+        except pyodbc.Error as error:
+            if not is_transient(error):
+                raise SchemaTransferError(
+                    f"Could not connect to {server}/{database}: {error}"
+                ) from error
+            last_error = error
+            if attempt == attempts:
+                break
+            if on_progress and attempt % 4 == 1:
+                on_progress(f"Waiting for SQL endpoint {database} to come online")
+            time.sleep(CONNECT_WAIT_SECONDS)
+
+    raise SchemaTransferError(
+        f"SQL endpoint {server}/{database} never became available after {attempts} "
+        f"attempt(s): {last_error}"
+    )
 
 
 def wait_for_database(
@@ -85,21 +147,9 @@ def wait_for_database(
     *,
     on_progress: Callable[[str], None] | None = None,
 ) -> None:
-    """Block until the endpoint accepts a query, which lags item creation by minutes."""
-    last_error: Exception | None = None
-    for attempt in range(1, CONNECT_ATTEMPTS + 1):
-        try:
-            with connect(server, database, tokens) as connection:
-                connection.cursor().execute("SELECT 1").fetchall()
-            return
-        except pyodbc.Error as error:
-            last_error = error
-            if on_progress and attempt % 4 == 1:
-                on_progress(f"Waiting for SQL endpoint {database} to come online")
-            time.sleep(CONNECT_WAIT_SECONDS)
-    raise SchemaTransferError(
-        f"SQL endpoint {server}/{database} never became available: {last_error}"
-    )
+    """Block until the endpoint answers a query, which lags item creation by minutes."""
+    with connect(server, database, tokens, on_progress=on_progress) as connection:
+        connection.cursor().execute("SELECT 1").fetchall()
 
 
 def extract_dacpac(
@@ -212,7 +262,7 @@ def apply_script(
         return []
 
     warnings: list[str] = []
-    with connect(server, database, tokens) as connection:
+    with connect(server, database, tokens, on_progress=on_progress) as connection:
         connection.autocommit = True
         cursor = connection.cursor()
         for index, batch in enumerate(batches, start=1):
@@ -310,6 +360,7 @@ __all__ = [
     "apply_script",
     "connect",
     "extract_dacpac",
+    "is_transient",
     "list_base_tables",
     "transfer_schema",
     "unpack_dacpac",
