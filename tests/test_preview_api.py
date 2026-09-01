@@ -92,6 +92,16 @@ def preview(client, session_id):
     return response.json()
 
 
+def dependencies(client, session_id):
+    response = client.get(
+        "/api/preview/dependencies",
+        params={"source_workspace_id": "ws-1"},
+        headers=auth(session_id),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["dependencies"]
+
+
 def test_preview_recommends_reassignment_for_power_bi_only(client, session_id, monkeypatch):
     install(
         monkeypatch,
@@ -167,10 +177,10 @@ def test_dependency_problems_are_reported_before_the_run_starts(client, session_
     monkeypatch.setattr(relations, "build_graph", lambda *a, **k: graph)
     monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
 
-    result = preview(client, session_id)
+    problems = dependencies(client, session_id)
 
-    assert result["dependencies"]
-    assert any("Finance" in message for message in result["dependencies"])
+    assert problems
+    assert any("Finance" in message for message in problems)
 
 
 def test_the_review_says_so_when_dependencies_cannot_be_checked(client, session_id, monkeypatch):
@@ -181,9 +191,7 @@ def test_the_review_says_so_when_dependencies_cannot_be_checked(client, session_
         lambda *a, **k: relations.DependencyGraph(available=False),
     )
 
-    result = preview(client, session_id)
-
-    assert result["dependencies"] == [
+    assert dependencies(client, session_id) == [
         "The relations API is unavailable to this service principal, so dependencies "
         "between items could not be checked."
     ]
@@ -198,4 +206,28 @@ def test_a_clean_workspace_reports_no_dependency_problems(client, session_id, mo
     )
     monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
 
-    assert preview(client, session_id)["dependencies"] == []
+    assert dependencies(client, session_id) == []
+
+
+def test_the_preview_does_not_wait_for_the_dependency_check(client, session_id, monkeypatch):
+    """The two are separate requests so the review screen can appear before the slow one lands."""
+    install(monkeypatch, [{"id": "lh", "displayName": "bronze", "type": "Lakehouse"}])
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("the preview must not run the dependency check")
+
+    monkeypatch.setattr(relations, "build_graph", explode)
+
+    assert "dependencies" not in preview(client, session_id)
+
+
+def test_a_reassignment_skips_the_dependency_check_entirely(client, session_id, monkeypatch):
+    # Nothing is rebuilt, so no reference has to be rewritten and nothing can be left dangling.
+    install(monkeypatch, [{"id": "r", "displayName": "Sales", "type": "Report"}])
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("a reassignment has no references to check")
+
+    monkeypatch.setattr(relations, "build_graph", explode)
+
+    assert dependencies(client, session_id) == []

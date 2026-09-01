@@ -237,13 +237,36 @@ def create_app() -> FastAPI:
                     "warehouses": len(data_stores.list_warehouses(client, source_workspace_id)),
                     "eventhouses": len(eventhouses.list_eventhouses(client, source_workspace_id)),
                 }
-                result["dependencies"] = _dependency_preview(
-                    client,
-                    source_workspace_id=source_workspace_id,
-                    migrated=assessment.migrated,
-                    client_id=session.principal.client_id,
-                )
                 return result
+
+        return await _run_fabric(work)
+
+    @app.get("/api/preview/dependencies")
+    async def preview_dependencies(
+        source_workspace_id: str,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        """The dependency check, split out because it is much slower than the rest of the preview.
+
+        It walks the relations API once per item and then reads every connection in the tenant,
+        so folding it into the preview left the review screen blank for long enough to look
+        stuck. The front end shows the rest of the review first and fills this in when it lands.
+        """
+
+        def work() -> dict[str, Any]:
+            with FabricClient(session.tokens) as client:
+                assessment = assess_workspace(list_items(client, source_workspace_id))
+                if assessment.strategy is Strategy.REASSIGN:
+                    # Nothing is rebuilt, so no reference has to be rewritten.
+                    return {"dependencies": []}
+                return {
+                    "dependencies": _dependency_preview(
+                        client,
+                        source_workspace_id=source_workspace_id,
+                        migrated=assessment.migrated,
+                        client_id=session.principal.client_id,
+                    )
+                }
 
         return await _run_fabric(work)
 

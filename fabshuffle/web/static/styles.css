@@ -265,6 +265,27 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .warnings.danger { border-color: rgba(229, 100, 107, 0.5); background: rgba(229, 100, 107, 0.1); }
 .warnings.danger h3 { color: var(--danger); }
 
+/* A check that is still running is not a warning yet, so it stays visually neutral. */
+.warnings.pending { border-color: var(--border); background: transparent; }
+.warnings.pending h3 { color: var(--text-dim); }
+.warnings.pending ul { list-style: none; padding-left: 0; }
+.warnings.pending li::before {
+  content: "";
+  display: inline-block;
+  width: 0.65rem;
+  height: 0.65rem;
+  margin-right: 0.5rem;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--text-dim);
+  animation: spin 0.9s linear infinite;
+  vertical-align: -0.1rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warnings.pending li::before { animation: none; }
+}
+
 .callout {
   margin-bottom: 1.25rem;
   padding: 0.9rem 1rem;

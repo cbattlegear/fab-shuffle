@@ -278,22 +278,77 @@ $("#workspace-filter").addEventListener("input", (event) => {
 $("#workspace-next").addEventListener("click", async () => {
   const button = $("#workspace-next");
   busy(button, true, "Inspecting…");
+  const params = new URLSearchParams({
+    capacity_id: state.capacity.id,
+    source_workspace_id: state.workspace.id,
+  });
+
+  // Both requests go out together, and the review screen appears straight away. The
+  // dependency check walks the relations API and every connection in the tenant, so waiting
+  // for it before showing anything left the wizard looking stuck.
+  const dependencies = api(`/api/preview/dependencies?${params}`);
+  dependencies.catch(() => {});
+
   try {
-    const params = new URLSearchParams({
-      capacity_id: state.capacity.id,
-      source_workspace_id: state.workspace.id,
-    });
+    goTo("review");
+    renderReviewPending();
     state.preview = await api(`/api/preview?${params}`);
     renderReview();
-    goTo("review");
   } catch (error) {
+    goTo("workspace");
     showError(error.message);
-  } finally {
     busy(button, false);
+    return;
   }
+  busy(button, false);
+
+  try {
+    state.preview.dependencies = (await dependencies).dependencies;
+  } catch (error) {
+    state.preview.dependencies = [`Dependencies could not be checked: ${error.message}`];
+  }
+  renderDependencies();
 });
 
 // -------------------------------------------------------------------- review
+
+function renderReviewPending() {
+  const callout = $("#strategy-callout");
+  callout.className = "callout";
+  callout.innerHTML = '<strong><span class="spin">◜</span> Inspecting the workspace</strong><p></p>';
+  callout.querySelector("p").textContent =
+    "Reading the items in the source workspace to work out whether it can be reassigned or " +
+    "has to be rebuilt.";
+  $("#review-summary").innerHTML = "";
+  ["#blockers", "#unsupported", "#dependencies", "#review-warnings"].forEach((id) => {
+    $(id).hidden = true;
+  });
+  // The name and options depend on the strategy, so they stay hidden until it is known.
+  $("#target-name-field").hidden = true;
+  $("#rebuild-options").hidden = true;
+  $("#start-run").disabled = true;
+}
+
+function renderDependencies() {
+  const container = $("#dependencies");
+  container.classList.remove("pending");
+  container.querySelector("h3").textContent = "Needs attention";
+  container.querySelector(".hint").hidden = false;
+  fillList(container, state.preview.dependencies || []);
+}
+
+function showDependenciesPending() {
+  const container = $("#dependencies");
+  container.hidden = false;
+  container.classList.add("pending");
+  container.querySelector("h3").textContent = "Checking dependencies…";
+  container.querySelector(".hint").hidden = true;
+  const list = container.querySelector("ul");
+  list.innerHTML = "";
+  const item = document.createElement("li");
+  item.textContent = "Reading references between items, and the connections they use.";
+  list.appendChild(item);
+}
 
 function renderReview() {
   const preview = state.preview;
@@ -337,8 +392,16 @@ function renderReview() {
 
   fillList($("#blockers"), preview.blockers);
   fillList($("#unsupported"), preview.unsupportedSummary);
-  fillList($("#dependencies"), preview.dependencies || []);
   fillList($("#review-warnings"), preview.capacityWarning ? [preview.capacityWarning] : []);
+
+  if (preview.dependencies) {
+    renderDependencies();
+  } else if (reassign) {
+    // A reassignment rewrites no references, so there is nothing to check.
+    $("#dependencies").hidden = true;
+  } else {
+    showDependenciesPending();
+  }
 
   // A reassignment keeps the workspace and its name, and copies nothing.
   $("#target-name-field").hidden = reassign;
