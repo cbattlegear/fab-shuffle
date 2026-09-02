@@ -268,6 +268,7 @@ def create_app() -> FastAPI:
                     migrated=assessment.migrated,
                     client_id=session.principal.client_id,
                     object_id=_object_id(session),
+                    tenant_id=session.principal.tenant_id,
                 )
                 return {
                     "dependencies": report["dependencies"],
@@ -464,6 +465,7 @@ def _dependency_report(
     migrated: list[dict[str, Any]],
     client_id: str,
     object_id: str = "",
+    tenant_id: str = "",
 ) -> dict[str, Any]:
     """Run the same dependency check the migration runs, before anything is created.
 
@@ -500,7 +502,12 @@ def _dependency_report(
         {
             "connections": [entry.as_dict() for entry in report.access],
             "instructions": portal_instructions(client_id),
-            "script": grant_script(client_id, report.access, object_id=object_id),
+            "script": grant_script(
+                client_id,
+                report.access,
+                object_id=object_id,
+                tenant_id=tenant_id,
+            ),
         }
         if report.access
         else None

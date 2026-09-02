@@ -21,6 +21,7 @@ from fabshuffle.orchestrator import ConnectionAccess, grant_script
 
 APP_ID = "9b57d15c-f03f-4112-adb8-b480df80bd02"
 OBJECT_ID = "3f2b9c71-55aa-4f0e-9c1d-8e77b0a41d22"
+TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 ENTRIES = [
     ConnectionAccess(
         connection_id="081da81e-f477-4715-8b66-c2a1debf8909",
@@ -78,16 +79,39 @@ def test_a_secure_string_token_is_handled() -> None:
     # Newer Az versions return a SecureString, older ones a plain string.
     script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
 
-    assert "$value -isnot [string]" in script
     assert "NetworkCredential" in script
 
 
-def test_the_sign_in_is_scoped_to_fabric() -> None:
-    """Without -AuthScope a tenant with conditional access refuses the token outright."""
+def test_the_sign_in_is_scoped_to_fabric_and_to_the_tenant() -> None:
+    """Without -AuthScope the token is refused; without -TenantId the sign-in itself is."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID, tenant_id=TENANT_ID)
+
+    assert "Connect-AzAccount -TenantId $tenantId -AuthScope $fabric" in script
+    assert f"$tenantId = '{TENANT_ID}'" in script
+    assert "Connect-AzAccount | Out-Null" not in script
+
+
+def test_the_tenant_falls_back_to_the_current_context() -> None:
     script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
 
-    assert "Connect-AzAccount -AuthScope $fabric" in script
-    assert "Connect-AzAccount | Out-Null" not in script
+    assert "$tenantId = (Get-AzContext).Tenant.Id" in script
+
+
+def test_a_sign_in_for_the_wrong_tenant_is_replaced() -> None:
+    """An existing context for another tenant would fail every call otherwise."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID, tenant_id=TENANT_ID)
+
+    assert "$context.Tenant.Id -ne $tenantId" in script
+
+
+def test_the_secure_string_change_is_taken_deliberately() -> None:
+    """Az 14 warns loudly before switching; asking for it silences that and pre-empts it."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID, tenant_id=TENANT_ID)
+
+    assert "Parameters.ContainsKey('AsSecureString')" in script
+    assert "-AsSecureString" in script
+    # And the old shape still works, because the parameter does not exist there.
+    assert "$value -isnot [string]" in script
 
 
 def test_an_existing_but_unscoped_sign_in_is_retried() -> None:

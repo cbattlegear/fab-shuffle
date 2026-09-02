@@ -437,6 +437,7 @@ def grant_script(
     entries: Iterable[ConnectionAccess],
     *,
     object_id: str = "",
+    tenant_id: str = "",
 ) -> str:
     """A PowerShell script that shares each connection with the service principal.
 
@@ -475,6 +476,10 @@ def grant_script(
             "$principalId = $principal.Id"
         )
 
+    # Signing in without a tenant lands on the "organizations" pseudo-tenant, which a
+    # conditional access policy cannot be evaluated against, so the sign-in is refused.
+    tenant = f"'{tenant_id}'" if tenant_id else "(Get-AzContext).Tenant.Id"
+
     return f"""{requires}
 # Shares the connections Fab Shuffle needs with its service principal.
 # Run this as a user who owns them, then choose Re-check in Fab Shuffle.
@@ -482,28 +487,42 @@ def grant_script(
 $ErrorActionPreference = 'Stop'
 
 $fabric = 'https://api.fabric.microsoft.com'
+$tenantId = {tenant}
 $connectionIds = @(
 {listed}
 )
 
 function Get-FabricToken {{
-    $value = (Get-AzAccessToken -ResourceUrl $fabric).Token
+    # Az 14 / Az.Accounts 5 return a SecureString and warn about it beforehand. Asking for
+    # one where the parameter exists takes the new behaviour deliberately and silences the
+    # warning, rather than waiting to be broken by it.
+    if ((Get-Command Get-AzAccessToken).Parameters.ContainsKey('AsSecureString')) {{
+        $secure = (Get-AzAccessToken -ResourceUrl $fabric -TenantId $tenantId -AsSecureString).Token
+        return [System.Net.NetworkCredential]::new('', $secure).Password
+    }}
+    $value = (Get-AzAccessToken -ResourceUrl $fabric -TenantId $tenantId).Token
     if ($value -isnot [string]) {{
-        # Newer Az versions hand back a SecureString.
-        $value = [System.Net.NetworkCredential]::new('', $value).Password
+        return [System.Net.NetworkCredential]::new('', $value).Password
     }}
     return $value
 }}
 
-# -AuthScope matters here. Without it the sign-in is not scoped to Fabric, and a tenant with
-# conditional access or MFA then refuses the token with "User interaction is required".
-if (-not (Get-AzContext)) {{ Connect-AzAccount -AuthScope $fabric | Out-Null }}
+function Connect-ForFabric {{
+    # -AuthScope asks for a token Fabric will accept; -TenantId keeps conditional access off
+    # the "organizations" pseudo-tenant, where it cannot be evaluated.
+    Connect-AzAccount -TenantId $tenantId -AuthScope $fabric | Out-Null
+}}
+
+$context = Get-AzContext
+if (-not $context -or $context.Tenant.Id -ne $tenantId) {{ Connect-ForFabric }}
 
 try {{
     $token = Get-FabricToken
 }} catch {{
+    # An existing sign-in from somewhere else looks fine to Get-AzContext and is still
+    # refused for Fabric, so the only way to find out is to ask.
     Write-Host 'Signing in again, scoped to Fabric.' -ForegroundColor Yellow
-    Connect-AzAccount -AuthScope $fabric | Out-Null
+    Connect-ForFabric
     $token = Get-FabricToken
 }}
 
