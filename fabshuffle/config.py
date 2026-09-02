@@ -47,10 +47,10 @@ class Settings:
     # Copy job / data movement behaviour.
     copy_job_poll_seconds: int = _env_int("FAB_SHUFFLE_COPY_JOB_POLL_SECONDS", 10)
     copy_job_timeout_seconds: int = _env_int("FAB_SHUFFLE_COPY_JOB_TIMEOUT_SECONDS", 43200)
-    # How many Copy Jobs to have running at once. Deliberately low: a Copy Job runs on the
-    # target capacity, so past a point more of them is not faster, and Fabric turns the
-    # over-subscription into a failed job rather than a queued one.
-    copy_job_concurrency: int = _env_int("FAB_SHUFFLE_COPY_JOB_CONCURRENCY", 3)
+    # How many Copy Jobs to have running at once. Zero means work it out from the target
+    # capacity's SKU, which is the sensible default because a Copy Job runs on that capacity:
+    # see ``workspaces.copy_job_concurrency``. Any other value overrides that outright.
+    copy_job_concurrency: int = _env_int("FAB_SHUFFLE_COPY_JOB_CONCURRENCY", 0)
     sql_endpoint_timeout_seconds: int = _env_int("FAB_SHUFFLE_SQL_ENDPOINT_TIMEOUT_SECONDS", 1800)
 
     # External tooling that has no REST equivalent yet.

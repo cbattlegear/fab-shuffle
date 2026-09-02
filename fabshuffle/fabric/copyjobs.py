@@ -337,7 +337,7 @@ def run_copy_jobs(
     Returns the ids of the jobs that were created, so the caller can clean them up, and a
     warning for each one that did not finish cleanly.
     """
-    limit = max(1, concurrency or SETTINGS.copy_job_concurrency)
+    limit = max(1, concurrency or SETTINGS.copy_job_concurrency or 1)
     queue = list(specs)
     total = len(queue)
     created: list[tuple[str, str]] = []

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import pytest
 
-from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import copyjobs
 from fabshuffle.fabric.client import FabricApiError
 
@@ -112,11 +111,21 @@ def test_no_more_than_the_limit_run_at_once():
     assert len(client.started) == 6
 
 
-def test_the_default_limit_comes_from_settings():
+def test_an_unset_setting_falls_back_to_one_at_a_time(monkeypatch):
+    """The caller normally sizes this from the capacity; on its own the runner does not guess."""
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_concurrency", 0)
     client = FakeClient(finish_after=3)
-    copyjobs.run_copy_jobs(client, specs(10))
+    copyjobs.run_copy_jobs(client, specs(4))
 
-    assert client.peak_in_flight == SETTINGS.copy_job_concurrency
+    assert client.peak_in_flight == 1
+
+
+def test_an_explicit_setting_is_used_when_the_caller_gives_no_limit(monkeypatch):
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_concurrency", 2)
+    client = FakeClient(finish_after=3)
+    copyjobs.run_copy_jobs(client, specs(6))
+
+    assert client.peak_in_flight == 2
 
 
 def test_an_empty_batch_does_nothing():

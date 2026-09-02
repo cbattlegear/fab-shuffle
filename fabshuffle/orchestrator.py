@@ -152,6 +152,9 @@ class MigrationPlan:
     # everything wants the normalised form, but an Apache Airflow job records its compute
     # location as the display string and will not accept anything else.
     capacity_display_region: str = ""
+    # The target capacity's SKU. Copy Jobs run on it, so how many are worth running at once
+    # is decided from its size.
+    capacity_sku: str = ""
     strategy: Strategy = Strategy.REBUILD
     capacity_warning: str | None = None
     include_files: bool = True
@@ -1228,10 +1231,17 @@ def _run_copy_jobs(
 ) -> list[str]:
     if not specs:
         return []
-    ctx.run.update_step(step, f"Copying {what} data in {len(specs)} job(s)")
+    # Sized from the capacity the jobs will run on, not from a fixed number: an F64 can keep
+    # four of these busy where an F16 can barely keep one.
+    concurrent = workspaces.copy_job_concurrency(ctx.plan.capacity_sku)
+    ctx.run.update_step(
+        step,
+        f"Copying {what} data in {len(specs)} job(s), {concurrent} at a time",
+    )
     created, warnings = copyjobs.run_copy_jobs(
         ctx.client,
         specs,
+        concurrency=concurrent,
         on_progress=lambda message: ctx.run.update_step(step, message),
     )
     ctx.copy_job_ids.extend(created)
@@ -2674,6 +2684,7 @@ def build_plan(
         capacity_name=capacity.get("displayName", capacity_id),
         capacity_region=region,
         capacity_display_region=capacity.get("region") or capacity.get("location") or "",
+        capacity_sku=capacity.get("sku") or "",
         source_workspace_id=source_workspace_id,
         source_workspace_name=source_name,
         # Reassignment moves the workspace itself, so its name never changes.

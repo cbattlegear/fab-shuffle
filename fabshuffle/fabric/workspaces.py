@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from fabshuffle.config import SETTINGS
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 
 # Scratch workspaces are named with this prefix so leftovers from an interrupted run can be
 # found again later, for example after the container has restarted.
 SCRATCH_WORKSPACE_PREFIX = "fab-shuffle-scratch-"
+
+# Capacity units per concurrent Copy Job. A Copy Job runs on the capacity, so what it can
+# usefully do at once scales with its size rather than being a fixed number.
+CU_PER_COPY_JOB = 16
+# Used when the SKU is not an F series one, so its size cannot be read as capacity units.
+UNKNOWN_SKU_COPY_JOBS = 3
 
 # ------------------------------------------------------------------- capacities
 
@@ -45,6 +53,28 @@ def _sku_size(sku: str) -> int | None:
         return int(text[1:])
     return None
 
+
+def copy_job_concurrency(sku: str) -> int:
+    """How many Copy Jobs to run at once against a capacity of this size.
+
+    A Copy Job runs on the target capacity, so how many are worth having in flight is a
+    question about capacity units rather than a fixed number: over-subscribe a small SKU and
+    Fabric turns the excess into a failed job rather than a queued one, while a large one
+    sits idle if we only ever ask it for three.
+
+    One job per 16 CUs, rounded up, so an F64 runs four and an F32 two. Anything smaller
+    still gets one, because refusing to copy at all is not an answer, and a SKU whose size
+    cannot be read numerically falls back to a conservative fixed number rather than a guess
+    at what P or EM might mean.
+
+    An explicit setting wins over all of it.
+    """
+    if SETTINGS.copy_job_concurrency:
+        return max(1, SETTINGS.copy_job_concurrency)
+    size = _sku_size(sku)
+    if size is None:
+        return UNKNOWN_SKU_COPY_JOBS
+    return max(1, math.ceil(size / CU_PER_COPY_JOB))
 
 def compare_capacities(source_sku: str, target_sku: str) -> str | None:
     """Warn when the target capacity is not the same size as the source's.
