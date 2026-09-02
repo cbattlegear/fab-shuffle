@@ -110,6 +110,12 @@ def _target_kind(target: Mapping[str, Any]) -> str:
     return next((key for key in target if key != "type"), "")
 
 
+def onelake_item_id(shortcut: Mapping[str, Any]) -> str:
+    """The source item a OneLake shortcut points at, before any remapping."""
+    settings = (shortcut.get("target") or {}).get("oneLake")
+    return str(settings.get("itemId") or "") if isinstance(settings, Mapping) else ""
+
+
 def unmigrated_target(
     shortcut: Mapping[str, Any],
     id_map: Mapping[str, str],
@@ -148,16 +154,49 @@ def describe_unmigrated(
     label: str = "Shortcut",
 ) -> str:
     """Say which item a shortcut needed, in the words the operator will recognise."""
-    item = (source_items or {}).get(item_id) or {}
-    described = (
-        f"{item.get('type') or 'item'} '{item['displayName']}'"
-        if item.get("displayName")
-        else f"the item {item_id}"
-    )
     return (
-        f"{label} '{name}' was not created: it points at {described}, which is not in the new "
-        "workspace because it did not migrate. Migrate that item, then recreate the shortcut."
+        f"{label} '{name}' was not created: it points at {_describe_item(item_id, source_items)}, "
+        "which is not in the new workspace because it did not migrate. Migrate that item, then "
+        "recreate the shortcut."
     )
+
+
+def _describe_item(
+    item_id: str,
+    source_items: Mapping[str, Mapping[str, Any]] | None,
+) -> str:
+    item = (source_items or {}).get(item_id) or {}
+    if item.get("displayName"):
+        return f"{item.get('type') or 'item'} '{item['displayName']}'"
+    return f"the item {item_id}"
+
+
+def describe_dormant(
+    name: str,
+    item_id: str,
+    reason: str,
+    status_code: int,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    *,
+    label: str = "Shortcut",
+    said: str = "",
+) -> str:
+    """Explain a failure caused by the target having arrived without its data.
+
+    Some items are migrated deliberately switched off, so that a copy does not start doing
+    the original's work in a second region the moment it exists. Nothing has written to them
+    yet, so a shortcut into one has nothing to point at.
+
+    This is only used once a create has actually failed. Whether Fabric refuses such a
+    shortcut is its business, and guessing at that in advance is how the last wrong message
+    got written.
+    """
+    message = (
+        f"{label} '{name}' could not be created (HTTP {status_code}): it points at "
+        f"{_describe_item(item_id, source_items)}, which migrated but {reason} "
+        "Do that, then recreate this shortcut."
+    )
+    return f"{message} The service said: {said}." if said else message
 
 
 def describe_failure(
@@ -228,8 +267,13 @@ def copy_shortcuts(
     id_map: Mapping[str, str],
     *,
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    dormant: Mapping[str, str] | None = None,
 ) -> tuple[int, list[str]]:
-    """Recreate every shortcut from a source item onto its migrated counterpart."""
+    """Recreate every shortcut from a source item onto its migrated counterpart.
+
+    ``dormant`` maps a source item id to why its copy has no data yet, for the items that are
+    migrated switched off. Used only to explain a failure, never to predict one.
+    """
     created = 0
     warnings: list[str] = []
 
@@ -248,8 +292,19 @@ def copy_shortcuts(
             create_shortcut(client, target_workspace_id, target_item_id, remapped)
             created += 1
         except FabricApiError as error:
+            source_id = onelake_item_id(shortcut)
+            reason = (dormant or {}).get(source_id)
             warnings.append(
-                describe_failure(
+                describe_dormant(
+                    name,
+                    source_id,
+                    reason,
+                    error.status_code,
+                    source_items,
+                    said=failure_detail(error),
+                )
+                if reason
+                else describe_failure(
                     name,
                     remapped["target"],
                     error.status_code,
@@ -322,6 +377,7 @@ def copy_table_shortcuts(
     *,
     shortcuts: Iterable[Mapping[str, Any]] | None = None,
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    dormant: Mapping[str, str] | None = None,
 ) -> tuple[int, list[str]]:
     """Recreate a KQL database's table shortcuts against the migrated items."""
     source = (
@@ -359,8 +415,20 @@ def copy_table_shortcuts(
             )
             created += 1
         except FabricApiError as error:
+            source_id = onelake_item_id(shortcut)
+            reason = (dormant or {}).get(source_id)
             warnings.append(
-                describe_failure(
+                describe_dormant(
+                    name,
+                    source_id,
+                    reason,
+                    error.status_code,
+                    source_items,
+                    label="KQL table shortcut",
+                    said=failure_detail(error),
+                )
+                if reason
+                else describe_failure(
                     name,
                     target,
                     error.status_code,
@@ -376,11 +444,13 @@ __all__ = [
     "copy_table_shortcuts",
     "create_shortcut",
     "create_table_shortcut",
+    "describe_dormant",
     "describe_failure",
     "describe_unmigrated",
     "failure_detail",
     "list_shortcuts",
     "list_table_shortcuts",
+    "onelake_item_id",
     "remap_shortcut_target",
     "table_shortcut_keys",
     "table_shortcut_names",

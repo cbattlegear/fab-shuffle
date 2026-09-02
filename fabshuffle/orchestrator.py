@@ -182,6 +182,10 @@ class _Context:
     kql_table_shortcuts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     graph: relations.DependencyGraph = field(default_factory=relations.DependencyGraph)
     spark_settings: dict[str, Any] | None = None
+    # Source ids of items that migrated but arrive with nothing in them, because we leave
+    # their replication switched off so a copy does not start doing the original's work in a
+    # second region. Keyed to why, so a shortcut that fails against one can say so.
+    dormant: dict[str, str] = field(default_factory=dict)
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -1727,6 +1731,12 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             f"(replication {state}). Start it from the new workspace once you are ready for a "
             "second mirror to read the source database."
         )
+        # Nothing has replicated into it yet, so anything reading its tables has nothing to
+        # read. A shortcut into it fails, and the reason is three steps back from the failure.
+        ctx.dormant[result.source_id] = (
+            "arrives with its mirroring not started, so no data has replicated into it yet. "
+            "Start mirroring in the new workspace."
+        )
 
     if catalogs:
         results, item_warnings = analytics.migrate_items(
@@ -1741,6 +1751,11 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
         )
         migrated.extend(results)
         warnings.extend(item_warnings)
+        for result in results:
+            ctx.dormant[result.source_id] = (
+                "arrives with its automatic sync disabled, so no data has synced into it yet. "
+                "Enable sync in the new workspace."
+            )
 
     if snowflake:
         warnings.extend(_migrate_snowflake_databases(ctx, step, snowflake, progress))
@@ -1849,6 +1864,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
             ctx.id_map,
             shortcuts=table_shortcuts,
             source_items=source_items,
+            dormant=ctx.dormant,
         )
         shortcuts_created += created
         warnings.extend(f"KQL database '{database_name}': {w}" for w in shortcut_warnings)
@@ -1869,6 +1885,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
             target_id,
             ctx.id_map,
             source_items=source_items,
+            dormant=ctx.dormant,
         )
         shortcuts_created += created
         warnings.extend(f"Lakehouse '{name}': {w}" for w in shortcut_warnings)

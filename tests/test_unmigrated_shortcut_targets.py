@@ -8,6 +8,7 @@ item id does not, so Fabric is asked for an item that was never in that workspac
 from __future__ import annotations
 
 from fabshuffle.fabric import shortcuts
+from fabshuffle.fabric.client import FabricApiError
 
 SOURCE_WS = "ws-source"
 TARGET_WS = "ws-target"
@@ -163,3 +164,89 @@ def test_kql_table_shortcuts_get_the_same_treatment():
     assert (created, client.created) == (0, [])
     assert "KQL table shortcut" in warnings[0]
     assert "BattleCabbageReplTest" in warnings[0]
+
+
+# ------------------------------------------------- a target with no data yet
+
+# The case that produced the wrong diagnosis. The mirrored database *did* migrate, so it is
+# in the id map and the shortcut is remapped correctly. It fails because we deliberately
+# leave mirroring stopped, so nothing has replicated into it and there is nothing to point at.
+
+MIGRATED_MIRROR = "mirror-migrated"
+DORMANT = {
+    MIGRATED_MIRROR: (
+        "arrives with its mirroring not started, so no data has replicated into it yet. "
+        "Start mirroring in the new workspace."
+    )
+}
+FULL_MAP = {**ID_MAP, MIGRATED_MIRROR: "mirror-new"}
+FULL_ITEMS = {
+    **SOURCE_ITEMS,
+    MIGRATED_MIRROR: {
+        "id": MIGRATED_MIRROR,
+        "displayName": "BattleCabbageReplTest",
+        "type": "MirroredDatabase",
+    },
+}
+
+
+class RefusingClient(FakeClient):
+    def post(self, path, json=None, params=None, wait=True):
+        raise FabricApiError(
+            "POST", path, 400, '{"errorCode":"InvalidPath","message":"path not found"}'
+        )
+
+
+def copy_against_dormant(dormant=DORMANT):
+    client = RefusingClient([onelake(SOURCE_WS, MIGRATED_MIRROR)])
+    created, warnings = shortcuts.copy_shortcuts(
+        client,
+        SOURCE_WS,
+        LAKEHOUSE,
+        TARGET_WS,
+        "lh-new",
+        FULL_MAP,
+        source_items=FULL_ITEMS,
+        dormant=dormant,
+    )
+    return created, warnings
+
+
+def test_a_failure_against_an_item_with_no_data_yet_explains_why():
+    _, warnings = copy_against_dormant()
+
+    assert "MirroredDatabase 'BattleCabbageReplTest'" in warnings[0]
+    # Not "did not migrate": it did, which is what made the first diagnosis wrong.
+    assert "did not migrate" not in warnings[0]
+    assert "no data has replicated into it yet" in warnings[0]
+    assert "Start mirroring in the new workspace. Do that, then recreate this shortcut" in warnings[0]
+
+
+def test_that_explanation_still_quotes_the_service():
+    _, warnings = copy_against_dormant()
+
+    # We explain our side. Whether Fabric refuses for that reason is its business to state.
+    assert "The service said: InvalidPath path not found." in warnings[0]
+
+
+def test_the_attempt_is_still_made():
+    """Whether Fabric allows a shortcut into an empty item is not ours to assume."""
+    client = RefusingClient([onelake(SOURCE_WS, MIGRATED_MIRROR)])
+    try:
+        shortcuts.copy_shortcuts(
+            client, SOURCE_WS, LAKEHOUSE, TARGET_WS, "lh-new", FULL_MAP, dormant=DORMANT
+        )
+    except FabricApiError:  # pragma: no cover - would be a regression
+        raise AssertionError("the failure should have been caught and explained") from None
+
+
+def test_without_that_context_the_generic_message_is_used():
+    _, warnings = copy_against_dormant(dormant={})
+
+    assert "InvalidPath path not found" in warnings[0]
+    assert "recreate this shortcut" not in warnings[0]
+
+
+def test_the_item_a_shortcut_points_at_is_read_before_remapping():
+    assert shortcuts.onelake_item_id(onelake(SOURCE_WS, MIGRATED_MIRROR)) == MIGRATED_MIRROR
+    assert shortcuts.onelake_item_id({"name": "x"}) == ""
