@@ -206,8 +206,83 @@ def test_a_clean_workspace_reports_no_dependency_problems(client, session_id, mo
         lambda *a, **k: relations.DependencyGraph(dependencies={"lh": set()}),
     )
     monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
+    monkeypatch.setattr("fabshuffle.orchestrator.scan_connection_access", lambda *a, **k: [])
 
     assert dependencies(client, session_id) == []
+
+
+def access(client, session_id):
+    response = client.get(
+        "/api/preview/dependencies",
+        params={"source_workspace_id": "ws-1"},
+        headers=auth(session_id),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["connectionAccess"]
+
+
+def clean_graph(monkeypatch):
+    install(monkeypatch, [{"id": "lh", "displayName": "bronze", "type": "Lakehouse"}])
+    monkeypatch.setattr(
+        relations,
+        "build_graph",
+        lambda *a, **k: relations.DependencyGraph(dependencies={"lh": set()}),
+    )
+
+
+def test_connections_needing_a_share_come_back_with_instructions(client, session_id, monkeypatch):
+    from fabshuffle.orchestrator import ConnectionAccess
+
+    clean_graph(monkeypatch)
+    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "fabshuffle.orchestrator.scan_connection_access",
+        lambda *a, **k: [ConnectionAccess(connection_id="c-1", used_by=("CopyJob 'j'",))],
+    )
+
+    result = access(client, session_id)
+
+    assert result["connections"] == [
+        {"connectionId": "c-1", "connectionName": "", "label": "c-1", "usedBy": ["CopyJob 'j'"]}
+    ]
+    assert any("Manage connections and gateways" in step for step in result["instructions"])
+    assert any("Re-check" in step for step in result["instructions"])
+
+
+def test_no_access_section_when_nothing_needs_sharing(client, session_id, monkeypatch):
+    clean_graph(monkeypatch)
+    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
+    monkeypatch.setattr("fabshuffle.orchestrator.scan_connection_access", lambda *a, **k: [])
+
+    assert access(client, session_id) is None
+
+
+def test_inward_connections_are_one_counted_line(client, session_id, monkeypatch):
+    """They are the customer's job to repoint, so they are not listed one by one."""
+    from fabshuffle.fabric.connections import ConnectionPrerequisite
+
+    clean_graph(monkeypatch)
+    monkeypatch.setattr("fabshuffle.orchestrator.scan_connection_access", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "fabshuffle.orchestrator.connection_prerequisites",
+        lambda *a, **k: [
+            ConnectionPrerequisite(
+                connection_id=f"c-{n}",
+                connection_name="",
+                path="p",
+                matched="m",
+                credential_type="unknown",
+                connectivity_type="ShareableCloud",
+                manageable=False,
+            )
+            for n in range(4)
+        ],
+    )
+
+    result = dependencies(client, session_id)
+
+    assert len(result) == 1
+    assert result[0].startswith("4 connection(s) point at items in this workspace")
 
 
 def test_the_preview_does_not_wait_for_the_dependency_check(client, session_id, monkeypatch):

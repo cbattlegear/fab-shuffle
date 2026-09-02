@@ -36,7 +36,6 @@ from fabshuffle.orchestrator import (
     dependency_warnings,
     portal_instructions,
     run_migration,
-    scan_connection_access,
 )
 from fabshuffle.run import REGISTRY, MigrationRun, RunStatus
 
@@ -261,19 +260,16 @@ def create_app() -> FastAPI:
                 if assessment.strategy is Strategy.REASSIGN:
                     # Nothing is rebuilt, so no reference has to be rewritten.
                     return {"dependencies": [], "connectionAccess": None}
+
+                report = _dependency_report(
+                    client,
+                    source_workspace_id=source_workspace_id,
+                    migrated=assessment.migrated,
+                    client_id=session.principal.client_id,
+                )
                 return {
-                    "dependencies": _dependency_preview(
-                        client,
-                        source_workspace_id=source_workspace_id,
-                        migrated=assessment.migrated,
-                        client_id=session.principal.client_id,
-                    ),
-                    "connectionAccess": _connection_access_preview(
-                        client,
-                        source_workspace_id=source_workspace_id,
-                        migrated=assessment.migrated,
-                        client_id=session.principal.client_id,
-                    ),
+                    "dependencies": report["dependencies"],
+                    "connectionAccess": report["connectionAccess"],
                 }
 
         return await _run_fabric(work)
@@ -446,20 +442,22 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
     }
 
 
-def _dependency_preview(
+def _dependency_report(
     client: FabricClient,
     *,
     source_workspace_id: str,
     migrated: list[dict[str, Any]],
     client_id: str,
-) -> list[str]:
+) -> dict[str, Any]:
     """Run the same dependency check the migration runs, before anything is created.
 
     The check is read only, so there is no reason to make the operator start a run to find
-    out that a semantic model points somewhere the migration cannot follow.
+    out that a semantic model points somewhere the migration cannot follow, or that a
+    connection has to be shared first.
     """
     if not migrated:
-        return []
+        return {"dependencies": [], "connectionAccess": None}
+
     try:
         report = dependency_warnings(
             client,
@@ -468,45 +466,29 @@ def _dependency_preview(
             client_id=client_id,
         )
     except FabricApiError as error:
-        return [f"Dependencies could not be checked: {error}"]
+        return {
+            "dependencies": [f"Dependencies could not be checked: {error}"],
+            "connectionAccess": None,
+        }
 
     if not report.available:
-        return [
-            "The relations API is unavailable to this service principal, so dependencies "
-            "between items could not be checked."
-        ]
-    return report.messages()
+        return {
+            "dependencies": [
+                "The relations API is unavailable to this service principal, so dependencies "
+                "between items could not be checked."
+            ],
+            "connectionAccess": None,
+        }
 
-
-def _connection_access_preview(
-    client: FabricClient,
-    *,
-    source_workspace_id: str,
-    migrated: list[dict[str, Any]],
-    client_id: str,
-) -> dict[str, Any] | None:
-    """Connections the migration needs more access to, with how to grant it.
-
-    Returned as its own section rather than folded into the warnings, because unlike the
-    other warnings this is a task to do before starting, and it has steps.
-    """
-    try:
-        blocked = scan_connection_access(
-            client,
-            source_workspace_id=source_workspace_id,
-            migrated=migrated,
-            client_id=client_id,
-        )
-    except FabricApiError as error:
-        logger.info("Could not check connection access: %s", error)
-        return None
-
-    if not blocked:
-        return None
-    return {
-        "connections": [entry.as_dict() for entry in blocked],
-        "instructions": portal_instructions(client_id),
-    }
+    access = (
+        {
+            "connections": [entry.as_dict() for entry in report.access],
+            "instructions": portal_instructions(client_id),
+        }
+        if report.access
+        else None
+    )
+    return {"dependencies": report.messages(), "connectionAccess": access}
 
 
 def _semantic_model_preview(

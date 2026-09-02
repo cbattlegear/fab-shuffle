@@ -80,8 +80,8 @@ def test_an_unusable_connection_is_reported_before_anything_is_built() -> None:
     )
 
     assert SHARED in warnings[0]
-    assert "User role" in warnings[0]
     assert "CopyRunFromDB" in warnings[0]
+    assert "cannot see it" in warnings[0]
     assert any("Manage connections and gateways" in w for w in warnings)
 
 
@@ -156,17 +156,21 @@ def test_every_connection_binding_type_is_checked() -> None:
     }
 
 
-def test_the_warning_reaches_the_dependency_report(monkeypatch) -> None:
+def test_the_access_list_reaches_the_dependency_report(monkeypatch) -> None:
     from fabshuffle.fabric import relations
 
     monkeypatch.setattr(
         relations, "build_graph", lambda *a, **k: relations.DependencyGraph(dependencies={})
     )
     monkeypatch.setattr(orchestrator, "connection_prerequisites", lambda *a, **k: [])
-    monkeypatch.setattr(orchestrator, "bound_connection_warnings", lambda *a, **k: ["grant access"])
+    monkeypatch.setattr(
+        orchestrator,
+        "scan_connection_access",
+        lambda *a, **k: [orchestrator.ConnectionAccess(connection_id="c-1", used_by=("CopyJob 'j'",))],
+    )
 
     report = orchestrator.dependency_warnings(
         object(), source_workspace_id="ws", migrated=[{"id": "x"}], client_id="spn"
     )
 
-    assert "grant access" in report.messages()
+    assert [e.connection_id for e in report.access] == ["c-1"]

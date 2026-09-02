@@ -68,7 +68,6 @@ from fabshuffle.fabric import (
 )
 from fabshuffle.fabric import items as items_module
 from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
-from fabshuffle.fabric.definitions import build_rewriter
 from fabshuffle.fabric.items import is_monitoring_item, list_items
 from fabshuffle.fabric.support import (
     Strategy,
@@ -101,15 +100,35 @@ class DependencyReport:
     graph: relations.DependencyGraph
     available: bool = True
     issues: list[relations.DependencyIssue] = field(default_factory=list)
-    prerequisites: list[connections.Prerequisite] = field(default_factory=list)
-    bound: list[str] = field(default_factory=list)
+    prerequisites: list[connections.ConnectionPrerequisite] = field(default_factory=list)
+    access: list[ConnectionAccess] = field(default_factory=list)
 
     def messages(self) -> list[str]:
-        return (
-            [issue.message() for issue in self.issues]
-            + [prerequisite.message() for prerequisite in self.prerequisites]
-            + list(self.bound)
-        )
+        """Warnings for the run log.
+
+        Connection access is deliberately not repeated here. It has its own section on the
+        review screen, and listing it twice made the same nine lines appear under two
+        headings.
+        """
+        warnings = [issue.message() for issue in self.issues]
+        if self.prerequisites:
+            warnings.append(inward_connection_summary(self.prerequisites))
+        return warnings
+
+
+def inward_connection_summary(prerequisites: list[connections.ConnectionPrerequisite]) -> str:
+    """One line for connections that point at items in the workspace being migrated.
+
+    Their target cannot be changed and a replacement needs credentials Fabric never returns,
+    so this is work for whoever owns them. Naming each one individually said the same
+    sentence several times over, so it is a count and a list of names.
+    """
+    named = sorted({p.connection_name or p.connection_id for p in prerequisites})
+    return (
+        f"{len(prerequisites)} connection(s) point at items in this workspace and will need to "
+        "be repointed by hand after the migration, because Fabric does not allow a "
+        f"connection's target to be changed: {', '.join(named)}."
+    )
 
 
 @dataclass
@@ -194,7 +213,6 @@ def run_migration(
             _migrate_warehouses(context)
             _migrate_mirrored_databases(context)
             _migrate_shortcuts_and_endpoints(context)
-            _replace_connections(context)
             _migrate_realtime(context)
             _migrate_engineering(context)
             _migrate_reports_and_models(context)
@@ -363,35 +381,38 @@ def _report_unsupported_items(ctx: _Context) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ConnectionAccess:
-    """A connection this service principal needs more access to before the migration works."""
+    """A connection this service principal needs access to before the migration works."""
 
     connection_id: str
-    role: str
-    reason: str
     used_by: tuple[str, ...] = ()
     connection_name: str = ""
+
+    @property
+    def label(self) -> str:
+        """A name where Fabric has one, otherwise the id.
+
+        Many of these have no display name at all, and the ones that matter most are exactly
+        the ones this service principal cannot see, so there is nothing else to show.
+        """
+        return self.connection_name or self.connection_id
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "connectionId": self.connection_id,
             "connectionName": self.connection_name,
-            "role": self.role,
-            "reason": self.reason,
+            "label": self.label,
             "usedBy": list(self.used_by),
         }
 
     def message(self) -> str:
-        label = (
-            f"'{self.connection_name}' ({self.connection_id})"
-            if self.connection_name
-            else self.connection_id
+        return (
+            f"Connection {self.label} is used by {', '.join(self.used_by)}, but this service "
+            "principal cannot see it, so those items will be refused."
         )
-        used = f" Needed by {', '.join(self.used_by)}." if self.used_by else ""
-        return f"Connection {label} needs the {self.role} role: {self.reason}.{used}"
 
 
 def portal_instructions(client_id: str) -> list[str]:
-    """How to grant the service principal access to a connection, in the portal.
+    """How to share a connection with the service principal, in the portal.
 
     There is an API for this, but adding a role assignment needs Owner on the connection,
     which is what is missing in the first place, so it cannot be done for the operator.
@@ -400,9 +421,9 @@ def portal_instructions(client_id: str) -> list[str]:
         "Open the Fabric portal and go to Settings, then Manage connections and gateways.",
         "Find each connection listed above by its id on the Connections tab.",
         "Select it, then open Manage users from the toolbar or the row's ... menu.",
-        f"Add the service principal (application id {client_id}) with the role shown against "
-        "that connection above, then Share.",
-        "Re-run the migration once every connection above has been shared.",
+        f"Add the service principal (application id {client_id}) with the User role, then "
+        "Share. User is enough to bind a connection; Owner is not needed.",
+        "Come back here and choose Re-check, which runs the assessment again.",
     ]
 
 
@@ -410,47 +431,21 @@ def scan_connection_access(
     client: FabricClient,
     *,
     source_workspace_id: str,
-    migrated: list[dict[str, Any]] | None = None,
-    client_id: str = "",
 ) -> list[ConnectionAccess]:
-    """Every connection whose access has to change before this migration will work.
+    """Connections that items bind but this service principal cannot use.
 
-    Two different problems land in one list, because from the operator's side they are the
-    same job. An item that binds a connection this service principal cannot see is refused
-    outright at creation, and needs only the User role to fix. A connection that points into
-    the workspace has to be replaced, and copying its role assignments onto the replacement
-    needs Owner on the original.
+    An item that binds an unusable connection is rejected outright at creation, and the
+    rejection arrives per item, so a workspace where one connection is shared by six items
+    fails six times for the same reason after everything else has already been built. The
+    definitions are read up front instead, and reported by connection, because one grant
+    fixes every item that shares it.
     """
-    entries: list[ConnectionAccess] = []
     known = connections.connections_by_id(client)
-
     # Without the tenant's connections there is nothing to compare against, and the run
     # already reports that separately.
-    if known:
-        entries.extend(_unusable_bound_connections(client, source_workspace_id, known))
-
-    if migrated is not None:
-        for prerequisite in connection_prerequisites(
-            client,
-            source_workspace_id=source_workspace_id,
-            migrated=migrated,
-            client_id=client_id,
-        ):
-            if prerequisite.manageable:
-                continue
-            entries.append(
-                ConnectionAccess(
-                    connection_id=prerequisite.connection_id,
-                    connection_name=prerequisite.connection_name,
-                    role="Owner",
-                    reason=(
-                        "it points into this workspace, so it has to be replaced, and copying "
-                        "its role assignments onto the replacement needs Owner on the original"
-                    ),
-                )
-            )
-
-    return entries
+    if not known:
+        return []
+    return _unusable_bound_connections(client, source_workspace_id, known)
 
 
 def _unusable_bound_connections(
@@ -479,11 +474,6 @@ def _unusable_bound_connections(
     return [
         ConnectionAccess(
             connection_id=connection_id,
-            role="User",
-            reason=(
-                "the items below bind it, and Fabric refuses to create an item whose "
-                "connection the caller cannot use"
-            ),
             used_by=tuple(sorted(items)),
         )
         for connection_id, items in sorted(unusable.items())
@@ -495,20 +485,14 @@ def bound_connection_warnings(
     *,
     source_workspace_id: str,
     client_id: str,
-    migrated: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """The connection access problem as warnings, for the run's warning list."""
-    blocked = scan_connection_access(
-        client,
-        source_workspace_id=source_workspace_id,
-        migrated=migrated,
-        client_id=client_id,
-    )
+    blocked = scan_connection_access(client, source_workspace_id=source_workspace_id)
     if not blocked:
         return []
     return [entry.message() for entry in blocked] + [
         f"Share the connection(s) above with application id {client_id} in Manage connections "
-        "and gateways, then re-run."
+        "and gateways, then re-check."
     ]
 
 
@@ -544,12 +528,7 @@ def dependency_warnings(
         graph=graph,
         issues=issues,
         prerequisites=prerequisites,
-        bound=bound_connection_warnings(
-            client,
-            source_workspace_id=source_workspace_id,
-            client_id=client_id,
-            migrated=migrated,
-        ),
+        access=scan_connection_access(client, source_workspace_id=source_workspace_id),
     )
 
 
@@ -620,8 +599,18 @@ def _check_dependencies(ctx: _Context) -> None:
         ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in report.issues]
     if report.prerequisites:
         ctx.run.summary["connectionPrerequisites"] = [p.as_dict() for p in report.prerequisites]
+    if report.access:
+        ctx.run.summary["connectionAccess"] = [entry.as_dict() for entry in report.access]
 
     warnings = report.messages()
+    # Access problems are listed separately, because each one stops specific items from being
+    # created at all rather than leaving them subtly wrong.
+    warnings.extend(entry.message() for entry in report.access)
+    if report.access:
+        warnings.append(
+            "Share the connection(s) above with application id "
+            f"{ctx.principal.client_id} in Manage connections and gateways, then re-check."
+        )
     if not warnings:
         ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Every dependency is inside this migration")
         return
@@ -1503,132 +1492,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     )
 
 
-# --------------------------------------------------------------------- phase 6
-
-
-def _replace_connections(ctx: _Context) -> None:
-    """Recreate connections that point into the source workspace, aimed at the new items.
-
-    A connection's target cannot be changed, so the only way to repoint one is to build a
-    replacement. That is only possible unattended when the credential type needs no secret
-    from us, since Fabric never returns an existing connection's credentials.
-
-    Runs after the data items and their SQL endpoints exist, and before anything that binds a
-    connection is migrated, so the new connection id is already in the id map by then.
-    """
-    step = "connections"
-    ctx.run.start_step(step, "Repointing connections at the migrated items")
-    ctx.run.raise_if_cancelled()
-
-    prerequisites = [
-        p for p in (ctx.run.summary.get("connectionPrerequisites") or []) if p.get("connectionId")
-    ]
-    if not prerequisites:
-        ctx.run.finish_step(step, StepStatus.SKIPPED, "No connections point into this workspace")
-        return
-
-    rewrite = build_rewriter(ctx.id_map)
-    known = connections.connections_by_id(ctx.client)
-    metadata = connections.supported_types(ctx.client)
-
-    replaced: list[connections.Replacement] = []
-    warnings: list[str] = []
-
-    for prerequisite in prerequisites:
-        ctx.run.raise_if_cancelled()
-        connection = known.get(prerequisite["connectionId"])
-        if not connection:
-            continue
-
-        name = connection.get("displayName") or prerequisite["connectionId"]
-        old_path = (connection.get("connectionDetails") or {}).get("path") or ""
-        new_path = rewrite(old_path) if rewrite else old_path
-
-        if new_path == old_path:
-            warnings.append(
-                f"Connection '{name}' points into this workspace, but nothing in its path "
-                f"('{old_path}') is an id or endpoint that changed during this migration, so "
-                "there was nothing to repoint it to. It still works against the source "
-                "workspace; recreate it by hand if you want the copy to use the new items."
-            )
-            continue
-
-        connection_type = (connection.get("connectionDetails") or {}).get("type") or ""
-        refusal = connections.can_recreate(connection, metadata.get(connection_type))
-        if refusal:
-            warnings.append(
-                f"Connection '{name}' {refusal}. Create one against '{new_path}' and repoint "
-                "the items that use it."
-            )
-            continue
-
-        payload = connections.build_creation_payload(
-            connection,
-            new_path,
-            metadata[connection_type],
-            display_name=f"{name} ({ctx.plan.capacity_region})",
-        )
-        if not payload:
-            warnings.append(
-                f"Connection '{name}' could not be rebuilt automatically because its path "
-                f"('{old_path}') does not line up with the parameters Fabric declares for "
-                f"{connection_type}. Create one against '{new_path}' by hand."
-            )
-            continue
-
-        ctx.run.update_step(step, f"Recreating connection '{name}'")
-        try:
-            created = connections.create_connection(ctx.client, payload)
-        except FabricApiError as error:
-            warnings.append(
-                f"Connection '{name}' could not be recreated (HTTP {error.status_code}). "
-                f"Create one against '{new_path}' by hand."
-            )
-            continue
-
-        # Feeding the map here is what makes later phases rebind to the new connection.
-        ctx.id_map[prerequisite["connectionId"]] = created["id"]
-        replaced.append(
-            connections.Replacement(
-                old_id=prerequisite["connectionId"],
-                new_id=created["id"],
-                name=name,
-                old_path=old_path,
-                new_path=new_path,
-            )
-        )
-
-        # A brand new connection is visible only to whoever created it, so everyone who could
-        # use the original would have to be added again by hand otherwise.
-        ctx.run.update_step(step, f"Sharing connection '{name}' with its original users")
-        copied, share_warnings = connections.copy_role_assignments(
-            ctx.client,
-            source_connection_id=prerequisite["connectionId"],
-            target_connection_id=created["id"],
-            client_id=ctx.principal.client_id,
-        )
-        warnings.extend(f"Connection '{name}': {w}" for w in share_warnings)
-        if copied:
-            logger.info("Copied %s role assignment(s) onto the replacement for '%s'", copied, name)
-
-    ctx.warnings.extend(warnings)
-    if replaced:
-        ctx.run.summary["replacedConnections"] = [
-            {"name": r.name, "oldId": r.old_id, "newId": r.new_id, "newPath": r.new_path}
-            for r in replaced
-        ]
-    ctx.run.finish_step(
-        step,
-        StepStatus.SUCCEEDED,
-        f"Recreated {len(replaced)} of {len(prerequisites)} connection(s)",
-        warnings,
-    )
-
-
 # --------------------------------------------------------------------- phase 7
-
-
-# --------------------------------------------------------------------- phase 8
 
 
 def _migrate_realtime(ctx: _Context) -> None:

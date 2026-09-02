@@ -302,16 +302,46 @@ $("#workspace-next").addEventListener("click", async () => {
   }
   busy(button, false);
 
+  await settleAssessment(dependencies);
+});
+
+$("#recheck").addEventListener("click", async () => {
+  const button = $("#recheck");
+  busy(button, true, "Re-checking…");
+  const params = new URLSearchParams({ source_workspace_id: state.workspace.id });
+
+  showDependenciesPending();
+  setStartEnabled(false);
   try {
-    const result = await dependencies;
+    await settleAssessment(api(`/api/preview/dependencies?${params}`));
+  } finally {
+    busy(button, false);
+  }
+});
+
+/** Apply the slow half of the assessment, however it was started. */
+async function settleAssessment(request) {
+  try {
+    const result = await request;
     state.preview.dependencies = result.dependencies;
     state.preview.connectionAccess = result.connectionAccess;
   } catch (error) {
     state.preview.dependencies = [`Dependencies could not be checked: ${error.message}`];
+    state.preview.connectionAccess = null;
   }
+  stopAssessmentTimer();
   renderDependencies();
   renderConnectionAccess();
-});
+  // Only now is it known whether anything blocks the run.
+  setStartEnabled(state.preview.blockers.length === 0);
+}
+
+function setStartEnabled(enabled) {
+  const start = $("#start-run");
+  start.disabled = !enabled;
+  start.title = enabled ? "" : "Waiting for the assessment to finish";
+}
+
 
 // -------------------------------------------------------------------- review
 
@@ -353,22 +383,13 @@ function renderConnectionAccess() {
   access.connections.forEach((entry) => {
     const item = document.createElement("li");
 
-    const role = document.createElement("strong");
-    role.className = "role";
-    role.textContent = entry.role;
-    item.appendChild(role);
-
-    const id = document.createElement("code");
-    id.textContent = entry.connectionName
-      ? `${entry.connectionName} (${entry.connectionId})`
-      : entry.connectionId;
-    item.appendChild(id);
+    const label = document.createElement("code");
+    label.textContent = entry.label;
+    item.appendChild(label);
 
     const why = document.createElement("div");
     why.className = "why";
-    why.textContent = entry.usedBy.length
-      ? `${entry.reason}: ${entry.usedBy.join(", ")}.`
-      : `${entry.reason}.`;
+    why.textContent = `Needed by ${entry.usedBy.join(", ")}.`;
     item.appendChild(why);
 
     list.appendChild(item);
@@ -392,8 +413,37 @@ function showDependenciesPending() {
   const list = container.querySelector("ul");
   list.innerHTML = "";
   const item = document.createElement("li");
-  item.textContent = "Reading references between items, and the connections they use.";
+  item.id = "assessment-progress";
   list.appendChild(item);
+  startAssessmentTimer(item);
+}
+
+/** Tick a live count so a slow assessment visibly moves. */
+function startAssessmentTimer(element) {
+  stopAssessmentTimer();
+  const started = Date.now();
+  const total = state.preview && state.preview.counts ? itemTotal(state.preview.counts) : 0;
+  const scope = total ? `${total} data item(s) plus everything that binds a connection` : "the workspace";
+
+  const tick = () => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    element.textContent =
+      `Reading references and connections across ${scope} — ${seconds}s elapsed. ` +
+      "This walks one API call per item, so it takes a moment on a large workspace.";
+  };
+  tick();
+  state.assessmentTimer = setInterval(tick, 1000);
+}
+
+function stopAssessmentTimer() {
+  if (state.assessmentTimer) {
+    clearInterval(state.assessmentTimer);
+    state.assessmentTimer = null;
+  }
+}
+
+function itemTotal(counts) {
+  return Object.values(counts).reduce((sum, value) => sum + (Number(value) || 0), 0);
 }
 
 function renderReview() {
@@ -455,7 +505,9 @@ function renderReview() {
   $("#rebuild-options").hidden = reassign;
   $("#target-name").value = preview.targetWorkspaceName;
 
-  $("#start-run").disabled = preview.blockers.length > 0;
+  // The button stays disabled until the dependency and connection assessment has finished,
+  // because until then it is not known whether anything blocks the run.
+  setStartEnabled(reassign && preview.blockers.length === 0);
   $("#start-run").textContent = reassign ? "Reassign workspace" : "Start migration";
 }
 
