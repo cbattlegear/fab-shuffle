@@ -1823,6 +1823,14 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     warnings: list[str] = []
     shortcuts_created = 0
 
+    # Names for the items in the source workspace, so a shortcut pointing at something that
+    # did not migrate can say which item that was rather than quoting a GUID.
+    source_items = {
+        item["id"]: item
+        for item in list_items(ctx.client, ctx.plan.source_workspace_id)
+        if item.get("id")
+    }
+
     # KQL table shortcuts can target lakehouses, warehouses, or other KQL databases, so they
     # are only safe to create now that every one of those exists.
     for source_db_id, target_db_id, database_name in ctx.kql_databases:
@@ -1840,6 +1848,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
             target_db_id,
             ctx.id_map,
             shortcuts=table_shortcuts,
+            source_items=source_items,
         )
         shortcuts_created += created
         warnings.extend(f"KQL database '{database_name}': {w}" for w in shortcut_warnings)
@@ -1859,6 +1868,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
             ctx.target_workspace_id,
             target_id,
             ctx.id_map,
+            source_items=source_items,
         )
         shortcuts_created += created
         warnings.extend(f"Lakehouse '{name}': {w}" for w in shortcut_warnings)

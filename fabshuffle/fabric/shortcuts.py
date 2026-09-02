@@ -110,6 +110,56 @@ def _target_kind(target: Mapping[str, Any]) -> str:
     return next((key for key in target if key != "type"), "")
 
 
+def unmigrated_target(
+    shortcut: Mapping[str, Any],
+    id_map: Mapping[str, str],
+    source_workspace_id: str,
+) -> str | None:
+    """The source item a shortcut points at that did not make it to the new workspace.
+
+    Read from the shortcut as it was exported, before remapping, because that is the only
+    place the original ids survive.
+
+    Only a target *inside the workspace being migrated* counts. A shortcut into a different
+    workspace is correct to leave exactly as it is: that workspace is not moving, and the
+    reference still resolves.
+
+    Worth checking before the call rather than after, because the failure it produces is
+    unreadable. The workspace id remaps and the item id does not, so Fabric is asked for an
+    item that was never in that workspace and answers with a bare 400.
+    """
+    target = shortcut.get("target") or {}
+    settings = target.get("oneLake")
+    if not isinstance(settings, Mapping):
+        return None
+
+    workspace_id = settings.get("workspaceId") or ""
+    item_id = settings.get("itemId") or ""
+    if workspace_id != source_workspace_id or not item_id:
+        return None
+    return None if item_id in id_map else str(item_id)
+
+
+def describe_unmigrated(
+    name: str,
+    item_id: str,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    *,
+    label: str = "Shortcut",
+) -> str:
+    """Say which item a shortcut needed, in the words the operator will recognise."""
+    item = (source_items or {}).get(item_id) or {}
+    described = (
+        f"{item.get('type') or 'item'} '{item['displayName']}'"
+        if item.get("displayName")
+        else f"the item {item_id}"
+    )
+    return (
+        f"{label} '{name}' was not created: it points at {described}, which is not in the new "
+        "workspace because it did not migrate. Migrate that item, then recreate the shortcut."
+    )
+
+
 def describe_failure(
     name: str,
     target: Mapping[str, Any],
@@ -176,15 +226,23 @@ def copy_shortcuts(
     target_workspace_id: str,
     target_item_id: str,
     id_map: Mapping[str, str],
+    *,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[int, list[str]]:
     """Recreate every shortcut from a source item onto its migrated counterpart."""
     created = 0
     warnings: list[str] = []
 
     for shortcut in list_shortcuts(client, source_workspace_id, source_item_id):
+        name = str(shortcut.get("name"))
+        missing = unmigrated_target(shortcut, id_map, source_workspace_id)
+        if missing:
+            warnings.append(describe_unmigrated(name, missing, source_items))
+            continue
+
         remapped = remap_shortcut_target(shortcut, id_map)
         if not remapped["target"]:
-            warnings.append(f"Shortcut '{shortcut.get('name')}' has no recognised target, skipped")
+            warnings.append(f"Shortcut '{name}' has no recognised target, skipped")
             continue
         try:
             create_shortcut(client, target_workspace_id, target_item_id, remapped)
@@ -192,7 +250,7 @@ def copy_shortcuts(
         except FabricApiError as error:
             warnings.append(
                 describe_failure(
-                    str(shortcut.get("name")),
+                    name,
                     remapped["target"],
                     error.status_code,
                     said=failure_detail(error),
@@ -263,6 +321,7 @@ def copy_table_shortcuts(
     id_map: Mapping[str, str],
     *,
     shortcuts: Iterable[Mapping[str, Any]] | None = None,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[int, list[str]]:
     """Recreate a KQL database's table shortcuts against the migrated items."""
     source = (
@@ -275,11 +334,17 @@ def copy_table_shortcuts(
     warnings: list[str] = []
 
     for shortcut in source:
+        name = str(shortcut.get("name"))
+        missing = unmigrated_target(shortcut, id_map, source_workspace_id)
+        if missing:
+            warnings.append(
+                describe_unmigrated(name, missing, source_items, label="KQL table shortcut")
+            )
+            continue
+
         target = _remap_target(shortcut.get("target") or {}, id_map)
         if not target:
-            warnings.append(
-                f"KQL table shortcut '{shortcut.get('name')}' has no recognised target, skipped"
-            )
+            warnings.append(f"KQL table shortcut '{name}' has no recognised target, skipped")
             continue
         try:
             create_table_shortcut(
@@ -296,7 +361,7 @@ def copy_table_shortcuts(
         except FabricApiError as error:
             warnings.append(
                 describe_failure(
-                    str(shortcut.get("name")),
+                    name,
                     target,
                     error.status_code,
                     label="KQL table shortcut",
@@ -312,10 +377,12 @@ __all__ = [
     "create_shortcut",
     "create_table_shortcut",
     "describe_failure",
+    "describe_unmigrated",
     "failure_detail",
     "list_shortcuts",
     "list_table_shortcuts",
     "remap_shortcut_target",
     "table_shortcut_keys",
     "table_shortcut_names",
+    "unmigrated_target",
 ]
