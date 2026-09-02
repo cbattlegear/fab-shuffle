@@ -91,10 +91,12 @@ def managed_tables(
     *,
     schema_enabled: bool,
 ) -> list[TableRef]:
-    """Return copyable tables, excluding shortcuts and external tables.
+    """Return the lakehouse's managed tables.
 
-    Shortcuts are recreated through the shortcuts API after the data move, so copying
-    them here would duplicate data and race with shortcut creation.
+    This cannot exclude shortcuts, because nothing in the response marks one: ``TableType``
+    is only ever ``Managed`` or ``External``, and a shortcut to a delta table is reported as
+    ``Managed``. Callers that are about to copy data must filter the result against the
+    shortcuts API, which is the only thing that knows.
     """
     refs: list[TableRef] = []
     for table in list_lakehouse_tables(client, workspace_id, lakehouse_id):

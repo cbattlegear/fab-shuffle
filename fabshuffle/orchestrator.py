@@ -1197,35 +1197,43 @@ def _lakehouse_tables(
 ) -> list[data_stores.TableRef]:
     """List the copyable tables in a lakehouse.
 
-    The lakehouse tables API rejects schema-enabled lakehouses with
-    ``UnsupportedOperationForSchemasEnabledLakehouse``, so those are enumerated over TDS
-    through the SQL analytics endpoint instead. Either way shortcuts are excluded: their data
-    belongs to the shortcut target, and they are recreated separately.
+    Two things have to be worked around. The lakehouse tables API rejects schema-enabled
+    lakehouses with ``UnsupportedOperationForSchemasEnabledLakehouse``, so those are
+    enumerated over TDS through the SQL analytics endpoint instead.
+
+    Either way shortcuts have to come out, and neither source can tell us which tables they
+    are: ``TableType`` is only ``Managed`` or ``External``, and on the SQL endpoint a shortcut
+    is just a table. So both lists are filtered against the shortcuts API. Their data belongs
+    to whatever they point at, and they are recreated properly in the shortcut phase.
     """
     workspace_id = ctx.plan.source_workspace_id
-    if not schema_enabled:
-        return data_stores.managed_tables(
+    if schema_enabled:
+        endpoint = data_stores.lakehouse_sql_endpoint(lakehouse).get("connectionString")
+        if not endpoint:
+            raise sqlschema.SchemaTransferError(
+                "the lakehouse has no SQL analytics endpoint, which is the only way to list the "
+                "tables of a schema-enabled lakehouse"
+            )
+        found = [
+            data_stores.TableRef(name=table, schema=schema)
+            for schema, table in sqlschema.list_base_tables(
+                endpoint, lakehouse["displayName"], ctx.tokens
+            )
+        ]
+    else:
+        found = data_stores.managed_tables(
             ctx.client, workspace_id, lakehouse["id"], schema_enabled=False
         )
 
-    endpoint = data_stores.lakehouse_sql_endpoint(lakehouse).get("connectionString")
-    if not endpoint:
-        raise sqlschema.SchemaTransferError(
-            "the lakehouse has no SQL analytics endpoint, which is the only way to list the "
-            "tables of a schema-enabled lakehouse"
-        )
-
-    shortcut_keys = {
-        (s.get("path", "").rsplit("/", 1)[-1].casefold(), (s.get("name") or "").casefold())
-        for s in shortcuts.list_shortcuts(ctx.client, workspace_id, lakehouse["id"])
-    }
-
-    refs: list[data_stores.TableRef] = []
-    for schema, table in sqlschema.list_base_tables(endpoint, lakehouse["displayName"], ctx.tokens):
-        if (schema.casefold(), table.casefold()) in shortcut_keys:
-            continue
-        refs.append(data_stores.TableRef(name=table, schema=schema))
-    return refs
+    shortcut_keys = shortcuts.table_shortcut_keys(
+        shortcuts.list_shortcuts(ctx.client, workspace_id, lakehouse["id"])
+    )
+    return [
+        ref
+        for ref in found
+        if (ref.schema.casefold() if ref.schema else None, ref.name.casefold())
+        not in shortcut_keys
+    ]
 
 
 def _copy_lakehouse_files(

@@ -133,3 +133,62 @@ def test_a_classic_lakehouse_still_uses_the_tables_api(monkeypatch):
 
     assert called == {"schema_enabled": False}
     assert [r.name for r in refs] == ["Orders"]
+
+
+def test_shortcuts_are_excluded_from_a_classic_lakehouse_too(monkeypatch):
+    """The regression: a shortcut is indistinguishable from a table in the tables API.
+
+    ``TableType`` is only ever ``Managed`` or ``External``, so a shortcut to a delta table is
+    reported as ``Managed`` like any other. Copying it duplicated the data into the target and
+    left a real table sitting on the name, so the shortcut phase then failed with a conflict
+    against our own copy.
+    """
+    client = FakeClient(shortcuts_=[{"path": "Tables", "name": "random_table"}])
+    monkeypatch.setattr(
+        orchestrator.data_stores,
+        "managed_tables",
+        lambda *a, **k: [
+            data_stores.TableRef(name="Orders"),
+            data_stores.TableRef(name="random_table"),
+        ],
+    )
+    ctx = make_ctx(client, monkeypatch, [])
+
+    refs = orchestrator._lakehouse_tables(ctx, CLASSIC_LAKEHOUSE, schema_enabled=False)
+
+    assert [r.name for r in refs] == ["Orders"]
+
+
+def test_a_files_shortcut_does_not_exclude_a_table_of_the_same_name(monkeypatch):
+    client = FakeClient(shortcuts_=[{"path": "Files/landing", "name": "Orders"}])
+    monkeypatch.setattr(
+        orchestrator.data_stores,
+        "managed_tables",
+        lambda *a, **k: [data_stores.TableRef(name="Orders")],
+    )
+    ctx = make_ctx(client, monkeypatch, [])
+
+    assert [r.name for r in orchestrator._lakehouse_tables(ctx, CLASSIC_LAKEHOUSE, schema_enabled=False)] == [
+        "Orders"
+    ]
+
+
+def test_a_schema_shortcut_does_not_exclude_the_same_name_in_another_schema(monkeypatch):
+    client = FakeClient(shortcuts_=[{"path": "Tables/shared", "name": "Orders"}])
+    ctx = make_ctx(client, monkeypatch, [("dbo", "Orders"), ("shared", "Orders")])
+
+    refs = orchestrator._lakehouse_tables(ctx, SCHEMA_LAKEHOUSE, schema_enabled=True)
+
+    assert {(r.schema, r.name) for r in refs} == {("dbo", "Orders")}
+
+
+def test_a_leading_slash_on_the_shortcut_path_still_matches(monkeypatch):
+    client = FakeClient(shortcuts_=[{"path": "/Tables/", "name": "random_table"}])
+    monkeypatch.setattr(
+        orchestrator.data_stores,
+        "managed_tables",
+        lambda *a, **k: [data_stores.TableRef(name="random_table")],
+    )
+    ctx = make_ctx(client, monkeypatch, [])
+
+    assert orchestrator._lakehouse_tables(ctx, CLASSIC_LAKEHOUSE, schema_enabled=False) == []

@@ -17,6 +17,40 @@ def list_shortcuts(client: FabricClient, workspace_id: str, item_id: str) -> lis
         raise
 
 
+def table_shortcut_keys(shortcuts: Iterable[Mapping[str, Any]]) -> set[tuple[str | None, str]]:
+    """Identify which of a lakehouse's tables are really shortcuts.
+
+    Nothing in the lakehouse tables API distinguishes them: ``TableType`` is only ever
+    ``Managed`` or ``External``, so a shortcut to a delta table is reported as ``Managed``
+    exactly like a table that lives there. The only way to tell them apart is to ask the
+    shortcuts API and match on name, which is what this returns keys for.
+
+    That matters because a shortcut's data belongs to whatever it points at. Copying it would
+    duplicate the data into the target and then leave a real table sitting on the name the
+    shortcut phase needs, so recreating the shortcut fails on a collision with our own copy.
+
+    Keys are ``(schema, name)`` case-folded, with ``schema`` ``None`` for a lakehouse without
+    schemas, matching how :class:`~fabshuffle.fabric.data_stores.TableRef` describes a table.
+    Shortcuts under ``Files/`` are ignored: they are not tables, and one sharing a name with a
+    table must not exclude it.
+    """
+    keys: set[tuple[str | None, str]] = set()
+    for shortcut in shortcuts:
+        name = (shortcut.get("name") or "").strip()
+        if not name:
+            continue
+        segments = [
+            segment
+            for segment in str(shortcut.get("path") or "").replace("\\", "/").split("/")
+            if segment
+        ]
+        if not segments or segments[0].casefold() != "tables":
+            continue
+        schema = segments[1].casefold() if len(segments) > 1 else None
+        keys.add((schema, name.casefold()))
+    return keys
+
+
 def create_shortcut(
     client: FabricClient,
     workspace_id: str,
@@ -93,8 +127,8 @@ def describe_failure(
 
     if status_code == 409:
         reason = (
-            "a shortcut of that name already exists there. Delete it if you are re-running "
-            "into a workspace that was already partly migrated"
+            "something of that name is already there. Delete it if you are re-running into a "
+            "workspace that was already partly migrated"
         )
     elif status_code == 404 and internal:
         reason = (
@@ -261,5 +295,6 @@ __all__ = [
     "list_shortcuts",
     "list_table_shortcuts",
     "remap_shortcut_target",
+    "table_shortcut_keys",
     "table_shortcut_names",
 ]

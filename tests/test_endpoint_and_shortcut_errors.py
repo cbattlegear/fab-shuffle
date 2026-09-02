@@ -113,7 +113,10 @@ def test_the_source_is_waited_for_before_extracting(monkeypatch, tmp_path: Path)
 def test_a_conflict_says_the_name_is_taken() -> None:
     message = shortcuts.describe_failure("random_table", ONELAKE, 409)
 
-    assert "already exists" in message
+    # Deliberately not "a shortcut of that name": whatever holds the name need not be a
+    # shortcut, and saying so sent us hunting for a shortcut that was never there.
+    assert "already there" in message
+    assert "shortcut of that name" not in message
     assert "connection" not in message
 
 
