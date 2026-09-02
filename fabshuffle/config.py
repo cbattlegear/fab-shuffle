@@ -54,6 +54,11 @@ class Settings:
     sql_endpoint_timeout_seconds: int = _env_int("FAB_SHUFFLE_SQL_ENDPOINT_TIMEOUT_SECONDS", 1800)
 
     # External tooling that has no REST equivalent yet.
+    # Both of these are bounded low on purpose. sqlpackage is a .NET process of a few hundred
+    # megabytes; azcopy tunes its own concurrency and stages whole directories through local
+    # disk. Several at once compete for the same memory and disk rather than going faster.
+    schema_transfer_concurrency: int = _env_int("FAB_SHUFFLE_SCHEMA_CONCURRENCY", 2)
+    file_transfer_concurrency: int = _env_int("FAB_SHUFFLE_FILE_CONCURRENCY", 2)
     sqlpackage_path: str = os.environ.get("FAB_SHUFFLE_SQLPACKAGE", "sqlpackage")
     unpackdacpac_path: str = os.environ.get("FAB_SHUFFLE_UNPACKDACPAC", "unpackdacpac")
     azcopy_path: str = os.environ.get("FAB_SHUFFLE_AZCOPY", "azcopy")

@@ -49,11 +49,12 @@ from __future__ import annotations
 
 import logging
 import shutil
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fabshuffle import concurrency
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
@@ -1170,9 +1171,7 @@ def _migrate_lakehouses(ctx: _Context) -> None:
         warnings.extend(_copy_lakehouse_tables(ctx, step, created_pairs))
 
     if ctx.plan.include_files:
-        for lakehouse, target, _schema in created_pairs:
-            ctx.run.raise_if_cancelled()
-            warnings.extend(_copy_lakehouse_files(ctx, step, lakehouse, target))
+        warnings.extend(_copy_all_lakehouse_files(ctx, step, created_pairs))
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
@@ -1286,40 +1285,67 @@ def _lakehouse_tables(
     ]
 
 
-def _copy_lakehouse_files(
+def _copy_all_lakehouse_files(
     ctx: _Context,
     step: str,
+    pairs: list[tuple[dict[str, Any], dict[str, Any], bool]],
+) -> list[str]:
+    """Copy every lakehouse's ``Files/``, a couple at a time.
+
+    Bounded tightly. Each copy stages the whole directory through local disk on the way past,
+    and azcopy already tunes its own parallelism, so more of them at once mostly means more
+    of them competing for the same disk.
+    """
+    jobs = [
+        concurrency.Job(
+            key=lakehouse["displayName"],
+            run=_lakehouse_file_job(ctx, lakehouse, target),
+        )
+        for lakehouse, target, _schema in pairs
+    ]
+    return concurrency.run_bounded(
+        jobs,
+        limit=SETTINGS.file_transfer_concurrency,
+        on_progress=lambda message: ctx.run.update_step(step, f"Copying files: {message}"),
+        noun="file copy",
+    )
+
+
+def _lakehouse_file_job(
+    ctx: _Context,
     lakehouse: dict[str, Any],
     target: dict[str, Any],
-) -> list[str]:
+) -> Callable[[], list[str]]:
     name = lakehouse["displayName"]
     source_files = (lakehouse.get("properties") or {}).get("oneLakeFilesPath")
     target_files = (target.get("properties") or {}).get("oneLakeFilesPath")
-    if not source_files or not target_files:
-        return []
 
-    ctx.run.update_step(step, f"Copying files for lakehouse '{name}'")
-    try:
-        file_transfer.copy_files(
-            source_files_path=source_files,
-            target_files_path=target_files,
-            principal=ctx.principal,
-            scratch_dir=ctx.scratch_dir / f"lakehouse-{lakehouse['id']}",
-            on_progress=lambda message: ctx.run.update_step(step, f"{name}: {message}"),
-        )
-        return []
-    except file_transfer.FileTransferError as error:
-        return [f"Files for lakehouse '{name}' did not copy: {error}"]
+    def run() -> list[str]:
+        if not source_files or not target_files:
+            return []
+        ctx.run.raise_if_cancelled()
+        try:
+            file_transfer.copy_files(
+                source_files_path=source_files,
+                target_files_path=target_files,
+                principal=ctx.principal,
+                scratch_dir=ctx.scratch_dir / f"lakehouse-{lakehouse['id']}",
+            )
+            return []
+        except file_transfer.FileTransferError as error:
+            return [f"Files for lakehouse '{name}' did not copy: {error}"]
+
+    return run
 
 
 # --------------------------------------------------------------------- phase 4
 
 
 def _migrate_warehouses(ctx: _Context) -> None:
-    """Recreate warehouses: schema one at a time, then all the data together.
+    """Recreate warehouses: create them all, transfer schema, then copy all the data.
 
-    The schema has to land before the data, since a Copy Job appends into tables it does not
-    create. Beyond that nothing here reads another warehouse, so the copies run as a batch.
+    Each stage waits for the last because each depends on it, but within a stage nothing
+    here reads another warehouse, so the schema transfers run together and so do the copies.
     """
     step = "warehouses"
     ctx.run.start_step(step, "Migrating warehouses")
@@ -1331,7 +1357,7 @@ def _migrate_warehouses(ctx: _Context) -> None:
         return
 
     warnings: list[str] = []
-    ready: list[tuple[dict[str, Any], str, str, str]] = []
+    created_pairs: list[tuple[dict[str, Any], str, str, str]] = []
 
     for warehouse in source_warehouses:
         ctx.run.raise_if_cancelled()
@@ -1354,24 +1380,10 @@ def _migrate_warehouses(ctx: _Context) -> None:
         if source_endpoint and target_endpoint:
             ctx.id_map[source_endpoint] = target_endpoint
 
-        ctx.run.update_step(step, f"Transferring schema for warehouse '{name}'")
-        try:
-            schema_warnings = sqlschema.transfer_schema(
-                source_server=source_endpoint,
-                target_server=target_endpoint,
-                database=name,
-                principal=ctx.principal,
-                tokens=ctx.tokens,
-                scratch_dir=ctx.scratch_dir / "sql",
-                source_type="Warehouse",
-                on_progress=lambda message: ctx.run.update_step(step, message),
-            )
-            warnings.extend(f"Warehouse '{name}': {w}" for w in schema_warnings)
-        except sqlschema.SchemaTransferError as error:
-            warnings.append(f"Schema for warehouse '{name}' did not transfer: {error}")
-            continue
+        created_pairs.append((warehouse, created["id"], source_endpoint, target_endpoint))
 
-        ready.append((warehouse, created["id"], source_endpoint, target_endpoint))
+    ready, schema_warnings = _transfer_warehouse_schemas(ctx, step, created_pairs)
+    warnings.extend(schema_warnings)
 
     if ctx.plan.include_data:
         warnings.extend(_copy_warehouse_tables(ctx, step, ready))
@@ -1380,6 +1392,60 @@ def _migrate_warehouses(ctx: _Context) -> None:
     ctx.run.finish_step(
         step, StepStatus.SUCCEEDED, f"Migrated {len(source_warehouses)} warehouse(s)", warnings
     )
+
+
+def _transfer_warehouse_schemas(
+    ctx: _Context,
+    step: str,
+    pairs: list[tuple[dict[str, Any], str, str, str]],
+) -> tuple[list[tuple[dict[str, Any], str, str, str]], list[str]]:
+    """Copy every warehouse's schema, a couple at a time.
+
+    Most of the elapsed time here is spent waiting: a freshly created endpoint takes minutes
+    to answer at all, and it does that whether or not we are watching another one.
+    """
+    ready: list[tuple[dict[str, Any], str, str, str]] = []
+    jobs: list[concurrency.Job] = []
+
+    def transfer(entry: tuple[dict[str, Any], str, str, str]) -> Callable[[], list[str]]:
+        warehouse, _target_id, source_endpoint, target_endpoint = entry
+        name = warehouse["displayName"]
+
+        def run() -> list[str]:
+            ctx.run.raise_if_cancelled()
+            try:
+                warnings = sqlschema.transfer_schema(
+                    source_server=source_endpoint,
+                    target_server=target_endpoint,
+                    database=name,
+                    principal=ctx.principal,
+                    tokens=ctx.tokens,
+                    scratch_dir=ctx.scratch_dir / "sql",
+                    source_type="Warehouse",
+                )
+            except sqlschema.SchemaTransferError as error:
+                # Without a schema there is nowhere for the rows to land, so this warehouse
+                # is left out of the copy rather than failing a table at a time.
+                return [f"Schema for warehouse '{name}' did not transfer: {error}"]
+            ready.append(entry)
+            return [f"Warehouse '{name}': {w}" for w in warnings]
+
+        return run
+
+    for entry in pairs:
+        jobs.append(concurrency.Job(key=entry[0]["displayName"], run=transfer(entry)))
+
+    warnings = concurrency.run_bounded(
+        jobs,
+        limit=SETTINGS.schema_transfer_concurrency,
+        on_progress=lambda message: ctx.run.update_step(step, f"Transferring schema: {message}"),
+        noun="schema transfer",
+    )
+    # Restored to the order the warehouses were listed in, so the copy jobs that follow are
+    # started in a fixed order too.
+    order = {id(entry): index for index, entry in enumerate(pairs)}
+    ready.sort(key=lambda entry: order[id(entry)])
+    return ready, warnings
 
 
 def _copy_warehouse_tables(
@@ -1891,6 +1957,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
     warnings: list[str] = []
     shortcuts_created = 0
+    endpoints: list[tuple[str, str, str]] = []
 
     # Names for the items in the source workspace, so a shortcut pointing at something that
     # did not migrate can say which item that was rather than quoting a GUID.
@@ -1954,28 +2021,49 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
         source_endpoint = data_stores.lakehouse_sql_endpoint(lakehouse).get("connectionString")
         target_endpoint = endpoint.get("connectionString")
-        if not source_endpoint or not target_endpoint:
-            continue
+        if source_endpoint and target_endpoint:
+            endpoints.append((name, source_endpoint, target_endpoint))
 
-        ctx.run.update_step(step, f"Transferring SQL endpoint schema for '{name}'")
-        try:
-            schema_warnings = sqlschema.transfer_schema(
-                source_server=source_endpoint,
-                target_server=target_endpoint,
-                database=name,
-                principal=ctx.principal,
-                tokens=ctx.tokens,
-                scratch_dir=ctx.scratch_dir / "sql",
-                source_type="Lakehouse",
-                on_progress=lambda message: ctx.run.update_step(step, message),
-            )
-            warnings.extend(f"Lakehouse '{name}' SQL endpoint: {w}" for w in schema_warnings)
-        except sqlschema.SchemaTransferError as error:
-            warnings.append(f"SQL endpoint schema for '{name}' did not transfer: {error}")
+    # Every endpoint has been refreshed by now, so the schema copies can run together. They
+    # are the slow part of this phase: a refreshed endpoint takes minutes to answer, and it
+    # takes them whether or not we are also waiting on another one.
+    warnings.extend(_transfer_endpoint_schemas(ctx, step, endpoints))
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
         step, StepStatus.SUCCEEDED, f"Created {shortcuts_created} shortcut(s)", warnings
+    )
+
+
+def _transfer_endpoint_schemas(
+    ctx: _Context,
+    step: str,
+    endpoints: list[tuple[str, str, str]],
+) -> list[str]:
+    def transfer(name: str, source_endpoint: str, target_endpoint: str) -> Callable[[], list[str]]:
+        def run() -> list[str]:
+            ctx.run.raise_if_cancelled()
+            try:
+                warnings = sqlschema.transfer_schema(
+                    source_server=source_endpoint,
+                    target_server=target_endpoint,
+                    database=name,
+                    principal=ctx.principal,
+                    tokens=ctx.tokens,
+                    scratch_dir=ctx.scratch_dir / "sql",
+                    source_type="Lakehouse",
+                )
+            except sqlschema.SchemaTransferError as error:
+                return [f"SQL endpoint schema for '{name}' did not transfer: {error}"]
+            return [f"Lakehouse '{name}' SQL endpoint: {w}" for w in warnings]
+
+        return run
+
+    return concurrency.run_bounded(
+        [concurrency.Job(key=name, run=transfer(name, source, target)) for name, source, target in endpoints],
+        limit=SETTINGS.schema_transfer_concurrency,
+        on_progress=lambda message: ctx.run.update_step(step, f"Transferring endpoint schema: {message}"),
+        noun="schema transfer",
     )
 
 
