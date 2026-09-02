@@ -81,6 +81,17 @@ from fabshuffle.transfer import kql, sqlschema
 
 logger = logging.getLogger(__name__)
 
+# Item types whose definitions bind a tenant connection. Creating one of these is refused
+# outright if the service principal cannot use the connection, so they are worth checking
+# before anything is built.
+CONNECTION_BINDING_TYPES = (
+    analytics.DATA_PIPELINE,
+    analytics.COPY_JOB,
+    analytics.EVENTSTREAM,
+    analytics.MIRRORED_DATABASE,
+    analytics.REFLEX,
+)
+
 
 @dataclass
 class DependencyReport:
@@ -90,11 +101,14 @@ class DependencyReport:
     available: bool = True
     issues: list[relations.DependencyIssue] = field(default_factory=list)
     prerequisites: list[connections.Prerequisite] = field(default_factory=list)
+    bound: list[str] = field(default_factory=list)
 
     def messages(self) -> list[str]:
-        return [issue.message() for issue in self.issues] + [
-            prerequisite.message() for prerequisite in self.prerequisites
-        ]
+        return (
+            [issue.message() for issue in self.issues]
+            + [prerequisite.message() for prerequisite in self.prerequisites]
+            + list(self.bound)
+        )
 
 
 @dataclass
@@ -346,6 +360,59 @@ def _report_unsupported_items(ctx: _Context) -> None:
     ctx.run.finish_step(step, StepStatus.SUCCEEDED, detail, warnings)
 
 
+def bound_connection_warnings(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    client_id: str,
+) -> list[str]:
+    """Report connections that migrated items bind but this service principal cannot use.
+
+    An item that binds an unusable connection is rejected outright at creation, and the
+    rejection arrives per item, so a workspace where one connection is shared by six items
+    fails six times for the same reason after everything else has already been built. The
+    definitions are read up front instead, and the connections reported once, so the access
+    can be granted before the run rather than after it.
+    """
+    binding_items: list[tuple[str, str, str]] = []
+    for item_type in CONNECTION_BINDING_TYPES:
+        for item in analytics.list_of_type(client, source_workspace_id, item_type):
+            binding_items.append((item_type, item.get("displayName") or item["id"], item["id"]))
+
+    if not binding_items:
+        return []
+
+    known = connections.connections_by_id(client)
+    # Without the tenant's connections there is nothing to compare against, and the run
+    # already warns about that separately.
+    if not known:
+        return []
+
+    # connection id -> the items that bind it
+    unusable: dict[str, list[str]] = {}
+    for item_type, name, item_id in binding_items:
+        definition = items_module.try_get_item_definition(client, source_workspace_id, item_id)
+        if not definition:
+            continue
+        for connection_id in connections.referenced_connection_ids(definition.get("parts") or []):
+            if connection_id not in known:
+                unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
+
+    if not unusable:
+        return []
+
+    listed = "; ".join(
+        f"{connection_id} (used by {', '.join(sorted(items))})"
+        for connection_id, items in sorted(unusable.items())
+    )
+    return [
+        f"{len(unusable)} connection(s) are bound by items in this workspace but cannot be seen "
+        f"by this service principal, so those items will be refused when they are recreated: "
+        f"{listed}. Grant it access in Manage Connections and Gateways before running, or "
+        "recreate those items by hand afterwards."
+    ]
+
+
 def dependency_warnings(
     client: FabricClient,
     *,
@@ -374,7 +441,14 @@ def dependency_warnings(
         migrated=migrated,
         client_id=client_id,
     )
-    return DependencyReport(graph=graph, issues=issues, prerequisites=prerequisites)
+    return DependencyReport(
+        graph=graph,
+        issues=issues,
+        prerequisites=prerequisites,
+        bound=bound_connection_warnings(
+            client, source_workspace_id=source_workspace_id, client_id=client_id
+        ),
+    )
 
 
 def connection_prerequisites(
@@ -1370,8 +1444,10 @@ def _replace_connections(ctx: _Context) -> None:
 
         if new_path == old_path:
             warnings.append(
-                f"Connection '{name}' points into this workspace but nothing in its path "
-                f"('{old_path}') matched a migrated item, so it was left alone."
+                f"Connection '{name}' points into this workspace, but nothing in its path "
+                f"('{old_path}') is an id or endpoint that changed during this migration, so "
+                "there was nothing to repoint it to. It still works against the source "
+                "workspace; recreate it by hand if you want the copy to use the new items."
             )
             continue
 
