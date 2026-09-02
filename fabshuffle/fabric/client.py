@@ -10,6 +10,7 @@ three behaviours every Fabric caller has to get right:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -44,6 +45,31 @@ class FabricApiError(FabricError):
         self.status_code = status_code
         self.body = body
         super().__init__(f"{method} {url} failed with HTTP {status_code}: {body}")
+
+    @property
+    def error_code(self) -> str:
+        """The service's own error code, which says far more than the status does."""
+        return self._from_body("errorCode")
+
+    @property
+    def detail(self) -> str:
+        return self._from_body("message")
+
+    def _from_body(self, key: str) -> str:
+        try:
+            parsed = json.loads(self.body)
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(parsed, Mapping):
+            return ""
+        value = parsed.get(key)
+        if value:
+            return str(value)
+        # Some responses nest the useful part one level down.
+        for nested in parsed.values():
+            if isinstance(nested, Mapping) and nested.get(key):
+                return str(nested[key])
+        return ""
 
 
 class OperationFailed(FabricError):

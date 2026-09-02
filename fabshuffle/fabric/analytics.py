@@ -24,7 +24,6 @@ from fabshuffle.fabric.client import (
     FabricApiError,
     FabricClient,
     FabricError,
-    OperationFailed,
     OperationTimeout,
 )
 from fabshuffle.fabric.definitions import (
@@ -269,30 +268,34 @@ def describe_failure(item_type: str, name: str, error: FabricError) -> str:
     """Explain why one item could not be created.
 
     Creation is a long running operation for several item types, so the interesting failure
-    usually arrives from the operation rather than from the request that started it, carrying
-    an error code worth repeating back.
+    can arrive either from the request or from the operation behind it. Both carry the
+    service's own error code, which says far more than a status ever does, so it is always
+    repeated back rather than being flattened into "check its data source bindings".
     """
-    if isinstance(error, OperationFailed) and error.error_code == "DataSourcesValidationError":
+    code = getattr(error, "error_code", "")
+    detail = getattr(error, "detail", "")
+
+    if code == "DataSourcesValidationError":
         return (
             f"{item_type} '{name}' was not migrated: one of its sources uses a connection "
             "this service principal cannot reach. Connections are tenant wide, so grant it "
             "access to the connection in Manage Connections and Gateways, then recreate the "
             f"{item_type.lower()}."
         )
-    if isinstance(error, OperationFailed):
-        detail = error.detail or error.error_code or "the operation failed"
-        return f"{item_type} '{name}' was not migrated: {detail}"
     if isinstance(error, OperationTimeout):
         return (
             f"{item_type} '{name}' was still being created when we stopped waiting. Check the "
             "new workspace before recreating it, in case it arrived late."
         )
-    if isinstance(error, FabricApiError):
-        return (
-            f"{item_type} '{name}' was not migrated (HTTP {error.status_code}). "
-            "Recreate it manually and check its data source bindings."
-        )
-    return f"{item_type} '{name}' was not migrated: {error}"
+
+    status = f" (HTTP {error.status_code})" if isinstance(error, FabricApiError) else ""
+    said = " ".join(part for part in (code, detail) if part).strip()
+    if said:
+        return f"{item_type} '{name}' was not migrated{status}: {said}"
+    return (
+        f"{item_type} '{name}' was not migrated{status}. Recreate it manually and check its "
+        "data source bindings."
+    )
 
 
 def migrate_items(

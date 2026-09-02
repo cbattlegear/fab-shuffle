@@ -65,6 +65,9 @@ RELATION_TYPE_ALIASES = {
     "kustoeventhouse": "Eventhouse",
     "kustodatabase": "KQLDatabase",
     "datamart": "Datamart",
+    # The relations APIs call a Fabric SQL database this, matching the GraphQL source type
+    # enum rather than the item type.
+    "sqldbnative": "SQLDatabase",
 }
 
 

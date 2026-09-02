@@ -17,12 +17,15 @@ SYSTEM_ITEM_NAMES = frozenset(
         "dataflowsstagingwarehouse",
         "monitoring eventhouse",
         "monitoring kql database",
+        "monitoring_eventstream",
     }
 )
 
-# The monitoring eventhouse and its database are created by turning on workspace monitoring,
-# not by creating an eventhouse, so they cannot be migrated as items at all.
-MONITORING_ITEM_NAMES = frozenset({"monitoring eventhouse", "monitoring kql database"})
+# Items created by turning on workspace monitoring rather than by creating an item, so they
+# cannot be migrated at all: the feature is switched on in the new workspace instead.
+MONITORING_ITEM_NAMES = frozenset(
+    {"monitoring eventhouse", "monitoring kql database", "monitoring_eventstream"}
+)
 
 
 def is_system_item(item: Mapping[str, Any]) -> bool:

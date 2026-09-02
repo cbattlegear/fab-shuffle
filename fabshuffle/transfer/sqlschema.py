@@ -31,12 +31,17 @@ CONNECT_WAIT_SECONDS = 15
 # produces freely while it is still waking up.
 _TRANSIENT_SQLSTATES = ("08", "HYT")
 # Messages the endpoint returns while a database exists but is not yet servable. These do not
-# come back under a connection-class SQLSTATE, so they are matched on text.
+# come back under a connection-class SQLSTATE, so they are matched on text. In particular a
+# freshly created warehouse answers a login with 28000 and "the database was not found",
+# which reads like a permission problem and is really the endpoint still catching up.
 _TRANSIENT_MESSAGES = (
     "not currently available",
     "is not available",
     "try the connection later",
     "please retry",
+    "database was not found",
+    "cannot open database",
+    "cannot open server",
 )
 
 # sqlpackage emits a SQLCMD preamble that Fabric's endpoint cannot parse. Everything up to
@@ -247,6 +252,19 @@ def _batches(script: str) -> list[str]:
     ]
 
 
+def _already_exists(error: pyodbc.Error) -> bool:
+    """Whether a batch failed only because the object it creates is already there.
+
+    Deploying into a lakehouse SQL analytics endpoint replays DDL for schemas the endpoint
+    derives from OneLake itself, so these are expected rather than problems.
+    """
+    state = str(error.args[0]) if error.args else ""
+    if state == "42S01":
+        return True
+    text = str(error).lower()
+    return "already exists" in text or "there is already an object named" in text
+
+
 def apply_script(
     script_path: Path,
     *,
@@ -269,6 +287,11 @@ def apply_script(
             try:
                 cursor.execute(batch)
             except pyodbc.Error as error:
+                if _already_exists(error):
+                    # A schema-enabled lakehouse derives its schemas from OneLake, so the
+                    # deploy script recreating them is expected and not worth reporting.
+                    logger.debug("Skipping batch %s, the object already exists", index)
+                    continue
                 summary = " ".join(batch.split())[:120]
                 warnings.append(f"Batch {index} failed ({error.args[0] if error.args else error}): {summary}")
             if on_progress and index % 25 == 0:
