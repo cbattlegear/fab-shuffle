@@ -120,6 +120,38 @@ def test_a_conflict_says_the_name_is_taken() -> None:
     assert "connection" not in message
 
 
+def test_an_unreadable_status_repeats_what_the_service_said() -> None:
+    """A 400 tells us nothing on its own, so guessing is worse than quoting."""
+    message = shortcuts.describe_failure(
+        "dbo_movies", ONELAKE, 400, said="InvalidPath The specified path is not supported"
+    )
+
+    assert "The specified path is not supported" in message
+    assert "the request was rejected" not in message
+
+
+def test_a_recognised_status_still_carries_the_detail() -> None:
+    message = shortcuts.describe_failure("dbo_movies", ONELAKE, 404, said="ItemNotFound no such item")
+
+    # Our reading of the status is a guess, so the service's own words go alongside it.
+    assert "does not exist in the new workspace" in message
+    assert "ItemNotFound no such item" in message
+
+
+def test_a_status_with_nothing_said_still_reads_as_a_sentence() -> None:
+    message = shortcuts.describe_failure("dbo_movies", ONELAKE, 400)
+
+    assert message.endswith("the request was rejected. Recreate it by hand.")
+
+
+def test_the_detail_joins_the_code_and_the_message() -> None:
+    error = FabricApiError(
+        "POST", "url", 400, '{"errorCode":"InvalidPath","message":"not supported"}'
+    )
+
+    assert shortcuts.failure_detail(error) == "InvalidPath not supported"
+
+
 def test_a_missing_internal_target_blames_the_item_not_the_connection() -> None:
     message = shortcuts.describe_failure("dbo_movies", ONELAKE, 404)
 

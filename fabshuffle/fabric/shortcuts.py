@@ -116,12 +116,17 @@ def describe_failure(
     status_code: int,
     *,
     label: str = "Shortcut",
+    said: str = "",
 ) -> str:
     """Explain why a shortcut could not be created.
 
     The status says which of three quite different things went wrong, and the fix differs for
     an internal OneLake target and an external one, so the message is built from both rather
     than blaming the connection for everything.
+
+    ``said`` is whatever the service itself reported. Where our own reading of the status is
+    a guess, that is the only thing that says what actually happened, so it is repeated back
+    rather than being flattened into "the request was rejected".
     """
     internal = _target_kind(target) == "oneLake"
 
@@ -147,10 +152,21 @@ def describe_failure(
             "its connection denied access. The connection is tenant wide, so check the "
             "service principal is allowed to use it and its credentials are still valid"
         )
+    elif said:
+        # Nothing useful can be inferred from the status alone, but the service said why.
+        reason = said
     else:
         reason = "the request was rejected. Recreate it by hand"
 
-    return f"{label} '{name}' could not be created (HTTP {status_code}): {reason}."
+    message = f"{label} '{name}' could not be created (HTTP {status_code}): {reason}."
+    # A recognised status still benefits from the detail, in case our reading of it is wrong.
+    if said and said not in reason:
+        message = f"{message} The service said: {said}."
+    return message
+
+
+def failure_detail(error: FabricApiError) -> str:
+    return " ".join(part for part in (error.error_code, error.detail) if part).strip()
 
 
 def copy_shortcuts(
@@ -176,7 +192,10 @@ def copy_shortcuts(
         except FabricApiError as error:
             warnings.append(
                 describe_failure(
-                    str(shortcut.get("name")), remapped["target"], error.status_code
+                    str(shortcut.get("name")),
+                    remapped["target"],
+                    error.status_code,
+                    said=failure_detail(error),
                 )
             )
     return created, warnings
@@ -281,6 +300,7 @@ def copy_table_shortcuts(
                     target,
                     error.status_code,
                     label="KQL table shortcut",
+                    said=failure_detail(error),
                 )
             )
     return created, warnings
@@ -292,6 +312,7 @@ __all__ = [
     "create_shortcut",
     "create_table_shortcut",
     "describe_failure",
+    "failure_detail",
     "list_shortcuts",
     "list_table_shortcuts",
     "remap_shortcut_target",
