@@ -73,6 +73,8 @@ class FakeClient:
     def get(self, path, params=None):
         if path == f"workspaces/{TARGET_WS}/sqlDatabases/{TARGET_DB}":
             return TARGET_ITEM
+        if "/jobs/instances/" in path:
+            return {"status": "Completed"}
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, path, json=None, params=None, wait=True):
@@ -102,8 +104,8 @@ class FakeClient:
 
 def make_ctx(client, monkeypatch, tables=(("dbo", "Orders"),)):
     monkeypatch.setattr(orchestrator.sqlschema, "list_base_tables", lambda *a, **k: list(tables))
-    monkeypatch.setattr(orchestrator.copyjobs, "start_copy_job", lambda *a, **k: "inst-1")
-    monkeypatch.setattr(orchestrator.copyjobs, "wait_for_copy_job", lambda *a, **k: {})
+    # The batch runner polls between passes; nothing here needs real time to pass.
+    monkeypatch.setattr(orchestrator.copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
 
     plan = orchestrator.MigrationPlan(
         capacity_id="cap",

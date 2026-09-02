@@ -10,11 +10,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric.client import FabricClient
+from fabshuffle.fabric.client import FabricClient, FabricError
 from fabshuffle.fabric.data_stores import TableRef
 from fabshuffle.fabric.definitions import part, platform_part
 
@@ -283,7 +284,7 @@ def run_copy_job(
     *,
     on_status: Callable[[str], None] | None = None,
 ) -> str:
-    """Create, run, and await a Copy Job. Returns the created Copy Job item id."""
+    """Create, run, and await a single Copy Job. Returns the created Copy Job item id."""
     copy_job = create_copy_job(client, workspace_id, display_name, content)
     copy_job_id = copy_job["id"]
     instance_id = start_copy_job(client, workspace_id, copy_job_id)
@@ -291,14 +292,135 @@ def run_copy_job(
     return copy_job_id
 
 
+@dataclass(frozen=True, slots=True)
+class CopyJobSpec:
+    """One Copy Job to run, and how to name it if it goes wrong."""
+
+    workspace_id: str
+    display_name: str
+    content: dict[str, Any]
+    label: str
+
+
+@dataclass(slots=True)
+class _InFlight:
+    spec: CopyJobSpec
+    copy_job_id: str
+    instance_id: str
+
+
+def _job_status(client: FabricClient, job: _InFlight) -> str:
+    instance = client.get(
+        f"workspaces/{job.spec.workspace_id}/items/{job.copy_job_id}"
+        f"/jobs/instances/{job.instance_id}"
+    )
+    return str(instance.get("status") or "NotStarted"), instance
+
+
+def run_copy_jobs(
+    client: FabricClient,
+    specs: Sequence[CopyJobSpec],
+    *,
+    concurrency: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Run a batch of Copy Jobs together rather than one after another.
+
+    Starting a job and waiting for one are separate calls, so there is no reason to finish
+    the first before starting the second. Several run at once and every one of them is polled
+    in the same loop, which needs no threads: all of this is waiting on HTTP.
+
+    Concurrency is bounded, and deliberately low. A Copy Job runs on the target capacity, so
+    a dozen at once on a small SKU is not a dozen times faster; Fabric queues them, and past
+    a point turns the over-subscription into a failed job rather than a slow one.
+
+    Returns the ids of the jobs that were created, so the caller can clean them up, and a
+    warning for each one that did not finish cleanly.
+    """
+    limit = max(1, concurrency or SETTINGS.copy_job_concurrency)
+    queue = list(specs)
+    total = len(queue)
+    created: list[tuple[str, str]] = []
+    warnings: list[str] = []
+    in_flight: list[_InFlight] = []
+    finished = 0
+
+    def report() -> None:
+        if on_progress and total:
+            running = len(in_flight)
+            on_progress(
+                f"{finished} of {total} copy job(s) finished"
+                + (f", {running} running" if running else "")
+            )
+
+    deadline = time.monotonic() + SETTINGS.copy_job_timeout_seconds
+
+    while queue or in_flight:
+        while queue and len(in_flight) < limit:
+            spec = queue.pop(0)
+            try:
+                copy_job = create_copy_job(client, spec.workspace_id, spec.display_name, spec.content)
+                copy_job_id = copy_job["id"]
+                created.append((spec.workspace_id, copy_job_id))
+                instance_id = start_copy_job(client, spec.workspace_id, copy_job_id)
+            except (FabricError, CopyJobFailed) as error:
+                finished += 1
+                warnings.append(f"{spec.label} did not start: {error}")
+                continue
+            in_flight.append(_InFlight(spec, copy_job_id, instance_id))
+        report()
+
+        if not in_flight:
+            continue
+
+        time.sleep(SETTINGS.copy_job_poll_seconds)
+
+        still_running: list[_InFlight] = []
+        for job in in_flight:
+            try:
+                status, instance = _job_status(client, job)
+            except FabricError as error:
+                finished += 1
+                warnings.append(f"{job.spec.label}: could not read the copy job's progress: {error}")
+                continue
+
+            if status not in TERMINAL_JOB_STATES:
+                still_running.append(job)
+                continue
+
+            finished += 1
+            if status not in SUCCESS_JOB_STATES:
+                reason = instance.get("failureReason") or {}
+                warnings.append(
+                    f"{job.spec.label} did not copy: the job ended as {status}"
+                    + (f": {reason.get('message') or reason}" if reason else "")
+                )
+        in_flight = still_running
+
+        if in_flight and time.monotonic() > deadline:
+            for job in in_flight:
+                warnings.append(
+                    f"{job.spec.label} was still running after "
+                    f"{SETTINGS.copy_job_timeout_seconds}s, so we stopped waiting. Check it in "
+                    "the new workspace before copying anything by hand."
+                )
+            break
+
+    if on_progress and total:
+        on_progress(f"{total} of {total} copy job(s) finished")
+    return created, warnings
+
+
 __all__ = [
     "COPY_JOB_CONTENT_PART",
     "CopyJobFailed",
+    "CopyJobSpec",
     "build_lakehouse_copy_job",
     "build_sql_database_copy_job",
     "build_warehouse_copy_job",
     "create_copy_job",
     "run_copy_job",
+    "run_copy_jobs",
     "start_copy_job",
     "wait_for_copy_job",
 ]

@@ -1121,6 +1121,12 @@ def _migrate_kql_database(
 
 
 def _migrate_lakehouses(ctx: _Context) -> None:
+    """Recreate lakehouses, then copy their data.
+
+    Creation and data movement are separated so the copy jobs can run together. Nothing in
+    this phase reads another lakehouse, so there is no reason to finish one before starting
+    the next, and the table copies are the longest thing in the whole migration.
+    """
     step = "lakehouses"
     ctx.run.start_step(step, "Migrating lakehouses")
     ctx.run.raise_if_cancelled()
@@ -1131,6 +1137,8 @@ def _migrate_lakehouses(ctx: _Context) -> None:
         return
 
     warnings: list[str] = []
+    created_pairs: list[tuple[dict[str, Any], dict[str, Any], bool]] = []
+
     for lakehouse in source_lakehouses:
         ctx.run.raise_if_cancelled()
         name = lakehouse["displayName"]
@@ -1156,10 +1164,14 @@ def _migrate_lakehouses(ctx: _Context) -> None:
         if source_endpoint.get("id") and target_endpoint.get("id"):
             ctx.id_map[source_endpoint["id"]] = target_endpoint["id"]
 
-        if ctx.plan.include_data:
-            warnings.extend(_copy_lakehouse_tables(ctx, step, lakehouse, created["id"], schema_enabled))
+        created_pairs.append((lakehouse, target, schema_enabled))
 
-        if ctx.plan.include_files:
+    if ctx.plan.include_data:
+        warnings.extend(_copy_lakehouse_tables(ctx, step, created_pairs))
+
+    if ctx.plan.include_files:
+        for lakehouse, target, _schema in created_pairs:
+            ctx.run.raise_if_cancelled()
             warnings.extend(_copy_lakehouse_files(ctx, step, lakehouse, target))
 
     ctx.warnings.extend(warnings)
@@ -1171,39 +1183,60 @@ def _migrate_lakehouses(ctx: _Context) -> None:
 def _copy_lakehouse_tables(
     ctx: _Context,
     step: str,
-    lakehouse: dict[str, Any],
-    target_id: str,
-    schema_enabled: bool,
+    pairs: list[tuple[dict[str, Any], dict[str, Any], bool]],
 ) -> list[str]:
-    name = lakehouse["displayName"]
-    try:
-        tables = _lakehouse_tables(ctx, lakehouse, schema_enabled=schema_enabled)
-    except (sqlschema.SchemaTransferError, FabricApiError) as error:
-        return [f"Could not list tables in lakehouse '{name}', so its data was not copied: {error}"]
+    """Copy every lakehouse's tables, several jobs at a time."""
+    warnings: list[str] = []
+    specs: list[copyjobs.CopyJobSpec] = []
 
-    if not tables:
-        return []
+    for lakehouse, target, schema_enabled in pairs:
+        ctx.run.raise_if_cancelled()
+        name = lakehouse["displayName"]
+        try:
+            tables = _lakehouse_tables(ctx, lakehouse, schema_enabled=schema_enabled)
+        except (sqlschema.SchemaTransferError, FabricApiError) as error:
+            warnings.append(
+                f"Could not list tables in lakehouse '{name}', so its data was not copied: {error}"
+            )
+            continue
+        if not tables:
+            continue
 
-    ctx.run.update_step(step, f"Copying {len(tables)} table(s) from lakehouse '{name}'")
-    content = copyjobs.build_lakehouse_copy_job(
-        source_workspace_id=ctx.plan.source_workspace_id,
-        source_item_id=lakehouse["id"],
-        target_workspace_id=ctx.target_workspace_id,
-        target_item_id=target_id,
-        tables=tables,
-    )
-    try:
-        copy_job_id = copyjobs.run_copy_job(
-            ctx.client,
-            ctx.scratch_workspace_id,
-            f"CopyJob_Lakehouse_{name}",
-            content,
-            on_status=lambda status: ctx.run.update_step(step, f"Lakehouse '{name}' copy job: {status}"),
+        specs.append(
+            copyjobs.CopyJobSpec(
+                workspace_id=ctx.scratch_workspace_id,
+                display_name=f"CopyJob_Lakehouse_{name}",
+                content=copyjobs.build_lakehouse_copy_job(
+                    source_workspace_id=ctx.plan.source_workspace_id,
+                    source_item_id=lakehouse["id"],
+                    target_workspace_id=ctx.target_workspace_id,
+                    target_item_id=target["id"],
+                    tables=tables,
+                ),
+                label=f"Table data for lakehouse '{name}'",
+            )
         )
-        ctx.copy_job_ids.append((ctx.scratch_workspace_id, copy_job_id))
+
+    warnings.extend(_run_copy_jobs(ctx, step, specs, "lakehouse"))
+    return warnings
+
+
+def _run_copy_jobs(
+    ctx: _Context,
+    step: str,
+    specs: list[copyjobs.CopyJobSpec],
+    what: str,
+) -> list[str]:
+    if not specs:
         return []
-    except copyjobs.CopyJobFailed as error:
-        return [f"Table data for lakehouse '{name}' did not copy: {error}"]
+    ctx.run.update_step(step, f"Copying {what} data in {len(specs)} job(s)")
+    created, warnings = copyjobs.run_copy_jobs(
+        ctx.client,
+        specs,
+        on_progress=lambda message: ctx.run.update_step(step, message),
+    )
+    ctx.copy_job_ids.extend(created)
+    return warnings
 
 
 def _lakehouse_tables(
@@ -1283,6 +1316,11 @@ def _copy_lakehouse_files(
 
 
 def _migrate_warehouses(ctx: _Context) -> None:
+    """Recreate warehouses: schema one at a time, then all the data together.
+
+    The schema has to land before the data, since a Copy Job appends into tables it does not
+    create. Beyond that nothing here reads another warehouse, so the copies run as a batch.
+    """
     step = "warehouses"
     ctx.run.start_step(step, "Migrating warehouses")
     ctx.run.raise_if_cancelled()
@@ -1293,6 +1331,8 @@ def _migrate_warehouses(ctx: _Context) -> None:
         return
 
     warnings: list[str] = []
+    ready: list[tuple[dict[str, Any], str, str, str]] = []
+
     for warehouse in source_warehouses:
         ctx.run.raise_if_cancelled()
         name = warehouse["displayName"]
@@ -1331,10 +1371,10 @@ def _migrate_warehouses(ctx: _Context) -> None:
             warnings.append(f"Schema for warehouse '{name}' did not transfer: {error}")
             continue
 
-        if ctx.plan.include_data:
-            warnings.extend(
-                _copy_warehouse_tables(ctx, step, warehouse, created["id"], source_endpoint, target_endpoint)
-            )
+        ready.append((warehouse, created["id"], source_endpoint, target_endpoint))
+
+    if ctx.plan.include_data:
+        warnings.extend(_copy_warehouse_tables(ctx, step, ready))
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
@@ -1345,42 +1385,41 @@ def _migrate_warehouses(ctx: _Context) -> None:
 def _copy_warehouse_tables(
     ctx: _Context,
     step: str,
-    warehouse: dict[str, Any],
-    target_id: str,
-    source_endpoint: str,
-    target_endpoint: str,
+    ready: list[tuple[dict[str, Any], str, str, str]],
 ) -> list[str]:
-    name = warehouse["displayName"]
-    try:
-        tables = _warehouse_tables(ctx, source_endpoint, name)
-    except sqlschema.SchemaTransferError as error:
-        return [f"Could not enumerate tables in warehouse '{name}': {error}"]
+    warnings: list[str] = []
+    specs: list[copyjobs.CopyJobSpec] = []
 
-    if not tables:
-        return []
+    for warehouse, target_id, source_endpoint, target_endpoint in ready:
+        ctx.run.raise_if_cancelled()
+        name = warehouse["displayName"]
+        try:
+            tables = _warehouse_tables(ctx, source_endpoint, name)
+        except sqlschema.SchemaTransferError as error:
+            warnings.append(f"Could not enumerate tables in warehouse '{name}': {error}")
+            continue
+        if not tables:
+            continue
 
-    ctx.run.update_step(step, f"Copying {len(tables)} table(s) from warehouse '{name}'")
-    content = copyjobs.build_warehouse_copy_job(
-        source_workspace_id=ctx.plan.source_workspace_id,
-        source_item_id=warehouse["id"],
-        source_endpoint=source_endpoint,
-        target_workspace_id=ctx.target_workspace_id,
-        target_item_id=target_id,
-        target_endpoint=target_endpoint,
-        tables=tables,
-    )
-    try:
-        copy_job_id = copyjobs.run_copy_job(
-            ctx.client,
-            ctx.scratch_workspace_id,
-            f"CopyJob_Warehouse_{name}",
-            content,
-            on_status=lambda status: ctx.run.update_step(step, f"Warehouse '{name}' copy job: {status}"),
+        specs.append(
+            copyjobs.CopyJobSpec(
+                workspace_id=ctx.scratch_workspace_id,
+                display_name=f"CopyJob_Warehouse_{name}",
+                content=copyjobs.build_warehouse_copy_job(
+                    source_workspace_id=ctx.plan.source_workspace_id,
+                    source_item_id=warehouse["id"],
+                    source_endpoint=source_endpoint,
+                    target_workspace_id=ctx.target_workspace_id,
+                    target_item_id=target_id,
+                    target_endpoint=target_endpoint,
+                    tables=tables,
+                ),
+                label=f"Table data for warehouse '{name}'",
+            )
         )
-        ctx.copy_job_ids.append((ctx.scratch_workspace_id, copy_job_id))
-        return []
-    except copyjobs.CopyJobFailed as error:
-        return [f"Table data for warehouse '{name}' did not copy: {error}"]
+
+    warnings.extend(_run_copy_jobs(ctx, step, specs, "warehouse"))
+    return warnings
 
 
 def _warehouse_tables(ctx: _Context, endpoint: str, database: str) -> list[data_stores.TableRef]:
@@ -1413,6 +1452,7 @@ def _migrate_sql_databases(ctx: _Context) -> None:
 
     warnings: list[str] = list(cosmos_warnings)
     migrated = 0
+    ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for database in source_databases:
         ctx.run.raise_if_cancelled()
         name = database["displayName"]
@@ -1459,8 +1499,10 @@ def _migrate_sql_databases(ctx: _Context) -> None:
             )
             continue
 
-        if ctx.plan.include_data:
-            warnings.extend(_copy_sql_database_tables(ctx, step, database, target))
+        ready.append((database, target))
+
+    if ctx.plan.include_data and ready:
+        warnings.extend(_copy_sql_database_tables(ctx, step, ready))
 
     ctx.warnings.extend(warnings)
     summary = ", ".join(
@@ -1477,76 +1519,88 @@ def _migrate_sql_databases(ctx: _Context) -> None:
 def _copy_sql_database_tables(
     ctx: _Context,
     step: str,
-    source: dict[str, Any],
-    target: dict[str, Any],
+    ready: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    """Copy rows between two SQL databases through a Copy Job.
+    """Copy rows between SQL databases through Copy Jobs, several at a time.
 
     Unlike a lakehouse or warehouse, Fabric will not bind a Copy Job to a SQL database by
     item id alone: each end needs a connection. Nothing existing can be reused, because a
     connection's credentials are never readable and its target cannot be repointed, so a pair
-    is created here as ourselves and deleted again below whatever happens.
+    is created here as ourselves.
+
+    They have to stay alive for as long as the jobs that use them, so they are all made
+    first and all removed at the end, whatever happened in between.
     """
-    name = source["displayName"]
-    source_server = sqldatabases.server_fqdn(source)
-    source_catalog = sqldatabases.database_name(source)
-    target_catalog = sqldatabases.database_name(target)
-    if not source_server or not source_catalog or not target_catalog:
-        return [
-            f"SQL database '{name}' did not report a server and database name, so its data "
-            "was not copied."
-        ]
-
-    try:
-        tables = [
-            data_stores.TableRef(name=table, schema=schema)
-            for schema, table in sqlschema.list_base_tables(source_server, source_catalog, ctx.tokens)
-        ]
-    except sqlschema.SchemaTransferError as error:
-        return [f"Could not enumerate tables in SQL database '{name}': {error}"]
-
-    if not tables:
-        return []
-
-    ctx.run.update_step(step, f"Preparing to copy {len(tables)} table(s) from '{name}'")
+    warnings: list[str] = []
+    specs: list[copyjobs.CopyJobSpec] = []
     created_connections: list[str] = []
-    try:
-        source_connection = _own_sql_connection(ctx, source_server, source_catalog, f"{name} source")
-        created_connections.append(source_connection)
-        target_connection = _own_sql_connection(
-            ctx, sqldatabases.server_fqdn(target), target_catalog, f"{name} target"
-        )
-        created_connections.append(target_connection)
-    except connections.ConnectionUnavailable as error:
-        _drop_connections(ctx, created_connections)
-        return [
-            f"Table data for SQL database '{name}' was not copied, because a Copy Job needs a "
-            f"connection at each end and one could not be created: {error}"
-        ]
 
-    content = copyjobs.build_sql_database_copy_job(
-        source_workspace_id=ctx.plan.source_workspace_id,
-        source_item_id=source["id"],
-        source_connection_id=created_connections[0],
-        target_workspace_id=ctx.target_workspace_id,
-        target_item_id=target["id"],
-        target_connection_id=created_connections[1],
-        tables=tables,
-    )
     try:
-        copy_job_id = copyjobs.run_copy_job(
-            ctx.client,
-            ctx.scratch_workspace_id,
-            f"CopyJob_SqlDatabase_{name}",
-            content,
-            on_status=lambda status: ctx.run.update_step(step, f"SQL database '{name}' copy job: {status}"),
-        )
-        ctx.copy_job_ids.append((ctx.scratch_workspace_id, copy_job_id))
-        return []
-    except copyjobs.CopyJobFailed as error:
-        return [f"Table data for SQL database '{name}' did not copy: {error}"]
+        for source, target in ready:
+            ctx.run.raise_if_cancelled()
+            name = source["displayName"]
+            source_server = sqldatabases.server_fqdn(source)
+            source_catalog = sqldatabases.database_name(source)
+            target_catalog = sqldatabases.database_name(target)
+            if not source_server or not source_catalog or not target_catalog:
+                warnings.append(
+                    f"SQL database '{name}' did not report a server and database name, so its "
+                    "data was not copied."
+                )
+                continue
+
+            try:
+                tables = [
+                    data_stores.TableRef(name=table, schema=schema)
+                    for schema, table in sqlschema.list_base_tables(
+                        source_server, source_catalog, ctx.tokens
+                    )
+                ]
+            except sqlschema.SchemaTransferError as error:
+                warnings.append(f"Could not enumerate tables in SQL database '{name}': {error}")
+                continue
+            if not tables:
+                continue
+
+            ctx.run.update_step(step, f"Preparing to copy {len(tables)} table(s) from '{name}'")
+            try:
+                source_connection = _own_sql_connection(
+                    ctx, source_server, source_catalog, f"{name} source"
+                )
+                created_connections.append(source_connection)
+                target_connection = _own_sql_connection(
+                    ctx, sqldatabases.server_fqdn(target), target_catalog, f"{name} target"
+                )
+                created_connections.append(target_connection)
+            except connections.ConnectionUnavailable as error:
+                warnings.append(
+                    f"Table data for SQL database '{name}' was not copied, because a Copy Job "
+                    f"needs a connection at each end and one could not be created: {error}"
+                )
+                continue
+
+            specs.append(
+                copyjobs.CopyJobSpec(
+                    workspace_id=ctx.scratch_workspace_id,
+                    display_name=f"CopyJob_SqlDatabase_{name}",
+                    content=copyjobs.build_sql_database_copy_job(
+                        source_workspace_id=ctx.plan.source_workspace_id,
+                        source_item_id=source["id"],
+                        source_connection_id=source_connection,
+                        target_workspace_id=ctx.target_workspace_id,
+                        target_item_id=target["id"],
+                        target_connection_id=target_connection,
+                        tables=tables,
+                    ),
+                    label=f"Table data for SQL database '{name}'",
+                )
+            )
+
+        warnings.extend(_run_copy_jobs(ctx, step, specs, "SQL database"))
     finally:
         _drop_connections(ctx, created_connections)
+
+    return warnings
 
 
 def _own_sql_connection(ctx: _Context, server: str, catalog: str, label: str) -> str:
