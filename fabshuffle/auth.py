@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -90,6 +93,38 @@ class TokenProvider:
         """Fail fast at login time rather than midway through a migration."""
         self.fabric_token()
 
+    def object_id(self) -> str:
+        """This service principal's object id in the tenant, from its own token.
+
+        Fabric's role assignment API identifies a principal by object id, but a service
+        principal is configured with its *application* id, and the two are different GUIDs.
+        Rather than ask Microsoft Graph for the mapping, which needs a directory permission
+        this application otherwise has no use for, it is read from the ``oid`` claim of a
+        token we already hold. For an app-only token that claim is the service principal.
+        """
+        return token_claim(self.fabric_token(), "oid")
+
+
+def token_claim(token: str, name: str) -> str:
+    """Read one claim from a JWT without validating it.
+
+    The token is one this process just obtained for itself, so there is nothing to verify
+    against and nothing is trusted on the strength of it: the value is only used to fill in
+    a script for the operator to read.
+    """
+    try:
+        payload = token.split(".")[1]
+    except IndexError:
+        return ""
+    # JWT uses base64url without padding.
+    padded = payload + "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, binascii.Error):
+        return ""
+    value = claims.get(name)
+    return str(value) if value else ""
+
 
 def sql_access_token_struct(token: str) -> bytes:
     """Pack an access token the way ODBC's SQL_COPT_SS_ACCESS_TOKEN attribute expects."""
@@ -111,5 +146,6 @@ __all__ = [
     "ServicePrincipal",
     "TokenProvider",
     "sql_access_token_struct",
+    "token_claim",
     "wait_backoff",
 ]

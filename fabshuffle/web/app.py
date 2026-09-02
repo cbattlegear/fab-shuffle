@@ -267,6 +267,7 @@ def create_app() -> FastAPI:
                     source_workspace_id=source_workspace_id,
                     migrated=assessment.migrated,
                     client_id=session.principal.client_id,
+                    object_id=_object_id(session),
                 )
                 return {
                     "dependencies": report["dependencies"],
@@ -443,12 +444,26 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
     }
 
 
+def _object_id(session: Session) -> str:
+    """The service principal's object id, for the grant script.
+
+    Read from the ``oid`` claim of a token this process already holds, so the script does not
+    have to ask the directory for it and the operator does not need a second sign-in scope.
+    """
+    try:
+        return session.tokens.object_id()
+    except AuthError as error:
+        logger.info("Could not read the service principal object id: %s", error)
+        return ""
+
+
 def _dependency_report(
     client: FabricClient,
     *,
     source_workspace_id: str,
     migrated: list[dict[str, Any]],
     client_id: str,
+    object_id: str = "",
 ) -> dict[str, Any]:
     """Run the same dependency check the migration runs, before anything is created.
 
@@ -485,7 +500,7 @@ def _dependency_report(
         {
             "connections": [entry.as_dict() for entry in report.access],
             "instructions": portal_instructions(client_id),
-            "script": grant_script(client_id, report.access),
+            "script": grant_script(client_id, report.access, object_id=object_id),
         }
         if report.access
         else None

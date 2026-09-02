@@ -432,7 +432,12 @@ def _script_comment(text: str) -> str:
     return " ".join(str(text).split())[:80]
 
 
-def grant_script(client_id: str, entries: Iterable[ConnectionAccess]) -> str:
+def grant_script(
+    client_id: str,
+    entries: Iterable[ConnectionAccess],
+    *,
+    object_id: str = "",
+) -> str:
     """A PowerShell script that shares each connection with the service principal.
 
     Finding a connection in the portal means matching a bare GUID by eye against a list that
@@ -440,41 +445,72 @@ def grant_script(client_id: str, entries: Iterable[ConnectionAccess]) -> str:
     single API call, so the ids that make it hard by hand are exactly what make it easy in a
     script.
 
-    The script resolves the service principal's object id from its application id, because
-    the role assignment API wants the former and the application id is what an operator
-    actually has to hand.
+    Fabric identifies a principal by object id rather than application id. Fab Shuffle knows
+    its own object id from the ``oid`` claim of the token it already holds, so the script is
+    given the value outright. Only if that is somehow unavailable does it fall back to asking
+    the directory, which needs a second sign-in scope and the Az.Resources module.
     """
     listed = "\n".join(
         f"    '{entry.connection_id}'  # {_script_comment(', '.join(entry.used_by))}"
         for entry in entries
     )
-    return f"""#Requires -Modules Az.Accounts, Az.Resources
+
+    if object_id:
+        requires = "#Requires -Modules Az.Accounts"
+        resolve = (
+            "# Fab Shuffle read this from its own access token, so no directory lookup is\n"
+            "# needed. It is the object id of the service principal, which is what Fabric\n"
+            f"# wants here; the application id ({client_id}) is a different GUID.\n"
+            f"$principalId = '{object_id}'"
+        )
+    else:
+        requires = "#Requires -Modules Az.Accounts, Az.Resources"
+        resolve = (
+            "# The role assignment API wants the service principal's object id, not its\n"
+            "# application id.\n"
+            f"$principal = Get-AzADServicePrincipal -ApplicationId '{client_id}'\n"
+            "if (-not $principal) {\n"
+            f"    throw \"No service principal found for application id {client_id}.\"\n"
+            "}\n"
+            "$principalId = $principal.Id"
+        )
+
+    return f"""{requires}
 # Shares the connections Fab Shuffle needs with its service principal.
 # Run this as a user who owns them, then choose Re-check in Fab Shuffle.
 
 $ErrorActionPreference = 'Stop'
 
-$applicationId = '{client_id}'
+$fabric = 'https://api.fabric.microsoft.com'
 $connectionIds = @(
 {listed}
 )
 
-if (-not (Get-AzContext)) {{ Connect-AzAccount | Out-Null }}
-
-# The role assignment API wants the service principal's object id, not its application id.
-$principal = Get-AzADServicePrincipal -ApplicationId $applicationId
-if (-not $principal) {{
-    throw "No service principal found for application id $applicationId in this tenant."
+function Get-FabricToken {{
+    $value = (Get-AzAccessToken -ResourceUrl $fabric).Token
+    if ($value -isnot [string]) {{
+        # Newer Az versions hand back a SecureString.
+        $value = [System.Net.NetworkCredential]::new('', $value).Password
+    }}
+    return $value
 }}
 
-$token = (Get-AzAccessToken -ResourceUrl 'https://api.fabric.microsoft.com').Token
-if ($token -isnot [string]) {{
-    # Newer Az versions hand back a SecureString.
-    $token = [System.Net.NetworkCredential]::new('', $token).Password
+# -AuthScope matters here. Without it the sign-in is not scoped to Fabric, and a tenant with
+# conditional access or MFA then refuses the token with "User interaction is required".
+if (-not (Get-AzContext)) {{ Connect-AzAccount -AuthScope $fabric | Out-Null }}
+
+try {{
+    $token = Get-FabricToken
+}} catch {{
+    Write-Host 'Signing in again, scoped to Fabric.' -ForegroundColor Yellow
+    Connect-AzAccount -AuthScope $fabric | Out-Null
+    $token = Get-FabricToken
 }}
+
+{resolve}
 
 $body = @{{
-    principal = @{{ id = $principal.Id; type = 'ServicePrincipal' }}
+    principal = @{{ id = $principalId; type = 'ServicePrincipal' }}
     role      = 'User'
 }} | ConvertTo-Json
 
@@ -482,7 +518,7 @@ foreach ($id in $connectionIds) {{
     try {{
         Invoke-RestMethod -Method POST -ContentType 'application/json' -Body $body `
             -Headers @{{ Authorization = "Bearer $token" }} `
-            -Uri "https://api.fabric.microsoft.com/v1/connections/$id/roleAssignments" | Out-Null
+            -Uri "$fabric/v1/connections/$id/roleAssignments" | Out-Null
         Write-Host "Shared $id" -ForegroundColor Green
     }} catch {{
         # One connection you do not own should not stop the rest.

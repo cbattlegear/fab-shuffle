@@ -20,6 +20,7 @@ import pytest
 from fabshuffle.orchestrator import ConnectionAccess, grant_script
 
 APP_ID = "9b57d15c-f03f-4112-adb8-b480df80bd02"
+OBJECT_ID = "3f2b9c71-55aa-4f0e-9c1d-8e77b0a41d22"
 ENTRIES = [
     ConnectionAccess(
         connection_id="081da81e-f477-4715-8b66-c2a1debf8909",
@@ -47,32 +48,55 @@ def test_each_id_is_commented_with_what_needs_it() -> None:
     assert "# CopyJob 'copyjob1', DataPipeline 'CopyRunFromDB'" in script
 
 
-def test_the_object_id_is_resolved_rather_than_assumed() -> None:
-    """The role assignment API wants the object id; an operator has the application id."""
+def test_the_object_id_is_used_directly_when_known() -> None:
+    """Fab Shuffle reads it from its own token, so the script needs no directory lookup."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
+
+    assert f"$principalId = '{OBJECT_ID}'" in script
+    assert "Get-AzADServicePrincipal" not in script
+    # Without a directory call, Az.Resources is not needed either.
+    assert "#Requires -Modules Az.Accounts\n" in script
+
+
+def test_the_directory_is_only_asked_as_a_fallback() -> None:
     script = grant_script(APP_ID, ENTRIES)
 
-    assert "Get-AzADServicePrincipal -ApplicationId $applicationId" in script
-    assert "id = $principal.Id" in script
-    assert f"'{APP_ID}'" in script
+    assert f"Get-AzADServicePrincipal -ApplicationId '{APP_ID}'" in script
+    assert "$principalId = $principal.Id" in script
+    assert "Az.Accounts, Az.Resources" in script
 
 
-def test_it_asks_for_user_not_owner() -> None:
-    assert "role      = 'User'" in grant_script(APP_ID, ENTRIES)
+def test_the_application_id_is_not_passed_as_the_principal() -> None:
+    """They are different GUIDs, and using the wrong one fails confusingly."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
 
-
-def test_it_posts_to_the_role_assignment_endpoint() -> None:
-    script = grant_script(APP_ID, ENTRIES)
-
-    assert "/v1/connections/$id/roleAssignments" in script
-    assert "-Method POST" in script
+    assert "id = $principalId" in script
+    assert f"principal = @{{ id = '{APP_ID}'" not in script
 
 
 def test_a_secure_string_token_is_handled() -> None:
     # Newer Az versions return a SecureString, older ones a plain string.
-    script = grant_script(APP_ID, ENTRIES)
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
 
-    assert "$token -isnot [string]" in script
+    assert "$value -isnot [string]" in script
     assert "NetworkCredential" in script
+
+
+def test_the_sign_in_is_scoped_to_fabric() -> None:
+    """Without -AuthScope a tenant with conditional access refuses the token outright."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
+
+    assert "Connect-AzAccount -AuthScope $fabric" in script
+    assert "Connect-AzAccount | Out-Null" not in script
+
+
+def test_an_existing_but_unscoped_sign_in_is_retried() -> None:
+    """Get-AzContext can be set from an earlier login that Fabric will not accept."""
+    script = grant_script(APP_ID, ENTRIES, object_id=OBJECT_ID)
+
+    # The token request is attempted, and a failure re-signs in rather than giving up.
+    assert "try {\n    $token = Get-FabricToken" in script
+    assert "Signing in again, scoped to Fabric." in script
 
 
 def test_one_failure_does_not_stop_the_others() -> None:
