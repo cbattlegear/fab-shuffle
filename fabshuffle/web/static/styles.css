@@ -343,3 +343,15 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   .choice { flex-direction: column; gap: 0.25rem; }
   .choice .meta { white-space: normal; }
 }
+
+/* The connection access list on the review screen: ids are worth reading exactly. */
+#connection-access code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+#connection-access ol { margin: 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--text-dim); }
+#connection-access ol li { margin-bottom: 0.25rem; }
+#connection-access .how { margin: 0.75rem 0 0.35rem; }

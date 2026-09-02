@@ -303,11 +303,14 @@ $("#workspace-next").addEventListener("click", async () => {
   busy(button, false);
 
   try {
-    state.preview.dependencies = (await dependencies).dependencies;
+    const result = await dependencies;
+    state.preview.dependencies = result.dependencies;
+    state.preview.connectionAccess = result.connectionAccess;
   } catch (error) {
     state.preview.dependencies = [`Dependencies could not be checked: ${error.message}`];
   }
   renderDependencies();
+  renderConnectionAccess();
 });
 
 // -------------------------------------------------------------------- review
@@ -320,9 +323,11 @@ function renderReviewPending() {
     "Reading the items in the source workspace to work out whether it can be reassigned or " +
     "has to be rebuilt.";
   $("#review-summary").innerHTML = "";
-  ["#blockers", "#unsupported", "#dependencies", "#review-warnings"].forEach((id) => {
-    $(id).hidden = true;
-  });
+  ["#blockers", "#unsupported", "#dependencies", "#review-warnings", "#connection-access"].forEach(
+    (id) => {
+      $(id).hidden = true;
+    },
+  );
   // The name and options depend on the strategy, so they stay hidden until it is known.
   $("#target-name-field").hidden = true;
   $("#rebuild-options").hidden = true;
@@ -335,6 +340,32 @@ function renderDependencies() {
   container.querySelector("h3").textContent = "Needs attention";
   container.querySelector(".hint").hidden = false;
   fillList(container, state.preview.dependencies || []);
+}
+
+function renderConnectionAccess() {
+  const container = $("#connection-access");
+  const access = state.preview.connectionAccess;
+  container.hidden = !access;
+  if (!access) return;
+
+  const list = container.querySelector("ul");
+  list.innerHTML = "";
+  access.connections.forEach((entry) => {
+    const item = document.createElement("li");
+    const id = document.createElement("code");
+    id.textContent = entry.connectionId;
+    item.appendChild(id);
+    item.appendChild(document.createTextNode(` — needed by ${entry.usedBy.join(", ")}`));
+    list.appendChild(item);
+  });
+
+  const steps = container.querySelector("ol");
+  steps.innerHTML = "";
+  access.instructions.forEach((instruction) => {
+    const step = document.createElement("li");
+    step.textContent = instruction;
+    steps.appendChild(step);
+  });
 }
 
 function showDependenciesPending() {
@@ -402,6 +433,7 @@ function renderReview() {
   } else {
     showDependenciesPending();
   }
+  renderConnectionAccess();
 
   // A reassignment keeps the workspace and its name, and copies nothing.
   $("#target-name-field").hidden = reassign;

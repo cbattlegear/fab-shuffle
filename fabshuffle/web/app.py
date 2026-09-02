@@ -34,7 +34,9 @@ from fabshuffle.orchestrator import (
     cleanup_run,
     default_target_name,
     dependency_warnings,
+    portal_instructions,
     run_migration,
+    scan_connection_access,
 )
 from fabshuffle.run import REGISTRY, MigrationRun, RunStatus
 
@@ -258,14 +260,19 @@ def create_app() -> FastAPI:
                 assessment = assess_workspace(list_items(client, source_workspace_id))
                 if assessment.strategy is Strategy.REASSIGN:
                     # Nothing is rebuilt, so no reference has to be rewritten.
-                    return {"dependencies": []}
+                    return {"dependencies": [], "connectionAccess": None}
                 return {
                     "dependencies": _dependency_preview(
                         client,
                         source_workspace_id=source_workspace_id,
                         migrated=assessment.migrated,
                         client_id=session.principal.client_id,
-                    )
+                    ),
+                    "connectionAccess": _connection_access_preview(
+                        client,
+                        source_workspace_id=source_workspace_id,
+                        client_id=session.principal.client_id,
+                    ),
                 }
 
         return await _run_fabric(work)
@@ -468,6 +475,31 @@ def _dependency_preview(
             "between items could not be checked."
         ]
     return report.messages()
+
+
+def _connection_access_preview(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    client_id: str,
+) -> dict[str, Any] | None:
+    """Connections the migration needs but cannot see, with how to grant access.
+
+    Returned as its own section rather than folded into the warnings, because unlike the
+    other warnings this is a task to do before starting, and it has steps.
+    """
+    try:
+        blocked = scan_connection_access(client, source_workspace_id=source_workspace_id)
+    except FabricApiError as error:
+        logger.info("Could not check connection access: %s", error)
+        return None
+
+    if not blocked:
+        return None
+    return {
+        "connections": [entry.as_dict() for entry in blocked],
+        "instructions": portal_instructions(client_id),
+    }
 
 
 def _semantic_model_preview(

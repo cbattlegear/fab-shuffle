@@ -262,6 +262,71 @@ def is_owned_by(assignments: Iterable[Mapping[str, Any]] | None, client_id: str)
     return False
 
 
+def add_role_assignment(
+    client: FabricClient,
+    connection_id: str,
+    principal: Mapping[str, Any],
+    role: str,
+) -> dict[str, Any]:
+    """Grant one principal a role on a connection."""
+    body = {"principal": {"id": principal.get("id"), "type": principal.get("type")}, "role": role}
+    return client.post(f"connections/{connection_id}/roleAssignments", json=body)
+
+
+def copy_role_assignments(
+    client: FabricClient,
+    *,
+    source_connection_id: str,
+    target_connection_id: str,
+    client_id: str,
+) -> tuple[int, list[str]]:
+    """Give a replacement connection the same people the original had.
+
+    A replacement is a new connection, so it starts out visible only to whoever created it.
+    Everyone who could use the original would otherwise have to be added again by hand, which
+    is exactly the manual work the replacement was meant to avoid.
+
+    The service principal's own Owner assignment is not replayed, because creating the
+    connection already granted it.
+    """
+    assignments = list_role_assignments(client, source_connection_id)
+    if not assignments:
+        return 0, [
+            f"The role assignments on connection {source_connection_id} could not be read, so "
+            f"the replacement is visible only to this service principal. Share it with whoever "
+            "used the original."
+        ]
+
+    copied = 0
+    failed: list[str] = []
+    for assignment in assignments:
+        principal = assignment.get("principal") or {}
+        principal_id = principal.get("id")
+        role = assignment.get("role")
+        if not principal_id or not role:
+            continue
+
+        details = principal.get("servicePrincipalDetails") or {}
+        if details.get("aadAppId") == client_id or principal_id == client_id:
+            # Creating the connection already made us its owner.
+            continue
+
+        try:
+            add_role_assignment(client, target_connection_id, principal, role)
+            copied += 1
+        except FabricApiError as error:
+            name = principal.get("displayName") or principal_id
+            failed.append(f"{name} ({role}, HTTP {error.status_code})")
+
+    warnings: list[str] = []
+    if failed:
+        warnings.append(
+            "These principals could not be given the same access to the replacement connection "
+            "as they had on the original: " + ", ".join(failed) + ". Share it with them by hand."
+        )
+    return copied, warnings
+
+
 def source_identifiers(
     workspace_id: str,
     items: Iterable[Mapping[str, Any]],

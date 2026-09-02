@@ -360,19 +360,46 @@ def _report_unsupported_items(ctx: _Context) -> None:
     ctx.run.finish_step(step, StepStatus.SUCCEEDED, detail, warnings)
 
 
-def bound_connection_warnings(
+@dataclass(frozen=True, slots=True)
+class ConnectionAccess:
+    """A connection that migrated items need, which this service principal cannot see."""
+
+    connection_id: str
+    used_by: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"connectionId": self.connection_id, "usedBy": list(self.used_by)}
+
+
+def portal_instructions(client_id: str) -> list[str]:
+    """How to grant the service principal access to a connection, in the portal.
+
+    There is an API for this, but adding a role assignment needs Owner on the connection,
+    which is exactly what is missing, so it cannot be done for the operator.
+    """
+    return [
+        "Open the Fabric portal and go to Settings, then Manage connections and gateways.",
+        "Find the connection by the id listed above on the Connections tab.",
+        "Select it, then open Manage users from the toolbar or the row's ... menu.",
+        f"Add the service principal (application id {client_id}) and give it the User role. "
+        "Owner is only needed if you want Fab Shuffle to be able to manage the connection "
+        "rather than just use it.",
+        "Re-run the migration once every connection above has been shared.",
+    ]
+
+
+def scan_connection_access(
     client: FabricClient,
     *,
     source_workspace_id: str,
-    client_id: str,
-) -> list[str]:
-    """Report connections that migrated items bind but this service principal cannot use.
+) -> list[ConnectionAccess]:
+    """Find connections that migrated items bind but this service principal cannot use.
 
     An item that binds an unusable connection is rejected outright at creation, and the
     rejection arrives per item, so a workspace where one connection is shared by six items
     fails six times for the same reason after everything else has already been built. The
-    definitions are read up front instead, and the connections reported once, so the access
-    can be granted before the run rather than after it.
+    definitions are read up front instead, and reported by connection, because one grant
+    fixes every item that shares it.
     """
     binding_items: list[tuple[str, str, str]] = []
     for item_type in CONNECTION_BINDING_TYPES:
@@ -388,7 +415,6 @@ def bound_connection_warnings(
     if not known:
         return []
 
-    # connection id -> the items that bind it
     unusable: dict[str, list[str]] = {}
     for item_type, name, item_id in binding_items:
         definition = items_module.try_get_item_definition(client, source_workspace_id, item_id)
@@ -398,18 +424,31 @@ def bound_connection_warnings(
             if connection_id not in known:
                 unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
 
-    if not unusable:
+    return [
+        ConnectionAccess(connection_id=connection_id, used_by=tuple(sorted(items)))
+        for connection_id, items in sorted(unusable.items())
+    ]
+
+
+def bound_connection_warnings(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    client_id: str,
+) -> list[str]:
+    """The connection access problem as a single warning, for the run's warning list."""
+    blocked = scan_connection_access(client, source_workspace_id=source_workspace_id)
+    if not blocked:
         return []
 
     listed = "; ".join(
-        f"{connection_id} (used by {', '.join(sorted(items))})"
-        for connection_id, items in sorted(unusable.items())
+        f"{entry.connection_id} (used by {', '.join(entry.used_by)})" for entry in blocked
     )
     return [
-        f"{len(unusable)} connection(s) are bound by items in this workspace but cannot be seen "
+        f"{len(blocked)} connection(s) are bound by items in this workspace but cannot be seen "
         f"by this service principal, so those items will be refused when they are recreated: "
-        f"{listed}. Grant it access in Manage Connections and Gateways before running, or "
-        "recreate those items by hand afterwards."
+        f"{listed}. Share them with application id {client_id} in Manage connections and "
+        "gateways, then re-run."
     ]
 
 
@@ -1495,6 +1534,19 @@ def _replace_connections(ctx: _Context) -> None:
                 new_path=new_path,
             )
         )
+
+        # A brand new connection is visible only to whoever created it, so everyone who could
+        # use the original would have to be added again by hand otherwise.
+        ctx.run.update_step(step, f"Sharing connection '{name}' with its original users")
+        copied, share_warnings = connections.copy_role_assignments(
+            ctx.client,
+            source_connection_id=prerequisite["connectionId"],
+            target_connection_id=created["id"],
+            client_id=ctx.principal.client_id,
+        )
+        warnings.extend(f"Connection '{name}': {w}" for w in share_warnings)
+        if copied:
+            logger.info("Copied %s role assignment(s) onto the replacement for '%s'", copied, name)
 
     ctx.warnings.extend(warnings)
     if replaced:

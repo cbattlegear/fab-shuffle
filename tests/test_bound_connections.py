@@ -82,7 +82,7 @@ def test_an_unusable_connection_is_reported_before_anything_is_built() -> None:
     assert len(warnings) == 1
     assert SHARED in warnings[0]
     assert "CopyRunFromDB" in warnings[0]
-    assert "Manage Connections and Gateways" in warnings[0]
+    assert "Manage connections and gateways" in warnings[0]
 
 
 def test_one_connection_shared_by_many_items_is_reported_once() -> None:
