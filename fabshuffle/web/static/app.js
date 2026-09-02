@@ -402,7 +402,39 @@ function renderConnectionAccess() {
     step.textContent = instruction;
     steps.appendChild(step);
   });
+
+  const script = $("#grant-script");
+  script.hidden = !access.script;
+  if (access.script) {
+    script.querySelector("code").textContent = access.script;
+    // Collapsed again on every re-check, so a stale expanded script is never mistaken
+    // for the current one.
+    script.open = false;
+  }
 }
+
+$("#grant-script").addEventListener("click", async (event) => {
+  if (!event.target.classList.contains("copy")) return;
+  const button = event.target;
+  const script = state.preview.connectionAccess && state.preview.connectionAccess.script;
+  if (!script) return;
+
+  try {
+    await navigator.clipboard.writeText(script);
+    button.textContent = "Copied";
+  } catch {
+    // Clipboard access needs a secure context, which a plain http:// host is not.
+    button.textContent = "Press Ctrl+C";
+    const range = document.createRange();
+    range.selectNodeContents($("#grant-script").querySelector("code"));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  setTimeout(() => {
+    button.textContent = "Copy";
+  }, 2000);
+});
 
 function showDependenciesPending() {
   const container = $("#dependencies");

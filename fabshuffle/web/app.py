@@ -34,6 +34,7 @@ from fabshuffle.orchestrator import (
     cleanup_run,
     default_target_name,
     dependency_warnings,
+    grant_script,
     portal_instructions,
     run_migration,
 )
@@ -484,6 +485,7 @@ def _dependency_report(
         {
             "connections": [entry.as_dict() for entry in report.access],
             "instructions": portal_instructions(client_id),
+            "script": grant_script(client_id, report.access),
         }
         if report.access
         else None

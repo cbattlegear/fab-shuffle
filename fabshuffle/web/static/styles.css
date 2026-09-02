@@ -358,3 +358,39 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 #connection-access li { margin-bottom: 0.5rem; }
 #connection-access .why { margin-top: 0.15rem; font-size: 0.8rem; }
 #connection-access button { margin-top: 0.75rem; }
+#grant-script { margin-top: 0.75rem; }
+#grant-script summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text);
+  padding: 0.15rem 0;
+}
+#grant-script summary:hover { color: var(--accent); }
+#grant-script .hint { margin: 0.4rem 0 0.5rem; }
+#grant-script .script { position: relative; }
+#grant-script pre {
+  margin: 0;
+  max-height: 20rem;
+  overflow: auto;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+}
+#grant-script code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre;
+  background: none;
+  padding: 0;
+  color: var(--text-dim);
+}
+#grant-script .copy {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  z-index: 1;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+}

@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import logging
 import shutil
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -425,6 +425,71 @@ def portal_instructions(client_id: str) -> list[str]:
         "Share. User is enough to bind a connection; Owner is not needed.",
         "Come back here and choose Re-check, which runs the assessment again.",
     ]
+
+
+def _script_comment(text: str) -> str:
+    """Make an item name safe to sit in a PowerShell comment."""
+    return " ".join(str(text).split())[:80]
+
+
+def grant_script(client_id: str, entries: Iterable[ConnectionAccess]) -> str:
+    """A PowerShell script that shares each connection with the service principal.
+
+    Finding a connection in the portal means matching a bare GUID by eye against a list that
+    does not show ids, which is unreasonable for more than one or two. The same grant is a
+    single API call, so the ids that make it hard by hand are exactly what make it easy in a
+    script.
+
+    The script resolves the service principal's object id from its application id, because
+    the role assignment API wants the former and the application id is what an operator
+    actually has to hand.
+    """
+    listed = "\n".join(
+        f"    '{entry.connection_id}'  # {_script_comment(', '.join(entry.used_by))}"
+        for entry in entries
+    )
+    return f"""#Requires -Modules Az.Accounts, Az.Resources
+# Shares the connections Fab Shuffle needs with its service principal.
+# Run this as a user who owns them, then choose Re-check in Fab Shuffle.
+
+$ErrorActionPreference = 'Stop'
+
+$applicationId = '{client_id}'
+$connectionIds = @(
+{listed}
+)
+
+if (-not (Get-AzContext)) {{ Connect-AzAccount | Out-Null }}
+
+# The role assignment API wants the service principal's object id, not its application id.
+$principal = Get-AzADServicePrincipal -ApplicationId $applicationId
+if (-not $principal) {{
+    throw "No service principal found for application id $applicationId in this tenant."
+}}
+
+$token = (Get-AzAccessToken -ResourceUrl 'https://api.fabric.microsoft.com').Token
+if ($token -isnot [string]) {{
+    # Newer Az versions hand back a SecureString.
+    $token = [System.Net.NetworkCredential]::new('', $token).Password
+}}
+
+$body = @{{
+    principal = @{{ id = $principal.Id; type = 'ServicePrincipal' }}
+    role      = 'User'
+}} | ConvertTo-Json
+
+foreach ($id in $connectionIds) {{
+    try {{
+        Invoke-RestMethod -Method POST -ContentType 'application/json' -Body $body `
+            -Headers @{{ Authorization = "Bearer $token" }} `
+            -Uri "https://api.fabric.microsoft.com/v1/connections/$id/roleAssignments" | Out-Null
+        Write-Host "Shared $id" -ForegroundColor Green
+    }} catch {{
+        # One connection you do not own should not stop the rest.
+        Write-Warning "Could not share $id : $($_.Exception.Message)"
+    }}
+}}
+"""
 
 
 def scan_connection_access(
