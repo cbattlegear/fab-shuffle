@@ -6,6 +6,7 @@ strategy choice can never drift apart.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -121,6 +122,70 @@ LARGE_MODEL_REGIONS = frozenset(
 )
 
 
+# The order the migration creates things in, used to present a count of what will move.
+# Data stores first, then what reads them, then what orchestrates that. Keeping it here next
+# to REBUILT_TYPES means a newly supported type is noticed when it is added rather than
+# quietly dropped off the end of the review screen.
+DISPLAY_ORDER = (
+    "Lakehouse",
+    "Warehouse",
+    "SQLDatabase",
+    "CosmosDBDatabase",
+    "Eventhouse",
+    "KQLDatabase",
+    "MirroredDatabase",
+    "MirroredAzureDatabricksCatalog",
+    "SnowflakeDatabase",
+    "Eventstream",
+    "KQLQueryset",
+    "KQLDashboard",
+    "Environment",
+    "Notebook",
+    "Dataflow",
+    "SparkJobDefinition",
+    "GraphQLApi",
+    "GraphModel",
+    "GraphQuerySet",
+    "Map",
+    "VariableLibrary",
+    "MountedDataFactory",
+    "SemanticModel",
+    "Report",
+    "DataPipeline",
+    "CopyJob",
+    "ApacheAirflowJob",
+    "Reflex",
+)
+
+# Plurals a machine would get wrong, and casing Fabric's own type names lose.
+TYPE_LABELS = {
+    "ApacheAirflowJob": "Apache Airflow jobs",
+    "CopyJob": "Copy Jobs",
+    "CosmosDBDatabase": "Cosmos DB databases",
+    "DataPipeline": "Data pipelines",
+    "GraphQLApi": "GraphQL APIs",
+    "GraphQuerySet": "Graph query sets",
+    "KQLDashboard": "KQL dashboards",
+    "KQLDatabase": "KQL databases",
+    "KQLQueryset": "KQL querysets",
+    "MirroredAzureDatabricksCatalog": "Mirrored Azure Databricks catalogs",
+    "Reflex": "Activator items",
+    "SQLDatabase": "SQL databases",
+    "SparkJobDefinition": "Spark job definitions",
+}
+
+
+def type_label(item_type: str) -> str:
+    """A human readable, plural name for an item type."""
+    if item_type in TYPE_LABELS:
+        return TYPE_LABELS[item_type]
+    # Split the CamelCase Fabric uses into a sentence: leading word capitalised, the rest
+    # not, so "SemanticModel" reads as "Semantic models" rather than "Semantic Models".
+    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+", item_type) or [item_type]
+    spaced = " ".join([words[0], *(word.lower() for word in words[1:])])
+    return f"{spaced[:-1]}ies" if spaced.endswith("y") else f"{spaced}s"
+
+
 class Strategy(StrEnum):
     """How a given workspace can be moved."""
 
@@ -153,6 +218,27 @@ class WorkspaceAssessment:
     @property
     def unsupported_types(self) -> list[str]:
         return sorted({item.type for item in self.unsupported})
+
+    def migrated_counts(self) -> list[dict[str, Any]]:
+        """What will move, counted by type, in the order the migration creates it.
+
+        Built from the assessment rather than by asking Fabric again, so it costs nothing and
+        can never disagree with what the run then does. Types that are not in
+        ``DISPLAY_ORDER`` still appear, at the end, so a newly supported one is visible even
+        before anyone decides where it belongs.
+        """
+        counts: dict[str, int] = {}
+        for item in self.migrated:
+            item_type = item.get("type") or "Unknown"
+            counts[item_type] = counts.get(item_type, 0) + 1
+
+        ranked = {item_type: rank for rank, item_type in enumerate(DISPLAY_ORDER)}
+        ordered = sorted(counts, key=lambda t: (ranked.get(t, len(ranked)), t))
+        return [{"type": t, "label": type_label(t), "count": counts[t]} for t in ordered]
+
+    @property
+    def migrated_total(self) -> int:
+        return len(self.migrated)
 
     def grouped_messages(self) -> list[str]:
         """One message per item type rather than per item.
@@ -261,11 +347,13 @@ def supports_large_semantic_models(region: str) -> bool:
 
 __all__ = [
     "DERIVED_TYPES",
+    "DISPLAY_ORDER",
     "LARGE_MODEL_REGIONS",
     "POWER_BI_TYPES",
     "REBUILT_TYPES",
     "RELATION_TYPE_ALIASES",
     "SPECIFIC_REASONS",
+    "TYPE_LABELS",
     "Strategy",
     "UnsupportedItem",
     "WorkspaceAssessment",
@@ -273,4 +361,5 @@ __all__ = [
     "is_derived_type",
     "normalise_type",
     "supports_large_semantic_models",
+    "type_label",
 ]

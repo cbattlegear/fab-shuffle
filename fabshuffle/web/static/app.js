@@ -505,11 +505,9 @@ function renderReview() {
   if (reassign) {
     rows.push(["Large semantic models", String(preview.largeSemanticModels.length)]);
   } else {
-    rows.push(
-      ["Lakehouses", String(preview.counts.lakehouses)],
-      ["Warehouses", String(preview.counts.warehouses)],
-      ["Eventhouses", String(preview.counts.eventhouses)]
-    );
+    // Every type that will move, in the order the migration creates them.
+    (preview.counts || []).forEach((entry) => rows.push([entry.label, String(entry.count)]));
+    rows.push(["Items in total", String(preview.migratedTotal ?? 0)]);
   }
 
   $("#review-summary").innerHTML = rows.map(() => `<div><span class="k"></span><span class="v"></span></div>`).join("");

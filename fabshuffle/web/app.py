@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from fabshuffle import __version__
 from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
-from fabshuffle.fabric import data_stores, eventhouses, workspaces
+from fabshuffle.fabric import workspaces
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.items import list_items
 from fabshuffle.fabric.powerbi import PowerBiClient, PowerBiError
@@ -230,15 +230,16 @@ def create_app() -> FastAPI:
                 }
 
                 if assessment.strategy is Strategy.REASSIGN:
-                    result["counts"] = {"lakehouses": 0, "warehouses": 0, "eventhouses": 0}
+                    result["counts"] = []
+                    result["migratedTotal"] = 0
                     result.update(_semantic_model_preview(session, source_workspace_id, plan))
                     return result
 
-                result["counts"] = {
-                    "lakehouses": len(data_stores.list_lakehouses(client, source_workspace_id)),
-                    "warehouses": len(data_stores.list_warehouses(client, source_workspace_id)),
-                    "eventhouses": len(eventhouses.list_eventhouses(client, source_workspace_id)),
-                }
+                # Counted from the assessment rather than by listing each type again: it costs
+                # nothing, covers every supported type automatically, and cannot disagree with
+                # what the migration then does.
+                result["counts"] = assessment.migrated_counts()
+                result["migratedTotal"] = assessment.migrated_total
                 return result
 
         return await _run_fabric(work)

@@ -58,13 +58,8 @@ def install(monkeypatch, items, models=None):
     monkeypatch.setattr("fabshuffle.orchestrator.FabricClient", fabric)
     monkeypatch.setattr("fabshuffle.orchestrator.list_items", lambda client, ws: items)
     monkeypatch.setattr(web, "list_items", lambda client, ws: items)
-    monkeypatch.setattr(
-        web.data_stores,
-        "list_lakehouses",
-        lambda c, w: [i for i in items if i["type"] == "Lakehouse"],
-    )
-    monkeypatch.setattr(web.data_stores, "list_warehouses", lambda c, w: [])
-    monkeypatch.setattr(web.eventhouses, "list_eventhouses", lambda c, w: [])
+    # Nothing to stub for the counts: they are derived from the item list above rather than
+    # from a call per item type.
 
     class FakePbi:
         def __call__(self, _tokens):
@@ -148,7 +143,12 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
 
     assert result["strategy"] == "rebuild"
     assert result["targetWorkspaceName"] == "Sales-westeurope"
-    assert result["counts"]["lakehouses"] == 1
+    # Everything that will move, counted by type, in the order the migration creates it.
+    assert result["counts"] == [
+        {"type": "Lakehouse", "label": "Lakehouses", "count": 1},
+        {"type": "Report", "label": "Reports", "count": 1},
+    ]
+    assert result["migratedTotal"] == 2
     # The report is migrated and rebound, so it is not reported as left behind.
     assert result["unsupportedItemTypes"] == ["Dashboard", "MLModel"]
 
