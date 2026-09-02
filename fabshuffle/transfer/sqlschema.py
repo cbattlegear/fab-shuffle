@@ -102,6 +102,18 @@ def is_transient(error: pyodbc.Error) -> bool:
     return any(message in text for message in _TRANSIENT_MESSAGES)
 
 
+def _server_with_port(server: str) -> str:
+    """Normalise a server address to ``host,port``.
+
+    Endpoints differ: a warehouse or SQL analytics endpoint reports a bare host, while a
+    Fabric SQL database's ``serverFqdn`` already carries ``,1433``. Appending unconditionally
+    produced ``host,1433,1433``, which ODBC cannot parse.
+    """
+    address = server.strip()
+    host, separator, _port = address.partition(",")
+    return address if separator else f"{host},1433"
+
+
 def connect(
     server: str,
     database: str,
@@ -117,7 +129,7 @@ def connect(
     schema transfer as best effort does not have to know about pyodbc as well.
     """
     connection_string = (
-        f"Driver={{{_driver()}}};Server={server},1433;Database={database};"
+        f"Driver={{{_driver()}}};Server={_server_with_port(server)};Database={database};"
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
 

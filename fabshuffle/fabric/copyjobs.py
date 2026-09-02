@@ -143,6 +143,69 @@ def build_warehouse_copy_job(
     }
 
 
+def _sql_database_connection(
+    workspace_id: str,
+    item_id: str,
+    connection_id: str,
+) -> dict[str, Any]:
+    """Bind one end of a Copy Job to a Fabric SQL database.
+
+    Unlike a lakehouse or warehouse, this needs ``externalReferences.connection``: the item
+    ids alone are not enough and Fabric rejects the job without it. ``typeProperties`` holds
+    only the two ids; the server and database come from the connection.
+    """
+    return {
+        "type": "FabricSqlDatabase",
+        "typeProperties": {"workspaceId": workspace_id, "artifactId": item_id},
+        "externalReferences": {"connection": connection_id},
+    }
+
+
+def build_sql_database_copy_job(
+    *,
+    source_workspace_id: str,
+    source_item_id: str,
+    source_connection_id: str,
+    target_workspace_id: str,
+    target_item_id: str,
+    target_connection_id: str,
+    tables: Iterable[TableRef],
+) -> dict[str, Any]:
+    """Build a Copy Job that moves table data between two Fabric SQL databases.
+
+    The tables already exist in the destination, created by the schema half of the migration,
+    so rows are appended rather than the table being recreated. That also makes the job safe
+    to look at as "add the data" rather than "rebuild the database".
+    """
+    activities = [
+        _activity(
+            table,
+            destination_extras={"writeBehavior": "Append"},
+            enable_staging=False,
+        )
+        for table in tables
+    ]
+    return {
+        "properties": {
+            "jobMode": "Batch",
+            "source": {
+                "type": "FabricSqlDatabaseTable",
+                "connectionSettings": _sql_database_connection(
+                    source_workspace_id, source_item_id, source_connection_id
+                ),
+            },
+            "destination": {
+                "type": "FabricSqlDatabaseTable",
+                "connectionSettings": _sql_database_connection(
+                    target_workspace_id, target_item_id, target_connection_id
+                ),
+            },
+            "policy": {"timeout": COPY_JOB_TIMEOUT},
+        },
+        "activities": activities,
+    }
+
+
 def create_copy_job(
     client: FabricClient,
     workspace_id: str,
@@ -232,6 +295,7 @@ __all__ = [
     "COPY_JOB_CONTENT_PART",
     "CopyJobFailed",
     "build_lakehouse_copy_job",
+    "build_sql_database_copy_job",
     "build_warehouse_copy_job",
     "create_copy_job",
     "run_copy_job",

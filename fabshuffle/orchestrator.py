@@ -17,9 +17,11 @@ items created by an *earlier* phase:
 3. ``lakehouses``   before warehouses, because warehouse views can reference lakehouse
    tables through the SQL analytics endpoint.
 4. ``warehouses``   schema before data, so Copy Job activities have tables to land in.
-5. ``mirrored``     mirrored databases, which are data stores with their own SQL analytics
+5. ``sqldatabases`` Fabric SQL databases, schema through the item definition and rows through
+   a Copy Job. A data store like the rest, and read by GraphQL APIs, pipelines and Copy Jobs.
+6. ``mirrored``     mirrored databases, which are data stores with their own SQL analytics
    endpoint, so they belong with the others and before anything that reads them.
-6. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
+7. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
    them. This covers both lakehouse shortcuts and KQL database table shortcuts. The SQL
    analytics endpoint is refreshed only now, so it picks up both the copied tables and the
    new shortcuts, and only then is its schema copied.
@@ -33,7 +35,8 @@ items created by an *earlier* phase:
    factories. A notebook attaches to an environment and reads a lakehouse; a semantic model
    can read a dataflow; a query set names its graph model. All of them come before analytics.
 10. ``analytics``   semantic models, then reports. Models bind to lakehouse and warehouse
-    SQL endpoints, so they need step 6 finished; reports bind to models, so they run after.
+    SQL endpoints, so they need the data store phases finished; reports bind to models, so
+    they run after.
 11. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
     above.
 12. ``reflexes``    Activator items, last of the content phases. One watches an eventstream or
@@ -54,16 +57,20 @@ from typing import Any
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
+    airflow,
     analytics,
     connections,
     copyjobs,
+    cosmosdb,
     data_stores,
+    definitions,
     eventhouses,
     powerbi,
     relations,
     shortcuts,
     spark,
     special_items,
+    sqldatabases,
     workspaces,
 )
 from fabshuffle.fabric import items as items_module
@@ -76,6 +83,7 @@ from fabshuffle.fabric.support import (
     supports_large_semantic_models,
 )
 from fabshuffle.run import CancelledError, MigrationRun, RunStatus, StepStatus
+from fabshuffle.transfer import cosmos as cosmos_transfer
 from fabshuffle.transfer import files as file_transfer
 from fabshuffle.transfer import kql, sqlschema
 
@@ -139,6 +147,10 @@ class MigrationPlan:
     source_workspace_id: str
     source_workspace_name: str
     target_workspace_name: str
+    # The capacity's region as the service spells it, such as ``West Central US``. Almost
+    # everything wants the normalised form, but an Apache Airflow job records its compute
+    # location as the display string and will not accept anything else.
+    capacity_display_region: str = ""
     strategy: Strategy = Strategy.REBUILD
     capacity_warning: str | None = None
     include_files: bool = True
@@ -211,6 +223,7 @@ def run_migration(
             _migrate_eventhouses(context)
             _migrate_lakehouses(context)
             _migrate_warehouses(context)
+            _migrate_sql_databases(context)
             _migrate_mirrored_databases(context)
             _migrate_shortcuts_and_endpoints(context)
             _migrate_realtime(context)
@@ -1377,7 +1390,272 @@ def _warehouse_tables(ctx: _Context, endpoint: str, database: str) -> list[data_
 # --------------------------------------------------------------------- phase 5
 
 
-# --------------------------------------------------------------------- phase 5
+def _migrate_sql_databases(ctx: _Context) -> None:
+    """Recreate Fabric SQL and Cosmos DB databases.
+
+    Both run here rather than with the definition-backed items, because each is a data store
+    that other things read: a GraphQL API, a Copy Job, and a pipeline can all bind a SQL
+    database, and the relations APIs call it ``SqlDbNative`` when they report that.
+    """
+    step = "sqldatabases"
+    ctx.run.start_step(step, "Migrating SQL and Cosmos databases")
+    ctx.run.raise_if_cancelled()
+
+    source_databases = sqldatabases.list_sql_databases(ctx.client, ctx.plan.source_workspace_id)
+    cosmos_migrated, cosmos_warnings = _migrate_cosmos_databases(ctx)
+    if not source_databases and not cosmos_migrated and not cosmos_warnings:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No SQL or Cosmos databases to migrate")
+        return
+
+    warnings: list[str] = list(cosmos_warnings)
+    migrated = 0
+    for database in source_databases:
+        ctx.run.raise_if_cancelled()
+        name = database["displayName"]
+        properties = database.get("properties") or {}
+
+        ctx.run.update_step(step, f"Creating SQL database '{name}'")
+        try:
+            created = sqldatabases.create_sql_database(
+                ctx.client,
+                ctx.target_workspace_id,
+                name,
+                collation=properties.get("collation"),
+                backup_retention_days=properties.get("backupRetentionDays"),
+                description=database.get("description") or None,
+                folder_id=ctx.id_map.get(database.get("folderId", "")),
+            )
+        except FabricError as error:
+            warnings.append(analytics.describe_failure(sqldatabases.SQL_DATABASE, name, error))
+            continue
+
+        target = sqldatabases.get_sql_database(ctx.client, ctx.target_workspace_id, created["id"])
+        ctx.id_map[database["id"]] = created["id"]
+        source_server = sqldatabases.server_fqdn(database)
+        target_server = sqldatabases.server_fqdn(target)
+        if source_server and target_server:
+            ctx.id_map[source_server] = target_server
+        migrated += 1
+
+        ctx.run.update_step(step, f"Applying schema to SQL database '{name}'")
+        try:
+            sqldatabases.copy_schema(
+                ctx.client,
+                source_workspace_id=ctx.plan.source_workspace_id,
+                source_id=database["id"],
+                target_workspace_id=ctx.target_workspace_id,
+                target_id=created["id"],
+            )
+        except FabricError as error:
+            # Without the schema there is nowhere to land rows, so the data copy is skipped
+            # too rather than left to fail one table at a time.
+            warnings.append(
+                f"Schema for SQL database '{name}' did not transfer, so its data was not "
+                f"copied either: {error}"
+            )
+            continue
+
+        if ctx.plan.include_data:
+            warnings.extend(_copy_sql_database_tables(ctx, step, database, target))
+
+    ctx.warnings.extend(warnings)
+    summary = ", ".join(
+        part
+        for part in (
+            f"{migrated} SQL database(s)" if migrated or source_databases else "",
+            f"{cosmos_migrated} Cosmos DB database(s)" if cosmos_migrated else "",
+        )
+        if part
+    )
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Migrated {summary or 'nothing'}", warnings)
+
+
+def _copy_sql_database_tables(
+    ctx: _Context,
+    step: str,
+    source: dict[str, Any],
+    target: dict[str, Any],
+) -> list[str]:
+    """Copy rows between two SQL databases through a Copy Job.
+
+    Unlike a lakehouse or warehouse, Fabric will not bind a Copy Job to a SQL database by
+    item id alone: each end needs a connection. Nothing existing can be reused, because a
+    connection's credentials are never readable and its target cannot be repointed, so a pair
+    is created here as ourselves and deleted again below whatever happens.
+    """
+    name = source["displayName"]
+    source_server = sqldatabases.server_fqdn(source)
+    source_catalog = sqldatabases.database_name(source)
+    target_catalog = sqldatabases.database_name(target)
+    if not source_server or not source_catalog or not target_catalog:
+        return [
+            f"SQL database '{name}' did not report a server and database name, so its data "
+            "was not copied."
+        ]
+
+    try:
+        tables = [
+            data_stores.TableRef(name=table, schema=schema)
+            for schema, table in sqlschema.list_base_tables(source_server, source_catalog, ctx.tokens)
+        ]
+    except sqlschema.SchemaTransferError as error:
+        return [f"Could not enumerate tables in SQL database '{name}': {error}"]
+
+    if not tables:
+        return []
+
+    ctx.run.update_step(step, f"Preparing to copy {len(tables)} table(s) from '{name}'")
+    created_connections: list[str] = []
+    try:
+        source_connection = _own_sql_connection(ctx, source_server, source_catalog, f"{name} source")
+        created_connections.append(source_connection)
+        target_connection = _own_sql_connection(
+            ctx, sqldatabases.server_fqdn(target), target_catalog, f"{name} target"
+        )
+        created_connections.append(target_connection)
+    except connections.ConnectionUnavailable as error:
+        _drop_connections(ctx, created_connections)
+        return [
+            f"Table data for SQL database '{name}' was not copied, because a Copy Job needs a "
+            f"connection at each end and one could not be created: {error}"
+        ]
+
+    content = copyjobs.build_sql_database_copy_job(
+        source_workspace_id=ctx.plan.source_workspace_id,
+        source_item_id=source["id"],
+        source_connection_id=created_connections[0],
+        target_workspace_id=ctx.target_workspace_id,
+        target_item_id=target["id"],
+        target_connection_id=created_connections[1],
+        tables=tables,
+    )
+    try:
+        copy_job_id = copyjobs.run_copy_job(
+            ctx.client,
+            ctx.scratch_workspace_id,
+            f"CopyJob_SqlDatabase_{name}",
+            content,
+            on_status=lambda status: ctx.run.update_step(step, f"SQL database '{name}' copy job: {status}"),
+        )
+        ctx.copy_job_ids.append((ctx.scratch_workspace_id, copy_job_id))
+        return []
+    except copyjobs.CopyJobFailed as error:
+        return [f"Table data for SQL database '{name}' did not copy: {error}"]
+    finally:
+        _drop_connections(ctx, created_connections)
+
+
+def _own_sql_connection(ctx: _Context, server: str, catalog: str, label: str) -> str:
+    connection = connections.create_own_connection(
+        ctx.client,
+        ctx.principal,
+        connection_type=connections.SQL_DATABASE_CONNECTION_TYPE,
+        path=f"{server};{catalog}",
+        display_name=f"Fab Shuffle {ctx.run.id[:8]} {label}"[:200],
+    )
+    return connection["id"]
+
+
+def _document_progress(ctx: _Context, step: str, name: str) -> Any:
+    """Bind the database name now, rather than reading it from the loop when called."""
+    return lambda message: ctx.run.update_step(step, f"{name}: {message}")
+
+
+def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
+    """Recreate Cosmos DB databases: containers from the definition, documents over the SDK.
+
+    Runs in the SQL database phase because it is the same kind of work at the same point in
+    the order, and a workspace almost never has both.
+    """
+    source_databases = cosmosdb.list_cosmos_databases(ctx.client, ctx.plan.source_workspace_id)
+    if not source_databases:
+        return 0, []
+
+    step = "sqldatabases"
+    warnings: list[str] = []
+    migrated = 0
+    for database in source_databases:
+        ctx.run.raise_if_cancelled()
+        name = database["displayName"]
+
+        # The definition holds only container metadata and no Fabric ids, so there is
+        # nothing to rewrite and the generic path handles it.
+        ctx.run.update_step(step, f"Creating Cosmos DB database '{name}'")
+        try:
+            result = analytics.migrate_definition_item(
+                ctx.client,
+                source_workspace_id=ctx.plan.source_workspace_id,
+                target_workspace_id=ctx.target_workspace_id,
+                item=database,
+                item_type=cosmosdb.COSMOS_DB_DATABASE,
+                id_map=ctx.id_map,
+                folder_id=ctx.id_map.get(database.get("folderId", "")),
+            )
+        except FabricError as error:
+            warnings.append(
+                analytics.describe_failure(cosmosdb.COSMOS_DB_DATABASE, name, error)
+            )
+            continue
+
+        ctx.id_map[result.source_id] = result.target_id
+        migrated += 1
+
+        if not ctx.plan.include_data:
+            continue
+
+        target = cosmosdb.get_cosmos_database(ctx.client, ctx.target_workspace_id, result.target_id)
+        source_endpoint = cosmosdb.endpoint_url(database)
+        target_endpoint = cosmosdb.endpoint_url(target)
+        if not source_endpoint or not target_endpoint:
+            warnings.append(
+                f"Cosmos DB database '{name}' did not report an endpoint, so its documents "
+                "were not copied. Its containers are there and ready for them."
+            )
+            continue
+
+        ctx.run.update_step(step, f"Copying documents for Cosmos DB database '{name}'")
+        progress = _document_progress(ctx, step, name)
+        try:
+            warnings.extend(
+                f"Cosmos DB database '{name}': {w}"
+                for w in cosmos_transfer.copy_documents(
+                    source_endpoint=source_endpoint,
+                    source_database=cosmosdb.database_name(database),
+                    target_endpoint=target_endpoint,
+                    target_database=cosmosdb.database_name(target),
+                    tokens=ctx.tokens,
+                    on_progress=progress,
+                )
+            )
+        except cosmos_transfer.CosmosTransferError as error:
+            warnings.append(
+                f"Documents for Cosmos DB database '{name}' did not copy: {error}. Its "
+                "containers are there and ready for them."
+            )
+
+    return migrated, warnings
+
+
+def _drop_connections(ctx: _Context, connection_ids: Iterable[str]) -> None:
+    """Delete the connections this run created for itself.
+
+    They hold this service principal's secret, so leaving one behind is worse than a failed
+    copy. A delete that fails is logged rather than raised: it must never mask the error that
+    brought us here.
+    """
+    for connection_id in connection_ids:
+        try:
+            connections.delete_connection(ctx.client, connection_id)
+        except FabricError:
+            logger.warning("Could not delete the temporary connection %s", connection_id)
+            ctx.warnings.append(
+                f"The temporary connection {connection_id}, created to copy SQL database data, "
+                "could not be deleted. Remove it in Manage connections and gateways: it holds "
+                "this service principal's credentials."
+            )
+
+
+# --------------------------------------------------------------------- phase 6
 
 
 def _migrate_mirrored_databases(ctx: _Context) -> None:
@@ -1929,7 +2207,7 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
 
 
 def _migrate_orchestration(ctx: _Context) -> None:
-    """Recreate data pipelines and Copy Jobs.
+    """Recreate data pipelines, Copy Jobs, and Apache Airflow jobs.
 
     These run last of the content phases because they orchestrate everything else: a pipeline
     can read a lakehouse, refresh a semantic model, or invoke another pipeline, so every one
@@ -1940,15 +2218,16 @@ def _migrate_orchestration(ctx: _Context) -> None:
     faithful copy is impossible anyway. Instead the ones each item binds are checked.
     """
     step = "orchestration"
-    ctx.run.start_step(step, "Migrating data pipelines and Copy Jobs")
+    ctx.run.start_step(step, "Migrating data pipelines, Copy Jobs, and Airflow jobs")
     ctx.run.raise_if_cancelled()
 
     source_id = ctx.plan.source_workspace_id
     pipelines = analytics.list_of_type(ctx.client, source_id, analytics.DATA_PIPELINE)
     jobs = analytics.list_of_type(ctx.client, source_id, analytics.COPY_JOB)
+    airflow_jobs = analytics.list_of_type(ctx.client, source_id, airflow.APACHE_AIRFLOW_JOB)
 
-    if not pipelines and not jobs:
-        ctx.run.finish_step(step, StepStatus.SKIPPED, "No data pipelines or Copy Jobs to migrate")
+    if not pipelines and not jobs and not airflow_jobs:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to orchestrate in this workspace")
         return
 
     warnings: list[str] = []
@@ -1978,15 +2257,86 @@ def _migrate_orchestration(ctx: _Context) -> None:
         migrated.extend(results)
         warnings.extend(item_warnings)
 
+    airflow_migrated = 0
+    if airflow_jobs:
+        airflow_migrated, airflow_warnings = _migrate_airflow_jobs(ctx, step, airflow_jobs, progress)
+        warnings.extend(airflow_warnings)
+
     warnings.extend(_check_connections(ctx, step, migrated))
 
-    ctx.warnings.extend(warnings)
-    ctx.run.finish_step(
-        step,
-        StepStatus.SUCCEEDED,
-        f"Migrated {len(pipelines)} data pipeline(s) and {len(jobs)} Copy Job(s)",
-        warnings,
+    counts = ", ".join(
+        part
+        for part in (
+            f"{len(pipelines)} data pipeline(s)" if pipelines else "",
+            f"{len(jobs)} Copy Job(s)" if jobs else "",
+            f"{airflow_migrated} Apache Airflow job(s)" if airflow_jobs else "",
+        )
+        if part
     )
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Migrated {counts}", warnings)
+
+
+def _migrate_airflow_jobs(
+    ctx: _Context,
+    step: str,
+    jobs: list[dict[str, Any]],
+    progress: Any,
+) -> tuple[int, list[str]]:
+    """Recreate Apache Airflow jobs, configuration and DAG files both.
+
+    The definition holds configuration only, so a job created from it alone would look
+    migrated and have nothing to run. The files follow immediately, over a separate beta API.
+    """
+    migrated = 0
+    warnings: list[str] = []
+
+    for job in jobs:
+        ctx.run.raise_if_cancelled()
+        name = job["displayName"]
+        progress(f"Migrating Apache Airflow job '{name}'")
+
+        try:
+            definition = items_module.get_item_definition(
+                ctx.client, ctx.plan.source_workspace_id, job["id"]
+            )
+            parts = definitions.strip_part(definition.get("parts") or [], airflow.PLATFORM_PART)
+            rewritten, _ = definitions.rewrite_parts(parts, ctx.id_map)
+            rewritten = airflow.retarget_location(rewritten, ctx.plan.capacity_display_region)
+
+            created = items_module.create_item(
+                ctx.client,
+                ctx.target_workspace_id,
+                name,
+                airflow.APACHE_AIRFLOW_JOB,
+                description=job.get("description") or None,
+                parts=rewritten,
+                folder_id=ctx.id_map.get(job.get("folderId", "")),
+            )
+        except FabricError as error:
+            warnings.append(analytics.describe_failure(airflow.APACHE_AIRFLOW_JOB, name, error))
+            continue
+
+        ctx.id_map[job["id"]] = created["id"]
+        migrated += 1
+        warnings.extend(airflow.configuration_warnings(rewritten, name))
+
+        copied, file_warnings = airflow.copy_files(
+            ctx.client,
+            source_workspace_id=ctx.plan.source_workspace_id,
+            source_job_id=job["id"],
+            target_workspace_id=ctx.target_workspace_id,
+            target_job_id=created["id"],
+            job_name=name,
+            on_progress=progress,
+        )
+        warnings.extend(file_warnings)
+        if not copied and not file_warnings:
+            warnings.append(
+                f"Apache Airflow job '{name}' had no files to copy, so the new job has no DAGs."
+            )
+
+    return migrated, warnings
 
 
 # -------------------------------------------------------------------- phase 7b
@@ -2154,6 +2504,7 @@ def build_plan(
         capacity_id=capacity_id,
         capacity_name=capacity.get("displayName", capacity_id),
         capacity_region=region,
+        capacity_display_region=capacity.get("region") or capacity.get("location") or "",
         source_workspace_id=source_workspace_id,
         source_workspace_name=source_name,
         # Reassignment moves the workspace itself, so its name never changes.

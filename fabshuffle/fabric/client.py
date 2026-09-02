@@ -148,11 +148,16 @@ class FabricClient:
         path: str,
         *,
         json: Any | None = None,
+        content: bytes | None = None,
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         expected: Sequence[int] | None = None,
     ) -> httpx.Response:
-        """Issue a single request, retrying throttled and transient failures."""
+        """Issue a single request, retrying throttled and transient failures.
+
+        ``content`` sends a raw body instead of JSON, which the file APIs need: they carry
+        file bytes rather than a document.
+        """
         url = self._url(path)
         last_response: httpx.Response | None = None
 
@@ -161,6 +166,7 @@ class FabricClient:
                 method.upper(),
                 url,
                 json=json,
+                content=content,
                 params=params,
                 headers=self._headers(headers),
             )

@@ -41,6 +41,9 @@ REBUILT_TYPES = frozenset(
         "GraphQuerySet",
         "MirroredAzureDatabricksCatalog",
         "SnowflakeDatabase",
+        "SQLDatabase",
+        "CosmosDBDatabase",
+        "ApacheAirflowJob",
     }
 )
 
