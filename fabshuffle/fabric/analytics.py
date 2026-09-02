@@ -40,6 +40,7 @@ from fabshuffle.fabric.items import (
     list_items,
     try_get_item_definition,
 )
+from fabshuffle.fabric.special_items import policy_for
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,9 @@ class MigratedItem:
     rebound_parts: int
     # Kept so the caller can inspect what the item binds without exporting it again.
     parts: tuple[dict[str, Any], ...] = ()
+    # Things worth telling the operator about an item that did migrate, such as a Reflex
+    # whose rules were switched off for the move.
+    warnings: tuple[str, ...] = ()
 
 
 def default_semantic_model_names(client: FabricClient, workspace_id: str) -> set[str]:
@@ -222,17 +226,24 @@ def migrate_definition_item(
     export for item types that have to be inspected before they can be migrated.
     """
     name = item["displayName"]
-    definition_format: str | None = None
+    policy = policy_for(item_type)
+    definition_format: str | None = policy.export_format
 
     if parts is None:
-        definition = get_item_definition(client, source_workspace_id, item["id"])
+        definition = get_item_definition(
+            client, source_workspace_id, item["id"], fmt=policy.export_format
+        )
         parts = list(definition.get("parts") or [])
-        definition_format = definition.get("format")
+        definition_format = policy.export_format or definition.get("format")
 
     rewritten, changed = rewrite_parts(parts, id_map)
     # The source platform file carries the original logical id, and Fabric respects it when
     # provided. Dropping it lets the new workspace mint its own identity for the item.
     rewritten = strip_part(rewritten, PLATFORM_PART)
+
+    warnings: list[str] = []
+    if policy.prepare:
+        rewritten, warnings = policy.prepare(rewritten, source_workspace_id)
 
     created = create_item(
         client,
@@ -250,6 +261,7 @@ def migrate_definition_item(
         name=name,
         rebound_parts=changed,
         parts=tuple(rewritten),
+        warnings=tuple(warnings),
     )
 
 
@@ -324,6 +336,7 @@ def migrate_items(
 
         id_map[result.source_id] = result.target_id
         migrated.append(result)
+        warnings.extend(f"{item_type} '{result.name}': {w}" for w in result.warnings)
 
     return migrated, warnings
 

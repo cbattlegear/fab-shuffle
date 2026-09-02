@@ -31,6 +31,16 @@ REBUILT_TYPES = frozenset(
         "Eventstream",
         "KQLDashboard",
         "KQLQueryset",
+        "GraphQLApi",
+        "Map",
+        "Reflex",
+        "SparkJobDefinition",
+        "VariableLibrary",
+        "MountedDataFactory",
+        "GraphModel",
+        "GraphQuerySet",
+        "MirroredAzureDatabricksCatalog",
+        "SnowflakeDatabase",
     }
 )
 
@@ -164,7 +174,44 @@ class WorkspaceAssessment:
         }
 
 
+# Types whose reason for not migrating is worth stating precisely, because "not supported
+# yet" would imply the work is simply outstanding when in fact the API refuses.
+SPECIFIC_REASONS = {
+    "DigitalTwinBuilder": (
+        "its APIs refuse service principals, and Fab Shuffle signs in as one. Recreate it by "
+        "hand, or run the migration as a user if that becomes possible"
+    ),
+    "DigitalTwinBuilderFlow": (
+        "a flow only means anything alongside its Digital Twin Builder, whose APIs refuse "
+        "service principals, so migrating the flow on its own would leave it pointing at a "
+        "twin that does not exist. Recreate both by hand"
+    ),
+    "MLModel": (
+        "its APIs refuse service principals, and the trained model itself lives outside the "
+        "item definition. Re-register the model in the new workspace"
+    ),
+    "MLExperiment": (
+        "its APIs refuse service principals, and run history cannot be exported. Recreate the "
+        "experiment in the new workspace"
+    ),
+    "UserDataFunction": "its APIs refuse service principals, and Fab Shuffle signs in as one",
+    "AnomalyDetector": "its APIs refuse service principals, and Fab Shuffle signs in as one",
+    "OperationsAgent": "its APIs refuse service principals, and Fab Shuffle signs in as one",
+    "Dashboard": (
+        "Fabric exposes no way to read a dashboard's definition, so it cannot be recreated. "
+        "Rebuild it in the new workspace and re-pin its tiles"
+    ),
+    "Datamart": "Fabric exposes no API to read or create one, so it cannot be recreated",
+    "WarehouseSnapshot": (
+        "a snapshot is a point in time view of a warehouse, and that history does not exist "
+        "in a newly created one. Take a fresh snapshot after the warehouse has migrated"
+    ),
+}
+
+
 def _reason_for(item_type: str) -> str:
+    if item_type in SPECIFIC_REASONS:
+        return SPECIFIC_REASONS[item_type]
     if item_type in POWER_BI_TYPES:
         return (
             "Fab Shuffle cannot recreate this Power BI item type yet. Recreate it in the new "
@@ -212,6 +259,7 @@ __all__ = [
     "POWER_BI_TYPES",
     "REBUILT_TYPES",
     "RELATION_TYPE_ALIASES",
+    "SPECIFIC_REASONS",
     "Strategy",
     "UnsupportedItem",
     "WorkspaceAssessment",

@@ -14,7 +14,8 @@ creating the copy. These four need something else first:
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from fabshuffle.fabric.definitions import decode_json_part, find_part, part, replace_part
@@ -159,6 +160,69 @@ def spark_job_warnings(parts: Iterable[Mapping[str, Any]], source_workspace_id: 
     return warnings
 
 
+# ------------------------------------------------------------------- policies
+
+
+@dataclass(frozen=True, slots=True)
+class ItemPolicy:
+    """What an item type needs beyond exporting a definition and creating it again.
+
+    ``export_format`` asks for a specific definition format. ``prepare`` runs after the ids
+    have been rewritten and may change the parts, returning any warning worth showing.
+    """
+
+    export_format: str | None = None
+    prepare: Callable[[list[dict[str, Any]], str], tuple[list[dict[str, Any]], list[str]]] | None = None
+
+
+def _prepare_catalog(
+    parts: list[dict[str, Any]],
+    _source_workspace_id: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    parts, was = disable_catalog_autosync(parts)
+    if was.casefold() != "enabled":
+        return parts, []
+    return parts, [
+        "its automatic sync was turned off for the move, so it is not mirroring the Databricks "
+        "catalog yet. Turn autoSync back on once you are ready for it to sync alongside the "
+        "original"
+    ]
+
+
+def _prepare_reflex(
+    parts: list[dict[str, Any]],
+    _source_workspace_id: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    parts, running = disable_reflex_rules(parts)
+    if not running:
+        return parts, []
+    return parts, [
+        f"{running} rule(s) were running and have been switched off for the move. Leaving them "
+        "on would have fired every alert twice and triggered every action twice, once from "
+        "each workspace. Turn them on when you are ready to cut over"
+    ]
+
+
+def _prepare_spark_job(
+    parts: list[dict[str, Any]],
+    source_workspace_id: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    return parts, spark_job_warnings(parts, source_workspace_id)
+
+
+POLICIES: dict[str, ItemPolicy] = {
+    "MirroredAzureDatabricksCatalog": ItemPolicy(prepare=_prepare_catalog),
+    "Reflex": ItemPolicy(prepare=_prepare_reflex),
+    "SparkJobDefinition": ItemPolicy(
+        export_format=SPARK_JOB_DEFINITION_FORMAT, prepare=_prepare_spark_job
+    ),
+}
+
+
+def policy_for(item_type: str) -> ItemPolicy:
+    return POLICIES.get(item_type, ItemPolicy())
+
+
 def encode_part(path: str, content: Mapping[str, Any] | list[Any]) -> dict[str, str]:
     """A definition part carrying JSON, for tests and for rebuilding a payload."""
     return part(path, content)
@@ -166,13 +230,16 @@ def encode_part(path: str, content: Mapping[str, Any] | list[Any]) -> dict[str, 
 
 __all__ = [
     "ADB_CATALOG_PART",
+    "POLICIES",
     "REFLEX_ENTITIES_PART",
     "SNOWFLAKE_PROPERTIES_PART",
     "SPARK_JOB_DEFINITION_FORMAT",
     "SPARK_JOB_PAYLOAD_PART",
+    "ItemPolicy",
     "disable_catalog_autosync",
     "disable_reflex_rules",
     "encode_part",
+    "policy_for",
     "snowflake_creation_payload",
     "spark_job_warnings",
 ]

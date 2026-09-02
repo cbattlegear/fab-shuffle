@@ -47,9 +47,28 @@ def test_rebuild_warns_about_every_item_it_leaves_behind():
     assert assessment.unsupported_types == ["Dashboard", "MLModel"]
 
     by_name = {item.name: item for item in assessment.unsupported}
-    assert "does not migrate this item type yet" in by_name["Nightly load"].reason
-    assert "cannot recreate this Power BI item type yet" in by_name["Exec"].reason
+    # Both of these are refused by the API rather than merely unbuilt, and say so.
+    assert "refuse service principals" in by_name["Nightly load"].reason
+    assert "no way to read a dashboard's definition" in by_name["Exec"].reason
     assert by_name["Nightly load"].message().startswith("MLModel 'Nightly load' was not migrated")
+
+
+def test_a_type_we_simply_have_not_built_says_so() -> None:
+    assessment = assess_workspace(items(("bronze", "Lakehouse"), ("Thing", "SomeFutureType")))
+
+    by_name = {item.name: item for item in assessment.unsupported}
+    assert "does not migrate this item type yet" in by_name["Thing"].reason
+
+
+def test_a_flow_explains_that_its_parent_cannot_move() -> None:
+    """Migrating one alone would leave it pointing at a twin that does not exist."""
+    assessment = assess_workspace(
+        items(("bronze", "Lakehouse"), ("Flow", "DigitalTwinBuilderFlow"))
+    )
+
+    reason = next(item.reason for item in assessment.unsupported if item.name == "Flow")
+    assert "Digital Twin Builder" in reason
+    assert "refuse service principals" in reason
 
 
 def test_derived_items_are_neither_migrated_nor_reported():

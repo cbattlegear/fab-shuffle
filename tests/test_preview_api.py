@@ -154,7 +154,8 @@ def test_preview_lists_unsupported_items_for_a_rebuild(client, session_id, monke
 
     names = {item["name"]: item for item in result["unsupported"]}
     assert set(names) == {"Nightly", "Exec"}
-    assert "Power BI item type" in names["Exec"]["reason"]
+    # A dashboard has no definition to read, which is worth saying rather than "not yet".
+    assert "no way to read a dashboard's definition" in names["Exec"]["reason"]
 
 
 def test_dependency_problems_are_reported_before_the_run_starts(client, session_id, monkeypatch):

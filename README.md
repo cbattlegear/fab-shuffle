@@ -55,9 +55,18 @@ copies everything it supports.
 | Data pipeline | ✅ | n/a | Rebound to migrated items; connections reused and checked |
 | Copy Job | ✅ | n/a | Rebound to migrated items; connections reused and checked |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
-| Workspace folders | ✅ | n/a | Hierarchy recreated |
+| Workspace folders | ✅ | n/a | Hierarchy recreated, and items placed back into it |
 | Custom Spark pools | ✅ | n/a | Recreated, and environments repointed at them |
 | Workspace Spark settings | ✅ | n/a | Default pool, starter pool, and job settings |
+| Spark job definition | ✅ | n/a | Exported as V2 so the code files come too |
+| API for GraphQL | ✅ | n/a | In-Fabric data sources rebound; external ones left alone |
+| Variable library | ✅ | n/a | Item references rebound |
+| Mounted data factory | ✅ | n/a | Points at the same Azure Data Factory |
+| Graph model / query set | ✅ | n/a | Mappings rebound; the index needs rebuilding |
+| Map | ✅ | n/a | Lakehouse and KQL sources rebound |
+| Activator (Reflex) | ✅ | n/a | Rules arrive switched off |
+| Mirrored Azure Databricks catalog | ✅ | n/a | Arrives with automatic sync off |
+| Snowflake database | ✅ | n/a | Points at the same Snowflake database |
 | Workspace permissions | ✅ | n/a | Role assignments replayed |
 
 On a rebuild, anything not in that table is reported by name and type — on the review screen
@@ -80,11 +89,21 @@ definition — Fabric documents that filtering the item list by dataflow type do
 reliable information. Anything that is not CI/CD-enabled is reported by name, telling you to
 upgrade it with the upgrade wizard or Save As and migrate again.
 
-**Mirrored databases arrive with mirroring stopped.** Creating the item does not start
-replication, and Fabric rejects a start while the item is still initializing. Fab Shuffle
-reports what the source mirror's status was and leaves the decision to you, because starting
-it adds a *second* live mirror reading the same source database while the original is
-presumably still running.
+**Some items arrive switched off.** Anything that acts on its own is created inactive, because
+leaving it running would mean two copies acting on the same source at once. Mirrored databases
+arrive with mirroring stopped, a mirrored Azure Databricks catalog with `autoSync` disabled,
+and an Activator with every rule's `shouldRun` set to false — otherwise every alert fires
+twice and every pipeline it triggers runs twice, once from each region. Each one reports what
+its original setting was so you can restore it at cutover.
+
+**A graph model's index is not copied.** The mappings and graph type come across, and the delta
+tables they read migrate with their lakehouse, but the index itself is built from the data.
+Refresh the model in the new workspace before running queries against it.
+
+**A Spark job definition is exported as `SparkJobDefinitionV2`.** V1 and V2 share a payload
+schema *and* a part filename, and only V2 carries the `Main/` and `Libs/` parts, so exporting
+with the default would silently produce a job whose executable does not exist. Jars cannot be
+carried inline at all, so a JVM job is reported instead.
 
 **Environments arrive unpublished.** Publish them in the new workspace before running
 anything that depends on them. Custom Spark pools are recreated with the workspace, so an
@@ -126,19 +145,24 @@ reference items created by an earlier one:
    them.
 8. **Eventstreams, KQL querysets, and KQL dashboards** — all three read the eventhouses and
    data stores above, and an eventstream sources from connections.
-9. **Environments, notebooks, then dataflows** — a notebook attaches to an environment and
-   reads a lakehouse, and a semantic model can read a dataflow, so all three come first.
+9. **Environments, notebooks, then dataflows, then the rest** — a notebook attaches to an
+   environment and reads a lakehouse, and a semantic model can read a dataflow, so those come
+   first. Spark job definitions, GraphQL APIs, graph models and query sets, maps, variable
+   libraries and mounted data factories follow, since each reads something built earlier.
 10. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
     endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 6 finished; a
     report embeds its model's GUID, so it runs after the models. Models are ordered among
     themselves using the relations graph, so a composite model follows what it reads.
 11. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
-    refreshing models, and invoking each other, so they go last and are ordered among
-    themselves by the relations graph.
-12. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+    refreshing models, and invoking each other, so they are ordered among themselves by the
+    relations graph.
+12. **Activators** — last of the content phases. An Activator watches an eventstream or KQL
+    database and acts by running pipelines and notebooks, so everything on both sides has to
+    exist first.
+13. **Permissions** — the source workspace's admins are granted as soon as the workspace is
     created, so a failed run never leaves a workspace nobody can open. The remaining roles
     are replayed here, last, so nothing is visible half built.
-13. **Cleanup** — drop the scratch workspace and local staging.
+14. **Cleanup** — drop the scratch workspace and local staging.
 
 ### Connections
 

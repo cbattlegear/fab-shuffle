@@ -28,15 +28,18 @@ items created by an *earlier* phase:
    them. A connection's target cannot be changed in place, so this is a replacement.
 8. ``realtime``     eventstreams, KQL querysets, and KQL dashboards. They read the
    eventhouses and data stores above, and an eventstream sources from connections.
-9. ``engineering``  environments, then notebooks, then dataflows. A notebook attaches to an
-   environment and reads a lakehouse; a semantic model can read a dataflow, so all three
-   come before the analytics phase.
+9. ``engineering``  environments, then notebooks, then dataflows, then Spark job definitions,
+   GraphQL APIs, graph models and query sets, maps, variable libraries, and mounted data
+   factories. A notebook attaches to an environment and reads a lakehouse; a semantic model
+   can read a dataflow; a query set names its graph model. All of them come before analytics.
 10. ``analytics``   semantic models, then reports. Models bind to lakehouse and warehouse
     SQL endpoints, so they need step 6 finished; reports bind to models, so they run after.
 11. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
-    above, so they go last.
-12. ``permissions`` remaining role assignments. Admins were granted back in step 1.
-13. ``cleanup``     drop the scratch workspace and local staging.
+    above.
+12. ``reflexes``    Activator items, last of the content phases. One watches an eventstream or
+    KQL database and acts by running pipelines and notebooks, so both sides must exist first.
+13. ``permissions`` remaining role assignments. Admins were granted back in step 1.
+14. ``cleanup``     drop the scratch workspace and local staging.
 """
 
 from __future__ import annotations
@@ -59,9 +62,11 @@ from fabshuffle.fabric import (
     relations,
     shortcuts,
     spark,
+    special_items,
     workspaces,
 )
-from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric import items as items_module
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.fabric.definitions import build_rewriter
 from fabshuffle.fabric.items import is_monitoring_item, list_items
 from fabshuffle.fabric.support import (
@@ -179,6 +184,7 @@ def run_migration(
             _migrate_engineering(context)
             _migrate_reports_and_models(context)
             _migrate_orchestration(context)
+            _migrate_reflexes(context)
             _copy_permissions(context)
             if cleanup:
                 cleanup_run(context.run, context.client, scratch_dir)
@@ -1098,8 +1104,10 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
 
     source_id = ctx.plan.source_workspace_id
     databases = data_stores.list_mirrored_databases(ctx.client, source_id)
-    if not databases:
-        ctx.run.finish_step(step, StepStatus.SKIPPED, "No mirrored databases in the source workspace")
+    catalogs = analytics.list_of_type(ctx.client, source_id, analytics.MIRRORED_ADB_CATALOG)
+    snowflake = analytics.list_of_type(ctx.client, source_id, analytics.SNOWFLAKE_DATABASE)
+    if not databases and not catalogs and not snowflake:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No mirrored data stores in the source workspace")
         return
 
     warnings: list[str] = []
@@ -1107,23 +1115,28 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
     def progress(message: str) -> None:
         ctx.run.update_step(step, message)
 
-    # Record what was running before the move, so the warning can say whether replication
-    # actually needs restarting in the new region.
-    running = {
-        db["id"]: data_stores.mirroring_status(ctx.client, source_id, db["id"]) for db in databases
-    }
+    if not databases:
+        migrated: list[analytics.MigratedItem] = []
+        running: dict[str, str | None] = {}
+    else:
+        # Record what was running before the move, so the warning can say whether replication
+        # actually needs restarting in the new region.
+        running = {
+            db["id"]: data_stores.mirroring_status(ctx.client, source_id, db["id"])
+            for db in databases
+        }
 
-    migrated, item_warnings = analytics.migrate_items(
-        ctx.client,
-        source_workspace_id=source_id,
-        target_workspace_id=ctx.target_workspace_id,
-        items=databases,
-        item_type=analytics.MIRRORED_DATABASE,
-        id_map=ctx.id_map,
-        folder_map=ctx.id_map,
-        on_progress=progress,
-    )
-    warnings.extend(item_warnings)
+        migrated, item_warnings = analytics.migrate_items(
+            ctx.client,
+            source_workspace_id=source_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=databases,
+            item_type=analytics.MIRRORED_DATABASE,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            on_progress=progress,
+        )
+        warnings.extend(item_warnings)
 
     for result in migrated:
         target = ctx.client.get(
@@ -1144,10 +1157,83 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             "second mirror to read the source database."
         )
 
+    if catalogs:
+        results, item_warnings = analytics.migrate_items(
+            ctx.client,
+            source_workspace_id=source_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=catalogs,
+            item_type=analytics.MIRRORED_ADB_CATALOG,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            on_progress=progress,
+        )
+        migrated.extend(results)
+        warnings.extend(item_warnings)
+
+    if snowflake:
+        warnings.extend(_migrate_snowflake_databases(ctx, step, snowflake, progress))
+
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
-        step, StepStatus.SUCCEEDED, f"Migrated {len(migrated)} mirrored database(s)", warnings
+        step, StepStatus.SUCCEEDED, f"Migrated {len(migrated) + len(snowflake)} item(s)", warnings
     )
+
+
+def _migrate_snowflake_databases(
+    ctx: _Context,
+    step: str,
+    items: list[dict[str, Any]],
+    progress: Any,
+) -> list[str]:
+    """Recreate Snowflake database items against the same Snowflake database.
+
+    These are not migrated through their definition. The definition article marks its two
+    fields as having to be empty on create, which only makes sense when creating *with* a
+    definition; the creation payload takes both directly. The data stays in Snowflake and the
+    connection is tenant scoped, so nothing else has to move.
+    """
+    warnings: list[str] = []
+
+    for item in items:
+        name = item["displayName"]
+        progress(f"Migrating SnowflakeDatabase '{name}'")
+
+        parts: list[dict[str, Any]] = []
+        try:
+            definition = items_module.get_item_definition(
+                ctx.client, ctx.plan.source_workspace_id, item["id"]
+            )
+            parts = list(definition.get("parts") or [])
+        except FabricError:
+            # The item properties alone are usually enough; the definition is a fallback.
+            logger.info("Could not export the definition of Snowflake database '%s'", name)
+
+        payload = special_items.snowflake_creation_payload(item, parts)
+        if not payload:
+            warnings.append(
+                f"SnowflakeDatabase '{name}' was not migrated because the database name and "
+                "connection it uses could not be read. Recreate it by hand."
+            )
+            continue
+
+        try:
+            created = items_module.create_item(
+                ctx.client,
+                ctx.target_workspace_id,
+                name,
+                analytics.SNOWFLAKE_DATABASE,
+                description=item.get("description") or None,
+                creation_payload=payload,
+                folder_id=ctx.id_map.get(item.get("folderId", "")),
+            )
+        except FabricError as error:
+            warnings.append(analytics.describe_failure(analytics.SNOWFLAKE_DATABASE, name, error))
+            continue
+
+        ctx.id_map[item["id"]] = created["id"]
+
+    return warnings
 
 
 # --------------------------------------------------------------------- phase 6
@@ -1426,8 +1512,23 @@ def _migrate_engineering(ctx: _Context) -> None:
     environments = analytics.list_of_type(ctx.client, source_id, analytics.ENVIRONMENT)
     notebooks = analytics.list_of_type(ctx.client, source_id, analytics.NOTEBOOK)
     dataflows = analytics.list_of_type(ctx.client, source_id, analytics.DATAFLOW)
+    # Ordered by what reads what. A Spark job definition pins an environment and a lakehouse,
+    # a GraphQuerySet names its GraphModel, and a Map reads lakehouses and KQL databases.
+    later_types = [
+        analytics.SPARK_JOB_DEFINITION,
+        analytics.GRAPHQL_API,
+        analytics.GRAPH_MODEL,
+        analytics.GRAPH_QUERY_SET,
+        analytics.MAP,
+        analytics.VARIABLE_LIBRARY,
+        analytics.MOUNTED_DATA_FACTORY,
+    ]
+    later = [
+        (item_type, analytics.list_of_type(ctx.client, source_id, item_type))
+        for item_type in later_types
+    ]
 
-    if not environments and not notebooks and not dataflows:
+    if not environments and not notebooks and not dataflows and not any(i for _, i in later):
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to migrate in this phase")
         return
 
@@ -1474,6 +1575,30 @@ def _migrate_engineering(ctx: _Context) -> None:
 
     if dataflows:
         counts[analytics.DATAFLOW] = _migrate_dataflows(ctx, step, dataflows, warnings, progress)
+
+    # Everything above is either depended on by these or independent of them, so they go last.
+    for item_type, items in later:
+        if not items:
+            continue
+        results, item_warnings = analytics.migrate_items(
+            ctx.client,
+            source_workspace_id=source_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=items,
+            item_type=item_type,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            on_progress=progress,
+        )
+        counts[item_type] = len(results)
+        warnings.extend(item_warnings)
+
+        if item_type == analytics.GRAPH_MODEL and results:
+            warnings.append(
+                f"{len(results)} graph model(s) were created with their mappings intact, but "
+                "the graph index itself is built from the data rather than copied. Refresh "
+                "them in the new workspace before running queries."
+            )
 
     # The workspace default environment is referenced by name, so it can only be set once the
     # environment it names exists here.
@@ -1678,6 +1803,45 @@ def _migrate_orchestration(ctx: _Context) -> None:
         StepStatus.SUCCEEDED,
         f"Migrated {len(pipelines)} data pipeline(s) and {len(jobs)} Copy Job(s)",
         warnings,
+    )
+
+
+# -------------------------------------------------------------------- phase 7b
+
+
+def _migrate_reflexes(ctx: _Context) -> None:
+    """Recreate Reflex (Activator) items, with every rule switched off.
+
+    This is the last content phase. A Reflex reacts to something and then acts on something
+    else: it watches an eventstream or a KQL database, and its actions run pipelines and
+    notebooks. Everything on both sides therefore has to exist and be in the id map already,
+    which puts it after orchestration rather than with the other real-time items.
+    """
+    step = "reflexes"
+    ctx.run.start_step(step, "Migrating Activator items")
+    ctx.run.raise_if_cancelled()
+
+    source_id = ctx.plan.source_workspace_id
+    reflexes = analytics.list_of_type(ctx.client, source_id, analytics.REFLEX)
+    if not reflexes:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No Activator items to migrate")
+        return
+
+    migrated, warnings = analytics.migrate_items(
+        ctx.client,
+        source_workspace_id=source_id,
+        target_workspace_id=ctx.target_workspace_id,
+        items=reflexes,
+        item_type=analytics.REFLEX,
+        id_map=ctx.id_map,
+        folder_map=ctx.id_map,
+        on_progress=lambda message: ctx.run.update_step(step, message),
+    )
+    warnings.extend(_check_connections(ctx, step, migrated))
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, f"Migrated {len(migrated)} Activator item(s)", warnings
     )
 
 
