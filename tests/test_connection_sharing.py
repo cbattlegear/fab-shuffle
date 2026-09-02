@@ -132,24 +132,117 @@ def test_the_instructions_name_the_application_to_add() -> None:
     assert any("Manage connections and gateways" in step for step in steps)
 
 
-def test_the_instructions_ask_for_the_least_role_that_works() -> None:
-    """Owner is only needed to manage a connection, not to use one."""
+def test_the_instructions_point_at_the_role_shown_per_connection() -> None:
+    """The roles differ: User to use a connection, Owner to replace one."""
     steps = " ".join(orchestrator.portal_instructions(SPN))
 
-    assert "User role" in steps
-    assert "Owner is only needed" in steps
+    assert "role shown against" in steps
+    assert SPN in steps
 
 
 def test_the_instructions_end_by_saying_to_re_run() -> None:
     assert "Re-run" in orchestrator.portal_instructions(SPN)[-1]
 
 
-def test_the_blocked_connections_carry_what_needs_them() -> None:
+def test_a_bound_connection_asks_for_user_and_names_what_needs_it() -> None:
     entry = orchestrator.ConnectionAccess(
-        connection_id="c-1", used_by=("CopyJob 'copyjob1'", "DataPipeline 'p'")
+        connection_id="c-1",
+        role="User",
+        reason="the items below bind it",
+        used_by=("CopyJob 'copyjob1'", "DataPipeline 'p'"),
     )
 
     assert entry.as_dict() == {
         "connectionId": "c-1",
+        "connectionName": "",
+        "role": "User",
+        "reason": "the items below bind it",
         "usedBy": ["CopyJob 'copyjob1'", "DataPipeline 'p'"],
     }
+    assert "needs the User role" in entry.message()
+    assert "copyjob1" in entry.message()
+
+
+def test_a_connection_needing_replacement_asks_for_owner() -> None:
+    entry = orchestrator.ConnectionAccess(
+        connection_id="c-2",
+        connection_name="Warehouse conn",
+        role="Owner",
+        reason="it points into this workspace",
+    )
+
+    assert "needs the Owner role" in entry.message()
+    assert "Warehouse conn" in entry.message()
+    # Nothing binds it in the item sense, so no item list is invented.
+    assert "Needed by" not in entry.message()
+
+
+def test_both_kinds_of_access_problem_land_in_one_list(monkeypatch) -> None:
+    """From the operator's side it is one job, even though the causes differ."""
+    monkeypatch.setattr(
+        orchestrator,
+        "_unusable_bound_connections",
+        lambda *a, **k: [
+            orchestrator.ConnectionAccess(
+                connection_id="bound-1", role="User", reason="items bind it", used_by=("CopyJob 'j'",)
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "connection_prerequisites",
+        lambda *a, **k: [
+            connections.ConnectionPrerequisite(
+                connection_id="into-1",
+                connection_name="Warehouse conn",
+                path="server;guid",
+                matched="Warehouse 'w'",
+                credential_type="ServicePrincipal",
+                connectivity_type="ShareableCloud",
+                manageable=False,
+            )
+        ],
+    )
+
+    class Client:
+        def list_all(self, path, params=None, value_key="value"):
+            return [{"id": "visible-1"}] if path.rstrip("/").endswith("connections") else []
+
+    entries = orchestrator.scan_connection_access(
+        Client(), source_workspace_id="ws", migrated=[{"id": "x"}], client_id=SPN
+    )
+
+    assert [(e.connection_id, e.role) for e in entries] == [
+        ("bound-1", "User"),
+        ("into-1", "Owner"),
+    ]
+
+
+def test_a_connection_we_already_own_is_not_asked_for_again(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator, "_unusable_bound_connections", lambda *a, **k: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "connection_prerequisites",
+        lambda *a, **k: [
+            connections.ConnectionPrerequisite(
+                connection_id="into-1",
+                connection_name="Owned",
+                path="p",
+                matched="m",
+                credential_type="ServicePrincipal",
+                connectivity_type="ShareableCloud",
+                manageable=True,
+            )
+        ],
+    )
+
+    class Client:
+        def list_all(self, path, params=None, value_key="value"):
+            return [{"id": "visible-1"}] if path.rstrip("/").endswith("connections") else []
+
+    assert (
+        orchestrator.scan_connection_access(
+            Client(), source_workspace_id="ws", migrated=[], client_id=SPN
+        )
+        == []
+    )

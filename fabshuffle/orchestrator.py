@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -362,28 +363,45 @@ def _report_unsupported_items(ctx: _Context) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ConnectionAccess:
-    """A connection that migrated items need, which this service principal cannot see."""
+    """A connection this service principal needs more access to before the migration works."""
 
     connection_id: str
-    used_by: tuple[str, ...]
+    role: str
+    reason: str
+    used_by: tuple[str, ...] = ()
+    connection_name: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {"connectionId": self.connection_id, "usedBy": list(self.used_by)}
+        return {
+            "connectionId": self.connection_id,
+            "connectionName": self.connection_name,
+            "role": self.role,
+            "reason": self.reason,
+            "usedBy": list(self.used_by),
+        }
+
+    def message(self) -> str:
+        label = (
+            f"'{self.connection_name}' ({self.connection_id})"
+            if self.connection_name
+            else self.connection_id
+        )
+        used = f" Needed by {', '.join(self.used_by)}." if self.used_by else ""
+        return f"Connection {label} needs the {self.role} role: {self.reason}.{used}"
 
 
 def portal_instructions(client_id: str) -> list[str]:
     """How to grant the service principal access to a connection, in the portal.
 
     There is an API for this, but adding a role assignment needs Owner on the connection,
-    which is exactly what is missing, so it cannot be done for the operator.
+    which is what is missing in the first place, so it cannot be done for the operator.
     """
     return [
         "Open the Fabric portal and go to Settings, then Manage connections and gateways.",
-        "Find the connection by the id listed above on the Connections tab.",
+        "Find each connection listed above by its id on the Connections tab.",
         "Select it, then open Manage users from the toolbar or the row's ... menu.",
-        f"Add the service principal (application id {client_id}) and give it the User role. "
-        "Owner is only needed if you want Fab Shuffle to be able to manage the connection "
-        "rather than just use it.",
+        f"Add the service principal (application id {client_id}) with the role shown against "
+        "that connection above, then Share.",
         "Re-run the migration once every connection above has been shared.",
     ]
 
@@ -392,27 +410,61 @@ def scan_connection_access(
     client: FabricClient,
     *,
     source_workspace_id: str,
+    migrated: list[dict[str, Any]] | None = None,
+    client_id: str = "",
 ) -> list[ConnectionAccess]:
-    """Find connections that migrated items bind but this service principal cannot use.
+    """Every connection whose access has to change before this migration will work.
 
-    An item that binds an unusable connection is rejected outright at creation, and the
-    rejection arrives per item, so a workspace where one connection is shared by six items
-    fails six times for the same reason after everything else has already been built. The
-    definitions are read up front instead, and reported by connection, because one grant
-    fixes every item that shares it.
+    Two different problems land in one list, because from the operator's side they are the
+    same job. An item that binds a connection this service principal cannot see is refused
+    outright at creation, and needs only the User role to fix. A connection that points into
+    the workspace has to be replaced, and copying its role assignments onto the replacement
+    needs Owner on the original.
     """
+    entries: list[ConnectionAccess] = []
+    known = connections.connections_by_id(client)
+
+    # Without the tenant's connections there is nothing to compare against, and the run
+    # already reports that separately.
+    if known:
+        entries.extend(_unusable_bound_connections(client, source_workspace_id, known))
+
+    if migrated is not None:
+        for prerequisite in connection_prerequisites(
+            client,
+            source_workspace_id=source_workspace_id,
+            migrated=migrated,
+            client_id=client_id,
+        ):
+            if prerequisite.manageable:
+                continue
+            entries.append(
+                ConnectionAccess(
+                    connection_id=prerequisite.connection_id,
+                    connection_name=prerequisite.connection_name,
+                    role="Owner",
+                    reason=(
+                        "it points into this workspace, so it has to be replaced, and copying "
+                        "its role assignments onto the replacement needs Owner on the original"
+                    ),
+                )
+            )
+
+    return entries
+
+
+def _unusable_bound_connections(
+    client: FabricClient,
+    source_workspace_id: str,
+    known: Mapping[str, Any],
+) -> list[ConnectionAccess]:
+    """Connections that items bind but this service principal cannot see."""
     binding_items: list[tuple[str, str, str]] = []
     for item_type in CONNECTION_BINDING_TYPES:
         for item in analytics.list_of_type(client, source_workspace_id, item_type):
             binding_items.append((item_type, item.get("displayName") or item["id"], item["id"]))
 
     if not binding_items:
-        return []
-
-    known = connections.connections_by_id(client)
-    # Without the tenant's connections there is nothing to compare against, and the run
-    # already warns about that separately.
-    if not known:
         return []
 
     unusable: dict[str, list[str]] = {}
@@ -425,7 +477,15 @@ def scan_connection_access(
                 unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
 
     return [
-        ConnectionAccess(connection_id=connection_id, used_by=tuple(sorted(items)))
+        ConnectionAccess(
+            connection_id=connection_id,
+            role="User",
+            reason=(
+                "the items below bind it, and Fabric refuses to create an item whose "
+                "connection the caller cannot use"
+            ),
+            used_by=tuple(sorted(items)),
+        )
         for connection_id, items in sorted(unusable.items())
     ]
 
@@ -435,20 +495,20 @@ def bound_connection_warnings(
     *,
     source_workspace_id: str,
     client_id: str,
+    migrated: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """The connection access problem as a single warning, for the run's warning list."""
-    blocked = scan_connection_access(client, source_workspace_id=source_workspace_id)
+    """The connection access problem as warnings, for the run's warning list."""
+    blocked = scan_connection_access(
+        client,
+        source_workspace_id=source_workspace_id,
+        migrated=migrated,
+        client_id=client_id,
+    )
     if not blocked:
         return []
-
-    listed = "; ".join(
-        f"{entry.connection_id} (used by {', '.join(entry.used_by)})" for entry in blocked
-    )
-    return [
-        f"{len(blocked)} connection(s) are bound by items in this workspace but cannot be seen "
-        f"by this service principal, so those items will be refused when they are recreated: "
-        f"{listed}. Share them with application id {client_id} in Manage connections and "
-        "gateways, then re-run."
+    return [entry.message() for entry in blocked] + [
+        f"Share the connection(s) above with application id {client_id} in Manage connections "
+        "and gateways, then re-run."
     ]
 
 
@@ -485,7 +545,10 @@ def dependency_warnings(
         issues=issues,
         prerequisites=prerequisites,
         bound=bound_connection_warnings(
-            client, source_workspace_id=source_workspace_id, client_id=client_id
+            client,
+            source_workspace_id=source_workspace_id,
+            client_id=client_id,
+            migrated=migrated,
         ),
     )
 

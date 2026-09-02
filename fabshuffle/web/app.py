@@ -271,6 +271,7 @@ def create_app() -> FastAPI:
                     "connectionAccess": _connection_access_preview(
                         client,
                         source_workspace_id=source_workspace_id,
+                        migrated=assessment.migrated,
                         client_id=session.principal.client_id,
                     ),
                 }
@@ -481,15 +482,21 @@ def _connection_access_preview(
     client: FabricClient,
     *,
     source_workspace_id: str,
+    migrated: list[dict[str, Any]],
     client_id: str,
 ) -> dict[str, Any] | None:
-    """Connections the migration needs but cannot see, with how to grant access.
+    """Connections the migration needs more access to, with how to grant it.
 
     Returned as its own section rather than folded into the warnings, because unlike the
     other warnings this is a task to do before starting, and it has steps.
     """
     try:
-        blocked = scan_connection_access(client, source_workspace_id=source_workspace_id)
+        blocked = scan_connection_access(
+            client,
+            source_workspace_id=source_workspace_id,
+            migrated=migrated,
+            client_id=client_id,
+        )
     except FabricApiError as error:
         logger.info("Could not check connection access: %s", error)
         return None

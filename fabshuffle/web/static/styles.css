@@ -354,4 +354,18 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 #connection-access ol { margin: 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--text-dim); }
 #connection-access ol li { margin-bottom: 0.25rem; }
-#connection-access .how { margin: 0.75rem 0 0.35rem; }
+#connection-access .how { margin: 0.75rem 0 0.35rem; }#connection-access li { margin-bottom: 0.5rem; }
+#connection-access .role {
+  display: inline-block;
+  min-width: 3.6rem;
+  margin-right: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-align: center;
+  color: var(--danger);
+  border: 1px solid rgba(229, 100, 107, 0.5);
+}
+#connection-access .why { margin-top: 0.15rem; font-size: 0.8rem; }

@@ -79,19 +79,11 @@ class ConnectionPrerequisite:
     manageable: bool
 
     def message(self) -> str:
-        access = (
-            ""
-            if self.manageable
-            else (
-                " The service principal also has no Owner role on it, so grant that first if "
-                "you want it managed programmatically."
-            )
-        )
         return (
             f"Connection '{self.connection_name}' points at '{self.matched}' in the source "
             f"workspace (path '{self.path}'). Fabric does not allow a connection's target to "
             f"be changed, so create a replacement {self.credential_type} connection against "
-            f"the migrated item and repoint the items that use it.{access}"
+            "the migrated item and repoint the items that use it."
         )
 
     def as_dict(self) -> dict[str, Any]:

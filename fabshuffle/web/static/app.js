@@ -352,10 +352,25 @@ function renderConnectionAccess() {
   list.innerHTML = "";
   access.connections.forEach((entry) => {
     const item = document.createElement("li");
+
+    const role = document.createElement("strong");
+    role.className = "role";
+    role.textContent = entry.role;
+    item.appendChild(role);
+
     const id = document.createElement("code");
-    id.textContent = entry.connectionId;
+    id.textContent = entry.connectionName
+      ? `${entry.connectionName} (${entry.connectionId})`
+      : entry.connectionId;
     item.appendChild(id);
-    item.appendChild(document.createTextNode(` — needed by ${entry.usedBy.join(", ")}`));
+
+    const why = document.createElement("div");
+    why.className = "why";
+    why.textContent = entry.usedBy.length
+      ? `${entry.reason}: ${entry.usedBy.join(", ")}.`
+      : `${entry.reason}.`;
+    item.appendChild(why);
+
     list.appendChild(item);
   });
 

@@ -120,8 +120,9 @@
       <div id="connection-access" class="warnings danger" hidden>
         <h3>Connections need sharing first</h3>
         <p class="hint">
-          These items bind connections this service principal cannot see, so Fabric will refuse
-          to recreate them. One share fixes every item listed against it.
+          Grant the service principal these roles before running. Fabric refuses to create an
+          item whose connection the caller cannot use, and a connection that has to be replaced
+          can only have its users copied across if we own the original.
         </p>
         <ul></ul>
         <p class="hint how">How to grant access:</p>

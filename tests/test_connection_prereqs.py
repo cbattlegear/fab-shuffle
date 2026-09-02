@@ -106,11 +106,15 @@ def test_connections_with_no_path_are_skipped():
     assert scan(FakeClient(), [connection("")]) == []
 
 
-def test_missing_owner_role_is_called_out_with_what_to_do():
+def test_missing_owner_role_is_recorded_for_the_access_list():
+    """The message itself no longer repeats it; the connection access section asks for it."""
     found = scan(FakeClient([USER_ASSIGNMENT]), [connection(ENDPOINT)])
 
     assert found[0].manageable is False
-    assert "no Owner role" in found[0].message()
+    assert found[0].as_dict()["manageable"] is False
+    # The message stays about what has to happen to the connection, not about our access.
+    assert "replacement" in found[0].message()
+    assert "Owner" not in found[0].message()
 
 
 def test_unreadable_role_assignments_count_as_not_manageable():
