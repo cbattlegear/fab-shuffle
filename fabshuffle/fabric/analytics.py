@@ -16,7 +16,7 @@ Because the rewrite is driven by the accumulated source-to-target id map, these 
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +30,7 @@ from fabshuffle.fabric.definitions import (
     decode_json_part,
     decode_payload,
     find_part,
+    is_text_part,
     rewrite_parts,
     strip_part,
 )
@@ -324,16 +325,34 @@ def migrate_definition_item(
     )
 
 
-def describe_failure(item_type: str, name: str, error: FabricError) -> str:
+def describe_failure(
+    item_type: str,
+    name: str,
+    error: FabricError,
+    *,
+    needed: Sequence[str] = (),
+) -> str:
     """Explain why one item could not be created.
 
     Creation is a long running operation for several item types, so the interesting failure
     can arrive either from the request or from the operation behind it. Both carry the
     service's own error code, which says far more than a status ever does, so it is always
     repeated back rather than being flattened into "check its data source bindings".
+
+    ``needed`` names items in this workspace the definition referred to that did not migrate.
+    Where Fabric says only "UnknownError", that is usually the whole story.
     """
     code = getattr(error, "error_code", "")
     detail = getattr(error, "detail", "")
+
+    if needed:
+        missing = ", ".join(needed)
+        return (
+            f"{item_type} '{name}' was not migrated: it refers to {missing}, which did not "
+            "migrate, so the reference points at the new workspace where they do not exist. "
+            "Migrate those first, then recreate it."
+            + (f" The service said: {' '.join(p for p in (code, detail) if p)}." if code or detail else "")
+        )
 
     if code == "DataSourcesValidationError":
         return (
@@ -358,17 +377,17 @@ def describe_failure(item_type: str, name: str, error: FabricError) -> str:
     )
 
 
-def _readable_definition(
+def _rewritten_definition(
     client: FabricClient,
     source_workspace_id: str,
     item: Mapping[str, Any],
     item_type: str,
     id_map: Mapping[str, str],
-) -> str:
-    """The rewritten definition, decoded, for the log after a rejection we cannot explain.
+) -> list[dict[str, Any]]:
+    """The parts as they were sent, read back after a rejection we cannot explain.
 
     Best effort by design: this runs while handling someone else's failure, so anything that
-    goes wrong here is swallowed rather than replacing the error we were reporting.
+    goes wrong here returns nothing rather than replacing the error we were reporting.
     """
     try:
         policy = policy_for(item_type)
@@ -376,18 +395,72 @@ def _readable_definition(
             client, source_workspace_id, item["id"], fmt=policy.export_format
         )
         rewritten, _ = rewrite_parts(definition.get("parts") or [], id_map)
-        lines: list[str] = []
-        for part in strip_part(rewritten, PLATFORM_PART):
-            path = part.get("path", "?")
-            try:
-                body = decode_payload(part.get("payload", "")).decode("utf-8")
-            except (ValueError, UnicodeDecodeError):
-                body = "<binary>"
-            lines.append(f"--- {path}\n{body}")
-        return "\n".join(lines)
+        return strip_part(rewritten, PLATFORM_PART)
     except Exception:
         # Diagnostics must never mask the failure we were reporting.
-        return "<the definition could not be read back for logging>"
+        return []
+
+
+def _readable(parts: Iterable[Mapping[str, Any]]) -> str:
+    lines: list[str] = []
+    for candidate in parts:
+        path = candidate.get("path", "?")
+        try:
+            body = decode_payload(candidate.get("payload", "")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            body = "<binary>"
+        lines.append(f"--- {path}\n{body}")
+    return "\n".join(lines) or "<the definition could not be read back for logging>"
+
+
+def dangling_references(
+    parts: Iterable[Mapping[str, Any]],
+    id_map: Mapping[str, str],
+    source_items: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Items in the migrating workspace that a definition names but that did not migrate.
+
+    These are worth finding because of how the rewrite works. A reference is usually a
+    workspace id beside an item id, and the workspace id is always in the map, so it is
+    always rewritten. If the item beside it is not, the pair becomes the *new* workspace and
+    the *old* item: something that was never in that workspace at all.
+
+    Fabric's answer to that is not always legible. Two Copy Jobs pointing at a lakehouse in
+    another workspace were rejected with nothing but ``UnknownError``.
+
+    Only items of the workspace being migrated count. A reference to another workspace is
+    correct to leave exactly as it is, because that workspace is not moving.
+    """
+    if not source_items:
+        return []
+
+    missing = {
+        item_id.casefold(): item
+        for item_id, item in source_items.items()
+        if item_id and item_id not in id_map
+    }
+    if not missing:
+        return []
+
+    haystack = _definition_text(parts).casefold()
+    found = [item for item_id, item in missing.items() if item_id in haystack]
+    return [
+        f"{item.get('type') or 'item'} '{item.get('displayName') or item.get('id')}'"
+        for item in sorted(found, key=lambda i: str(i.get("displayName") or i.get("id")))
+    ]
+
+
+def _definition_text(parts: Iterable[Mapping[str, Any]]) -> str:
+    chunks: list[str] = []
+    for candidate in parts:
+        payload = candidate.get("payload") or ""
+        if not payload or not is_text_part(candidate.get("path", "")):
+            continue
+        try:
+            chunks.append(decode_payload(payload).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return "\n".join(chunks)
 
 
 def migrate_items(
@@ -400,12 +473,16 @@ def migrate_items(
     id_map: dict[str, str],
     folder_map: Mapping[str, str] | None = None,
     parts_by_id: Mapping[str, list[dict[str, Any]]] | None = None,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
     on_progress: Any = None,
 ) -> tuple[list[MigratedItem], list[str]]:
     """Migrate a batch of definition-backed items, collecting per-item failures.
 
     Each success is recorded in ``id_map`` immediately so later items in the same batch, and
     later phases, can be rebound to it.
+
+    ``source_items`` maps every item in the workspace being migrated to its record, and is
+    used to say which of them a definition needed but did not get.
     """
     migrated: list[MigratedItem] = []
     warnings: list[str] = []
@@ -414,6 +491,7 @@ def migrate_items(
         name = item.get("displayName") or item.get("id")
         if on_progress:
             on_progress(f"Migrating {item_type} '{name}'")
+        definition_parts = (parts_by_id or {}).get(item.get("id", ""))
         try:
             result = migrate_definition_item(
                 client,
@@ -423,25 +501,41 @@ def migrate_items(
                 item_type=item_type,
                 id_map=id_map,
                 folder_id=(folder_map or {}).get(item.get("folderId", "")),
-                parts=(parts_by_id or {}).get(item.get("id", "")),
+                parts=definition_parts,
             )
         except FabricError as error:
             # Fabric answers some rejections with nothing but "UnknownError", which leaves
             # the operator and us with nowhere to go. The payload it refused is the only
             # other evidence there is, so it goes to the log rather than being lost.
+            sent = _rewritten_definition(client, source_workspace_id, item, item_type, id_map)
             logger.warning(
                 "%s '%s' was rejected: %s\nDefinition sent:\n%s",
                 item_type,
                 name,
                 error,
-                _readable_definition(client, source_workspace_id, item, item_type, id_map),
+                _readable(sent),
             )
-            warnings.append(describe_failure(item_type, str(name), error))
+            warnings.append(
+                describe_failure(
+                    item_type,
+                    str(name),
+                    error,
+                    needed=dangling_references(sent, id_map, source_items or {}),
+                )
+            )
             continue
 
         id_map[result.source_id] = result.target_id
         migrated.append(result)
         warnings.extend(f"{item_type} '{result.name}': {w}" for w in result.warnings)
+
+        needed = dangling_references(result.parts, id_map, source_items or {})
+        if needed:
+            warnings.append(
+                f"{item_type} '{result.name}' was created, but it refers to "
+                f"{', '.join(needed)}, which did not migrate. It points at the new workspace "
+                "for those, where they do not exist, so fix them before running it."
+            )
 
     return migrated, warnings
 

@@ -186,6 +186,10 @@ class _Context:
     kql_table_shortcuts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     graph: relations.DependencyGraph = field(default_factory=relations.DependencyGraph)
     spark_settings: dict[str, Any] | None = None
+    # Every item in the workspace being migrated, by id. Used to say which of them a
+    # definition referred to but did not get, since the workspace id in that reference is
+    # always rewritten while the item id beside it is only rewritten if it migrated.
+    source_items: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Source ids of items that migrated but arrive with nothing in them, because we leave
     # their replication switched off so a copy does not start doing the original's work in a
     # second region. Keyed to why, so a shortcut that fails against one can say so.
@@ -373,6 +377,9 @@ def _report_unsupported_items(ctx: _Context) -> None:
 
     assessment = assess_workspace(list_items(ctx.client, ctx.plan.source_workspace_id))
     ctx.assessment = assessment
+    # Kept for the whole run: a definition that names one of these and does not get it ends
+    # up pointing at the new workspace for an item that was never in it.
+    ctx.source_items = {item["id"]: item for item in all_items if item.get("id")}
     ctx.run.summary["unsupported"] = [item.as_dict() for item in assessment.unsupported]
 
     warnings = assessment.grouped_messages()
@@ -1792,6 +1799,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             item_type=analytics.MIRRORED_DATABASE,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
+            source_items=ctx.source_items,
             on_progress=progress,
         )
         warnings.extend(item_warnings)
@@ -1830,6 +1838,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             item_type=analytics.MIRRORED_ADB_CATALOG,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
+            source_items=ctx.source_items,
             on_progress=progress,
         )
         migrated.extend(results)
@@ -2073,6 +2082,7 @@ def _migrate_realtime(ctx: _Context) -> None:
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
+            source_items=ctx.source_items,
             on_progress=progress,
         )
         counts[item_type] = len(results)
@@ -2145,6 +2155,7 @@ def _migrate_engineering(ctx: _Context) -> None:
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
+            source_items=ctx.source_items,
             on_progress=progress,
         )
         counts[item_type] = len(results)
@@ -2181,6 +2192,7 @@ def _migrate_engineering(ctx: _Context) -> None:
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
+            source_items=ctx.source_items,
             on_progress=progress,
         )
         counts[item_type] = len(results)
@@ -2243,6 +2255,7 @@ def _migrate_dataflows(
         item_type=analytics.DATAFLOW,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
+        source_items=ctx.source_items,
         parts_by_id=parts_by_id,
         on_progress=progress,
     )
@@ -2298,6 +2311,7 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
         item_type=analytics.SEMANTIC_MODEL,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
+        source_items=ctx.source_items,
         on_progress=progress,
     )
     warnings.extend(model_warnings)
@@ -2313,6 +2327,7 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
         item_type=analytics.REPORT,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
+        source_items=ctx.source_items,
         on_progress=progress,
     )
     warnings.extend(report_warnings)
@@ -2385,6 +2400,7 @@ def _migrate_orchestration(ctx: _Context) -> None:
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
+            source_items=ctx.source_items,
             on_progress=progress,
         )
         migrated.extend(results)
@@ -2501,6 +2517,7 @@ def _migrate_reflexes(ctx: _Context) -> None:
         item_type=analytics.REFLEX,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
+        source_items=ctx.source_items,
         on_progress=lambda message: ctx.run.update_step(step, message),
     )
     warnings.extend(_check_connections(ctx, step, migrated))
