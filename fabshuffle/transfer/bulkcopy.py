@@ -57,9 +57,15 @@ def token_file(tokens: TokenProvider):
         location.unlink(missing_ok=True)
 
 
-def _quoted(table: TableRef) -> str:
-    schema = table.schema or "dbo"
-    return f"[{schema}].[{table.name}]"
+def _qualified(table: TableRef) -> str:
+    """The name to hand bcp, as ``schema.table``.
+
+    Deliberately not bracketed. ``-q`` sets ``QUOTED_IDENTIFIER ON`` and expects the name in
+    quotation marks, not square brackets, so a bracketed name reaches the server as a single
+    literal identifier and comes back as "Invalid object name '[dbo].[Orders]'". The name is
+    one argument in the argv list, so a space in it needs no quoting from us.
+    """
+    return f"{table.schema or 'dbo'}.{table.name}"
 
 
 def _run(command: list[str], *, what: str) -> str:
@@ -88,7 +94,7 @@ def _bcp(
 ) -> str:
     command = [
         SETTINGS.bcp_path,
-        _quoted(table),
+        _qualified(table),
         direction,
         str(data_file),
         "-S",
@@ -106,7 +112,7 @@ def _bcp(
         "-q",
         *extra,
     ]
-    return _run(command, what=f"bcp {direction} of {_quoted(table)}")
+    return _run(command, what=f"bcp {direction} of {_qualified(table)}")
 
 
 def copy_tables(
@@ -138,7 +144,7 @@ def copy_tables(
     with token_file(tokens) as token:
         for index, table in enumerate(wanted, start=1):
             if on_progress:
-                on_progress(f"Copying {_quoted(table)} ({index} of {len(wanted)})")
+                on_progress(f"Copying {_qualified(table)} ({index} of {len(wanted)})")
             data_file = scratch_dir / f"{index}.bcp"
             try:
                 _bcp(
@@ -160,9 +166,9 @@ def copy_tables(
                     extra=("-E",),
                 )
                 match = _ROWS_COPIED.search(output)
-                logger.debug("Copied %s rows into %s", match.group(1) if match else "?", _quoted(table))
+                logger.debug("Copied %s rows into %s", match.group(1) if match else "?", _qualified(table))
             except BulkCopyError as error:
-                warnings.append(f"Rows for {_quoted(table)} did not copy: {error}")
+                warnings.append(f"Rows for {_qualified(table)} did not copy: {error}")
             finally:
                 data_file.unlink(missing_ok=True)
 

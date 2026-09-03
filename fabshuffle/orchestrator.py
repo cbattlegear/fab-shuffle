@@ -1168,12 +1168,10 @@ def _migrate_lakehouses(ctx: _Context) -> None:
 
         source_endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
         target_endpoint = data_stores.lakehouse_sql_endpoint(target)
-        if source_endpoint.get("connectionString") and target_endpoint.get("connectionString"):
-            ctx.id_map[source_endpoint["connectionString"]] = target_endpoint["connectionString"]
-        # A semantic model can reference the SQL analytics endpoint by item id rather than by
-        # connection string, so that mapping is needed too.
-        if source_endpoint.get("id") and target_endpoint.get("id"):
-            ctx.id_map[source_endpoint["id"]] = target_endpoint["id"]
+        # Both may be absent. The endpoint is provisioned asynchronously, so a lakehouse read
+        # straight after creation usually has no endpoint id or connection string yet. The
+        # shortcut phase reads it again, by which time it exists, and records what is missing.
+        _map_sql_endpoint(ctx, source_endpoint, target_endpoint)
 
         created_pairs.append((lakehouse, target, schema_enabled))
 
@@ -1187,6 +1185,29 @@ def _migrate_lakehouses(ctx: _Context) -> None:
     ctx.run.finish_step(
         step, StepStatus.SUCCEEDED, f"Migrated {len(source_lakehouses)} lakehouse(s)", warnings
     )
+
+
+def _map_sql_endpoint(
+    ctx: _Context,
+    source_endpoint: Mapping[str, Any],
+    target_endpoint: Mapping[str, Any],
+) -> None:
+    """Record a SQL analytics endpoint's identifiers, if both ends have them yet.
+
+    An endpoint is created by Fabric alongside its lakehouse, not by us, and not
+    synchronously: the item read back straight after creation frequently reports no endpoint
+    at all. So this is called twice, once at creation and again once the endpoint has
+    appeared, and only fills in what it can each time.
+
+    Both identifiers matter. A semantic model refers to its endpoint by connection string in
+    one place and by item id in another, and missing either leaves the model reading from the
+    workspace being migrated away from.
+    """
+    for key in ("connectionString", "id"):
+        source_value = source_endpoint.get(key)
+        target_value = target_endpoint.get(key)
+        if source_value and target_value:
+            ctx.id_map[source_value] = target_value
 
 
 def _copy_lakehouse_tables(
@@ -1988,6 +2009,10 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
         ctx.run.update_step(step, f"Refreshing SQL endpoint for '{name}'")
         target = data_stores.get_lakehouse(ctx.client, ctx.target_workspace_id, target_id)
         endpoint = data_stores.lakehouse_sql_endpoint(target)
+        # By now the endpoint exists, which it very often did not when the lakehouse was
+        # created. This is the point at which its id and connection string can be recorded,
+        # and everything that binds to one is migrated after this phase.
+        _map_sql_endpoint(ctx, data_stores.lakehouse_sql_endpoint(lakehouse), endpoint)
         if endpoint.get("id"):
             data_stores.refresh_sql_endpoint_metadata(ctx.client, ctx.target_workspace_id, endpoint["id"])
 

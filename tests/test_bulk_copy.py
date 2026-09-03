@@ -120,7 +120,7 @@ def test_each_table_goes_out_then_in(monkeypatch, tmp_path):
 
     assert warnings == []
     assert [command[2] for command in runs] == ["out", "in"]
-    assert runs[0][1] == "[dbo].[Orders]"
+    assert runs[0][1] == "dbo.Orders"
 
 
 def test_the_source_is_read_and_the_target_written(monkeypatch, tmp_path):
@@ -159,17 +159,22 @@ def test_identity_values_are_preserved_on_the_way_in(monkeypatch, tmp_path):
     assert "-E" not in runs[0]
 
 
-def test_identifiers_are_quoted(monkeypatch, tmp_path):
-    runs, _ = copy(monkeypatch, tmp_path, tables=[TableRef(name="Order", schema="user")])
+def test_the_name_is_not_bracketed(monkeypatch, tmp_path):
+    """Brackets reach the server as one literal identifier: "Invalid object name '[a].[b]'".
 
-    assert runs[0][1] == "[user].[Order]"
+    ``-q`` sets QUOTED_IDENTIFIER ON and expects quotation marks, not square brackets, and
+    the name is a single argv entry so a space in it needs no quoting from us.
+    """
+    runs, _ = copy(monkeypatch, tmp_path, tables=[TableRef(name="Order Detail", schema="user")])
+
+    assert runs[0][1] == "user.Order Detail"
     assert all("-q" in command for command in runs)
 
 
 def test_a_table_without_a_schema_defaults_to_dbo(monkeypatch, tmp_path):
     runs, _ = copy(monkeypatch, tmp_path, tables=[TableRef(name="Orders")])
 
-    assert runs[0][1] == "[dbo].[Orders]"
+    assert runs[0][1] == "dbo.Orders"
 
 
 # ------------------------------------------------------------------ failures
@@ -177,10 +182,10 @@ def test_a_table_without_a_schema_defaults_to_dbo(monkeypatch, tmp_path):
 
 def test_one_table_failing_does_not_stop_the_rest(monkeypatch, tmp_path):
     tables = [TableRef(name="Good"), TableRef(name="Bad"), TableRef(name="AlsoGood")]
-    runs, warnings = copy(monkeypatch, tmp_path, tables=tables, fail_on="[dbo].[Bad]")
+    runs, warnings = copy(monkeypatch, tmp_path, tables=tables, fail_on="dbo.Bad")
 
     assert len(warnings) == 1
-    assert "[dbo].[Bad]" in warnings[0]
+    assert "dbo.Bad" in warnings[0]
     assert "the table went away" in warnings[0]
     # The other two still went out and in.
     assert len(runs) == 5
@@ -255,4 +260,4 @@ def test_progress_names_the_table_and_counts_them(monkeypatch, tmp_path):
         on_progress=seen.append,
     )
 
-    assert seen == ["Copying [dbo].[A] (1 of 2)", "Copying [dbo].[B] (2 of 2)"]
+    assert seen == ["Copying dbo.A (1 of 2)", "Copying dbo.B (2 of 2)"]

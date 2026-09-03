@@ -41,6 +41,7 @@ from fabshuffle.fabric.items import (
     try_get_item_definition,
 )
 from fabshuffle.fabric.special_items import policy_for
+from fabshuffle.fabric.support import is_derived_type
 
 logger = logging.getLogger(__name__)
 
@@ -468,7 +469,10 @@ def dangling_references(
     missing = {
         item_id.casefold(): item
         for item_id, item in source_items.items()
-        if item_id and item_id not in id_map
+        # A SQL analytics endpoint is created with its lakehouse, warehouse or mirrored
+        # database rather than by us, so it is never "not migrated": it arrives with its
+        # parent, under a new id that is recorded once the parent has provisioned it.
+        if item_id and item_id not in id_map and not is_derived_type(item.get("type") or "")
     }
     if not missing:
         return []

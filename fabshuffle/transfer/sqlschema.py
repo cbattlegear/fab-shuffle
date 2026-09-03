@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 CONNECT_ATTEMPTS = 40
 CONNECT_WAIT_SECONDS = 15
+# sqlpackage runs as its own process with its own connection and its own timeout, so waiting
+# for the endpoint over ODBC first does not stop it timing out on the way in.
+EXTRACT_ATTEMPTS = 4
+EXTRACT_WAIT_SECONDS = 30
+
+# What a command line tool prints when the endpoint is not ready rather than not reachable.
+# These are separate processes, so there is no status to inspect, only what they said.
+_TRANSIENT_TOOL_MESSAGES = (
+    "connection attempt timed out",
+    "network-related or instance-specific error",
+    "server was not found or was not accessible",
+    "an internal exception was caught",
+    "timeout expired",
+    "is not currently available",
+)
 
 # SQLSTATE prefixes worth retrying. 08 is the connection class (link failure, server
 # rejected, unable to establish) and HYT is timeouts, both of which a SQL analytics endpoint
@@ -175,23 +190,57 @@ def extract_dacpac(
     database: str,
     principal: ServicePrincipal,
     output: Path,
+    attempts: int = EXTRACT_ATTEMPTS,
 ) -> Path:
+    """Extract a database's schema, retrying a connection that does not answer in time.
+
+    sqlpackage opens its own connection with its own timeout, so waiting for the endpoint
+    over ODBC first is not enough: it proves the endpoint answers a login, not that it will
+    finish a metadata read. A freshly refreshed SQL analytics endpoint regularly refuses the
+    first attempt and accepts the second.
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
     connection_string = (
         f"Server={server};Initial Catalog={database};Encrypt=True;TrustServerCertificate=False;"
         "Connection Timeout=60;Authentication=Active Directory Service Principal;"
         f"User Id={principal.client_id};Password={principal.client_secret}"
     )
-    _run(
-        [
-            SETTINGS.sqlpackage_path,
-            "/Action:Extract",
-            f"/TargetFile:{output}",
-            f"/SourceConnectionString:{connection_string}",
-        ],
-        what=f"sqlpackage extract of {database}",
-    )
+
+    for attempt in range(1, attempts + 1):
+        try:
+            _run(
+                [
+                    SETTINGS.sqlpackage_path,
+                    "/Action:Extract",
+                    f"/TargetFile:{output}",
+                    f"/SourceConnectionString:{connection_string}",
+                ],
+                what=f"sqlpackage extract of {database}",
+            )
+            return output
+        except SchemaTransferError as error:
+            if attempt == attempts or not _is_transient_tool_failure(str(error)):
+                raise
+            logger.warning(
+                "sqlpackage extract of %s did not connect, retrying (attempt %s/%s)",
+                database,
+                attempt,
+                attempts,
+            )
+            output.unlink(missing_ok=True)
+            time.sleep(EXTRACT_WAIT_SECONDS)
+
     return output
+
+
+def _is_transient_tool_failure(message: str) -> bool:
+    """Whether a command line tool's failure is the endpoint not being ready yet.
+
+    Matched on the message because these are separate processes with their own error
+    reporting: there is no status code to inspect, only what they printed.
+    """
+    text = message.lower()
+    return any(phrase in text for phrase in _TRANSIENT_TOOL_MESSAGES)
 
 
 def unpack_dacpac(dacpac: Path, destination: Path, *, exclude_tables: bool) -> Path:
