@@ -269,6 +269,28 @@ def _semantic_model_id(connection_string: str) -> str:
     return ""
 
 
+class StrandedReference(FabricError):
+    """A definition names items in this workspace that did not migrate.
+
+    Creating it anyway is not an option. Both halves of a reference are rewritten
+    independently and the workspace id is always in the map, so the pair would end up naming
+    the new workspace and an item that was never in it. Leaving the workspace id alone is no
+    better: the copy would quietly read from the workspace being migrated away from, and
+    break the day it is deleted, which is the point of the move.
+
+    So the item does not migrate, and the reason says which items it needed.
+    """
+
+    def __init__(self, needed: Sequence[str]) -> None:
+        self.needed = list(needed)
+        super().__init__(f"depends on {', '.join(self.needed)}, which did not migrate")
+
+
+def stranded_items(id_map: Mapping[str, str], source_items: Mapping[str, Any]) -> list[str]:
+    """Items of the migrating workspace that have no counterpart in the new one."""
+    return [item_id for item_id in source_items if item_id and item_id not in id_map]
+
+
 def migrate_definition_item(
     client: FabricClient,
     *,
@@ -279,11 +301,16 @@ def migrate_definition_item(
     id_map: Mapping[str, str],
     folder_id: str | None = None,
     parts: list[dict[str, Any]] | None = None,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> MigratedItem:
     """Export one item, repoint its references, and recreate it in the target workspace.
 
     ``parts`` lets a caller reuse a definition it has already fetched, which avoids a second
     export for item types that have to be inspected before they can be migrated.
+
+    ``source_items`` is every item in the workspace being migrated, and is what lets a
+    definition depending on something that did not migrate be refused rather than created
+    half bound. See :class:`StrandedReference`.
     """
     name = item["displayName"]
     policy = policy_for(item_type)
@@ -295,6 +322,10 @@ def migrate_definition_item(
         )
         parts = list(definition.get("parts") or [])
         definition_format = policy.export_format or definition.get("format")
+
+    needed = dangling_references(parts, id_map, source_items or {})
+    if needed:
+        raise StrandedReference(needed)
 
     rewritten, changed = rewrite_parts(parts, id_map)
     # The source platform file carries the original logical id, and Fabric respects it when
@@ -502,7 +533,18 @@ def migrate_items(
                 id_map=id_map,
                 folder_id=(folder_map or {}).get(item.get("folderId", "")),
                 parts=definition_parts,
+                source_items=source_items,
             )
+        except StrandedReference as error:
+            # Refused before anything was created, so there is nothing half bound to clean up.
+            warnings.append(
+                f"{item_type} '{name}' was not migrated: it depends on "
+                f"{', '.join(error.needed)}, which did not migrate. Migrating it anyway would "
+                "either point it at something that does not exist in the new workspace, or "
+                "leave it reading from the old one, which breaks when that is deleted. "
+                "Migrate what it needs, then recreate it."
+            )
+            continue
         except FabricError as error:
             # Fabric answers some rejections with nothing but "UnknownError", which leaves
             # the operator and us with nowhere to go. The payload it refused is the only
@@ -515,27 +557,12 @@ def migrate_items(
                 error,
                 _readable(sent),
             )
-            warnings.append(
-                describe_failure(
-                    item_type,
-                    str(name),
-                    error,
-                    needed=dangling_references(sent, id_map, source_items or {}),
-                )
-            )
+            warnings.append(describe_failure(item_type, str(name), error))
             continue
 
         id_map[result.source_id] = result.target_id
         migrated.append(result)
         warnings.extend(f"{item_type} '{result.name}': {w}" for w in result.warnings)
-
-        needed = dangling_references(result.parts, id_map, source_items or {})
-        if needed:
-            warnings.append(
-                f"{item_type} '{result.name}' was created, but it refers to "
-                f"{', '.join(needed)}, which did not migrate. It points at the new workspace "
-                "for those, where they do not exist, so fix them before running it."
-            )
 
     return migrated, warnings
 

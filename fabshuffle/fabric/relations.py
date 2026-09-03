@@ -39,6 +39,17 @@ class DependencyGraph:
     workspaces: dict[str, str] = field(default_factory=dict)
     available: bool = True
 
+    def dependents_of(self, item_id: str) -> set[str]:
+        """What reads from, or is written to by, this item.
+
+        The reverse of ``dependencies``. Needed because an item can be broken by something it
+        *feeds* as easily as by something it reads: a Copy Job whose destination is a
+        lakehouse in another workspace is a copy that leaves the region it was moved out of.
+        """
+        return {
+            other for other, upstream in self.dependencies.items() if item_id in upstream
+        }
+
     def name_of(self, item_id: str) -> str:
         return (self.items.get(item_id) or {}).get("displayName") or item_id
 
@@ -66,10 +77,13 @@ class DependencyIssue:
     dependency: str
     dependency_type: str
     reason: str
+    # Whether the item reads the other one, or writes to it. Only changes the wording.
+    reading: bool = True
 
     def message(self) -> str:
+        verb = "depends on" if self.reading else "writes to"
         return (
-            f"{self.item_type} '{self.item}' depends on {self.dependency_type} "
+            f"{self.item_type} '{self.item}' {verb} {self.dependency_type} "
             f"'{self.dependency}', which {self.reason}."
         )
 
@@ -89,9 +103,33 @@ def get_upstream(
     item_id: str,
 ) -> dict[str, Any] | None:
     """Fetch what an item depends on. Returns ``None`` when the beta API is unavailable."""
+    return _relations(client, workspace_id, item_id, "upstream")
+
+
+def get_downstream(
+    client: FabricClient,
+    workspace_id: str,
+    item_id: str,
+) -> dict[str, Any] | None:
+    """Fetch what depends on an item. Returns ``None`` when the beta API is unavailable.
+
+    Upstream alone is not enough. It reports what an item *reads*, so the destination of a
+    Copy Job or a pipeline, which it writes to, never appears. That destination decides
+    whether the migrated copy still works just as much as its source does, and a destination
+    in another workspace means the copy keeps writing into the region we moved out of.
+    """
+    return _relations(client, workspace_id, item_id, "downstream")
+
+
+def _relations(
+    client: FabricClient,
+    workspace_id: str,
+    item_id: str,
+    direction: str,
+) -> dict[str, Any] | None:
     try:
         return client.get(
-            f"workspaces/{workspace_id}/items/{item_id}/relations/upstream",
+            f"workspaces/{workspace_id}/items/{item_id}/relations/{direction}",
             params={"beta": "true"},
         )
     except FabricApiError as error:
@@ -107,9 +145,13 @@ def build_graph(
 ) -> DependencyGraph:
     """Build a dependency graph for the given items.
 
-    One call per item, so this only runs over items Fab Shuffle actually migrates. If the
-    very first call shows the beta API is unavailable, the rest are skipped rather than
-    spending the caller's API quota on certain failures.
+    Both directions are read for every item. Upstream says what it reads; downstream says
+    what reads from it, which is the only way a write destination shows up. Both report the
+    same kind of edge, ``itemId depends on dependentOnItemId``, just discovered from opposite
+    ends, so they merge into one set of edges.
+
+    If the very first call shows the beta API is unavailable, the rest are skipped rather
+    than spending the caller's API quota on certain failures.
     """
     graph = DependencyGraph()
     first = True
@@ -138,23 +180,32 @@ def build_graph(
             continue
         first = False
 
-        for related in response.get("items") or []:
-            if related.get("id"):
-                graph.items.setdefault(related["id"], dict(related))
-        for workspace in response.get("workspaces") or []:
-            if workspace.get("id"):
-                graph.workspaces[workspace["id"]] = workspace.get("displayName") or workspace["id"]
-
-        for edge in response.get("relations") or []:
-            if edge.get("relationType") in IGNORED_RELATION_TYPES:
-                continue
-            source = edge.get("itemId")
-            dependency = edge.get("dependentOnItemId")
-            if not source or not dependency or source == dependency:
-                continue
-            graph.dependencies.setdefault(source, set()).add(dependency)
+        # Downstream is best effort on top: losing it costs us write destinations, not the
+        # whole analysis, so it must not take the run down with it.
+        downstream = get_downstream(client, workspace_id, item_id)
+        for payload in (response, downstream):
+            if payload:
+                _absorb(graph, payload)
 
     return graph
+
+
+def _absorb(graph: DependencyGraph, response: Mapping[str, Any]) -> None:
+    for related in response.get("items") or []:
+        if related.get("id"):
+            graph.items.setdefault(related["id"], dict(related))
+    for workspace in response.get("workspaces") or []:
+        if workspace.get("id"):
+            graph.workspaces[workspace["id"]] = workspace.get("displayName") or workspace["id"]
+
+    for edge in response.get("relations") or []:
+        if edge.get("relationType") in IGNORED_RELATION_TYPES:
+            continue
+        source = edge.get("itemId")
+        dependency = edge.get("dependentOnItemId")
+        if not source or not dependency or source == dependency:
+            continue
+        graph.dependencies.setdefault(source, set()).add(dependency)
 
 
 def analyse(
@@ -176,38 +227,75 @@ def analyse(
             continue
 
         for dependency_id in sorted(graph.dependencies.get(item_id, set())):
-            dependency_type = graph.type_of(dependency_id)
-
-            # A SQL analytics endpoint is created with its lakehouse, warehouse, or mirrored
-            # database, so it arrives on its own and never needs reporting.
-            if is_derived_type(graph.raw_type_of(dependency_id)):
-                continue
-            if graph.is_monitoring(dependency_id):
-                continue
-
-            dependency_workspace = graph.workspace_of(dependency_id)
-            if dependency_workspace and dependency_workspace != source_workspace_id:
-                reason = (
-                    f"lives in workspace '{graph.workspace_name(dependency_workspace)}'. That "
-                    "workspace is not part of this migration, so the copy will keep reading "
-                    "from the original region"
-                )
-            elif dependency_id not in migrated_ids:
-                reason = "is not migrated, so the copy will be missing its source"
-            else:
-                continue
-
-            issues.append(
-                DependencyIssue(
-                    item=graph.name_of(item_id),
-                    item_type=graph.type_of(item_id),
-                    dependency=graph.name_of(dependency_id),
-                    dependency_type=dependency_type,
-                    reason=reason,
-                )
+            issue = _issue(
+                graph,
+                item_id=item_id,
+                other_id=dependency_id,
+                migrated_ids=migrated_ids,
+                source_workspace_id=source_workspace_id,
+                reading=True,
             )
+            if issue:
+                issues.append(issue)
+
+        # And what it feeds. A Copy Job or pipeline writing into a lakehouse that is not
+        # coming across, or that lives in another workspace, is just as broken as one whose
+        # source is missing, and it never shows up as something the item depends on.
+        for dependent_id in sorted(graph.dependents_of(item_id)):
+            if dependent_id in migrated_ids:
+                continue
+            issue = _issue(
+                graph,
+                item_id=item_id,
+                other_id=dependent_id,
+                migrated_ids=migrated_ids,
+                source_workspace_id=source_workspace_id,
+                reading=False,
+            )
+            if issue:
+                issues.append(issue)
 
     return issues
+
+
+def _issue(
+    graph: DependencyGraph,
+    *,
+    item_id: str,
+    other_id: str,
+    migrated_ids: set[str],
+    source_workspace_id: str,
+    reading: bool,
+) -> DependencyIssue | None:
+    # A SQL analytics endpoint is created with its lakehouse, warehouse, or mirrored
+    # database, so it arrives on its own and never needs reporting.
+    if is_derived_type(graph.raw_type_of(other_id)) or graph.is_monitoring(other_id):
+        return None
+
+    other_workspace = graph.workspace_of(other_id)
+    if other_workspace and other_workspace != source_workspace_id:
+        where = "keep reading from" if reading else "keep writing into"
+        reason = (
+            f"lives in workspace '{graph.workspace_name(other_workspace)}'. That workspace is "
+            f"not part of this migration, so the copy will {where} the original region"
+        )
+    elif other_id not in migrated_ids:
+        reason = (
+            "is not migrated, so the copy will be missing its source"
+            if reading
+            else "is not migrated, so the copy has nowhere to write"
+        )
+    else:
+        return None
+
+    return DependencyIssue(
+        item=graph.name_of(item_id),
+        item_type=graph.type_of(item_id),
+        dependency=graph.name_of(other_id),
+        dependency_type=graph.type_of(other_id),
+        reason=reason,
+        reading=reading,
+    )
 
 
 def topological_order(
@@ -247,6 +335,7 @@ __all__ = [
     "DependencyIssue",
     "analyse",
     "build_graph",
+    "get_downstream",
     "get_upstream",
     "topological_order",
 ]

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from fabshuffle.fabric.analytics import dangling_references, describe_failure
 from fabshuffle.fabric.client import FabricApiError
 from fabshuffle.fabric.definitions import part
@@ -97,25 +99,55 @@ def test_a_binary_part_is_skipped_rather_than_crashing():
     assert dangling_references(parts, ID_MAP, SOURCE_ITEMS) == []
 
 
+# ------------------------------------------------------------- the refusal
+
+
+def test_an_item_needing_something_that_did_not_migrate_is_refused():
+    """It must not be created. Half rewritten it points at nothing; left alone it points at
+    the workspace being migrated away from, and breaks the day that is deleted."""
+    from fabshuffle.fabric.analytics import StrandedReference, migrate_definition_item
+
+    class Client:
+        def post(self, path, json=None, params=None, wait=True):
+            raise AssertionError("nothing should have been created")
+
+    with pytest.raises(StrandedReference) as raised:
+        migrate_definition_item(
+            Client(),
+            source_workspace_id=SOURCE_WS,
+            target_workspace_id="ws-new",
+            item={"id": "cj-1", "displayName": "TestCopyCrossWorkspace"},
+            item_type="CopyJob",
+            id_map=ID_MAP,
+            parts=copy_job(STRANDED_LAKEHOUSE),
+            source_items=SOURCE_ITEMS,
+        )
+
+    assert raised.value.needed == ["Lakehouse 'ShortcutCopyTest'"]
+
+
+def test_an_item_whose_references_all_migrated_is_created():
+    from fabshuffle.fabric.analytics import migrate_definition_item
+
+    class Client:
+        def post(self, path, json=None, params=None, wait=True):
+            return {"id": "new-1"}
+
+    result = migrate_definition_item(
+        Client(),
+        source_workspace_id=SOURCE_WS,
+        target_workspace_id="ws-new",
+        item={"id": "cj-1", "displayName": "SchemaLakeCopyTest"},
+        item_type="CopyJob",
+        id_map=ID_MAP,
+        parts=copy_job(MIGRATED_LAKEHOUSE),
+        source_items=SOURCE_ITEMS,
+    )
+
+    assert result.target_id == "new-1"
+
+
 # ------------------------------------------------------------- the message
-
-
-def test_the_failure_says_which_item_was_missing():
-    error = FabricApiError("POST", "url", 400, '{"errorCode":"UnknownError","message":"An error occurred"}')
-    message = describe_failure("CopyJob", "TestCopyCrossWorkspace", error, needed=["Lakehouse 'X'"])
-
-    assert "it refers to Lakehouse 'X', which did not migrate" in message
-    assert "Migrate those first" in message
-    # The service's own words are still repeated, in case our reading is wrong.
-    assert "UnknownError" in message
-
-
-def test_without_a_missing_item_the_message_is_unchanged():
-    error = FabricApiError("POST", "url", 400, '{"errorCode":"UnknownError","message":"An error occurred"}')
-    message = describe_failure("CopyJob", "Nightly", error)
-
-    assert "refers to" not in message
-    assert "UnknownError An error occurred" in message
 
 
 def test_a_connection_failure_still_reads_as_a_connection_failure():
@@ -123,3 +155,9 @@ def test_a_connection_failure_still_reads_as_a_connection_failure():
     message = describe_failure("Eventstream", "Meshtastic", error)
 
     assert "Manage Connections and Gateways" in message
+
+
+def test_an_unreadable_failure_repeats_what_the_service_said():
+    error = FabricApiError("POST", "url", 400, '{"errorCode":"UnknownError","message":"An error occurred"}')
+
+    assert "UnknownError An error occurred" in describe_failure("CopyJob", "Nightly", error)

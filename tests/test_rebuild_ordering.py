@@ -71,13 +71,10 @@ class FakeFabric:
     # -- reads -----------------------------------------------------------------------
 
     def get(self, path, params=None):
-        if path.endswith("/relations/upstream"):
+        if path.endswith("/relations/upstream") or path.endswith("/relations/downstream"):
             item_id = path.split("/items/")[1].split("/")[0]
-            return {
-                "items": [],
-                "relations": self.relations.get(item_id, []),
-                "workspaces": [],
-            }
+            edges = self.relations.get(item_id, []) if path.endswith("/upstream") else []
+            return {"items": [], "relations": edges, "workspaces": []}
         if path.endswith("/spark/settings"):
             return {}
         if path == f"workspaces/{TARGET_WS}/lakehouses/lh-new":
