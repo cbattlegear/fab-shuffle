@@ -208,6 +208,66 @@ def environment_warnings(
     return warnings
 
 
+def report_binding_warning(
+    name: str,
+    parts: Iterable[Mapping[str, Any]],
+    id_map: Mapping[str, str],
+) -> str | None:
+    """Whether a report that changed nothing during the rewrite is actually a problem.
+
+    A report records its semantic model one of two ways in ``definition.pbir``. A
+    ``byConnection`` reference carries ``semanticmodelid=<guid>``, which has to be repointed.
+    A ``byPath`` reference names the model by relative path, and Fabric resolves it inside
+    the new workspace on its own, so there is nothing to rewrite and nothing to report.
+
+    Treating "nothing changed" as a failure warned about every ``byPath`` report, which is
+    the normal shape for a report stored next to its model.
+    """
+    pbir = find_part(parts, PBIR_PART)
+    if not pbir:
+        return (
+            f"Report '{name}' has no {PBIR_PART}, so its semantic model reference could not be "
+            "checked. Open it in the new workspace and confirm what it points at."
+        )
+
+    try:
+        document = decode_json_part(pbir.get("payload", ""))
+    except ValueError:
+        return (
+            f"Report '{name}' has a {PBIR_PART} that could not be read, so its semantic model "
+            "reference could not be checked. Open it in the new workspace."
+        )
+
+    reference = (document or {}).get("datasetReference") or {}
+    if reference.get("byPath"):
+        # Resolved relative to the report, so it follows it into the new workspace.
+        return None
+
+    connection = (reference.get("byConnection") or {}).get("connectionString") or ""
+    model_id = _semantic_model_id(connection)
+    if not model_id:
+        return (
+            f"Report '{name}' does not name a semantic model in a way we recognise, so it was "
+            "copied as it is. Check what it points at in the new workspace."
+        )
+    if model_id in id_map:
+        # Rewritten already, so this is not the no-op case at all.
+        return None
+    return (
+        f"Report '{name}' points at semantic model '{model_id}', which is not one that "
+        "migrated, so it still reads from the original workspace. Repoint it if that model "
+        "was meant to come across."
+    )
+
+
+def _semantic_model_id(connection_string: str) -> str:
+    for fragment in connection_string.split(";"):
+        key, _, value = fragment.partition("=")
+        if key.strip().casefold() == "semanticmodelid":
+            return value.strip()
+    return ""
+
+
 def migrate_definition_item(
     client: FabricClient,
     *,
@@ -298,6 +358,38 @@ def describe_failure(item_type: str, name: str, error: FabricError) -> str:
     )
 
 
+def _readable_definition(
+    client: FabricClient,
+    source_workspace_id: str,
+    item: Mapping[str, Any],
+    item_type: str,
+    id_map: Mapping[str, str],
+) -> str:
+    """The rewritten definition, decoded, for the log after a rejection we cannot explain.
+
+    Best effort by design: this runs while handling someone else's failure, so anything that
+    goes wrong here is swallowed rather than replacing the error we were reporting.
+    """
+    try:
+        policy = policy_for(item_type)
+        definition = get_item_definition(
+            client, source_workspace_id, item["id"], fmt=policy.export_format
+        )
+        rewritten, _ = rewrite_parts(definition.get("parts") or [], id_map)
+        lines: list[str] = []
+        for part in strip_part(rewritten, PLATFORM_PART):
+            path = part.get("path", "?")
+            try:
+                body = decode_payload(part.get("payload", "")).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                body = "<binary>"
+            lines.append(f"--- {path}\n{body}")
+        return "\n".join(lines)
+    except Exception:
+        # Diagnostics must never mask the failure we were reporting.
+        return "<the definition could not be read back for logging>"
+
+
 def migrate_items(
     client: FabricClient,
     *,
@@ -334,6 +426,16 @@ def migrate_items(
                 parts=(parts_by_id or {}).get(item.get("id", "")),
             )
         except FabricError as error:
+            # Fabric answers some rejections with nothing but "UnknownError", which leaves
+            # the operator and us with nowhere to go. The payload it refused is the only
+            # other evidence there is, so it goes to the log rather than being lost.
+            logger.warning(
+                "%s '%s' was rejected: %s\nDefinition sent:\n%s",
+                item_type,
+                name,
+                error,
+                _readable_definition(client, source_workspace_id, item, item_type, id_map),
+            )
             warnings.append(describe_failure(item_type, str(name), error))
             continue
 

@@ -2317,12 +2317,13 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
     )
     warnings.extend(report_warnings)
 
-    unbound = [item.name for item in migrated_reports if item.rebound_parts == 0]
-    if unbound:
-        warnings.append(
-            "These reports had no reference to rewrite, so they still point at their original "
-            "semantic model: " + ", ".join(unbound)
-        )
+    unbound = [
+        message
+        for item in migrated_reports
+        if item.rebound_parts == 0
+        and (message := analytics.report_binding_warning(item.name, item.parts, ctx.id_map))
+    ]
+    warnings.extend(unbound)
     if skipped:
         logger.info("Skipped %s default semantic model(s)", len(skipped))
 
