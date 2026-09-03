@@ -2,10 +2,19 @@
 
 Region transfer tool for Microsoft Fabric workspaces.
 
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
+
+```bash
+docker run --rm -p 8080:8080 -v fab-shuffle-scratch:/app/local ghcr.io/cbattlegear/fab-shuffle:latest
+```
+
 Fab Shuffle recreates a Fabric workspace on a capacity in a different region and moves the
 data across. Fabric blocks reassigning a workspace that contains Fabric items to a capacity
 in another region, so the only way to "move" a workspace is to rebuild it — that is what
 this tool automates.
+
+See [Run it](#run-it) for what you need first: this needs a service principal with a handful
+of Fabric settings turned on, and it will not get far without them.
 
 ## Current state
 
@@ -234,11 +243,48 @@ Steps to set up your service principal:
 
 ### Run it
 
+Fab Shuffle is a container with a web wizard. Run it wherever you like — your own machine is
+the simplest, and Azure Container Apps takes one click.
+
+#### Locally
+
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/cbattlegear/fab-shuffle:latest
+docker run --rm -p 8080:8080 -v fab-shuffle-scratch:/app/local \
+  ghcr.io/cbattlegear/fab-shuffle:latest
 ```
 
-Open <http://localhost:8080> and follow the wizard:
+Then open <http://localhost:8080>.
+
+The volume is worth having. Lakehouse files and warehouse schema are staged on local disk on
+the way past, and without it that goes into the container's writable layer and is thrown away
+with the container.
+
+#### In Azure
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
+
+Deploys [`deploy/azuredeploy.json`](deploy/azuredeploy.json): a Container App running the
+same public image, its environment, and a Log Analytics workspace for the container's logs.
+The template's output `url` is the wizard.
+
+Worth knowing before you use it:
+
+- **Set `allowedClientIpAddress` to your own public IP.** Fab Shuffle has no sign-in of its
+  own, so leaving it empty publishes the wizard to the internet. Nobody can do anything
+  without supplying their own service principal, but an open migration console is not
+  something to leave lying around.
+- **It runs as exactly one replica, deliberately.** Sessions and run progress are held in the
+  process, so a second replica would not know about your sign-in or your migration. Do not
+  raise `maxReplicas`.
+- **Delete it when you are done.** It bills while it runs, and it exists for one job.
+- The region you deploy into has nothing to do with the region you are migrating *to*. That
+  comes from the capacity you pick in the wizard.
+
+Container Apps gives a few GiB of ephemeral disk, which is the ceiling on lakehouse file
+transfer there. If you are moving more files than that, run it locally with a volume instead:
+nothing else about the migration differs.
+
+#### The wizard
 
 1. **Sign in** with the service principal's tenant ID, client ID, and secret.
 2. **Pick the target capacity** — its region is the destination region.
@@ -254,9 +300,6 @@ written to disk.
 The service principal also needs the **"Service principals can use Fabric APIs"** tenant
 setting for Power BI, since the reassignment path calls the Power BI semantic model APIs and
 must be able to update those models.
-
-> Lakehouse file transfer stages files on local disk inside the container. Mount a volume at
-> `/app/local` if you are moving more data than the container's writable layer can hold.
 
 ### Building the image yourself
 
