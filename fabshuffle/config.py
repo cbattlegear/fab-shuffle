@@ -62,6 +62,7 @@ class Settings:
     sqlpackage_path: str = os.environ.get("FAB_SHUFFLE_SQLPACKAGE", "sqlpackage")
     unpackdacpac_path: str = os.environ.get("FAB_SHUFFLE_UNPACKDACPAC", "unpackdacpac")
     azcopy_path: str = os.environ.get("FAB_SHUFFLE_AZCOPY", "azcopy")
+    bcp_path: str = os.environ.get("FAB_SHUFFLE_BCP", "bcp")
 
     def scratch_dir_for(self, run_id: str) -> Path:
         path = self.scratch_root / run_id

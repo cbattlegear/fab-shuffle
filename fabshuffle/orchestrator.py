@@ -84,9 +84,9 @@ from fabshuffle.fabric.support import (
     supports_large_semantic_models,
 )
 from fabshuffle.run import CancelledError, MigrationRun, RunStatus, StepStatus
+from fabshuffle.transfer import bulkcopy, kql, sqlschema
 from fabshuffle.transfer import cosmos as cosmos_transfer
 from fabshuffle.transfer import files as file_transfer
-from fabshuffle.transfer import kql, sqlschema
 
 logger = logging.getLogger(__name__)
 
@@ -1597,97 +1597,69 @@ def _copy_sql_database_tables(
     step: str,
     ready: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    """Copy rows between SQL databases through Copy Jobs, several at a time.
+    """Copy rows between SQL databases with bcp.
 
-    Unlike a lakehouse or warehouse, Fabric will not bind a Copy Job to a SQL database by
-    item id alone: each end needs a connection. Nothing existing can be reused, because a
-    connection's credentials are never readable and its target cannot be repointed, so a pair
-    is created here as ourselves.
+    A Copy Job cannot do this. The SQL database in Fabric connector accepts only an
+    organizational account, so there is no connection a service principal can create that the
+    job would be able to use; the one we tried failed with an invalid token, having asked for
+    one against the wrong thing.
 
-    They have to stay alive for as long as the jobs that use them, so they are all made
-    first and all removed at the end, whatever happened in between.
+    bcp supports SQL database in Fabric directly, and authenticates with the access token we
+    already hold and already use to read these tables. So the rows go out to a native-format
+    file and straight back in, with no connection involved at either end.
     """
     warnings: list[str] = []
-    specs: list[copyjobs.CopyJobSpec] = []
-    created_connections: list[str] = []
 
-    try:
-        for source, target in ready:
-            ctx.run.raise_if_cancelled()
-            name = source["displayName"]
-            source_server = sqldatabases.server_fqdn(source)
-            source_catalog = sqldatabases.database_name(source)
-            target_catalog = sqldatabases.database_name(target)
-            if not source_server or not source_catalog or not target_catalog:
-                warnings.append(
-                    f"SQL database '{name}' did not report a server and database name, so its "
-                    "data was not copied."
-                )
-                continue
+    for source, target in ready:
+        ctx.run.raise_if_cancelled()
+        name = source["displayName"]
+        source_server = sqldatabases.server_fqdn(source)
+        source_catalog = sqldatabases.database_name(source)
+        target_server = sqldatabases.server_fqdn(target)
+        target_catalog = sqldatabases.database_name(target)
+        if not source_server or not source_catalog or not target_server or not target_catalog:
+            warnings.append(
+                f"SQL database '{name}' did not report a server and database name, so its "
+                "data was not copied."
+            )
+            continue
 
-            try:
-                tables = [
-                    data_stores.TableRef(name=table, schema=schema)
-                    for schema, table in sqlschema.list_base_tables(
-                        source_server, source_catalog, ctx.tokens
-                    )
-                ]
-            except sqlschema.SchemaTransferError as error:
-                warnings.append(f"Could not enumerate tables in SQL database '{name}': {error}")
-                continue
-            if not tables:
-                continue
+        try:
+            tables = [
+                data_stores.TableRef(name=table, schema=schema)
+                for schema, table in sqlschema.list_base_tables(
+                    source_server, source_catalog, ctx.tokens
+                )
+            ]
+        except sqlschema.SchemaTransferError as error:
+            warnings.append(f"Could not enumerate tables in SQL database '{name}': {error}")
+            continue
+        if not tables:
+            continue
 
-            ctx.run.update_step(step, f"Preparing to copy {len(tables)} table(s) from '{name}'")
-            try:
-                source_connection = _own_sql_connection(
-                    ctx, source_server, source_catalog, f"{name} source"
-                )
-                created_connections.append(source_connection)
-                target_connection = _own_sql_connection(
-                    ctx, sqldatabases.server_fqdn(target), target_catalog, f"{name} target"
-                )
-                created_connections.append(target_connection)
-            except connections.ConnectionUnavailable as error:
-                warnings.append(
-                    f"Table data for SQL database '{name}' was not copied, because a Copy Job "
-                    f"needs a connection at each end and one could not be created: {error}"
-                )
-                continue
-
-            specs.append(
-                copyjobs.CopyJobSpec(
-                    workspace_id=ctx.scratch_workspace_id,
-                    display_name=f"CopyJob_SqlDatabase_{name}",
-                    content=copyjobs.build_sql_database_copy_job(
-                        source_workspace_id=ctx.plan.source_workspace_id,
-                        source_item_id=source["id"],
-                        source_connection_id=source_connection,
-                        target_workspace_id=ctx.target_workspace_id,
-                        target_item_id=target["id"],
-                        target_connection_id=target_connection,
-                        tables=tables,
-                    ),
-                    label=f"Table data for SQL database '{name}'",
+        ctx.run.update_step(step, f"Copying {len(tables)} table(s) from SQL database '{name}'")
+        try:
+            warnings.extend(
+                f"SQL database '{name}': {w}"
+                for w in bulkcopy.copy_tables(
+                    source_server=source_server,
+                    source_database=source_catalog,
+                    target_server=target_server,
+                    target_database=target_catalog,
+                    tables=tables,
+                    tokens=ctx.tokens,
+                    scratch_dir=ctx.scratch_dir / f"bcp-{source['id']}",
+                    on_progress=_bulk_copy_progress(ctx, step, name),
                 )
             )
-
-        warnings.extend(_run_copy_jobs(ctx, step, specs, "SQL database"))
-    finally:
-        _drop_connections(ctx, created_connections)
+        except bulkcopy.BulkCopyError as error:
+            warnings.append(f"Table data for SQL database '{name}' did not copy: {error}")
 
     return warnings
 
 
-def _own_sql_connection(ctx: _Context, server: str, catalog: str, label: str) -> str:
-    connection = connections.create_own_connection(
-        ctx.client,
-        ctx.principal,
-        connection_type=connections.SQL_DATABASE_CONNECTION_TYPE,
-        path=f"{server};{catalog}",
-        display_name=f"Fab Shuffle {ctx.run.id[:8]} {label}"[:200],
-    )
-    return connection["id"]
+def _bulk_copy_progress(ctx: _Context, step: str, name: str) -> Callable[[str], None]:
+    return lambda message: ctx.run.update_step(step, f"SQL database '{name}': {message}")
 
 
 def _document_progress(ctx: _Context, step: str, name: str) -> Any:
@@ -1768,25 +1740,6 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
             )
 
     return migrated, warnings
-
-
-def _drop_connections(ctx: _Context, connection_ids: Iterable[str]) -> None:
-    """Delete the connections this run created for itself.
-
-    They hold this service principal's secret, so leaving one behind is worse than a failed
-    copy. A delete that fails is logged rather than raised: it must never mask the error that
-    brought us here.
-    """
-    for connection_id in connection_ids:
-        try:
-            connections.delete_connection(ctx.client, connection_id)
-        except FabricError:
-            logger.warning("Could not delete the temporary connection %s", connection_id)
-            ctx.warnings.append(
-                f"The temporary connection {connection_id}, created to copy SQL database data, "
-                "could not be deleted. Remove it in Manage connections and gateways: it holds "
-                "this service principal's credentials."
-            )
 
 
 # --------------------------------------------------------------------- phase 6

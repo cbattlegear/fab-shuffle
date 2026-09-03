@@ -11,7 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # The Microsoft package feed provides the .NET SDK and the ODBC driver on both
 # architectures. Fabric has no REST API for T-SQL schema or OneLake file copy yet,
-# so sqlpackage, unpackdacpac, and azcopy stay in the image.
+# so sqlpackage, unpackdacpac, azcopy, and bcp stay in the image.
 RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates gnupg && \
     wget -q https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb && \
     dpkg -i packages-microsoft-prod.deb && \
@@ -20,9 +20,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certifi
     ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
         dotnet-sdk-10.0 \
         msodbcsql18 \
+        mssql-tools18 \
         unixodbc \
         unixodbc-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# mssql-tools18 installs outside the default PATH.
+ENV PATH="/opt/mssql-tools18/bin:${PATH}"
 
 # azcopy has no arm64 apt package, so take the architecture-matched tarball.
 ARG TARGETARCH

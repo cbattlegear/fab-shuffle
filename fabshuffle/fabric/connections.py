@@ -17,7 +17,6 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import decode_payload, is_text_part
 
@@ -525,100 +524,13 @@ def delete_connection(client: FabricClient, connection_id: str) -> None:
     client.delete(f"connections/{connection_id}")
 
 
-# The connection type Fabric uses for a SQL database in Fabric. Its creation parameters are
-# read from the tenant rather than assumed, so a rename or an added parameter surfaces as a
-# clear refusal instead of a malformed request.
-SQL_DATABASE_CONNECTION_TYPE = "SQL"
-
-
-class ConnectionUnavailable(RuntimeError):
-    """A connection Fab Shuffle needs for itself could not be created."""
-
-
-def create_own_connection(
-    client: FabricClient,
-    principal: ServicePrincipal,
-    *,
-    connection_type: str,
-    path: str,
-    display_name: str,
-    metadata: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Create a connection authenticating as us, for our own use during a migration.
-
-    Some Copy Job endpoints will not bind to an item by id alone and insist on a connection.
-    Nothing existing can be reused for that: a connection's credentials are never readable,
-    and its target cannot be repointed, so one is made here and deleted again by the caller
-    once the copy is done.
-
-    The credentials are this service principal's own, which is the only secret this process
-    holds and the identity it is already acting as. It is written to Fabric the same way an
-    operator would type it into Manage connections and gateways.
-    """
-    if metadata is None:
-        metadata = supported_types(client).get(connection_type)
-    if not metadata:
-        raise ConnectionUnavailable(
-            f"this tenant does not report '{connection_type}' as a supported connection type"
-        )
-
-    method = _creation_method(metadata, connection_type)
-    if not method:
-        raise ConnectionUnavailable(
-            f"'{connection_type}' declares no single creation method to build a connection with"
-        )
-
-    parameters = build_parameters(path, method)
-    if not parameters:
-        raise ConnectionUnavailable(
-            f"'{path}' does not line up with the parameters '{connection_type}' declares"
-        )
-
-    if "ServicePrincipal" not in (metadata.get("supportedCredentialTypes") or []):
-        raise ConnectionUnavailable(
-            f"'{connection_type}' connections cannot authenticate with a service principal in "
-            "this tenant"
-        )
-
-    payload = {
-        "connectivityType": "ShareableCloud",
-        "displayName": display_name,
-        "privacyLevel": "Organizational",
-        "connectionDetails": {
-            "type": connection_type,
-            "creationMethod": method["name"],
-            "parameters": parameters,
-        },
-        "credentialDetails": {
-            "singleSignOnType": "None",
-            "connectionEncryption": "NotEncrypted",
-            "skipTestConnection": False,
-            "credentials": {
-                "credentialType": "ServicePrincipal",
-                "tenantId": principal.tenant_id,
-                "servicePrincipalClientId": principal.client_id,
-                "servicePrincipalSecret": principal.client_secret,
-            },
-        },
-    }
-    try:
-        return create_connection(client, payload)
-    except FabricApiError as error:
-        raise ConnectionUnavailable(
-            f"Fabric refused to create it: {error.error_code or error.status_code} "
-            f"{error.detail}".strip()
-        ) from error
-
-
 __all__ = [
     "GATEWAY_TYPES",
     "NO_SECRET_CREDENTIALS",
     "RECREATABLE_CONNECTIVITY",
     "REGIONAL_GATEWAY_TYPES",
-    "SQL_DATABASE_CONNECTION_TYPE",
     "ConnectionIssue",
     "ConnectionPrerequisite",
-    "ConnectionUnavailable",
     "Replacement",
     "build_creation_payload",
     "build_parameters",
@@ -626,7 +538,6 @@ __all__ = [
     "check",
     "connections_by_id",
     "create_connection",
-    "create_own_connection",
     "delete_connection",
     "is_owned_by",
     "list_connections",
