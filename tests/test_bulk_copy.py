@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 
+import pyodbc
 import pytest
 
 from fabshuffle.fabric.data_stores import TableRef
@@ -24,6 +25,51 @@ class FakeTokens:
     def sql_token(self):
         self.asked += 1
         return self.token
+
+
+class FakeCursor:
+    def __init__(self, owner, refuse_truncate=False) -> None:
+        self.owner = owner
+        self.refuse_truncate = refuse_truncate
+
+    def execute(self, sql):
+        self.owner.executed.append(sql)
+        if self.refuse_truncate and sql.startswith("TRUNCATE"):
+            raise pyodbc.Error("42000", "Cannot truncate a table referenced by a FOREIGN KEY")
+        return self
+
+
+class FakeConnection:
+    """Stands in for the target connection used to empty each table before it is loaded."""
+
+    def __init__(self, refuse_truncate=False, refuse_everything=False) -> None:
+        self.executed: list[str] = []
+        self.autocommit = False
+        self.refuse_truncate = refuse_truncate
+        self.refuse_everything = refuse_everything
+
+    def cursor(self):
+        if self.refuse_everything:
+            raise pyodbc.Error("42000", "no")
+        return FakeCursor(self, self.refuse_truncate)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+@pytest.fixture(autouse=True)
+def target_connection(monkeypatch):
+    """Every copy now opens one connection to the target, to empty each table before loading.
+
+    Autouse because three tests call ``copy_tables`` directly, and none of them should be
+    reaching for a real SQL endpoint.
+    """
+    connection = FakeConnection()
+    monkeypatch.setattr(bulkcopy.sqlschema, "connect", lambda *a, **k: connection)
+    return connection
 
 
 def record_runs(monkeypatch, *, fail_on=None, stdout="10 rows copied."):
@@ -175,6 +221,133 @@ def test_a_table_without_a_schema_defaults_to_dbo(monkeypatch, tmp_path):
     runs, _ = copy(monkeypatch, tmp_path, tables=[TableRef(name="Orders")])
 
     assert runs[0][1] == "dbo.Orders"
+
+
+# --------------------------------------------- emptying the table before loading
+
+
+def test_the_target_table_is_emptied_before_it_is_loaded(monkeypatch, tmp_path, target_connection):
+    """bcp in appends, so without this a second copy would double every row."""
+    _, warnings = copy(monkeypatch, tmp_path)
+
+    assert warnings == []
+    assert target_connection.executed == ["TRUNCATE TABLE [dbo].[Orders]"]
+
+
+def test_the_table_is_emptied_after_the_export_but_before_the_load(
+    monkeypatch, tmp_path, target_connection
+):
+    """Order matters: emptying before the export would risk losing the rows for nothing.
+
+    The source and the target are different databases here, but the export is what proves
+    there is something to load, so it goes first.
+    """
+    order: list[str] = []
+
+    def run(command, capture_output=True, text=True, check=False):
+        order.append(f"bcp {command[2]}")
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = "10 rows copied."
+
+        return Result()
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    class Watching(FakeConnection):
+        def cursor(self):
+            order.append("clear")
+            return super().cursor()
+
+    watching = Watching()
+    monkeypatch.setattr(bulkcopy.sqlschema, "connect", lambda *a, **k: watching)
+    bulkcopy.copy_tables(
+        source_server="a",
+        source_database="b",
+        target_server="c",
+        target_database="d",
+        tables=[TableRef(name="Orders")],
+        tokens=FakeTokens(),
+        scratch_dir=tmp_path,
+    )
+
+    assert order.index("bcp out") < order.index("bcp in")
+    assert order[-1] == "bcp in"
+
+
+def test_copying_the_same_table_twice_clears_it_each_time(monkeypatch, tmp_path, target_connection):
+    """The point of the whole exercise: a repeated copy converges instead of accumulating."""
+    copy(monkeypatch, tmp_path)
+    copy(monkeypatch, tmp_path)
+
+    assert target_connection.executed == [
+        "TRUNCATE TABLE [dbo].[Orders]",
+        "TRUNCATE TABLE [dbo].[Orders]",
+    ]
+
+
+def test_a_table_behind_a_foreign_key_falls_back_to_delete(
+    monkeypatch, tmp_path, target_connection
+):
+    """TRUNCATE is refused on a table referenced by a foreign key; the docs say use DELETE."""
+    target_connection.refuse_truncate = True
+
+    runs, warnings = copy(monkeypatch, tmp_path)
+
+    assert warnings == []
+    assert target_connection.executed == [
+        "TRUNCATE TABLE [dbo].[Orders]",
+        "DELETE FROM [dbo].[Orders]",
+    ]
+    # The load still happened.
+    assert [command[2] for command in runs] == ["out", "in"]
+
+
+def test_the_clearing_statement_brackets_the_name(monkeypatch, tmp_path, target_connection):
+    """The opposite of the bcp argument, which must not be bracketed. Both are deliberate."""
+    copy(monkeypatch, tmp_path, tables=[TableRef(name="Order Detail", schema="user")])
+
+    assert target_connection.executed == ["TRUNCATE TABLE [user].[Order Detail]"]
+
+
+def test_a_bracket_in_the_name_is_escaped(monkeypatch, tmp_path, target_connection):
+    copy(monkeypatch, tmp_path, tables=[TableRef(name="Odd]Name")])
+
+    assert target_connection.executed == ["TRUNCATE TABLE [dbo].[Odd]]Name]"]
+
+
+def test_a_table_that_cannot_be_emptied_is_not_loaded(monkeypatch, tmp_path):
+    """Loading a table we could not clear is what would duplicate its rows, so we refuse."""
+
+    class Refusing(FakeConnection):
+        def cursor(self):
+            return RefusingCursor()
+
+    class RefusingCursor:
+        def execute(self, sql):
+            raise pyodbc.Error("42000", "cannot clear this")
+
+    refusing = Refusing()
+    monkeypatch.setattr(bulkcopy.sqlschema, "connect", lambda *a, **k: refusing)
+    runs = record_runs(monkeypatch)
+
+    warnings = bulkcopy.copy_tables(
+        source_server="a",
+        source_database="b",
+        target_server="c",
+        target_database="d",
+        tables=[TableRef(name="Orders")],
+        tokens=FakeTokens(),
+        scratch_dir=tmp_path,
+    )
+
+    assert len(warnings) == 1
+    assert "could not be emptied" in warnings[0]
+    assert "duplicate" in warnings[0]
+    # It was exported, but never loaded.
+    assert [command[2] for command in runs] == ["out"]
 
 
 # ------------------------------------------------------------------ failures

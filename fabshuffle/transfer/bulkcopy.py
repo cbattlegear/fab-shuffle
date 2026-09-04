@@ -12,6 +12,9 @@ hold a token for and already use to list these tables over TDS.
 The token file has to be UTF-16LE with no BOM, is written with owner-only permissions, and is
 removed as soon as the copy is done. Data goes out to a native-format file and straight back
 in, so nothing is parsed or retyped on the way past.
+
+One connection is opened to the target, but only to empty each table before it is loaded:
+``bcp in`` appends, so without that a repeated copy would double every row.
 """
 
 from __future__ import annotations
@@ -24,10 +27,14 @@ import tempfile
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
+
+import pyodbc
 
 from fabshuffle.auth import TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric.data_stores import TableRef
+from fabshuffle.transfer import sqlschema
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +73,35 @@ def _qualified(table: TableRef) -> str:
     one argument in the argv list, so a space in it needs no quoting from us.
     """
     return f"{table.schema or 'dbo'}.{table.name}"
+
+
+def _bracketed(table: TableRef) -> str:
+    """The same table as a T-SQL identifier, which *does* want brackets.
+
+    The opposite of :func:`_qualified`, and deliberately so: what bcp takes as an argument and
+    what the server parses as T-SQL are not the same thing. A closing bracket inside a name is
+    doubled, which is how T-SQL escapes it.
+    """
+    schema = (table.schema or "dbo").replace("]", "]]")
+    name = table.name.replace("]", "]]")
+    return f"[{schema}].[{name}]"
+
+
+def _clear_table(cursor: Any, table: TableRef) -> None:
+    """Empty a target table so that loading it a second time does not double its rows.
+
+    ``TRUNCATE`` is preferred: it deallocates pages rather than logging a row at a time. It is
+    [refused on a table referenced by a foreign key](https://learn.microsoft.com/sql/t-sql/statements/truncate-table-transact-sql),
+    and the documentation's own answer to that is ``DELETE``, so that is the fallback rather
+    than a failure. Both are supported on SQL database in Fabric.
+    """
+    target = _bracketed(table)
+    try:
+        cursor.execute(f"TRUNCATE TABLE {target}")
+    except pyodbc.Error:
+        # Almost always the foreign key restriction above. DELETE has no such limit, and if it
+        # fails too the error is the caller's to report.
+        cursor.execute(f"DELETE FROM {target}")
 
 
 def _run(command: list[str], *, what: str) -> str:
@@ -131,6 +167,10 @@ def copy_tables(
     The tables already exist, created from the source's dacpac, so this only moves rows.
     Identity values are preserved: a copy whose keys differ from the original is not a copy.
 
+    Each target table is emptied immediately before it is loaded, because ``bcp in`` appends.
+    Without that, copying a table twice doubles its rows, which makes the whole operation
+    unsafe to repeat. Every other data mover here overwrites, and this one now matches them.
+
     One table failing is reported and the rest are still attempted, because losing one table
     should not cost the operator the other fifty.
     """
@@ -141,7 +181,14 @@ def copy_tables(
     scratch_dir.mkdir(parents=True, exist_ok=True)
     warnings: list[str] = []
 
-    with token_file(tokens) as token:
+    # One connection for the whole batch, used only to empty each table before it is loaded.
+    # The schema was deployed over this same endpoint moments ago, so it is known to answer.
+    with (
+        sqlschema.connect(target_server, target_database, tokens, on_progress=on_progress) as target,
+        token_file(tokens) as token,
+    ):
+        target.autocommit = True
+        cursor = target.cursor()
         for index, table in enumerate(wanted, start=1):
             if on_progress:
                 on_progress(f"Copying {_qualified(table)} ({index} of {len(wanted)})")
@@ -155,6 +202,7 @@ def copy_tables(
                     database=source_database,
                     token=token,
                 )
+                _clear_table(cursor, table)
                 output = _bcp(
                     table,
                     "in",
@@ -169,6 +217,11 @@ def copy_tables(
                 logger.debug("Copied %s rows into %s", match.group(1) if match else "?", _qualified(table))
             except BulkCopyError as error:
                 warnings.append(f"Rows for {_qualified(table)} did not copy: {error}")
+            except pyodbc.Error as error:
+                warnings.append(
+                    f"Rows for {_qualified(table)} did not copy: the table could not be "
+                    f"emptied first, and loading it as it stands would duplicate its rows: {error}"
+                )
             finally:
                 data_file.unlink(missing_ok=True)
 

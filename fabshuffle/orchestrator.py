@@ -1634,7 +1634,8 @@ def _copy_sql_database_tables(
 
     bcp supports SQL database in Fabric directly, and authenticates with the access token we
     already hold and already use to read these tables. So the rows go out to a native-format
-    file and straight back in, with no connection involved at either end.
+    file and straight back in, without either end being parsed or retyped. The only connection
+    involved empties each target table first, because ``bcp in`` appends.
     """
     warnings: list[str] = []
 
