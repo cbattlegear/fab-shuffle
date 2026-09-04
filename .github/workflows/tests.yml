@@ -1,0 +1,38 @@
+name: Tests
+
+# The image takes minutes to build and pulls the .NET SDK, the ODBC driver, sqlpackage and
+# azcopy, so the tests run on their own rather than behind it. Nothing here talks to Fabric.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # pyodbc links against unixODBC and fails at import without it, which takes every test
+      # module with it. Installed explicitly rather than relying on what the runner ships.
+      - name: Install unixODBC
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends unixodbc
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        # python -m, not bare pytest: two test modules import helpers from the tests package,
+        # which only resolves when the repo root is on sys.path.
+        run: python -m pytest -q
