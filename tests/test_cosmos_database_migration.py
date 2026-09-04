@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from fabshuffle import orchestrator
+from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import cosmosdb
 from fabshuffle.fabric.client import FabricApiError
@@ -168,6 +168,30 @@ def test_no_documents_are_copied_when_the_plan_says_not_to(monkeypatch):
     migrated, warnings = orchestrator._migrate_cosmos_databases(ctx)
 
     assert (migrated, warnings, calls) == (1, [], [])
+
+
+def test_resume_adopts_cosmos_and_continues_documents(monkeypatch):
+    client = FakeClient()
+    ctx, copies = make_ctx(client, monkeypatch)
+    ctx.prior = journal.Replay(id_map={SOURCE_DB: TARGET_DB})
+    ctx.id_map.update(ctx.prior.id_map)
+    migrated, warnings = orchestrator._migrate_cosmos_databases(ctx)
+    assert (migrated, warnings) == (1, [])
+    assert not any(path.endswith("/items") for path, _ in client.posts)
+    assert len(copies) == 1
+    assert copies[0]["target_endpoint"] == "https://dst.xyz.cosmos.fabric.microsoft.com:443/"
+
+
+def test_resume_adopts_cosmos_without_repeating_finished_documents(monkeypatch):
+    client = FakeClient()
+    ctx, copies = make_ctx(client, monkeypatch)
+    ctx.prior = journal.Replay(
+        id_map={SOURCE_DB: TARGET_DB}, data_done={(SOURCE_DB, "documents", "")}
+    )
+    ctx.id_map.update(ctx.prior.id_map)
+    orchestrator._migrate_cosmos_databases(ctx)
+    assert copies == []
+    assert not any(path.endswith("/items") for path, _ in client.posts)
 
 
 def test_a_document_copy_failure_still_leaves_the_containers(monkeypatch):

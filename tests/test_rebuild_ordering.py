@@ -52,6 +52,9 @@ class FakeFabric:
         self.created: list[tuple[str, str, str]] = []
         self.definitions: dict[str, list[dict]] = {}
         self.next_id = 0
+        self.lakehouse_id = "lh-new"
+        self.target_endpoint = TARGET_ENDPOINT
+        self.updated: list[str] = []
         # source item id -> upstream relation edges
         self.relations = relations or {}
 
@@ -82,15 +85,15 @@ class FakeFabric:
         # A resume checks the scratch workspace is still there before aiming Copy Jobs at it.
         if path in (f"workspaces/{TARGET_WS}", "workspaces/ws-scratch"):
             return {"id": path.split("/")[1]}
-        if path == f"workspaces/{TARGET_WS}/lakehouses/lh-new":
+        if path == f"workspaces/{TARGET_WS}/lakehouses/{self.lakehouse_id}":
             return {
-                "id": "lh-new",
+                "id": self.lakehouse_id,
                 "displayName": "bronze",
                 "properties": {
                     "oneLakeFilesPath": "https://onelake/target/Files",
                     "sqlEndpointProperties": {
                         "id": "ep-new",
-                        "connectionString": TARGET_ENDPOINT,
+                        "connectionString": self.target_endpoint,
                         "provisioningStatus": "Success",
                     },
                 },
@@ -143,12 +146,17 @@ class FakeFabric:
             return {"id": TARGET_WS if body["displayName"].startswith("bronze-ws") else "ws-scratch"}
         if path.endswith("/lakehouses"):
             if TARGET_WS in path:
-                self.created.append(("Lakehouse", body["displayName"], "lh-new"))
-                return {"id": "lh-new"}
+                self.created.append(("Lakehouse", body["displayName"], self.lakehouse_id))
+                return {"id": self.lakehouse_id}
             return {"id": "lh-scratch"}
         if path.endswith("/getDefinition"):
             item_id = path.split("/items/")[1].split("/")[0]
             return {"definition": {"parts": self.definitions[item_id]}}
+        if path.endswith("/updateDefinition"):
+            item_id = path.split("/items/")[1].split("/")[0]
+            self.updated.append(item_id)
+            self.definitions[item_id] = body["definition"]["parts"]
+            return {}
         if path.endswith("/items"):
             new_id = self._mint(body["type"].lower())
             self.created.append((body["type"], body["displayName"], new_id))
@@ -304,19 +312,124 @@ def test_a_resumed_run_still_rebinds_correctly(fabric):
     assert TARGET_ENDPOINT in text and SOURCE_ENDPOINT not in text
 
 
-def test_an_item_deleted_between_attempts_is_built_again(fabric):
+def test_an_item_deleted_between_attempts_is_built_again(fabric, monkeypatch):
     """The journal says what was done, not what is there now. Reality wins."""
+    tables, files = record_data_copies(monkeypatch)
     with dies_at("analytics"):
         first = attempt()
     replay = journal.read(SETTINGS.journal_for(first.id))
     # Somebody removed the lakehouse from the new workspace in between.
     fabric.created = [entry for entry in fabric.created if entry[0] != "Lakehouse"]
+    fabric.lakehouse_id = "lh-recreated"
 
     second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
 
     assert second.status == RunStatus.SUCCEEDED, second.error
     assert any(kind == "Lakehouse" for kind, _, _ in fabric.created)
     assert any("no longer in the new workspace" in w for w in second.summary["warnings"])
+    assert tables == ["lh-new", "lh-recreated"]
+    assert len(files) == 2
+
+
+def record_data_copies(monkeypatch):
+    tables, files = [], []
+    monkeypatch.setattr(
+        orchestrator, "_lakehouse_tables",
+        lambda *a, **k: [orchestrator.data_stores.TableRef(name="Orders", schema="dbo")],
+    )
+
+    def copy_jobs(client, specs, **kwargs):
+        for spec in specs:
+            # The definition itself is exercised by other tests; here each confirmed job
+            # drives the real orchestrator checkpoint callback.
+            tables.append(client.lakehouse_id)
+            kwargs["on_done"](spec)
+        return [], []
+
+    monkeypatch.setattr(orchestrator.copyjobs, "run_copy_jobs", copy_jobs)
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: files.append(k))
+    return tables, files
+
+
+def test_second_resume_keeps_first_attempts_finished_data(fabric, monkeypatch):
+    tables, files = record_data_copies(monkeypatch)
+    with dies_at("analytics"):
+        first = attempt()
+    with dies_at("orchestration"):
+        second = attempt(prior=journal.read(SETTINGS.journal_for(first.id)))
+    second_replay = journal.read(SETTINGS.journal_for(second.id))
+    assert second_replay.data_is_done(LAKEHOUSE, "tables")
+    assert second_replay.data_is_done(LAKEHOUSE, "files")
+    third = attempt(prior=second_replay)
+    assert third.status == RunStatus.SUCCEEDED, third.error
+    assert tables == ["lh-new"]
+    assert len(files) == 1
+    assert journal.read(SETTINGS.journal_for(third.id)).ancestors == [first.id, second.id]
+
+
+def test_completed_checkpoint_reconciles_crash_before_job_record_clear(fabric, monkeypatch):
+    tables, _ = record_data_copies(monkeypatch)
+    with dies_at("analytics"):
+        first = attempt()
+    book = journal.Journal(SETTINGS.journal_for(first.id))
+    book.copy_job({
+        "workspace_id": "ws-scratch", "copy_job_id": "copy", "instance_id": "instance",
+        "item_id": LAKEHOUSE, "display_name": "copy-lakehouse", "label": "Lakehouse",
+    }, target_id="lh-new")
+    second = attempt(prior=journal.read(book.path))
+    assert second.status == RunStatus.SUCCEEDED, second.error
+    assert tables == ["lh-new"]
+    assert journal.read(SETTINGS.journal_for(second.id)).copy_jobs == {}
+
+
+def test_changed_target_refreshes_existing_consumers_even_after_another_interruption(
+    fabric, monkeypatch
+):
+    tables, files = record_data_copies(monkeypatch)
+    first = attempt()
+    assert first.status == RunStatus.SUCCEEDED, first.error
+    consumers = {kind: item_id for kind, _, item_id in fabric.created if kind != "Lakehouse"}
+    fabric.created = [entry for entry in fabric.created if entry[0] != "Lakehouse"]
+    fabric.lakehouse_id = "lh-replacement"
+    fabric.target_endpoint = "replacement.datawarehouse.fabric.microsoft.com"
+    with dies_at("analytics"):
+        second = attempt(prior=journal.read(SETTINGS.journal_for(first.id)))
+    replay = journal.read(SETTINGS.journal_for(second.id))
+    assert {MODEL, REPORT} <= replay.refresh_needed
+    third = attempt(prior=replay)
+    assert third.status == RunStatus.SUCCEEDED, third.error
+    assert set(fabric.updated) == set(consumers.values())
+    assert {kind: item_id for kind, _, item_id in fabric.created if kind != "Lakehouse"} == consumers
+    model_text = decode_payload(fabric.definitions[consumers["SemanticModel"]][0]["payload"]).decode()
+    assert "lh-replacement" in model_text and "lh-new" not in model_text
+    assert fabric.target_endpoint in model_text and TARGET_ENDPOINT not in model_text
+    assert tables == ["lh-new", "lh-replacement"]
+    assert len(files) == 2
+
+
+@pytest.mark.parametrize(
+    ("kind", "key"), [("tables", ""), ("files", ""), ("table", "[dbo].[Orders]"),
+                     ("kql", ""), ("documents", "")],
+)
+def test_legacy_checkpoints_do_not_apply_to_a_recreated_target(fabric, tmp_path, kind, key):
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(record) for record in (
+            {"t": "run", "plan": {"source_workspace_id": SOURCE_WS}},
+            {"t": "workspace", "role": "target", "id": TARGET_WS},
+            {"t": "mapping", "source": LAKEHOUSE, "target": "deleted"},
+            {"t": "data", "item": LAKEHOUSE, "kind": kind, "key": key},
+        )) + "\n", encoding="utf-8",
+    )
+    replay = journal.read(path)
+    kept, _ = orchestrator.verify_prior(fabric, replay)
+    ctx = orchestrator._Context(
+        client=fabric, tokens=object(), principal=PRINCIPAL, plan=make_plan(),
+        run=MigrationRun(source_workspace_name="source", capacity_name="F64"),
+        scratch_dir=tmp_path, prior=replay, id_map=kept,
+    )
+    ctx.id_map[LAKEHOUSE] = "new-target"
+    assert not ctx.already_copied(LAKEHOUSE, kind, key)
 
 
 def test_resuming_into_a_workspace_that_has_gone_is_refused(fabric, monkeypatch):
@@ -424,8 +537,8 @@ def test_the_journal_records_endpoints_as_well_as_items(fabric):
     assert replay.id_map.get(SOURCE_ENDPOINT) == TARGET_ENDPOINT
 
 
-def test_a_run_that_died_records_no_ending(fabric, monkeypatch):
-    """A run with no ending is exactly the one worth offering back, and how it is recognised."""
+def test_a_failed_run_keeps_its_diagnostics_and_is_resumable(fabric, monkeypatch):
+    """Failures must remain discoverable without losing the service's diagnostic context."""
 
     def explode(_ctx):
         raise RuntimeError("the capacity went away")
@@ -447,7 +560,8 @@ def test_a_run_that_died_records_no_ending(fabric, monkeypatch):
 
     assert migration.status == RunStatus.FAILED
     assert replay.interrupted
-    assert not replay.status
+    assert replay.status == "failed"
+    assert replay.error == "the capacity went away"
     # What it got through is still there to be picked up.
     assert "lakehouses" in replay.phases_finished
     assert "realtime" not in replay.phases_finished

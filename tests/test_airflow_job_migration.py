@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from fabshuffle import orchestrator
+from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import airflow
 from fabshuffle.fabric.client import FabricApiError
@@ -175,6 +175,40 @@ def test_dag_files_are_copied_into_the_new_job():
     path, content = client.written[0]
     assert path == f"workspaces/{TARGET_WS}/apacheAirflowJobs/{NEW_JOB}/files/dags/my_dag.py"
     assert content == b"print('hello')"
+
+
+def test_resume_adopts_airflow_and_continues_incomplete_files():
+    client = FakeClient()
+    ctx = make_ctx(client)
+    ctx.prior = journal.Replay(id_map={JOB: NEW_JOB})
+    ctx.id_map.update(ctx.prior.id_map)
+    migrated, _ = orchestrator._migrate_airflow_jobs(ctx, "orchestration", [JOB_ITEM], lambda _: None)
+    assert migrated == 1
+    assert client.created == []
+    assert client.written[0][0] == (
+        f"workspaces/{TARGET_WS}/apacheAirflowJobs/{NEW_JOB}/files/dags/my_dag.py"
+    )
+
+
+def test_resume_keeps_finished_airflow_files():
+    client = FakeClient()
+    ctx = make_ctx(client)
+    ctx.prior = journal.Replay(id_map={JOB: NEW_JOB}, data_done={(JOB, "airflow-files", "")})
+    ctx.id_map.update(ctx.prior.id_map)
+    orchestrator._migrate_airflow_jobs(ctx, "orchestration", [JOB_ITEM], lambda _: None)
+    assert client.created == client.written == []
+
+
+def test_rebinding_airflow_refreshes_even_previously_finished_files():
+    client = FakeClient()
+    ctx = make_ctx(client)
+    ctx.prior = journal.Replay(id_map={JOB: NEW_JOB}, data_done={(JOB, "airflow-files", "")})
+    ctx.id_map.update(ctx.prior.id_map)
+    ctx.refresh_needed.add(JOB)
+    orchestrator._migrate_airflow_jobs(ctx, "orchestration", [JOB_ITEM], lambda _: None)
+    assert client.created == []
+    assert len(client.written) == 1
+    assert JOB not in ctx.refresh_needed
 
 
 def test_every_file_request_marks_itself_as_beta():

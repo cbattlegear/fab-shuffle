@@ -31,6 +31,7 @@ from fabshuffle.fabric.support import (
 )
 from fabshuffle.orchestrator import (
     MigrationPlan,
+    _plan_record,
     build_plan,
     cleanup_run,
     default_target_name,
@@ -40,7 +41,7 @@ from fabshuffle.orchestrator import (
     portal_instructions,
     run_migration,
 )
-from fabshuffle.run import REGISTRY, MigrationRun, RunStatus
+from fabshuffle.run import REGISTRY, MigrationRun, RunConflict, RunStatus
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,51 @@ def require_session(
     if not session:
         raise HTTPException(status_code=401, detail="Sign in with a service principal first")
     return session
+
+
+def _run_conflict(error: RunConflict) -> HTTPException:
+    return HTTPException(
+        status_code=409, detail={"message": str(error), "runId": error.run_id}
+    )
+
+
+def _start_attempt(
+    session: Session, plan: MigrationPlan, *, cleanup: bool, prior: journal.Replay | None = None
+) -> MigrationRun:
+    run = MigrationRun(
+        source_workspace_name=plan.source_workspace_name, capacity_name=plan.capacity_name
+    )
+    registry = REGISTRY
+    try:
+        prior = registry.admit(
+            run, directory=SETTINGS.journal_dir, plan=_plan_record(plan), cleanup=cleanup, prior=prior
+        )
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+
+    def failed(error: Exception) -> None:
+        logger.exception("Migration attempt %s could not run", run.id)
+        journal.Journal(SETTINGS.journal_for(run.id)).finished("failed", str(error))
+        run.mark_finished(RunStatus.FAILED, str(error))
+
+    def work() -> None:
+        try:
+            kwargs: dict[str, Any] = {"cleanup": cleanup}
+            if prior is not None:
+                kwargs["prior"] = prior
+            run_migration(run, session.principal, plan, **kwargs)
+        except Exception as error:
+            failed(error)
+        finally:
+            registry.release(run.id)
+
+    try:
+        threading.Thread(target=work, name=f"fab-shuffle-{run.id}", daemon=True).start()
+    except Exception as error:
+        failed(error)
+        registry.release(run.id)
+        raise HTTPException(status_code=500, detail=f"Could not start migration: {error}") from error
+    return run
 
 
 # ---------------------------------------------------------------------- schemas
@@ -301,21 +347,9 @@ def create_app() -> FastAPI:
                 )
 
         plan = await _run_fabric(prepare)
-        run = REGISTRY.add(
-            MigrationRun(
-                source_workspace_name=plan.source_workspace_name,
-                capacity_name=plan.capacity_name,
-            )
+        run = _start_attempt(
+            session, plan, cleanup=body.cleanup_when_done,
         )
-
-        thread = threading.Thread(
-            target=run_migration,
-            args=(run, session.principal, plan),
-            kwargs={"cleanup": body.cleanup_when_done},
-            name=f"fab-shuffle-{run.id}",
-            daemon=True,
-        )
-        thread.start()
 
         return {"runId": run.id, "plan": _plan_dict(plan)}
 
@@ -335,10 +369,15 @@ def create_app() -> FastAPI:
     @app.post("/api/scratch-workspaces/cleanup")
     async def cleanup_scratch(session: Session = Depends(require_session)) -> dict[str, Any]:
         def work() -> tuple[int, list[str]]:
-            with FabricClient(session.tokens) as client:
+            with REGISTRY.cleanup_claim(
+                directory=SETTINGS.journal_dir
+            ), FabricClient(session.tokens) as client:
                 return workspaces.delete_scratch_workspaces(client)
 
-        deleted, warnings = await _run_fabric(work)
+        try:
+            deleted, warnings = await _run_fabric(work)
+        except RunConflict as error:
+            raise _run_conflict(error) from error
         return {"deleted": deleted, "warnings": warnings}
 
     @app.post("/api/workspaces/restore-access")
@@ -377,8 +416,7 @@ def create_app() -> FastAPI:
         """
 
         def work() -> list[dict[str, Any]]:
-            return [_resumable_dict(replay) for replay in journal.list_runs(SETTINGS.journal_dir)
-                    if replay.interrupted]
+            return [_resumable_dict(replay) for replay in REGISTRY.resumable(SETTINGS.journal_dir)]
 
         return {"runs": await asyncio.to_thread(work)}
 
@@ -404,20 +442,7 @@ def create_app() -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
-        run = REGISTRY.add(
-            MigrationRun(
-                source_workspace_name=plan.source_workspace_name,
-                capacity_name=plan.capacity_name,
-            )
-        )
-        thread = threading.Thread(
-            target=run_migration,
-            args=(run, session.principal, plan),
-            kwargs={"cleanup": replay.cleanup, "prior": replay},
-            name=f"fab-shuffle-{run.id}",
-            daemon=True,
-        )
-        thread.start()
+        run = _start_attempt(session, plan, cleanup=replay.cleanup, prior=replay)
         return {"runId": run.id, "plan": _plan_dict(plan), "resumedFrom": run_id}
 
     @app.post("/api/runs/{run_id}/cancel")
@@ -432,14 +457,16 @@ def create_app() -> FastAPI:
         session: Session = Depends(require_session),
     ) -> dict[str, Any]:
         run = _require_run(run_id)
-        if run.status == RunStatus.RUNNING:
-            raise HTTPException(status_code=409, detail="Wait for the migration to finish first")
-
         def work() -> list[str]:
-            with FabricClient(session.tokens) as client:
+            with REGISTRY.cleanup_claim(
+                run, directory=SETTINGS.journal_dir
+            ), FabricClient(session.tokens) as client:
                 return cleanup_run(run, client)
 
-        warnings = await _run_fabric(work)
+        try:
+            warnings = await _run_fabric(work)
+        except RunConflict as error:
+            raise _run_conflict(error) from error
         return {"ok": not warnings, "warnings": warnings, "run": run.snapshot()}
 
     @app.get("/api/runs/{run_id}/events")
@@ -509,6 +536,10 @@ def _resumable_dict(replay: journal.Replay) -> dict[str, Any]:
     plan = replay.plan
     return {
         "runId": replay.run_id,
+        "lineageId": replay.lineage_id,
+        "resumedFrom": replay.resumed_from,
+        "status": replay.status or "interrupted",
+        "error": replay.error,
         "startedAt": replay.created_at,
         "sourceWorkspaceName": plan.get("source_workspace_name") or "",
         "targetWorkspaceName": plan.get("target_workspace_name") or "",

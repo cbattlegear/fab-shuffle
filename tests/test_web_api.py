@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,7 +12,7 @@ from fabshuffle import journal
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.orchestrator import MigrationPlan
-from fabshuffle.run import REGISTRY, RunStatus, StepStatus
+from fabshuffle.run import REGISTRY, MigrationRun, RunStatus, StepStatus
 from fabshuffle.web import app as web
 
 
@@ -33,7 +35,12 @@ PLAN = MigrationPlan(
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(monkeypatch) -> TestClient:
+    from fabshuffle.run import RunRegistry
+
+    registry = RunRegistry()
+    monkeypatch.setattr(web, "REGISTRY", registry)
+    monkeypatch.setitem(globals(), "REGISTRY", registry)
     return TestClient(web.app)
 
 
@@ -163,7 +170,7 @@ def journal_dir(tmp_path, monkeypatch):
     return SETTINGS.journal_dir
 
 
-def write_journal(*, finished=False, plan=True):
+def write_journal(*, finished=False, plan=True, target="ws-target"):
     """A journal on disk, as a previous run of the container would have left it."""
     run_id = uuid.uuid4().hex
     book = journal.Journal(SETTINGS.journal_for(run_id))
@@ -181,7 +188,7 @@ def write_journal(*, finished=False, plan=True):
         )
     else:
         book.run_created({}, cleanup=True)
-    book.workspace("target", "ws-target", "Sales-westeurope")
+    book.workspace("target", target, "Sales-westeurope")
     book.phase_started("lakehouses")
     book.item("lh-src", "lh-new", "Lakehouse", "bronze")
     if finished:
@@ -195,7 +202,7 @@ def test_the_resumable_list_needs_a_session(client: TestClient):
 
 def test_only_runs_that_never_finished_are_offered_back(client: TestClient, session_id: str, journal_dir):
     interrupted = write_journal()
-    write_journal(finished=True)
+    write_journal(finished=True, target="other-target")
 
     listed = client.get("/api/resumable", headers=auth(session_id)).json()["runs"]
 
@@ -213,9 +220,12 @@ def test_resuming_a_run_nobody_has_a_journal_for_is_404(client: TestClient, sess
     assert response.status_code == 404
 
 
-def test_resuming_a_run_that_finished_is_allowed(client: TestClient, session_id: str, journal_dir):
+def test_resuming_a_run_that_finished_is_allowed(
+    client: TestClient, session_id: str, journal_dir, monkeypatch
+):
     """It used to be refused. Retrying the items a run left behind reads the same journal."""
     run_id = write_journal(finished=True)
+    monkeypatch.setattr(web, "run_migration", lambda run, *a, **k: run.mark_finished(RunStatus.SUCCEEDED))
     response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
 
     assert response.status_code == 200
@@ -274,3 +284,146 @@ def test_resuming_hands_the_migration_the_earlier_attempt(
     assert seen["plan"].target_workspace_name == "Sales-westeurope"
     assert seen["prior"].id_map["lh-src"] == "lh-new"
     assert seen["prior"].target_workspace_id == "ws-target"
+
+
+def test_active_original_is_not_discovered_or_resumed(client, session_id, journal_dir):
+    run_id = write_journal()
+    active = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    active.id = active.lineage_id = run_id
+    active.target_workspace = {"id": "ws-target"}
+    active.mark_running()
+    REGISTRY.add(active)
+    assert client.get("/api/resumable", headers=auth(session_id)).json()["runs"] == []
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+    assert response.status_code == 409
+    assert response.json()["detail"]["runId"] == run_id
+
+
+def test_simultaneous_resumes_admit_exactly_one_worker(client, session_id, journal_dir, monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+    runs = []
+
+    def worker(run, *args, **kwargs):
+        runs.append(run)
+        run.mark_running()
+        entered.set()
+        release.wait(10)
+        run.mark_finished(RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(web, "run_migration", worker)
+    run_id = write_journal()
+    barrier = threading.Barrier(2)
+
+    def submit():
+        barrier.wait()
+        with TestClient(web.app) as browser:
+            return browser.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(lambda _: submit(), range(2)))
+        assert sorted(response.status_code for response in responses) == [200, 409]
+        assert entered.wait(2)
+        assert len(runs) == 1
+        child_id = next(response.json()["runId"] for response in responses if response.status_code == 200)
+        assert next(response for response in responses if response.status_code == 409).json()[
+            "detail"
+        ]["runId"] == child_id
+        assert client.get("/api/resumable", headers=auth(session_id)).json()["runs"] == []
+        child = journal.read(SETTINGS.journal_for(child_id))
+        assert child.ancestors == [run_id]
+        assert child.id_map["lh-src"] == "lh-new"
+        assert child.lineage_id == run_id
+        assert client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id)).status_code == 409
+    finally:
+        release.set()
+
+
+def test_superseded_ancestor_stays_hidden_after_registry_restart(
+    client, session_id, journal_dir, monkeypatch
+):
+    from fabshuffle.run import RunRegistry
+
+    ancestor = write_journal()
+    child = journal.Journal(SETTINGS.journal_for("child"))
+    child.run_created(PLAN.__dict__, cleanup=False, prior=journal.read(SETTINGS.journal_for(ancestor)))
+    child.finished("failed", "retryable failure")
+    monkeypatch.setattr(web, "REGISTRY", RunRegistry())
+    listed = client.get("/api/resumable", headers=auth(session_id)).json()["runs"]
+    assert [entry["runId"] for entry in listed] == ["child"]
+    response = client.post(f"/api/runs/{ancestor}/resume", headers=auth(session_id))
+    assert response.status_code == 409
+    assert response.json()["detail"]["runId"] == "child"
+
+
+def test_cleanup_of_an_ancestor_is_refused_while_child_is_active(
+    client, session_id, journal_dir
+):
+    ancestor = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    ancestor.target_workspace = {"id": "ws-target"}
+    ancestor.mark_finished(RunStatus.FAILED)
+    REGISTRY.add(ancestor)
+    child = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    child.lineage_id = ancestor.lineage_id
+    child.target_workspace = ancestor.target_workspace
+    REGISTRY.add(child)
+    response = client.post(f"/api/runs/{ancestor.id}/cleanup", headers=auth(session_id))
+    assert response.status_code == 409
+    assert response.json()["detail"]["runId"] == child.id
+    assert client.post("/api/scratch-workspaces/cleanup", headers=auth(session_id)).status_code == 409
+
+
+def test_worker_start_failure_releases_claim_and_keeps_failure_journal(
+    client, session_id, journal_dir, monkeypatch
+):
+    class BrokenThread:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("worker unavailable")
+
+    # Replace only the web module's reference, not Python's threading module used by TestClient.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(web, "threading", SimpleNamespace(Thread=BrokenThread))
+    ancestor = write_journal()
+    response = client.post(f"/api/runs/{ancestor}/resume", headers=auth(session_id))
+    assert response.status_code == 500
+    attempts = REGISTRY.resumable(SETTINGS.journal_dir)
+    assert len(attempts) == 1
+    assert attempts[0].run_id != ancestor
+    assert attempts[0].status == "failed"
+    assert attempts[0].error == "worker unavailable"
+    assert not REGISTRY._claims
+
+
+def test_cleanup_is_refused_for_remote_jobs_after_worker_failure(client, session_id, journal_dir):
+    run_id = write_journal()
+    book = journal.Journal(SETTINGS.journal_for(run_id))
+    book.copy_job({
+        "workspace_id": "scratch", "copy_job_id": "copy", "instance_id": "instance",
+        "item_id": "lh-src", "display_name": "copy-lh", "label": "Lakehouse",
+    }, target_id="lh-new")
+    book.finished("failed", "completion unknown")
+    failed = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    failed.id = failed.lineage_id = run_id
+    failed.target_workspace = {"id": "ws-target"}
+    failed.mark_finished(RunStatus.FAILED)
+    REGISTRY.add(failed)
+    for url in (f"/api/runs/{run_id}/cleanup", "/api/scratch-workspaces/cleanup"):
+        response = client.post(url, headers=auth(session_id))
+        assert response.status_code == 409
+        assert "Unfinished Copy Jobs" in response.json()["detail"]["message"]
+
+
+def test_resume_is_refused_during_cleanup(client, session_id, journal_dir):
+    run_id = write_journal()
+    cleaning = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    cleaning.lineage_id = run_id
+    cleaning.target_workspace = {"id": "ws-target"}
+    with REGISTRY.cleanup_claim(cleaning):
+        response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+        assert response.status_code == 409
+        assert "cleanup" in response.json()["detail"]["message"]

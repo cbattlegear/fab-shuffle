@@ -291,3 +291,82 @@ def test_pruning_leaves_a_directory_under_the_limit_alone(tmp_path):
 
 def test_pruning_a_directory_that_does_not_exist_is_not_an_error(tmp_path):
     assert journal.prune(tmp_path / "nope") == 0
+
+
+def test_each_attempt_inherits_checkpoints_and_diagnostics_without_ancestor_files(tmp_path):
+    first = write_sample(tmp_path / "first.jsonl")
+    first.finished("failed", "CapacityUnavailable: retry later")
+    replay = journal.read(first.path)
+    for name in ("second", "third"):
+        book = journal.Journal(tmp_path / f"{name}.jsonl")
+        book.run_created(replay.plan, cleanup=replay.cleanup, prior=replay)
+        replay = journal.read(book.path)
+    (tmp_path / "first.jsonl").unlink()
+    (tmp_path / "second.jsonl").unlink()
+    replay = journal.read(tmp_path / "third.jsonl")
+    assert replay.lineage_id == "first"
+    assert replay.resumed_from == "second"
+    assert replay.ancestors == ["first", "second"]
+    assert replay.data_targets[("lh-src", "table", "dbo.Orders")] == "lh-tgt"
+    assert replay.data_is_done("lh-src", "table", "dbo.Orders")
+    assert replay.items["lh-src"]["type"] == "Lakehouse"
+    assert replay.warnings == ["Shortcut 'x' could not be created"]
+    assert replay.attempts[0]["error"] == "CapacityUnavailable: retry later"
+    assert replay.attempts[0]["last_phase"] == "lakehouses"
+    assert replay.status == ""
+
+
+def test_checkpoint_keeps_its_original_target_when_mapping_changes(tmp_path):
+    book = journal.Journal(tmp_path / "run.jsonl")
+    book.mapping("source", "original")
+    book.data("source", "documents")
+    book.mapping("source", "replacement")
+    replay = journal.read(book.path)
+    assert replay.id_map["source"] == "replacement"
+    assert replay.data_targets[("source", "documents", "")] == "original"
+
+
+def test_invalidating_a_target_and_scheduling_consumers_is_one_durable_event(tmp_path):
+    book = write_sample(tmp_path / "run.jsonl")
+    book.invalidate(["lh-src"], refresh=["model"])
+    replay = journal.read(book.path)
+    assert "lh-src" not in replay.id_map
+    assert not replay.data_is_done("lh-src", "table", "dbo.Orders")
+    assert replay.refresh_needed == {"model"}
+    book.refresh(["model"], required=False)
+    assert journal.read(book.path).refresh_needed == set()
+
+
+def test_failed_admission_is_not_silently_accepted(tmp_path):
+    import pytest
+
+    book = journal.Journal(tmp_path / "directory" / "run.jsonl")
+    book.path.parent.rmdir()
+    with pytest.raises(OSError):
+        book.run_created({"source_workspace_id": "source"}, cleanup=True)
+
+
+def test_active_copy_job_state_survives_resume_and_terminal_clear(tmp_path):
+    book = journal.Journal(tmp_path / "first.jsonl")
+    book.run_created({"source_workspace_id": "source"}, cleanup=False)
+    job = {
+        "workspace_id": "scratch", "copy_job_id": "copy", "instance_id": "instance",
+        "item_id": "lakehouse", "display_name": "copy-lakehouse", "label": "lakehouse",
+        "last_status": "Unknown", "last_error": "Unavailable: no progress response",
+    }
+    book.copy_job(job, target_id="target-lakehouse")
+    resumed = journal.Journal(tmp_path / "second.jsonl")
+    resumed.run_created({}, cleanup=False, prior=journal.read(book.path))
+    replay = journal.read(resumed.path)
+    assert replay.copy_jobs[("lakehouse", "copy-lakehouse")]["job"] == job
+    assert replay.copy_jobs[("lakehouse", "copy-lakehouse")]["target"] == "target-lakehouse"
+    resumed.copy_job(job, target_id="target-lakehouse", active=False)
+    assert journal.read(resumed.path).copy_jobs == {}
+
+
+def test_retention_does_not_delete_the_latest_recovery_attempt(tmp_path):
+    book = journal.Journal(tmp_path / "recoverable.jsonl")
+    book.run_created({"source_workspace_id": "source"}, cleanup=False)
+    book.finished("failed", "retryable failure")
+    assert journal.prune(tmp_path, keep=0) == 0
+    assert book.path.exists()

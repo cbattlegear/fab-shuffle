@@ -316,6 +316,17 @@ adopted; data that had finished moving is left alone. Anything the journal claim
 no longer there is built again, because the journal records what an attempt *did*, not what is
 there now.
 
+Completion checkpoints belong to the target item that received the data. If that item was
+deleted, the replacement receives a fresh copy; existing consumers are rebound to its new
+identifiers before recovery can succeed. Checkpoints and diagnostics carry across every
+attempt, including a second or later resume.
+
+Only the latest inactive attempt is offered for recovery. Concurrent resumes and cleanup of
+a related active migration are refused. Unfinished Copy Jobs are retained and polled on
+resume rather than started twice; if a submission has no confirmed job or instance ID, stop
+and reconcile it in Fabric before resolving its journal record. Do not delete its scratch
+workspace while completion is unknown.
+
 The same machinery retries a run that *did* finish but left items behind — a connection that
 was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
 what did not migrate** on the progress screen, and only the missing items are attempted. The
@@ -327,7 +338,7 @@ Two things follow from this:
   restart a migration on its own. This is deliberate.
 - **Journals live on the volume**, under `local/journal`. They hold workspace and item ids and
   names — the same things the screen shows — and no credentials. The hundred most recent are
-  kept.
+  kept, along with the latest recoverable attempts and unresolved Copy Jobs.
 
 Without a mounted volume the journal goes when the container does, and there is nothing to
 pick up. That is the main reason the `docker run` line above mounts one.

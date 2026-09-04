@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fabshuffle import orchestrator
+from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import sqldatabases
 from fabshuffle.fabric.client import FabricApiError
@@ -255,3 +255,35 @@ def test_a_server_that_already_carries_a_port_is_not_given_another():
     assert _server_with_port("warehouse.datawarehouse.fabric.microsoft.com") == (
         "warehouse.datawarehouse.fabric.microsoft.com,1433"
     )
+
+
+def test_resumed_first_database_uses_its_verified_schema_destination(monkeypatch):
+    client = FakeClient()
+    ctx = make_ctx(client, monkeypatch)
+    ctx.prior = journal.Replay(id_map={SOURCE_DB: TARGET_DB})
+    ctx.id_map.update(ctx.prior.id_map)
+    orchestrator._migrate_sql_databases(ctx)
+    assert not any(path.endswith("/sqlDatabases") for path, _ in client.posts)
+    assert any(path == f"workspaces/{TARGET_WS}/sqlDatabases/{TARGET_DB}/updateDefinition"
+               for path, _ in client.posts)
+    assert client.bulk_copies[0]["target_database"] == "RegionBounceTest-2222"
+
+
+def test_mixed_created_and_adopted_databases_do_not_share_schema_destinations(monkeypatch):
+    client = FakeClient()
+    ctx = make_ctx(client, monkeypatch)
+    adopted = {**SOURCE_ITEM, "id": "adopted", "displayName": "Adopted"}
+    monkeypatch.setattr(sqldatabases, "list_sql_databases", lambda *a: [SOURCE_ITEM, adopted])
+    monkeypatch.setattr(
+        sqldatabases, "get_sql_database",
+        lambda client, workspace, item_id: {**TARGET_ITEM, "id": item_id},
+    )
+    schemas = []
+    monkeypatch.setattr(
+        sqldatabases, "copy_schema",
+        lambda client, **kwargs: schemas.append((kwargs["source_id"], kwargs["target_id"])),
+    )
+    ctx.prior = journal.Replay(id_map={"adopted": "adopted-target"})
+    ctx.id_map.update(ctx.prior.id_map)
+    orchestrator._migrate_sql_databases(ctx)
+    assert schemas == [(SOURCE_DB, TARGET_DB), ("adopted", "adopted-target")]

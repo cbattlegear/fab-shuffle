@@ -10,7 +10,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
+
+from fabshuffle import journal
 
 
 class StepStatus(StrEnum):
@@ -64,6 +67,9 @@ class MigrationRun:
 
     def __init__(self, *, source_workspace_name: str, capacity_name: str) -> None:
         self.id = uuid.uuid4().hex
+        self.lineage_id = self.id
+        self.resumed_from = ""
+        self.journal_started = False
         self.source_workspace_name = source_workspace_name
         self.capacity_name = capacity_name
         self.status = RunStatus.PENDING
@@ -169,6 +175,8 @@ class MigrationRun:
         with self._lock:
             return {
                 "id": self.id,
+                "lineageId": self.lineage_id,
+                "resumedFrom": self.resumed_from,
                 "status": self.status.value,
                 "error": self.error,
                 "createdAt": self.created_at,
@@ -213,12 +221,132 @@ class MigrationRun:
                 subscriber.put_nowait(None)
 
 
+class RunConflict(RuntimeError):
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        super().__init__(reason)
+
+
 class RunRegistry:
     """Holds the runs for this process. Fab Shuffle is a single-container tool, so memory is fine."""
 
     def __init__(self) -> None:
         self._runs: dict[str, MigrationRun] = {}
         self._lock = threading.Lock()
+        self._claims: set[str] = set()
+        self._cleaning: set[str] = set()
+
+    @staticmethod
+    def _related(run: MigrationRun, lineage_id: str, target_id: str) -> bool:
+        target = (run.target_workspace or {}).get("id")
+        return run.lineage_id == lineage_id or bool(target_id and target == target_id)
+
+    def _active(self, lineage_id: str = "", target_id: str = "") -> MigrationRun | None:
+        for run in self._runs.values():
+            if (
+                run.id in self._claims or run.status in (RunStatus.PENDING, RunStatus.RUNNING)
+            ) and (not lineage_id or self._related(run, lineage_id, target_id)):
+                return run
+        return None
+
+    def admit(
+        self, run: MigrationRun, *, directory: Path, plan: dict[str, Any],
+        cleanup: bool, prior: journal.Replay | None = None,
+    ) -> journal.Replay | None:
+        """Check, durably record and claim an attempt under one single-writer lock.
+
+        The registry is process scoped, matching the single-container worker architecture.
+        Persisted ancestry makes old attempt URLs unusable even after a process restart.
+        """
+        with self._lock:
+            if prior:
+                prior = journal.read(directory / f"{prior.run_id}.jsonl")
+            lineage = (prior.lineage_id or prior.run_id) if prior else run.id
+            target = prior.target_workspace_id if prior else ""
+            active = self._active(lineage, target)
+            if active:
+                raise RunConflict(active.id, "This migration already has an active attempt.")
+            if "*" in self._cleaning or lineage in self._cleaning or target in self._cleaning:
+                raise RunConflict(run.id, "Wait for workspace cleanup to finish before starting.")
+            if prior:
+                for replay in journal.list_runs(directory):
+                    if (
+                        prior.run_id in replay.ancestors
+                        or (
+                            replay.run_id != prior.run_id
+                            and (replay.lineage_id == lineage or (
+                                target and replay.target_workspace_id == target
+                            ))
+                            and replay.created_at > prior.created_at
+                        )
+                    ):
+                        raise RunConflict(
+                            replay.run_id, "This attempt was superseded. Resume the latest attempt."
+                        )
+            journal.Journal(directory / f"{run.id}.jsonl").run_created(
+                plan, cleanup=cleanup, prior=prior
+            )
+            run.journal_started = True
+            run.lineage_id = lineage
+            run.resumed_from = prior.run_id if prior else ""
+            if target:
+                run.target_workspace = {"id": target, "displayName": prior.target_workspace_name}
+            self._runs[run.id] = run
+            self._claims.add(run.id)
+        return prior
+
+    def release(self, run_id: str) -> None:
+        with self._lock:
+            self._claims.discard(run_id)
+
+    def resumable(self, directory: Path) -> list[journal.Replay]:
+        with self._lock:
+            latest: list[journal.Replay] = []
+            for replay in journal.latest_runs(directory):
+                lineage = replay.lineage_id or replay.run_id
+                target = replay.target_workspace_id
+                if (
+                    replay.interrupted
+                    and not self._active(lineage, target)
+                    and "*" not in self._cleaning
+                    and lineage not in self._cleaning and target not in self._cleaning
+                ):
+                    latest.append(replay)
+            return latest
+
+    @contextlib.contextmanager
+    def cleanup_claim(
+        self, run: MigrationRun | None = None, *, directory: Path | None = None
+    ) -> Iterator[None]:
+        """Serialize manual cleanup with admission, including cleanup through an ancestor."""
+        lineage = run.lineage_id if run else ""
+        target = str((run.target_workspace or {}).get("id") or "") if run else ""
+        keys = {lineage, target} - {""} if run else {"*"}
+        with self._lock:
+            active = self._active(lineage, target)
+            if active:
+                raise RunConflict(active.id, "Wait for the related migration to finish before cleanup.")
+            if directory is not None:
+                for replay in journal.latest_runs(directory):
+                    if replay.copy_jobs and (
+                        not run or replay.lineage_id == lineage or (
+                            target and replay.target_workspace_id == target
+                        )
+                    ):
+                        raise RunConflict(
+                            replay.run_id, "Unfinished Copy Jobs may still be running. Resume and "
+                            "reconcile that attempt before deleting its scratch workspace."
+                        )
+            if "*" in self._cleaning or self._cleaning.intersection(keys) or (
+                not run and self._cleaning
+            ):
+                raise RunConflict(run.id if run else "", "Workspace cleanup is already in progress.")
+            self._cleaning.update(keys)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._cleaning.difference_update(keys)
 
     def add(self, run: MigrationRun) -> MigrationRun:
         with self._lock:
@@ -241,6 +369,7 @@ __all__ = [
     "REGISTRY",
     "CancelledError",
     "MigrationRun",
+    "RunConflict",
     "RunRegistry",
     "RunStatus",
     "Step",
