@@ -7,6 +7,7 @@ each phase feeds the next, are exercised together rather than unit by unit.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
@@ -101,6 +102,15 @@ class FakeFabric:
                 {"id": LAKEHOUSE, "displayName": "bronze", "type": "Lakehouse"},
                 {"id": MODEL, "displayName": "Sales Model", "type": "SemanticModel"},
                 {"id": REPORT, "displayName": "Sales", "type": "Report"},
+            ]
+            return [i for i in items if not item_type or i["type"] == item_type]
+
+        if path == f"workspaces/{TARGET_WS}/items":
+            # What this fake has built so far, which is what a resume checks its journal
+            # against before trusting it.
+            items = [
+                {"id": new_id, "displayName": name, "type": kind}
+                for kind, name, new_id in self.created
             ]
             return [i for i in items if not item_type or i["type"] == item_type]
 
@@ -207,6 +217,135 @@ def test_phases_run_in_dependency_order(fabric):
         "reflexes",
         "permissions",
     ]
+
+
+# ---------------------------------------------------------------- resuming a run
+
+
+@contextmanager
+def dies_at(phase_id):
+    """Run with one phase throwing, leaving the run interrupted partway through.
+
+    The phase table is swapped directly rather than through monkeypatch, because the resume
+    has to happen with the table put back but the fixture's fake Fabric still in place, and
+    ``monkeypatch.undo`` would take both away.
+    """
+    original = orchestrator._REBUILD_PHASES
+
+    def explode(_ctx):
+        raise RuntimeError("the container went away")
+
+    orchestrator._REBUILD_PHASES = tuple(
+        (name, explode if name == phase_id else fn) for name, fn in original
+    )
+    try:
+        yield
+    finally:
+        orchestrator._REBUILD_PHASES = original
+
+
+def attempt(plan=None, prior=None):
+    migration = MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64")
+    orchestrator.run_migration(
+        migration, PRINCIPAL, plan or make_plan(), cleanup=False, prior=prior
+    )
+    return migration
+
+
+def interrupted_then_resumed(phase_id):
+    """Run until ``phase_id`` throws, then pick it up from its journal. Returns both runs."""
+    with dies_at(phase_id):
+        first = attempt()
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+    return first, second, replay
+
+
+def test_a_resumed_run_does_not_build_anything_twice(fabric):
+    """The whole point. A second attempt finishes the job instead of starting it again."""
+    with dies_at("analytics"):
+        first = attempt()
+    assert first.status == RunStatus.FAILED
+    built_before = list(fabric.created)
+    assert built_before, "the first attempt should have got something done"
+
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+
+    assert second.status == RunStatus.SUCCEEDED, second.error
+    # Nothing the first attempt built was built again.
+    names = [(kind, name) for kind, name, _ in fabric.created]
+    assert len(names) == len(set(names)), f"something was created twice: {names}"
+    # And the run went further than it did the first time.
+    assert len(fabric.created) > len(built_before)
+
+
+def test_a_resumed_run_reuses_the_workspace_rather_than_making_another(fabric):
+    """Creating a second workspace would abandon everything the first attempt built."""
+    _first, second, _replay = interrupted_then_resumed("lakehouses")
+
+    assert second.snapshot()["targetWorkspace"]["id"] == TARGET_WS
+    step = next(s for s in second.snapshot()["steps"] if s["id"] == "workspaces")
+    assert "Reusing" in step["detail"]
+
+
+def test_a_resumed_run_still_rebinds_correctly(fabric):
+    """A model carried across attempts must still point at the new endpoint, not the source."""
+    _first, second, _replay = interrupted_then_resumed("analytics")
+    assert second.status == RunStatus.SUCCEEDED, second.error
+
+    model_id = next(new_id for kind, _, new_id in fabric.created if kind == "SemanticModel")
+    payload = next(p for p in fabric.definitions[model_id] if p["path"] == "model.bim")
+    text = decode_payload(payload["payload"]).decode()
+    # Rebound through the id map the first attempt wrote down and this one read back.
+    assert TARGET_ENDPOINT in text and SOURCE_ENDPOINT not in text
+
+
+def test_an_item_deleted_between_attempts_is_built_again(fabric):
+    """The journal says what was done, not what is there now. Reality wins."""
+    with dies_at("analytics"):
+        first = attempt()
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    # Somebody removed the lakehouse from the new workspace in between.
+    fabric.created = [entry for entry in fabric.created if entry[0] != "Lakehouse"]
+
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+
+    assert second.status == RunStatus.SUCCEEDED, second.error
+    assert any(kind == "Lakehouse" for kind, _, _ in fabric.created)
+    assert any("no longer in the new workspace" in w for w in second.summary["warnings"])
+
+
+def test_resuming_into_a_workspace_that_has_gone_is_refused(fabric, monkeypatch):
+    """Rebuilding into a workspace that is not there would be worse than saying so."""
+    with dies_at("analytics"):
+        first = attempt()
+    replay = journal.read(SETTINGS.journal_for(first.id))
+
+    def gone(path, params=None, value_key="value"):
+        if path == f"workspaces/{TARGET_WS}/items":
+            raise orchestrator.FabricApiError("GET", path, 404, "WorkspaceNotFound")
+        return FakeFabric.list_all(fabric, path, params, value_key)
+
+    monkeypatch.setattr(fabric, "list_all", gone)
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+
+    assert second.status == RunStatus.FAILED
+    assert "cannot be read any more" in second.error
+    assert "Start the migration again" in second.error
+
+
+def test_the_plan_survives_the_round_trip(fabric):
+    """A resume must not have to ask the operator for the plan a second time."""
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert orchestrator.plan_from_journal(replay) == make_plan()
+
+
+def test_a_journal_with_no_plan_cannot_be_resumed():
+    with pytest.raises(ValueError, match="does not say what it was migrating"):
+        orchestrator.plan_from_journal(journal.Replay())
 
 
 # ------------------------------------------------------------------- the journal

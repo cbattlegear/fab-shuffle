@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 import shutil
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -211,6 +211,24 @@ class _Context:
         """
         return self.prior is not None and self.prior.data_is_done(item_id, kind, key)
 
+    def already_created(self, source_id: str) -> bool:
+        """Whether an earlier attempt already built the target item for this source item.
+
+        Read from ``id_map`` after it has been checked against the workspace, so an item that
+        was recorded and has since been deleted is not counted. Only ever true on a resume:
+        within one attempt each type is walked once, and answering yes here on a first run
+        would silently skip something.
+        """
+        return self.prior is not None and bool(source_id) and source_id in self.id_map
+
+    def to_migrate(self, items: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        """Whichever of these still need creating.
+
+        Rebuilding one that is already there would fail on the duplicate name, and if it did
+        not, the new id would not be the one every definition has already been rewritten to.
+        """
+        return [item for item in items if not self.already_created(str(item.get("id") or ""))]
+
     def __post_init__(self) -> None:
         """Point the three collections a resume depends on at the journal.
 
@@ -234,8 +252,15 @@ def run_migration(
     plan: MigrationPlan,
     *,
     cleanup: bool = True,
+    prior: journal_module.Replay | None = None,
 ) -> None:
-    """Execute a migration, recording every phase on ``run``."""
+    """Execute a migration, recording every phase on ``run``.
+
+    ``prior`` is an earlier attempt at this same move, read back from its journal. Given one,
+    the phases all run again but skip what was already done: creation is adopted from the id
+    map, and data that finished moving is left alone. Every phase runs because two of them
+    only read, and what they read is what the later ones need in order to rebind anything.
+    """
     tokens = TokenProvider(principal)
     scratch_dir = SETTINGS.scratch_dir_for(run.id)
     book = journal_module.Journal(SETTINGS.journal_for(run.id))
@@ -251,8 +276,23 @@ def run_migration(
             run=run,
             scratch_dir=scratch_dir,
             journal=book,
+            prior=prior,
         )
         try:
+            if prior is not None:
+                # Inside the try: a resume that has to be refused is a failed run with a
+                # reason on it, not an exception escaping into the thread that started it.
+                starting_map, notes = verify_prior(client, prior)
+                context.id_map.update(starting_map)
+                context.dormant.update(prior.dormant)
+                context.warnings.extend(notes)
+                context.target_workspace_id = prior.target_workspace_id
+                context.scratch_workspace_id = prior.scratch_workspace_id
+                if prior.target_workspace_id:
+                    book.workspace("target", prior.target_workspace_id)
+                if prior.scratch_workspace_id:
+                    book.workspace("scratch", prior.scratch_workspace_id)
+
             if plan.strategy is Strategy.REASSIGN:
                 _reassign_capacity(context)
                 run.summary["strategy"] = Strategy.REASSIGN.value
@@ -286,6 +326,84 @@ def _plan_record(plan: MigrationPlan) -> dict[str, Any]:
     record = asdict(plan)
     record["strategy"] = plan.strategy.value
     return record
+
+
+def plan_from_journal(replay: journal_module.Replay) -> MigrationPlan:
+    """Rebuild the plan a run was given. Raises if the journal never recorded one."""
+    record = dict(replay.plan)
+    if not record.get("source_workspace_id"):
+        raise ValueError("This run's journal does not say what it was migrating.")
+    record["strategy"] = Strategy(record.get("strategy") or Strategy.REBUILD.value)
+    known = {f.name for f in fields(MigrationPlan)}
+    # Anything the journal carries that this build does not know about is dropped rather than
+    # passed on, so an older build can still resume a newer build's run.
+    return MigrationPlan(**{k: v for k, v in record.items() if k in known})
+
+
+class ResumeRefused(RuntimeError):
+    """The run cannot be picked up, and rebuilding into nothing would be worse than saying so."""
+
+
+def verify_prior(
+    client: FabricClient, replay: journal_module.Replay
+) -> tuple[dict[str, str], list[str]]:
+    """Check what the journal claims against the workspaces themselves.
+
+    The journal records what a previous attempt *did*, which is not the same as what is there
+    now: somebody may have deleted an item, or the whole workspace, in between. Anything that
+    has gone is dropped from the map so that this attempt builds it again.
+
+    Only item mappings are checked. id_map also holds folder ids, SQL endpoint names, server
+    addresses and cluster URIs, none of which appear in an item listing, so a mapping is only
+    discarded when its source really is an item in the source workspace and its target really
+    is absent from the target workspace.
+    """
+    if not replay.target_workspace_id:
+        raise ResumeRefused(
+            "This run stopped before it created the new workspace, so there is nothing to "
+            "pick up. Start it again."
+        )
+
+    try:
+        target_items = {
+            item["id"] for item in list_items(client, replay.target_workspace_id) if item.get("id")
+        }
+    except FabricApiError as error:
+        if error.status_code in (403, 404):
+            raise ResumeRefused(
+                f"The workspace this run was building, {replay.target_workspace_id}, cannot be "
+                f"read any more: the service said {error}. It was deleted, or this service "
+                "principal lost access. Start the migration again rather than resuming into "
+                "a workspace that is not there."
+            ) from error
+        raise
+
+    source_workspace = str(replay.plan.get("source_workspace_id") or "")
+    source_items = {
+        item["id"] for item in list_items(client, source_workspace) if item.get("id")
+    }
+
+    kept: dict[str, str] = {}
+    lost: list[str] = []
+    for source, target in replay.id_map.items():
+        if source in source_items and target not in target_items:
+            lost.append(source)
+            continue
+        kept[source] = target
+
+    notes = []
+    if lost:
+        notes.append(
+            f"{len(lost)} item(s) recorded by the earlier attempt are no longer in the new "
+            "workspace, so they will be created again."
+        )
+    if replay.damaged_lines:
+        notes.append(
+            "The end of this run's journal was cut off, which is what a run that was "
+            "interrupted looks like. Anything it did not manage to write down will be done "
+            "again."
+        )
+    return kept, notes
 
 
 # --------------------------------------------------------------- reassign path
@@ -813,19 +931,33 @@ def _create_workspaces(ctx: _Context) -> None:
     ctx.run.start_step(step, "Creating target and scratch workspaces")
     ctx.run.raise_if_cancelled()
 
-    target = workspaces.create_workspace(
-        ctx.client,
-        ctx.plan.target_workspace_name,
-        ctx.plan.capacity_id,
-        description=(
-            f"Created by Fab Shuffle from '{ctx.plan.source_workspace_name}' "
-            f"in {ctx.plan.capacity_region}."
-        ),
-    )
-    ctx.target_workspace_id = target["id"]
-    ctx.run.target_workspace = {"id": target["id"], "displayName": ctx.plan.target_workspace_name}
-    ctx.journal.workspace("target", target["id"], ctx.plan.target_workspace_name)
-    ctx.id_map[ctx.plan.source_workspace_id] = target["id"]
+    # A resumed run reuses the workspaces the earlier attempt made. Creating a second pair
+    # would abandon everything already built in the first and collide on the name besides.
+    resumed = bool(ctx.target_workspace_id)
+    if resumed:
+        ctx.run.update_step(step, "Reusing the workspace the earlier attempt created")
+        ctx.run.target_workspace = {
+            "id": ctx.target_workspace_id,
+            "displayName": ctx.plan.target_workspace_name,
+        }
+        ctx.id_map[ctx.plan.source_workspace_id] = ctx.target_workspace_id
+    else:
+        target = workspaces.create_workspace(
+            ctx.client,
+            ctx.plan.target_workspace_name,
+            ctx.plan.capacity_id,
+            description=(
+                f"Created by Fab Shuffle from '{ctx.plan.source_workspace_name}' "
+                f"in {ctx.plan.capacity_region}."
+            ),
+        )
+        ctx.target_workspace_id = target["id"]
+        ctx.run.target_workspace = {
+            "id": target["id"],
+            "displayName": ctx.plan.target_workspace_name,
+        }
+        ctx.journal.workspace("target", target["id"], ctx.plan.target_workspace_name)
+        ctx.id_map[ctx.plan.source_workspace_id] = target["id"]
 
     # Grant the source workspace's admins straight away rather than waiting for the final
     # permissions phase. A run that fails before then would otherwise leave a workspace only
@@ -841,25 +973,28 @@ def _create_workspaces(ctx: _Context) -> None:
 
     # Copy Jobs must live somewhere that is not the workspace being built, otherwise they
     # show up as leftover items in the migrated workspace.
-    scratch_name = workspaces.scratch_workspace_name()
-    ctx.run.update_step(step, "Creating scratch workspace for Copy Jobs")
-    scratch = workspaces.create_workspace(
-        ctx.client,
-        scratch_name,
-        ctx.plan.capacity_id,
-        description="Temporary Fab Shuffle workspace for Copy Jobs. Safe to delete.",
-    )
-    ctx.scratch_workspace_id = scratch["id"]
-    ctx.run.scratch_workspace = {"id": scratch["id"], "displayName": scratch_name}
-    ctx.journal.workspace("scratch", scratch["id"], scratch_name)
+    if not ctx.scratch_workspace_id:
+        scratch_name = workspaces.scratch_workspace_name()
+        ctx.run.update_step(step, "Creating scratch workspace for Copy Jobs")
+        scratch = workspaces.create_workspace(
+            ctx.client,
+            scratch_name,
+            ctx.plan.capacity_id,
+            description="Temporary Fab Shuffle workspace for Copy Jobs. Safe to delete.",
+        )
+        ctx.scratch_workspace_id = scratch["id"]
+        ctx.run.scratch_workspace = {"id": scratch["id"], "displayName": scratch_name}
+        ctx.journal.workspace("scratch", scratch["id"], scratch_name)
 
-    # The scratch workspace needs the same treatment so a stranded one stays deletable.
-    workspaces.copy_role_assignments(
-        ctx.client, ctx.source_role_assignments, ctx.scratch_workspace_id, roles={"Admin"}
-    )
+        # The scratch workspace needs the same treatment so a stranded one stays deletable.
+        workspaces.copy_role_assignments(
+            ctx.client, ctx.source_role_assignments, ctx.scratch_workspace_id, roles={"Admin"}
+        )
 
-    # A workspace is not fully initialised for Copy Jobs until it holds a lakehouse.
-    data_stores.create_lakehouse(ctx.client, ctx.scratch_workspace_id, "hold")
+        # A workspace is not fully initialised for Copy Jobs until it holds a lakehouse.
+        data_stores.create_lakehouse(ctx.client, ctx.scratch_workspace_id, "hold")
+    else:
+        ctx.run.scratch_workspace = {"id": ctx.scratch_workspace_id, "displayName": ""}
 
     ctx.run.update_step(step, "Recreating workspace folders")
     folder_map = workspaces.clone_folder_tree(
@@ -870,7 +1005,14 @@ def _create_workspaces(ctx: _Context) -> None:
     warnings = _copy_spark_configuration(ctx, step)
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
-        step, StepStatus.SUCCEEDED, f"Created '{ctx.plan.target_workspace_name}'", warnings
+        step,
+        StepStatus.SUCCEEDED,
+        (
+            f"Reusing '{ctx.plan.target_workspace_name}'"
+            if resumed
+            else f"Created '{ctx.plan.target_workspace_name}'"
+        ),
+        warnings,
     )
 
 
@@ -1193,15 +1335,21 @@ def _migrate_lakehouses(ctx: _Context) -> None:
         schema_enabled = data_stores.is_schema_enabled(lakehouse)
 
         ctx.run.update_step(step, f"Creating lakehouse '{name}'")
-        created = data_stores.create_lakehouse(
-            ctx.client,
-            ctx.target_workspace_id,
-            name,
-            schema_enabled=schema_enabled,
-            folder_id=ctx.id_map.get(lakehouse.get("folderId", "")),
-        )
-        target = data_stores.get_lakehouse(ctx.client, ctx.target_workspace_id, created["id"])
-        ctx.id_map[lakehouse["id"]] = created["id"]
+        if ctx.already_created(lakehouse["id"]):
+            # An earlier attempt built it. Read it back rather than making a second one: its
+            # tables and files may still need copying, and the endpoint still needs mapping.
+            target_id = ctx.id_map[lakehouse["id"]]
+        else:
+            created = data_stores.create_lakehouse(
+                ctx.client,
+                ctx.target_workspace_id,
+                name,
+                schema_enabled=schema_enabled,
+                folder_id=ctx.id_map.get(lakehouse.get("folderId", "")),
+            )
+            target_id = created["id"]
+            ctx.id_map[lakehouse["id"]] = target_id
+        target = data_stores.get_lakehouse(ctx.client, ctx.target_workspace_id, target_id)
 
         source_endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
         target_endpoint = data_stores.lakehouse_sql_endpoint(target)
@@ -1448,22 +1596,28 @@ def _migrate_warehouses(ctx: _Context) -> None:
         collation = (warehouse.get("properties") or {}).get("collationType")
 
         ctx.run.update_step(step, f"Creating warehouse '{name}'")
-        created = data_stores.create_warehouse(
-            ctx.client,
-            ctx.target_workspace_id,
-            name,
-            collation_type=collation,
-            folder_id=ctx.id_map.get(warehouse.get("folderId", "")),
-        )
-        target = data_stores.get_warehouse(ctx.client, ctx.target_workspace_id, created["id"])
+        if ctx.already_created(warehouse["id"]):
+            # Already built by an earlier attempt. Its schema and tables may still be missing,
+            # and both of those steps decide for themselves what is left to do.
+            target_id = ctx.id_map[warehouse["id"]]
+        else:
+            created = data_stores.create_warehouse(
+                ctx.client,
+                ctx.target_workspace_id,
+                name,
+                collation_type=collation,
+                folder_id=ctx.id_map.get(warehouse.get("folderId", "")),
+            )
+            target_id = created["id"]
+            ctx.id_map[warehouse["id"]] = target_id
+        target = data_stores.get_warehouse(ctx.client, ctx.target_workspace_id, target_id)
 
         source_endpoint = data_stores.warehouse_connection_string(warehouse)
         target_endpoint = data_stores.warehouse_connection_string(target)
-        ctx.id_map[warehouse["id"]] = created["id"]
         if source_endpoint and target_endpoint:
             ctx.id_map[source_endpoint] = target_endpoint
 
-        created_pairs.append((warehouse, created["id"], source_endpoint, target_endpoint))
+        created_pairs.append((warehouse, target_id, source_endpoint, target_endpoint))
 
     ready, schema_warnings = _transfer_warehouse_schemas(ctx, step, created_pairs)
     warnings.extend(schema_warnings)
@@ -1609,22 +1763,27 @@ def _migrate_sql_databases(ctx: _Context) -> None:
         properties = database.get("properties") or {}
 
         ctx.run.update_step(step, f"Creating SQL database '{name}'")
-        try:
-            created = sqldatabases.create_sql_database(
-                ctx.client,
-                ctx.target_workspace_id,
-                name,
-                collation=properties.get("collation"),
-                backup_retention_days=properties.get("backupRetentionDays"),
-                description=database.get("description") or None,
-                folder_id=ctx.id_map.get(database.get("folderId", "")),
-            )
-        except FabricError as error:
-            warnings.append(analytics.describe_failure(sqldatabases.SQL_DATABASE, name, error))
-            continue
+        if ctx.already_created(database["id"]):
+            # Built by an earlier attempt. Its schema and rows are decided separately below.
+            target_id = ctx.id_map[database["id"]]
+        else:
+            try:
+                created = sqldatabases.create_sql_database(
+                    ctx.client,
+                    ctx.target_workspace_id,
+                    name,
+                    collation=properties.get("collation"),
+                    backup_retention_days=properties.get("backupRetentionDays"),
+                    description=database.get("description") or None,
+                    folder_id=ctx.id_map.get(database.get("folderId", "")),
+                )
+            except FabricError as error:
+                warnings.append(analytics.describe_failure(sqldatabases.SQL_DATABASE, name, error))
+                continue
+            target_id = created["id"]
+            ctx.id_map[database["id"]] = target_id
 
-        target = sqldatabases.get_sql_database(ctx.client, ctx.target_workspace_id, created["id"])
-        ctx.id_map[database["id"]] = created["id"]
+        target = sqldatabases.get_sql_database(ctx.client, ctx.target_workspace_id, target_id)
         source_server = sqldatabases.server_fqdn(database)
         target_server = sqldatabases.server_fqdn(target)
         if source_server and target_server:
@@ -1884,7 +2043,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             ctx.client,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=databases,
+            items=ctx.to_migrate(databases),
             item_type=analytics.MIRRORED_DATABASE,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -1923,7 +2082,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             ctx.client,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=catalogs,
+            items=ctx.to_migrate(catalogs),
             item_type=analytics.MIRRORED_ADB_CATALOG,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -2182,7 +2341,7 @@ def _migrate_realtime(ctx: _Context) -> None:
             ctx.client,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=items,
+            items=ctx.to_migrate(items),
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -2255,7 +2414,7 @@ def _migrate_engineering(ctx: _Context) -> None:
             ctx.client,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=items,
+            items=ctx.to_migrate(items),
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -2292,7 +2451,7 @@ def _migrate_engineering(ctx: _Context) -> None:
             ctx.client,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=items,
+            items=ctx.to_migrate(items),
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -2355,7 +2514,7 @@ def _migrate_dataflows(
         ctx.client,
         source_workspace_id=ctx.plan.source_workspace_id,
         target_workspace_id=ctx.target_workspace_id,
-        items=movable,
+        items=ctx.to_migrate(movable),
         item_type=analytics.DATAFLOW,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
@@ -2405,7 +2564,7 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
         ctx.client,
         source_workspace_id=source_id,
         target_workspace_id=ctx.target_workspace_id,
-        items=models,
+        items=ctx.to_migrate(models),
         item_type=analytics.SEMANTIC_MODEL,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
@@ -2421,7 +2580,7 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
         ctx.client,
         source_workspace_id=source_id,
         target_workspace_id=ctx.target_workspace_id,
-        items=reports,
+        items=ctx.to_migrate(reports),
         item_type=analytics.REPORT,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
@@ -2493,7 +2652,7 @@ def _migrate_orchestration(ctx: _Context) -> None:
             ctx.client,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=ordered,
+            items=ctx.to_migrate(ordered),
             item_type=item_type,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -2610,7 +2769,7 @@ def _migrate_reflexes(ctx: _Context) -> None:
         ctx.client,
         source_workspace_id=source_id,
         target_workspace_id=ctx.target_workspace_id,
-        items=reflexes,
+        items=ctx.to_migrate(reflexes),
         item_type=analytics.REFLEX,
         id_map=ctx.id_map,
         folder_map=ctx.id_map,
