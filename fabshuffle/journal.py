@@ -43,6 +43,10 @@ DORMANT = "dormant"
 WARNING = "warning"
 FINISHED = "finished"
 
+#: How many run journals to keep. They are small, but the directory sits on a volume that
+#: outlives the container and nothing else ever removes them.
+KEEP_JOURNALS = 100
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -292,12 +296,34 @@ def list_runs(directory: Path) -> list[Replay]:
     return replays
 
 
+def prune(directory: Path, keep: int = KEEP_JOURNALS) -> int:
+    """Delete the oldest journals once there are more than ``keep``. Returns how many went.
+
+    They are small but they are never otherwise removed, and the directory is on a volume that
+    outlives the container. A finished run's journal is kept rather than deleted on success,
+    because retrying the items it left behind reads the same file, so age is the only thing
+    that can decide.
+    """
+    if not directory.is_dir():
+        return 0
+    files = sorted(directory.glob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+    removed = 0
+    for path in files[keep:]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as error:
+            logger.warning("Could not remove the old run journal %s: %s", path, error)
+    return removed
+
+
 __all__ = [
     "DATA",
     "DISCARD",
     "DORMANT",
     "FINISHED",
     "ITEM",
+    "KEEP_JOURNALS",
     "MAPPING",
     "PHASE",
     "RUN",
@@ -308,5 +334,6 @@ __all__ = [
     "RecordingMap",
     "Replay",
     "list_runs",
+    "prune",
     "read",
 ]

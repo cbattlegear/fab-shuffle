@@ -264,6 +264,7 @@ def run_migration(
     tokens = TokenProvider(principal)
     scratch_dir = SETTINGS.scratch_dir_for(run.id)
     book = journal_module.Journal(SETTINGS.journal_for(run.id))
+    journal_module.prune(SETTINGS.journal_dir)
     book.run_created(_plan_record(plan), cleanup=cleanup)
     run.mark_running()
 

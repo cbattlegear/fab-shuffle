@@ -263,3 +263,31 @@ def test_runs_are_listed_newest_first(tmp_path):
 
 def test_listing_a_directory_that_does_not_exist_is_empty(tmp_path):
     assert journal.list_runs(tmp_path / "nope") == []
+
+
+# ------------------------------------------------------------------- retention
+
+
+def test_only_the_most_recent_journals_are_kept(tmp_path):
+    """Nothing else ever removes them, and the directory outlives the container."""
+    import os
+    import time
+
+    for n in range(8):
+        path = tmp_path / f"run{n}.jsonl"
+        path.write_text('{"t":"run","plan":{}}\n', encoding="utf-8")
+        os.utime(path, (time.time() + n, time.time() + n))
+
+    assert journal.prune(tmp_path, keep=3) == 5
+    assert sorted(p.stem for p in tmp_path.glob("*.jsonl")) == ["run5", "run6", "run7"]
+
+
+def test_pruning_leaves_a_directory_under_the_limit_alone(tmp_path):
+    (tmp_path / "only.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert journal.prune(tmp_path, keep=10) == 0
+    assert (tmp_path / "only.jsonl").exists()
+
+
+def test_pruning_a_directory_that_does_not_exist_is_not_an_error(tmp_path):
+    assert journal.prune(tmp_path / "nope") == 0
