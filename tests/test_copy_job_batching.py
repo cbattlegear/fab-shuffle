@@ -27,7 +27,9 @@ def _no_waiting(monkeypatch):
 class FakeClient:
     """Serves job instances, and records how many were running at the same time."""
 
-    def __init__(self, *, finish_after=1, fail: set[str] | None = None, never_finish=()) -> None:
+    def __init__(
+        self, *, finish_after=1, fail: set[str] | None = None, never_finish=(), retry_after=None,
+    ) -> None:
         self.finish_after = finish_after
         self.fail = fail or set()
         self.never_finish = set(never_finish)
@@ -36,6 +38,7 @@ class FakeClient:
         self.peak_in_flight = 0
         self.live: set[str] = set()
         self.next_id = 0
+        self.retry_after = retry_after or {}
 
     def post(self, path, json=None, params=None, wait=True):
         self.next_id += 1
@@ -51,10 +54,10 @@ class FakeClient:
         self.live.add(job_id)
         self.peak_in_flight = max(self.peak_in_flight, len(self.live))
 
-        class Response:
-            headers = {"Location": f"https://api/instances/inst-{job_id}"}  # noqa: RUF012
-
-        return Response()
+        headers = {"Location": f"https://api/instances/inst-{job_id}"}
+        if job_id in self.retry_after:
+            headers["Retry-After"] = self.retry_after[job_id]
+        return httpx.Response(202, headers=headers)
 
     def get(self, path, params=None):
         job_id = path.split("/items/")[1].split("/")[0]
@@ -294,7 +297,7 @@ def test_batch_deadline_also_bounds_reconciliation_and_preserves_the_last_error(
     client = ScriptedClient({"job-1": [unreadable()] * 3})
     with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="waiting budget") as caught:
         copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
-    assert client.reads == ["job-1", "job-1"]
+    assert client.reads == ["job-1"]
     assert caught.value.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 0, 1, 1)
     assert "Unavailable" in caught.value.active_jobs[0].last_error
 
@@ -572,3 +575,64 @@ def test_deadline_during_a_progress_read_keeps_other_active_ids_without_more_rea
     assert caught.value.counts == copyjobs.CopyJobCounts(3, 1, 0, 0, 1, 0, 1)
     assert caught.value.active_jobs[0].instance_id == "inst-job-2"
     assert done == [specs(3)[0]]
+
+
+def test_first_poll_hints_are_honored_without_delaying_other_eligible_jobs(clock, monkeypatch):
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 2)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 60)
+    client = ScriptedClient({}, retry_after={"job-1": "20", "job-2": "2"})
+    polls = []
+    done = []
+    get = client.get
+
+    def poll(path, **kwargs):
+        polls.append((path.split("/items/")[1].split("/")[0], clock.now))
+        return get(path, **kwargs)
+
+    monkeypatch.setattr(client, "get", poll)
+    batch = specs(2)
+    created, warnings = copyjobs.run_copy_jobs(client, batch, concurrency=2, on_done=done.append)
+
+    assert len(created) == 2
+    assert warnings == []
+    assert polls == [("job-2", 2), ("job-1", 20)]
+    assert done == [batch[1], batch[0]]
+
+
+def test_first_poll_hint_beyond_deadline_does_not_trigger_an_early_get(clock):
+    client = ScriptedClient({}, retry_after={"job-1": "20"})
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert client.reads == []
+    assert clock.now == 10
+    assert caught.value.active_jobs[0].instance_id == "inst-job-1"
+    assert caught.value.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 1, 0, 1)
+
+
+def test_single_job_runner_honors_its_first_poll_hint(clock, monkeypatch):
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 30)
+    client = ScriptedClient({}, retry_after={"job-1": "15"})
+    get = client.get
+    polls = []
+
+    def poll(*args, **kwargs):
+        polls.append(clock.now)
+        return get(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get", poll)
+    assert copyjobs.run_copy_job(client, WS, "CopyJob_One", {}) == "job-1"
+    assert polls == [15]
+
+
+def test_single_job_does_not_wait_past_its_budget_to_honor_a_poll_hint(clock):
+    client = ScriptedClient({}, retry_after={"job-1": "20"})
+    with pytest.raises(copyjobs.CopyJobFailed, match="Completion is unknown"):
+        copyjobs.run_copy_job(client, WS, "CopyJob_One", {})
+    assert client.reads == []
+    assert clock.now == 10
+
+
+def test_public_start_helper_still_returns_only_the_instance_id_without_waiting(clock):
+    client = FakeClient(retry_after={"existing": "30"})
+    assert copyjobs.start_copy_job(client, WS, "existing") == "inst-existing"
+    assert clock.now == 0

@@ -18,7 +18,13 @@ from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError, OperationFailed
+from fabshuffle.fabric.client import (
+    FabricApiError,
+    FabricClient,
+    FabricError,
+    OperationFailed,
+    _retry_after_seconds,
+)
 from fabshuffle.fabric.data_stores import TableRef
 from fabshuffle.fabric.definitions import part, platform_part
 
@@ -174,6 +180,18 @@ def create_copy_job(
 
 def start_copy_job(client: FabricClient, workspace_id: str, copy_job_id: str) -> str:
     """Kick off a Copy Job run and return the job instance id from the ``Location`` header."""
+    return _submit_copy_job(client, workspace_id, copy_job_id).instance_id
+
+
+@dataclass(frozen=True, slots=True)
+class _CopyJobSubmission:
+    instance_id: str
+    first_poll_seconds: float
+
+
+def _submit_copy_job(
+    client: FabricClient, workspace_id: str, copy_job_id: str,
+) -> _CopyJobSubmission:
     response = client.request(
         "POST",
         f"workspaces/{workspace_id}/items/{copy_job_id}/jobs/CopyJob/instances",
@@ -188,7 +206,12 @@ def start_copy_job(client: FabricClient, workspace_id: str, copy_job_id: str) ->
         ) from error
     if len(segments) < 2 or segments[-2] != "instances" or not segments[-1]:
         raise CopyJobFailed(f"Copy Job {copy_job_id} did not return a job instance location")
-    return segments[-1]
+    # The job scheduler requires waiting at least this long before the first status GET.
+    # https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job
+    return _CopyJobSubmission(
+        segments[-1],
+        max(SETTINGS.copy_job_poll_seconds, _retry_after_seconds(response, 0.0)),
+    )
 
 
 def wait_for_copy_job(
@@ -199,8 +222,29 @@ def wait_for_copy_job(
     *,
     on_status: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    return _wait_for_copy_job(client, workspace_id, copy_job_id, instance_id, on_status=on_status)
+
+
+def _wait_for_copy_job(
+    client: FabricClient,
+    workspace_id: str,
+    copy_job_id: str,
+    instance_id: str,
+    *,
+    on_status: Callable[[str], None] | None = None,
+    first_poll_seconds: float = 0.0,
+) -> dict[str, Any]:
     deadline = time.monotonic() + SETTINGS.copy_job_timeout_seconds
     last_status = ""
+
+    if first_poll_seconds:
+        time.sleep(min(first_poll_seconds, max(0.0, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
+            raise CopyJobFailed(
+                f"Copy Job {copy_job_id}, instance {instance_id} could not be polled before "
+                f"the waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired. "
+                "Completion is unknown; check this run in Fabric before retrying or cleaning up."
+            )
 
     while True:
         instance = client.get(
@@ -238,8 +282,11 @@ def run_copy_job(
     """Create, run, and await a single Copy Job. Returns the created Copy Job item id."""
     copy_job = create_copy_job(client, workspace_id, display_name, content)
     copy_job_id = copy_job["id"]
-    instance_id = start_copy_job(client, workspace_id, copy_job_id)
-    wait_for_copy_job(client, workspace_id, copy_job_id, instance_id, on_status=on_status)
+    submission = _submit_copy_job(client, workspace_id, copy_job_id)
+    _wait_for_copy_job(
+        client, workspace_id, copy_job_id, submission.instance_id,
+        on_status=on_status, first_poll_seconds=submission.first_poll_seconds,
+    )
     return copy_job_id
 
 
@@ -264,6 +311,7 @@ class _InFlight:
     last_status: str = "Unknown"
     last_error: str = ""
     read_failures: int = 0
+    next_poll_at: float = 0.0
 
     def snapshot(self) -> CopyJobRun:
         return CopyJobRun(
@@ -405,6 +453,9 @@ def run_copy_jobs(
     caller must scope those records to the current target incarnation. Missing run IDs
     require operator reconciliation and prevent automatic restart.
 
+    Each new run's first poll honors its submission's ``Retry-After`` header independently,
+    so waiting for one run never delays another that is eligible for a status read.
+
     Returns the ids of the jobs that were created/adopted and warnings only once no work is
     unresolved or queued; this is the only result that permits cleanup.
     """
@@ -453,7 +504,10 @@ def run_copy_jobs(
         spec = matches[0]
         queue.remove(spec)
         in_flight.append(
-            _InFlight(spec, saved.copy_job_id, saved.instance_id, saved.last_status, saved.last_error)
+            _InFlight(
+                spec, saved.copy_job_id, saved.instance_id, saved.last_status, saved.last_error,
+                next_poll_at=time.monotonic() + SETTINGS.copy_job_poll_seconds,
+            )
         )
         if saved.copy_job_id:
             created.append((spec.workspace_id, saved.copy_job_id))
@@ -477,7 +531,7 @@ def run_copy_jobs(
                 if time.monotonic() >= deadline:
                     queue.appendleft(spec)
                     stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
-                instance_id = start_copy_job(client, spec.workspace_id, copy_job_id)
+                submission = _submit_copy_job(client, spec.workspace_id, copy_job_id)
             except CopyJobBatchIncomplete:
                 raise
             except (FabricError, CopyJobFailed) as error:
@@ -489,25 +543,35 @@ def run_copy_jobs(
                     continue
                 in_flight.append(_InFlight(spec, copy_job_id, None, last_error=str(error)))
                 stop("a submission's outcome is unknown")
-            in_flight.append(_InFlight(spec, copy_job_id, instance_id, "NotStarted"))
+            in_flight.append(
+                _InFlight(
+                    spec, copy_job_id, submission.instance_id, "NotStarted",
+                    next_poll_at=time.monotonic() + submission.first_poll_seconds,
+                )
+            )
             if on_started:
-                on_started(spec, copy_job_id, instance_id)
+                on_started(spec, copy_job_id, submission.instance_id)
         report()
 
         if not in_flight:
             continue
 
-        time.sleep(min(SETTINGS.copy_job_poll_seconds, max(0.0, deadline - time.monotonic())))
+        now = time.monotonic()
+        next_poll = min(job.next_poll_at for job in in_flight)
+        time.sleep(min(max(0.0, next_poll - now), max(0.0, deadline - now)))
 
         for index, job in enumerate(list(in_flight)):
             if index and time.monotonic() >= deadline:
                 stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
+            if time.monotonic() < job.next_poll_at:
+                continue
             try:
                 status, instance = _job_status(client, job)
             except FabricError as error:
                 job.last_status = "Unknown"
                 job.last_error = str(error)
                 job.read_failures += 1
+                job.next_poll_at = time.monotonic() + SETTINGS.copy_job_poll_seconds
                 logger.warning(
                     "%s: progress is unknown for Copy Job %s, instance %s (read %s/%s): %s",
                     job.spec.label, job.copy_job_id, job.instance_id,
@@ -519,6 +583,7 @@ def run_copy_jobs(
             job.last_error = ""
             job.read_failures = 0
             if status not in TERMINAL_JOB_STATES:
+                job.next_poll_at = time.monotonic() + SETTINGS.copy_job_poll_seconds
                 continue
 
             in_flight.remove(job)
