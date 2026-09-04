@@ -5,7 +5,7 @@ three behaviours every Fabric caller has to get right:
 
 * continuation-token paging on list endpoints,
 * long running operations (``202`` + ``Location`` + ``Retry-After`` + ``/operations/{id}``),
-* throttling (``429``) and transient ``5xx`` retries.
+* throttling retries and bounded retries for safe reads, without replaying uncertain mutations.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from fabshuffle.config import FABRIC_API_BASE, SETTINGS
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_SAFE_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _TERMINAL_OPERATION_STATES = frozenset({"Succeeded", "Failed", "Undefined"})
 
 
@@ -70,6 +71,24 @@ class FabricApiError(FabricError):
             if isinstance(nested, Mapping) and nested.get(key):
                 return str(nested[key])
         return ""
+
+
+class FabricTransportError(FabricError):
+    """A request failed without a usable HTTP response; a mutation may have taken effect."""
+
+    def __init__(self, method: str, url: str, attempts: int, error: httpx.RequestError) -> None:
+        self.method = method
+        self.url = url
+        self.attempts = attempts
+        self.detail = f"{type(error).__name__}: {error}"
+        self.outcome_unknown = method not in _SAFE_READ_METHODS
+        super().__init__(
+            f"{method} {url} failed after {attempts} attempt(s): {self.detail}"
+            + (
+                ". The request outcome is unknown. Check Fabric before retrying this operation."
+                if self.outcome_unknown else ""
+            )
+        )
 
 
 class OperationFailed(FabricError):
@@ -153,35 +172,56 @@ class FabricClient:
         headers: Mapping[str, str] | None = None,
         expected: Sequence[int] | None = None,
     ) -> httpx.Response:
-        """Issue a single request, retrying throttled and transient failures.
+        """Retry throttled requests and transient read failures, not uncertain mutations.
 
         ``content`` sends a raw body instead of JSON, which the file APIs need: they carry
         file bytes rather than a document.
+
+        A lost response or a server error does not prove a mutation failed. Even PUT and
+        DELETE are not replayed automatically: endpoint-specific reconciliation belongs to
+        the caller, not to this transport. An explicit 429 rejection is different: Fabric
+        documents retries for throttled requests, including writes.
         """
         url = self._url(path)
-        last_response: httpx.Response | None = None
+        method = method.upper()
+        safe_read = method in _SAFE_READ_METHODS
+        attempts = max(1, SETTINGS.max_retries)
 
-        for attempt in range(1, SETTINGS.max_retries + 1):
-            response = self._http.request(
-                method.upper(),
-                url,
-                json=json,
-                content=content,
-                params=params,
-                headers=self._headers(headers),
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._http.request(
+                    method,
+                    url,
+                    json=json,
+                    content=content,
+                    params=params,
+                    headers=self._headers(headers),
+                )
+            except httpx.RequestError as error:
+                if not safe_read or attempt == attempts or not isinstance(error, httpx.TransportError):
+                    raise FabricTransportError(method, url, attempt, error) from error
+                delay = min(60.0, 2.0 ** attempt)
+                logger.warning(
+                    "%s %s could not be read: %s: %s; retrying in %.1fs (attempt %s/%s)",
+                    method, url, type(error).__name__, error, delay, attempt, attempts,
+                )
+                time.sleep(delay)
+                continue
+
+            # https://learn.microsoft.com/rest/api/fabric/articles/throttling
+            retryable = response.status_code == 429 or (
+                safe_read and response.status_code in RETRYABLE_STATUS
             )
-            last_response = response
-
-            if response.status_code in RETRYABLE_STATUS and attempt < SETTINGS.max_retries:
+            if retryable and attempt < attempts:
                 delay = _retry_after_seconds(response, fallback=min(60.0, 2.0 ** attempt))
                 logger.warning(
                     "%s %s returned %s, retrying in %.1fs (attempt %s/%s)",
-                    method.upper(),
+                    method,
                     url,
                     response.status_code,
                     delay,
                     attempt,
-                    SETTINGS.max_retries,
+                    attempts,
                 )
                 time.sleep(delay)
                 continue
@@ -192,10 +232,9 @@ class FabricClient:
             elif response.is_success:
                 return response
 
-            raise FabricApiError(method.upper(), url, response.status_code, response.text)
+            raise FabricApiError(method, url, response.status_code, response.text)
 
-        assert last_response is not None  # pragma: no cover - loop always assigns
-        raise FabricApiError(method.upper(), url, last_response.status_code, last_response.text)
+        raise AssertionError("Request attempts exhausted without a response or error")  # pragma: no cover
 
     # --------------------------------------------------------------- verb helpers
 
@@ -350,6 +389,7 @@ __all__ = [
     "FabricApiError",
     "FabricClient",
     "FabricError",
+    "FabricTransportError",
     "OperationFailed",
     "OperationTimeout",
 ]

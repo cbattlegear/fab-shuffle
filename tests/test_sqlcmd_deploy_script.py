@@ -233,3 +233,120 @@ def test_a_column_default_mentioning_use_survives() -> None:
     script = "ALTER TABLE [dbo].[T] ADD CONSTRAINT [D] DEFAULT N'use me' FOR [Note];\n"
 
     assert sqlschema.resolve_sqlcmd(script) == script
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "CREATE VIEW [dbo].[Notes] AS SELECT N'SET NOEXEC ON' AS [Note];",
+        "CREATE TABLE [dbo].[Notes] ([Note] NVARCHAR(100) DEFAULT N'it''s SET NOEXEC ON');",
+        "CREATE VIEW [dbo].[Notes] AS SELECT N'line one\nSET NOEXEC ON\nline three' AS [Note];",
+        "CREATE TABLE [dbo].[T] ([Id] INT); -- SET NOEXEC ON",
+        "/* SET NOEXEC ON */ CREATE TABLE [dbo].[T] ([Id] INT);",
+        "CREATE TABLE [dbo].[T] (/* SET NOEXEC ON */ [Id] INT);",
+        "/* outer /* inner */ SET NOEXEC ON */ CREATE TABLE [dbo].[T] ([Id] INT);",
+        "CREATE TABLE [dbo].[SET NOEXEC ON] ([a]]b] INT);",
+        'CREATE TABLE "SET NOEXEC ON" ("a""b" INT);',
+        "CREATE PROCEDURE [dbo].[Guard] AS BEGIN SET NOEXEC ON; END;",
+        "CREATE OR ALTER PROCEDURE [dbo].[Guard] AS SET NOEXEC ON;",
+        "ALTER PROCEDURE [dbo].[Guard] AS SET NOEXEC ON;",
+        "CREATE VIEW [dbo].[Notes] AS SELECT N'/* not a comment */ SET NOEXEC ON --' AS [Note];",
+        "-- an unmatched quote ' and SET NOEXEC ON\nCREATE TABLE [dbo].[T] ([Id] INT);",
+    ],
+)
+def test_real_ddl_mentioning_noexec_is_preserved_verbatim(ddl: str) -> None:
+    assert not sqlschema._is_noise(ddl)
+    assert sqlschema._batches(ddl) == [ddl]
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "SET NOEXEC ON;",
+        "set noexec on",
+        "SET /* deployment guard */ NOEXEC -- session guard\n ON;",
+        """IF N'$(__IsSqlCmdEnabled)' NOT IN (N'True',N'False')
+BEGIN
+    PRINT N'SQLCMD mode must be enabled to successfully execute this script.';
+    SET NOEXEC ON;
+END""",
+        """IF N'an invalid sqlcmd value' NOT IN (N'True', N'False')
+BEGIN
+    PRINT N'SQLCMD mode must be enabled to successfully execute this script.';
+    SET /* guard */ NOEXEC ON;
+END;""",
+    ],
+)
+def test_only_standalone_noexec_and_known_sqlcmd_guards_are_scaffolding(guard: str) -> None:
+    assert sqlschema._is_noise(guard)
+    assert sqlschema._batches(guard) == []
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        "SET NOEXEC ON;\nCREATE TABLE [dbo].[T] ([Id] INT);",
+        "CREATE TABLE [dbo].[T] ([Id] INT);\nSET NOEXEC ON;",
+        "IF 1 = 1 BEGIN SET NOEXEC ON; END",
+        """IF N'True' NOT IN (N'True',N'False')
+BEGIN
+    CREATE TABLE [dbo].[T] ([Id] INT);
+    SET NOEXEC ON;
+END""",
+    ],
+)
+def test_unrecognized_executable_noexec_fails_instead_of_discarding_schema(batch: str) -> None:
+    with pytest.raises(sqlschema.SchemaTransferError, match="Unrecognized executable SET NOEXEC ON"):
+        sqlschema._batches(batch)
+
+
+@pytest.mark.parametrize(
+    "batch", ["/* unclosed", "SELECT N'unclosed", "SELECT [unclosed", 'SELECT "unclosed'],
+)
+def test_malformed_quoted_tokens_or_comments_do_not_silently_hide_schema(batch: str) -> None:
+    with pytest.raises(sqlschema.SchemaTransferError, match="Unterminated SQL"):
+        sqlschema._batches(batch)
+
+
+def test_nested_comment_only_batch_is_noise() -> None:
+    assert sqlschema._is_noise("/* outer /* inner */ SET NOEXEC ON */ -- comment")
+
+
+def test_real_ddl_with_noexec_literal_reaches_the_connection(tmp_path: Path, monkeypatch) -> None:
+    executed = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return self
+
+        def execute(self, batch):
+            executed.append(batch)
+
+    ddl = "CREATE VIEW [dbo].[Notes] AS SELECT N'SET NOEXEC ON' AS [Note];"
+    monkeypatch.setattr(sqlschema, "connect", lambda *args, **kwargs: Connection())
+    script = tmp_path / "Deploy.sql"
+    script.write_text(f"/* generated header */\nGO\n{ddl}\nGO\n", encoding="utf-8")
+
+    assert sqlschema.apply_script(script, server="srv", database="target", tokens=object()) == []
+    assert executed == [ddl]
+
+
+def test_invalid_guard_is_rejected_before_any_schema_execution(tmp_path: Path, monkeypatch) -> None:
+    def no_connection(*args, **kwargs):
+        pytest.fail("The entire script must be inspected before any batches execute")
+
+    monkeypatch.setattr(sqlschema, "connect", no_connection)
+    script = tmp_path / "Deploy.sql"
+    script.write_text(
+        "/* generated header */\nGO\nCREATE TABLE [dbo].[T] ([Id] INT);\nGO\n"
+        "IF 1 = 1 SET NOEXEC ON;\nGO\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(sqlschema.SchemaTransferError, match="Remove or correct"):
+        sqlschema.apply_script(script, server="srv", database="target", tokens=object())

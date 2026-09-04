@@ -84,9 +84,16 @@ _USE_STATEMENT = re.compile(
 # the session. It must never reach the server: NOEXEC is connection scoped, so one stray
 # batch silently turns every later batch into a no-op and the schema is never applied.
 _NOEXEC = re.compile(r"\bSET\s+NOEXEC\s+ON\b", re.IGNORECASE)
-# Comments, so a batch left holding nothing but commentary can be recognised as empty.
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-_LINE_COMMENT = re.compile(r"--[^\r\n]*")
+_SQLCMD_GUARD = re.compile(
+    r"IF\s+N?'(?:''|[^'])*'\s+NOT\s+IN\s*\(\s*N?'True'\s*,\s*N?'False'\s*\)"
+    r"\s*BEGIN\s+PRINT\s+N?'SQLCMD mode must be enabled to successfully execute this script\.'\s*;"
+    r"\s*SET\s+NOEXEC\s+ON\s*;\s*END\s*;?",
+    re.IGNORECASE,
+)
+_MODULE_DEFINITION = re.compile(
+    r"^\s*(?:CREATE(?:\s+OR\s+ALTER)?|ALTER)\s+(?:PROC(?:EDURE)?|FUNCTION|TRIGGER)\b",
+    re.IGNORECASE,
+)
 
 
 class SchemaTransferError(RuntimeError):
@@ -292,6 +299,56 @@ def resolve_sqlcmd(script: str) -> str:
     return _SQLCMD_VARIABLE.sub(lambda m: variables.get(m.group(1), m.group(0)), script)
 
 
+def _sql_guard_text(batch: str) -> tuple[str, str]:
+    """Remove comments and mask quoted tokens for guard detection, not execution."""
+    text: list[str] = []
+    code: list[str] = []
+    index = 0
+    while index < len(batch):
+        if batch.startswith("--", index):
+            end = batch.find("\n", index + 2)
+            index = len(batch) if end < 0 else end
+            text.append(" ")
+            code.append(" ")
+        elif batch.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < len(batch) and depth:
+                if batch.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif batch.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise SchemaTransferError("Unterminated SQL block comment; correct the deployment script.")
+            text.append(" ")
+            code.append(" ")
+        elif batch[index] in "'\"[":
+            start = index
+            closer = "]" if batch[index] == "[" else batch[index]
+            index += 1
+            while index < len(batch):
+                if batch[index] != closer:
+                    index += 1
+                elif index + 1 < len(batch) and batch[index + 1] == closer:
+                    index += 2
+                else:
+                    index += 1
+                    break
+            else:
+                raise SchemaTransferError("Unterminated SQL quoted token; correct the deployment script.")
+            text.append(batch[start:index])
+            code.append("?")
+        else:
+            text.append(batch[index])
+            code.append(batch[index])
+            index += 1
+    return "".join(text), "".join(code)
+
+
 def _is_noise(batch: str) -> bool:
     """Whether a batch is deployment scaffolding rather than schema.
 
@@ -299,10 +356,21 @@ def _is_noise(batch: str) -> bool:
     comment that introduced them, which is not worth a round trip and reads as a failure if
     the endpoint rejects it.
     """
-    if _NOEXEC.search(batch):
+    without_comments, code = _sql_guard_text(batch)
+    if not without_comments.strip():
         return True
-    without_comments = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", batch))
-    return not without_comments.strip()
+    if not _NOEXEC.search(code) or _MODULE_DEFINITION.match(code):
+        return False
+    if (
+        _SQLCMD_GUARD.fullmatch(without_comments.strip())
+        or re.fullmatch(r"\s*SET\s+NOEXEC\s+ON\s*;?\s*", code, re.IGNORECASE)
+    ):
+        return True
+    raise SchemaTransferError(
+        "Unrecognized executable SET NOEXEC ON outside the SQLCMD guard. Remove or correct "
+        "that statement before deploying; discarding its batch could lose schema, and "
+        "executing it could disable subsequent schema batches."
+    )
 
 
 def _batches(script: str) -> list[str]:

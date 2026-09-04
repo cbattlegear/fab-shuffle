@@ -10,10 +10,11 @@ over-subscription into a failed job rather than a slow one.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from fabshuffle.fabric import copyjobs
-from fabshuffle.fabric.client import FabricApiError
+from fabshuffle.fabric.client import FabricApiError, FabricError, FabricTransportError, OperationFailed
 
 WS = "ws-scratch"
 
@@ -67,7 +68,10 @@ class FakeClient:
 
         self.live.discard(job_id)
         if name in self.fail:
-            return {"status": "Failed", "failureReason": {"message": "the source went away"}}
+            return {
+                "status": "Failed",
+                "failureReason": {"errorCode": "SourceGone", "message": "the source went away"},
+            }
         return {"status": "Completed"}
 
 
@@ -156,14 +160,29 @@ def test_a_job_that_fails_reports_what_the_service_said():
     assert "the source went away" in warnings[0]
 
 
-def test_a_job_still_running_at_the_deadline_is_reported_not_waited_on(monkeypatch):
-    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 0)
+def test_a_job_still_running_at_the_deadline_aborts_with_all_queued_work(clock):
     client = FakeClient(never_finish={"job-1"})
+    seen = []
+    done = []
+    batch = specs(3)
 
-    _, warnings = copyjobs.run_copy_jobs(client, specs(1))
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, concurrency=1, on_progress=seen.append, on_done=done.append)
 
-    assert "still running after" in warnings[0]
-    assert "before copying anything by hand" in warnings[0]
+    error = caught.value
+    assert error.created == [(WS, "job-1")]
+    assert error.not_started == tuple(batch[1:])
+    assert error.active_jobs[0].copy_job_id == "job-1"
+    assert error.active_jobs[0].instance_id == "inst-job-1"
+    assert error.counts == copyjobs.CopyJobCounts(3, 0, 0, 0, 1, 0, 2)
+    assert all(spec.label in str(error) for spec in batch)
+    assert "Do not clean up" in str(error)
+    assert "batch waiting budget of 10s expired" in str(error)
+    assert not any("3 of 3" in message for message in seen)
+    assert seen[-1].startswith("0 of 3 copy job(s) finished")
+    assert len(client.started) == 1
+    assert done == []
+    assert clock.now == 10
 
 
 def test_a_failed_job_is_still_returned_for_cleanup():
@@ -183,7 +202,7 @@ def test_progress_counts_finished_against_the_total():
     copyjobs.run_copy_jobs(client, specs(3), concurrency=1, on_progress=seen.append)
 
     # A single detail line cannot name every job at once, so it counts them instead.
-    assert seen[-1] == "3 of 3 copy job(s) finished"
+    assert seen[-1] == copyjobs.CopyJobCounts(3, 3, 0, 0, 0, 0, 0).summary()
     assert any("running" in message for message in seen)
 
 
@@ -203,3 +222,353 @@ def test_the_single_job_helper_still_works():
     job_id = copyjobs.run_copy_job(client, WS, "CopyJob_One", {"properties": {}})
 
     assert job_id == "job-1"
+
+
+class Clock:
+    now = 0.0
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(copyjobs.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(copyjobs.time, "sleep", clock.sleep)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 6)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 10)
+    return clock
+
+
+class ScriptedClient(FakeClient):
+    def __init__(self, outcomes, **kwargs):
+        super().__init__(**kwargs)
+        self.outcomes = outcomes
+        self.reads = []
+
+    def get(self, path, params=None):
+        job_id = path.split("/items/")[1].split("/")[0]
+        self.reads.append(job_id)
+        outcomes = self.outcomes.get(job_id)
+        if not outcomes:
+            return super().get(path, params)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, FabricError):
+            raise outcome
+        if outcome.get("status") in copyjobs.TERMINAL_JOB_STATES:
+            self.live.discard(job_id)
+        return outcome
+
+
+def unreadable():
+    return FabricApiError(
+        "GET", "job/progress", 503, '{"errorCode":"Unavailable","message":"capacity is unavailable"}',
+    )
+
+
+def test_repeated_failed_progress_reads_never_release_the_slot():
+    client = ScriptedClient({"job-1": [unreadable() for _ in range(3)]})
+    done = []
+    seen = []
+    batch = specs(3)
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, concurrency=1, on_done=done.append, on_progress=seen.append)
+
+    error = caught.value
+    assert client.peak_in_flight == 1
+    assert len(client.started) == 1
+    assert client.reads == ["job-1"] * 3
+    assert error.counts == copyjobs.CopyJobCounts(3, 0, 0, 0, 0, 1, 2)
+    assert error.active_jobs[0].last_status == "Unknown"
+    assert "Unavailable" in error.active_jobs[0].last_error
+    assert "capacity is unavailable" in str(error)
+    assert "3 consecutive reconciliation attempts" in str(error)
+    assert all(spec.label in str(error) for spec in batch)
+    assert "1 unknown" in seen[-1]
+    assert done == []
+
+
+def test_batch_deadline_also_bounds_reconciliation_and_preserves_the_last_error(clock):
+    client = ScriptedClient({"job-1": [unreadable()] * 3})
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="waiting budget") as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert client.reads == ["job-1", "job-1"]
+    assert caught.value.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 0, 1, 1)
+    assert "Unavailable" in caught.value.active_jobs[0].last_error
+
+
+def test_progress_recovers_and_resets_the_consecutive_failure_budget():
+    client = ScriptedClient({
+        "job-1": [
+            unreadable(), unreadable(), {"status": "InProgress"},
+            unreadable(), unreadable(), {"status": "Completed"},
+        ],
+    })
+    done = []
+
+    created, warnings = copyjobs.run_copy_jobs(client, specs(2), concurrency=1, on_done=done.append)
+
+    assert len(created) == len(done) == 2
+    assert client.peak_in_flight == 1
+    assert warnings == []
+    assert client.reads[:6] == ["job-1"] * 6
+
+
+def test_exhausted_transport_error_is_reconciled_as_unknown():
+    error = FabricTransportError("GET", "progress", 6, httpx.ReadTimeout("response lost"))
+    client = ScriptedClient({"job-1": [error] * 3})
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="ReadTimeout: response lost") as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert caught.value.counts.unknown == 1
+    assert client.peak_in_flight == 1
+    assert len(client.started) == 1
+
+
+def test_deadline_counts_success_failure_rejection_running_and_queue_separately(clock):
+    client = FakeClient(
+        fail={"CopyJob_Lakehouse_0", "CopyJobjob-3"}, never_finish={"job-4"},
+    )
+    batch = specs(6)
+    done = []
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, concurrency=2, on_done=done.append)
+
+    error = caught.value
+    assert error.counts == copyjobs.CopyJobCounts(6, 1, 1, 1, 2, 0, 1)
+    assert error.counts.finished == 2
+    assert error.not_started == (batch[5],)
+    assert done == [batch[1]]
+    assert "SourceGone" in str(error)
+    assert "the source went away" in str(error)
+    assert error.created == [(WS, "job-2"), (WS, "job-3"), (WS, "job-4"), (WS, "job-5")]
+
+
+@pytest.mark.parametrize("status", ["Completed", "Failed", "Cancelled", "Deduped"])
+def test_only_confirmed_success_is_checkpointed_and_terminal_counts_are_honest(status):
+    client = ScriptedClient({"job-1": [{
+        "status": status,
+        "failureReason": {"errorCode": "ServiceCode", "message": "service detail"},
+    }]})
+    done = []
+    seen = []
+    batch = specs(1)
+    created, warnings = copyjobs.run_copy_jobs(
+        client, batch, on_done=done.append, on_progress=seen.append,
+    )
+    success = int(status == "Completed")
+    assert done == (batch if success else [])
+    assert created == [(WS, "job-1")]
+    assert seen[-1] == copyjobs.CopyJobCounts(1, success, 1 - success, 0, 0, 0, 0).summary()
+    if not success:
+        assert status in warnings[0]
+        assert "ServiceCode" in warnings[0]
+        assert "service detail" in warnings[0]
+
+
+def test_deadline_with_only_queued_jobs_left_still_aborts(clock, monkeypatch):
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 10)
+    client = FakeClient()
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(3), concurrency=1)
+    assert caught.value.counts == copyjobs.CopyJobCounts(3, 1, 0, 0, 0, 0, 2)
+    assert caught.value.active_jobs == ()
+    assert len(client.started) == 1
+
+
+def test_no_submission_is_started_after_the_batch_deadline(clock, monkeypatch):
+    client = FakeClient()
+    create = client.post
+
+    def slow_create(*args, **kwargs):
+        clock.now += 11
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(client, "post", slow_create)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert caught.value.created == [(WS, "job-1")]
+    assert caught.value.counts.not_started == 2
+    assert client.live == set()
+
+
+def test_zero_batch_budget_does_not_start_any_work(clock, monkeypatch):
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 0)
+    client = FakeClient()
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(2))
+    assert client.started == []
+    assert caught.value.counts.not_started == 2
+
+
+@pytest.mark.parametrize("status", [None, "NewServiceStatus"])
+def test_missing_or_unrecognized_status_is_not_terminal(status, clock):
+    client = ScriptedClient({"job-1": [{"status": status}] * 2})
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert caught.value.counts.unknown == 1
+    assert caught.value.active_jobs[0].last_status == (status or "Unknown")
+    assert len(client.started) == 1
+
+
+def saved_run(spec, *, job_id="existing", instance_id="existing-instance", **kwargs):
+    return copyjobs.CopyJobRun(
+        workspace_id=spec.workspace_id, copy_job_id=job_id, instance_id=instance_id,
+        item_id=spec.item_id, display_name=spec.display_name, label=spec.label, **kwargs,
+    )
+
+
+def test_resume_adopts_and_polls_without_recreating_or_restarting():
+    batch = specs(2)
+    client = FakeClient(finish_after=2)
+    client.live.add("existing")
+    started = []
+    done = []
+
+    created, warnings = copyjobs.run_copy_jobs(
+        client, batch, concurrency=1, resume_jobs=[saved_run(batch[0])],
+        on_started=lambda *args: started.append(args), on_done=done.append,
+    )
+
+    assert created == [(WS, "existing"), (WS, "job-1")]
+    assert client.polls["existing"] == 2
+    assert client.started == [batch[1].display_name]
+    assert started == [(batch[1], "job-1", "inst-job-1")]
+    assert done == batch
+    assert client.peak_in_flight == 1
+    assert warnings == []
+
+
+@pytest.mark.parametrize("job_id,instance_id", [(None, None), ("existing", None)])
+def test_unknown_submission_refuses_automatic_resume(job_id, instance_id):
+    batch = specs(2)
+    client = FakeClient()
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(
+            client, batch, resume_jobs=[saved_run(batch[0], job_id=job_id, instance_id=instance_id)],
+        )
+    assert client.started == []
+    assert caught.value.active_jobs[0].instance_id is None
+    assert caught.value.not_started == (batch[1],)
+    assert "reconcile it in Fabric" in str(caught.value)
+
+
+def test_resume_rejects_wrong_workspace_before_starting_anything():
+    batch = specs(1)
+    saved = copyjobs.CopyJobRun("other-workspace", "job", "instance", "", batch[0].display_name, "old")
+    client = FakeClient()
+    with pytest.raises(FabricError, match="current target"):
+        copyjobs.run_copy_jobs(client, batch, resume_jobs=[saved])
+    assert client.started == []
+
+
+def test_started_callback_runs_before_any_status_read(monkeypatch):
+    client = FakeClient()
+    recorded = []
+    get = client.get
+
+    def poll(*args, **kwargs):
+        assert recorded == [(specs(1)[0], "job-1", "inst-job-1")]
+        return get(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get", poll)
+    copyjobs.run_copy_jobs(client, specs(1), on_started=lambda *args: recorded.append(args))
+
+
+@pytest.mark.parametrize(
+    "location", ["", "https://api", "https://api/jobs/instances?jobType=CopyJob", "https://["],
+)
+def test_accepted_start_without_an_instance_location_is_not_a_failed_start(location, monkeypatch):
+    client = FakeClient()
+    request = client.request
+
+    def start(*args, **kwargs):
+        response = request(*args, **kwargs)
+        response.headers = {"Location": location}
+        return response
+
+    monkeypatch.setattr(client, "request", start)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert caught.value.active_jobs[0].copy_job_id == "job-1"
+    assert caught.value.active_jobs[0].instance_id is None
+    assert caught.value.counts.failed_to_start == 0
+    assert len(client.started) == 1
+    assert client.live == {"job-1"}
+
+
+@pytest.mark.parametrize("failure", [
+    FabricTransportError("POST", "instances", 1, httpx.ReadTimeout("response lost")),
+    FabricApiError("POST", "instances", 503, '{"errorCode":"Unknown","message":"service unavailable"}'),
+])
+def test_uncertain_start_aborts_without_releasing_a_slot(failure, monkeypatch):
+    client = FakeClient()
+
+    def start(*args, **kwargs):
+        client.live.add("job-1")
+        raise failure
+
+    monkeypatch.setattr(client, "request", start)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(3), concurrency=1)
+    assert len(client.started) == 1
+    assert caught.value.counts == copyjobs.CopyJobCounts(3, 0, 0, 0, 0, 1, 2)
+    assert str(failure) in str(caught.value)
+
+
+def test_unknown_creation_keeps_label_and_refuses_to_assume_no_item_exists(monkeypatch):
+    client = FakeClient()
+
+    def create(*args, **kwargs):
+        raise FabricTransportError("POST", "copyJobs", 1, httpx.ReadTimeout("lost create response"))
+
+    monkeypatch.setattr(client, "post", create)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(2))
+    assert caught.value.created == []
+    assert caught.value.active_jobs[0].copy_job_id is None
+    assert caught.value.active_jobs[0].label == specs(2)[0].label
+    assert caught.value.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 0, 1, 1)
+
+
+@pytest.mark.parametrize("result", [{}, {"id": ""}, {"id": None}, {"id": 5}])
+def test_creation_without_a_usable_id_is_reported_as_unknown(result, monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(client, "post", lambda *args, **kwargs: result)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="did not return an item ID") as caught:
+        copyjobs.run_copy_jobs(client, specs(2), concurrency=1)
+    assert caught.value.active_jobs[0].copy_job_id is None
+    assert caught.value.created == []
+    assert client.live == set()
+
+
+def test_undefined_creation_operation_is_not_treated_as_a_confirmed_failure(monkeypatch):
+    client = FakeClient()
+
+    def create(*args, **kwargs):
+        raise OperationFailed("op-1", "Undefined", {"message": "state unavailable"})
+
+    monkeypatch.setattr(client, "post", create)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="state unavailable") as caught:
+        copyjobs.run_copy_jobs(client, specs(2))
+    assert caught.value.counts.unknown == 1
+    assert caught.value.counts.failed_to_start == 0
+
+
+def test_deadline_during_a_progress_read_keeps_other_active_ids_without_more_reads(clock, monkeypatch):
+    client = ScriptedClient({})
+    get = client.get
+
+    def slow_poll(*args, **kwargs):
+        clock.now += 11
+        return get(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get", slow_poll)
+    done = []
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, specs(3), concurrency=2, on_done=done.append)
+    assert client.reads == ["job-1"]
+    assert caught.value.counts == copyjobs.CopyJobCounts(3, 1, 0, 0, 1, 0, 1)
+    assert caught.value.active_jobs[0].instance_id == "inst-job-2"
+    assert done == [specs(3)[0]]
