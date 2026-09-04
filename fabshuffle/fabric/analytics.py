@@ -308,7 +308,9 @@ def migrate_definition_item(
         parts = list(definition.get("parts") or [])
         definition_format = policy.export_format or definition.get("format")
 
-    needed = dangling_references(parts, id_map, source_items or {})
+    needed = dangling_references(
+        parts, id_map, source_items or {}, ignore=(item.get("id", ""),)
+    )
     if needed:
         raise StrandedReference(needed)
 
@@ -443,6 +445,8 @@ def dangling_references(
     parts: Iterable[Mapping[str, Any]],
     id_map: Mapping[str, str],
     source_items: Mapping[str, Mapping[str, Any]],
+    *,
+    ignore: Collection[str] = (),
 ) -> list[str]:
     """Items in the migrating workspace that a definition names but that did not migrate.
 
@@ -456,17 +460,25 @@ def dangling_references(
 
     Only items of the workspace being migrated count. A reference to another workspace is
     correct to leave exactly as it is, because that workspace is not moving.
+
+    ``ignore`` is for the item being migrated itself. Several item types carry their own id
+    inside their own definition, and an item is never a reason not to create itself: it is
+    not in the map yet precisely because this is the call that would put it there.
     """
     if not source_items:
         return []
 
+    skip = {str(item).casefold() for item in ignore if item}
     missing = {
         item_id.casefold(): item
         for item_id, item in source_items.items()
         # A SQL analytics endpoint is created with its lakehouse, warehouse or mirrored
         # database rather than by us, so it is never "not migrated": it arrives with its
         # parent, under a new id that is recorded once the parent has provisioned it.
-        if item_id and item_id not in id_map and not is_derived_type(item.get("type") or "")
+        if item_id
+        and item_id not in id_map
+        and item_id.casefold() not in skip
+        and not is_derived_type(item.get("type") or "")
     }
     if not missing:
         return []

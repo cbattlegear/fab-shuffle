@@ -99,6 +99,48 @@ def test_a_binary_part_is_skipped_rather_than_crashing():
     assert dangling_references(parts, ID_MAP, SOURCE_ITEMS) == []
 
 
+def test_an_item_is_never_a_reason_not_to_create_itself():
+    """Several types carry their own id in their own definition.
+
+    It is not in the map yet precisely because this is the call that would put it there, so
+    reading that as a missing dependency refused every one of them: "SemanticModel 'CloneTest'
+    depends on SemanticModel 'CloneTest'".
+    """
+    from fabshuffle.fabric.analytics import migrate_definition_item
+
+    model_id = "sm-self"
+    items = {model_id: {"id": model_id, "displayName": "CloneTest", "type": "SemanticModel"}}
+    parts = [part("model.bim", json.dumps({"model": {"id": model_id}}))]
+
+    class Client:
+        def post(self, path, json=None, params=None, wait=True):
+            return {"id": "sm-new"}
+
+    result = migrate_definition_item(
+        Client(),
+        source_workspace_id=SOURCE_WS,
+        target_workspace_id="ws-new",
+        item={"id": model_id, "displayName": "CloneTest"},
+        item_type="SemanticModel",
+        id_map={SOURCE_WS: "ws-new"},
+        parts=parts,
+        source_items=items,
+    )
+
+    assert result.target_id == "sm-new"
+
+
+def test_a_self_reference_does_not_hide_a_real_one():
+    model_id = "sm-self"
+    items = {
+        model_id: {"id": model_id, "displayName": "CloneTest", "type": "SemanticModel"},
+        "lh-1": {"id": "lh-1", "displayName": "Bronze", "type": "Lakehouse"},
+    }
+    parts = [part("model.bim", json.dumps({"id": model_id, "reads": "lh-1"}))]
+
+    assert dangling_references(parts, {}, items, ignore=(model_id,)) == ["Lakehouse 'Bronze'"]
+
+
 # ------------------------------------------------------------- the refusal
 
 
