@@ -75,6 +75,11 @@ def _qualified(table: TableRef) -> str:
     return f"{table.schema or 'dbo'}.{table.name}"
 
 
+#: The same name, for a caller that needs to record which tables it has already moved. Public
+#: so the journal and this module cannot drift into disagreeing about what a table is called.
+qualified_name = _qualified
+
+
 def _bracketed(table: TableRef) -> str:
     """The same table as a T-SQL identifier, which *does* want brackets.
 
@@ -161,6 +166,7 @@ def copy_tables(
     tokens: TokenProvider,
     scratch_dir: Path,
     on_progress: Callable[[str], None] | None = None,
+    on_copied: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Copy every table's rows from one SQL database to another. Returns per-table warnings.
 
@@ -170,6 +176,9 @@ def copy_tables(
     Each target table is emptied immediately before it is loaded, because ``bcp in`` appends.
     Without that, copying a table twice doubles its rows, which makes the whole operation
     unsafe to repeat. Every other data mover here overwrites, and this one now matches them.
+
+    ``on_copied`` is told each table's qualified name as it lands, so a caller can write down
+    what it will not have to do again.
 
     One table failing is reported and the rest are still attempted, because losing one table
     should not cost the operator the other fifty.
@@ -215,6 +224,8 @@ def copy_tables(
                 )
                 match = _ROWS_COPIED.search(output)
                 logger.debug("Copied %s rows into %s", match.group(1) if match else "?", _qualified(table))
+                if on_copied:
+                    on_copied(_qualified(table))
             except BulkCopyError as error:
                 warnings.append(f"Rows for {_qualified(table)} did not copy: {error}")
             except pyodbc.Error as error:
@@ -228,4 +239,4 @@ def copy_tables(
     return warnings
 
 
-__all__ = ["BulkCopyError", "copy_tables", "token_file"]
+__all__ = ["BulkCopyError", "copy_tables", "qualified_name", "token_file"]

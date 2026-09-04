@@ -10,8 +10,9 @@ import json
 
 import pytest
 
-from fabshuffle import orchestrator
+from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
+from fabshuffle.config import SETTINGS
 from fabshuffle.fabric.definitions import decode_payload, part
 from fabshuffle.fabric.support import Strategy
 from fabshuffle.run import MigrationRun, RunStatus
@@ -206,6 +207,78 @@ def test_phases_run_in_dependency_order(fabric):
         "reflexes",
         "permissions",
     ]
+
+
+# ------------------------------------------------------------------- the journal
+
+
+def test_a_run_writes_down_enough_to_be_picked_up(fabric):
+    """The whole point of the journal: what a later attempt needs in order to skip ahead."""
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert replay.plan["source_workspace_id"] == SOURCE_WS
+    assert replay.target_workspace_id == TARGET_WS
+    # Every phase that ran is recorded as finished, in the order it ran.
+    assert replay.phases_started[:3] == ["assessment", "dependencies", "workspaces"]
+    assert "analytics" in replay.phases_finished
+    assert replay.status == RunStatus.SUCCEEDED.value
+
+
+def test_the_journal_maps_every_item_that_was_created(fabric):
+    """id_map is what later phases rewrite definitions through, so it has to survive intact.
+
+    Nothing may be created without being written down: an item missing from the journal is one
+    a resume would build a second time, under a name that is already taken.
+    """
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    recorded = set(replay.id_map.values())
+    for kind, name, new_id in fabric.created:
+        assert new_id in recorded, f"{kind} '{name}' was created but never recorded"
+
+    # And the bindings the rebuild test depends on are the ones that came back.
+    assert replay.id_map[LAKEHOUSE] == "lh-new"
+    assert replay.id_map[SOURCE_WS] == TARGET_WS
+
+
+def test_the_journal_records_endpoints_as_well_as_items(fabric):
+    """A semantic model rebinds through the endpoint name, not only through the item id."""
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert replay.id_map.get(SOURCE_ENDPOINT) == TARGET_ENDPOINT
+
+
+def test_a_run_that_died_records_no_ending(fabric, monkeypatch):
+    """A run with no ending is exactly the one worth offering back, and how it is recognised."""
+
+    def explode(_ctx):
+        raise RuntimeError("the capacity went away")
+
+    # Patched in the phase table rather than on the module: the table holds the functions
+    # themselves, taken when it was defined, so rebinding the name would have no effect.
+    monkeypatch.setattr(
+        orchestrator,
+        "_REBUILD_PHASES",
+        tuple(
+            (name, explode if name == "realtime" else fn)
+            for name, fn in orchestrator._REBUILD_PHASES
+        ),
+    )
+
+    migration = MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64")
+    orchestrator.run_migration(migration, PRINCIPAL, make_plan(), cleanup=False)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert migration.status == RunStatus.FAILED
+    assert replay.interrupted
+    assert not replay.status
+    # What it got through is still there to be picked up.
+    assert "lakehouses" in replay.phases_finished
+    assert "realtime" not in replay.phases_finished
+    assert replay.target_workspace_id == TARGET_WS
 
 
 def test_data_items_are_created_before_the_models_that_read_them(fabric):

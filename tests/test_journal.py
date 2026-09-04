@@ -191,6 +191,63 @@ def test_several_threads_can_record_at_once(tmp_path):
     assert len(replay.id_map) == 120
 
 
+# ------------------------------------------------------- the recording containers
+
+
+def test_a_recording_map_reports_every_addition(tmp_path):
+    seen = []
+    id_map = journal.RecordingMap(lambda k, v: seen.append((k, v)))
+    id_map["a"] = "b"
+
+    assert id_map == {"a": "b"}
+    assert seen == [("a", "b")]
+
+
+def test_a_recording_map_reports_an_update_too(tmp_path):
+    """dict.update does not go through __setitem__, and two callers add a whole map at once.
+
+    Getting this wrong loses the folder and Spark pool mappings, which a resume needs to place
+    items and to attach environments to their pool.
+    """
+    seen = []
+    id_map = journal.RecordingMap(lambda k, v: seen.append((k, v)))
+    id_map.update({"folder-a": "folder-1", "folder-b": "folder-2"})
+
+    assert id_map == {"folder-a": "folder-1", "folder-b": "folder-2"}
+    assert sorted(seen) == [("folder-a", "folder-1"), ("folder-b", "folder-2")]
+
+
+def test_a_recording_list_reports_appends_and_extends():
+    seen = []
+    warnings = journal.RecordingList(seen.append)
+    warnings.append("one")
+    warnings.extend(["two", "three"])
+
+    assert list(warnings) == ["one", "two", "three"]
+    assert seen == ["one", "two", "three"]
+
+
+def test_a_recording_map_wired_to_a_journal_survives_a_round_trip(tmp_path):
+    j = journal.Journal(tmp_path / "run.jsonl")
+    id_map = journal.RecordingMap(j.mapping)
+    id_map["lh-src"] = "lh-tgt"
+    id_map.update({"src.fabric.com": "dst.fabric.com"})
+
+    assert journal.read(tmp_path / "run.jsonl").id_map == {
+        "lh-src": "lh-tgt",
+        "src.fabric.com": "dst.fabric.com",
+    }
+
+
+def test_a_discarding_journal_writes_nothing(tmp_path):
+    """A preview, or a test with nothing to resume, should not leave a file behind."""
+    journal.DISCARD.item("a", "b", "Notebook", "N")
+    journal.DISCARD.finished("succeeded")
+
+    assert list(tmp_path.iterdir()) == []
+    assert journal.DISCARD.path is None
+
+
 # --------------------------------------------------------------- listing runs
 
 

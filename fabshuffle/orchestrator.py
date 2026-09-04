@@ -50,11 +50,12 @@ from __future__ import annotations
 import logging
 import shutil
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fabshuffle import concurrency
+from fabshuffle import journal as journal_module
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
@@ -170,6 +171,9 @@ class _Context:
     plan: MigrationPlan
     run: MigrationRun
     scratch_dir: Path
+    # Where this run is writing down what it did, so it can be picked up again. Defaults to
+    # recording nothing, which is what a preview or a test wants.
+    journal: journal_module.Journal = field(default=journal_module.DISCARD)
     target_workspace_id: str = ""
     scratch_workspace_id: str = ""
     # Maps every source identifier (workspace, item, endpoint, cluster URI) to its target
@@ -194,6 +198,30 @@ class _Context:
     # their replication switched off so a copy does not start doing the original's work in a
     # second region. Keyed to why, so a shortcut that fails against one can say so.
     dormant: dict[str, str] = field(default_factory=dict)
+    # What an earlier attempt at this run already did, when this is a resume. ``None`` on a
+    # first attempt, which is what makes every "have we done this already" check answer no.
+    prior: journal_module.Replay | None = None
+
+    def already_copied(self, item_id: str, kind: str, key: str = "") -> bool:
+        """Whether an earlier attempt finished moving this data.
+
+        Copy Jobs overwrite, KQL replaces, Cosmos upserts, azcopy overwrites and bcp now
+        clears first, so doing any of it twice is *correct*. It is only slow. This is what
+        keeps a resume from spending another six hours being correct.
+        """
+        return self.prior is not None and self.prior.data_is_done(item_id, kind, key)
+
+    def __post_init__(self) -> None:
+        """Point the three collections a resume depends on at the journal.
+
+        Recorded here rather than beside each of the dozens of places that add to them: a
+        forgotten call site would not fail, it would produce a resume that quietly rebinds an
+        item to something that is no longer there. Anything already present is kept as the
+        starting point, which is how a resumed run begins with what the journal replayed.
+        """
+        self.id_map = journal_module.RecordingMap(self.journal.mapping, self.id_map)
+        self.warnings = journal_module.RecordingList(self.journal.warning, self.warnings)
+        self.dormant = journal_module.RecordingMap(self.journal.dormant, self.dormant)
 
 
 def default_target_name(source_name: str, region: str) -> str:
@@ -210,6 +238,8 @@ def run_migration(
     """Execute a migration, recording every phase on ``run``."""
     tokens = TokenProvider(principal)
     scratch_dir = SETTINGS.scratch_dir_for(run.id)
+    book = journal_module.Journal(SETTINGS.journal_for(run.id))
+    book.run_created(_plan_record(plan), cleanup=cleanup)
     run.mark_running()
 
     with FabricClient(tokens) as client:
@@ -220,40 +250,42 @@ def run_migration(
             plan=plan,
             run=run,
             scratch_dir=scratch_dir,
+            journal=book,
         )
         try:
             if plan.strategy is Strategy.REASSIGN:
                 _reassign_capacity(context)
                 run.summary["strategy"] = Strategy.REASSIGN.value
                 run.summary["warnings"] = context.warnings
+                book.finished(RunStatus.SUCCEEDED.value)
                 run.mark_finished(RunStatus.SUCCEEDED)
                 return
 
-            _report_unsupported_items(context)
-            _check_dependencies(context)
-            _create_workspaces(context)
-            _migrate_eventhouses(context)
-            _migrate_lakehouses(context)
-            _migrate_warehouses(context)
-            _migrate_sql_databases(context)
-            _migrate_mirrored_databases(context)
-            _migrate_shortcuts_and_endpoints(context)
-            _migrate_realtime(context)
-            _migrate_engineering(context)
-            _migrate_reports_and_models(context)
-            _migrate_orchestration(context)
-            _migrate_reflexes(context)
-            _copy_permissions(context)
+            for phase, migrate in _REBUILD_PHASES:
+                book.phase_started(phase)
+                migrate(context)
+                book.phase_finished(phase)
             if cleanup:
                 cleanup_run(context.run, context.client, scratch_dir)
             run.summary["strategy"] = Strategy.REBUILD.value
             run.summary["warnings"] = context.warnings
+            book.finished(RunStatus.SUCCEEDED.value)
             run.mark_finished(RunStatus.SUCCEEDED)
         except CancelledError as error:
+            book.finished(RunStatus.CANCELLED.value, str(error))
             run.mark_finished(RunStatus.CANCELLED, str(error))
         except Exception as error:
             logger.exception("Migration %s failed", run.id)
+            # Deliberately no ``finished`` record: a run that died is exactly the one worth
+            # offering back, and the journal is how it will be found.
             run.mark_finished(RunStatus.FAILED, str(error))
+
+
+def _plan_record(plan: MigrationPlan) -> dict[str, Any]:
+    """The plan as the journal keeps it, so a resume can rebuild it without asking again."""
+    record = asdict(plan)
+    record["strategy"] = plan.strategy.value
+    return record
 
 
 # --------------------------------------------------------------- reassign path
@@ -792,6 +824,7 @@ def _create_workspaces(ctx: _Context) -> None:
     )
     ctx.target_workspace_id = target["id"]
     ctx.run.target_workspace = {"id": target["id"], "displayName": ctx.plan.target_workspace_name}
+    ctx.journal.workspace("target", target["id"], ctx.plan.target_workspace_name)
     ctx.id_map[ctx.plan.source_workspace_id] = target["id"]
 
     # Grant the source workspace's admins straight away rather than waiting for the final
@@ -818,6 +851,7 @@ def _create_workspaces(ctx: _Context) -> None:
     )
     ctx.scratch_workspace_id = scratch["id"]
     ctx.run.scratch_workspace = {"id": scratch["id"], "displayName": scratch_name}
+    ctx.journal.workspace("scratch", scratch["id"], scratch_name)
 
     # The scratch workspace needs the same treatment so a stranded one stays deletable.
     workspaces.copy_role_assignments(
@@ -1114,6 +1148,8 @@ def _migrate_kql_database(
         return True, [], adopted_name
     if not source_query_uri or not target_query_uri:
         return True, [f"KQL database '{name}' has no query endpoint, data was not copied"], adopted_name
+    if ctx.already_copied(database_id, "kql"):
+        return True, [], adopted_name
 
     ctx.run.update_step(step, f"Copying data for KQL database '{name}'")
     result = kql.copy_database(
@@ -1124,6 +1160,7 @@ def _migrate_kql_database(
         exclude=shortcut_names,
         on_progress=lambda message: ctx.run.update_step(step, message),
     )
+    ctx.journal.data(database_id, "kql")
     logger.info("KQL database %s: copied %s table(s)", name, result["tables"])
     return True, [], adopted_name
 
@@ -1244,6 +1281,7 @@ def _copy_lakehouse_tables(
                     tables=tables,
                 ),
                 label=f"Table data for lakehouse '{name}'",
+                item_id=lakehouse["id"],
             )
         )
 
@@ -1257,6 +1295,9 @@ def _run_copy_jobs(
     specs: list[copyjobs.CopyJobSpec],
     what: str,
 ) -> list[str]:
+    # A resume does not re-copy what an earlier attempt finished. These are the longest thing
+    # in the whole migration, so this is most of what makes picking one up worth doing.
+    specs = [spec for spec in specs if not ctx.already_copied(spec.item_id, "tables")]
     if not specs:
         return []
     # Sized from the capacity the jobs will run on, not from a fixed number: an F64 can keep
@@ -1271,6 +1312,7 @@ def _run_copy_jobs(
         specs,
         concurrency=concurrent,
         on_progress=lambda message: ctx.run.update_step(step, message),
+        on_done=lambda spec: ctx.journal.data(spec.item_id, "tables"),
     )
     ctx.copy_job_ids.extend(created)
     return warnings
@@ -1361,6 +1403,8 @@ def _lakehouse_file_job(
     def run() -> list[str]:
         if not source_files or not target_files:
             return []
+        if ctx.already_copied(lakehouse["id"], "files"):
+            return []
         ctx.run.raise_if_cancelled()
         try:
             file_transfer.copy_files(
@@ -1369,6 +1413,7 @@ def _lakehouse_file_job(
                 principal=ctx.principal,
                 scratch_dir=ctx.scratch_dir / f"lakehouse-{lakehouse['id']}",
             )
+            ctx.journal.data(lakehouse["id"], "files")
             return []
         except file_transfer.FileTransferError as error:
             return [f"Files for lakehouse '{name}' did not copy: {error}"]
@@ -1519,6 +1564,7 @@ def _copy_warehouse_tables(
                     tables=tables,
                 ),
                 label=f"Table data for warehouse '{name}'",
+                item_id=warehouse["id"],
             )
         )
 
@@ -1663,6 +1709,13 @@ def _copy_sql_database_tables(
         except sqlschema.SchemaTransferError as error:
             warnings.append(f"Could not enumerate tables in SQL database '{name}': {error}")
             continue
+        # A resume does not repeat a table an earlier attempt finished. Doing so would be
+        # correct now that the target is cleared first, but for a large database it is hours.
+        tables = [
+            table
+            for table in tables
+            if not ctx.already_copied(source["id"], "table", bulkcopy.qualified_name(table))
+        ]
         if not tables:
             continue
 
@@ -1679,6 +1732,7 @@ def _copy_sql_database_tables(
                     tokens=ctx.tokens,
                     scratch_dir=ctx.scratch_dir / f"bcp-{source['id']}",
                     on_progress=_bulk_copy_progress(ctx, step, f"SQL database '{name}'"),
+                    on_copied=_table_recorder(ctx, source["id"]),
                 )
             )
         except bulkcopy.BulkCopyError as error:
@@ -1690,6 +1744,11 @@ def _copy_sql_database_tables(
 def _bulk_copy_progress(ctx: _Context, step: str, label: str) -> Callable[[str], None]:
     """Bind the label now, rather than reading it from the loop when the callback runs."""
     return lambda message: ctx.run.update_step(step, f"{label}: {message}")
+
+
+def _table_recorder(ctx: _Context, item_id: str) -> Callable[[str], None]:
+    """Bind the item now, so each table is written down against the right database."""
+    return lambda table: ctx.journal.data(item_id, "table", table)
 
 
 def _document_progress(ctx: _Context, step: str, name: str) -> Any:
@@ -1738,6 +1797,8 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
 
         if not ctx.plan.include_data:
             continue
+        if ctx.already_copied(database["id"], "documents"):
+            continue
 
         target = cosmosdb.get_cosmos_database(ctx.client, ctx.target_workspace_id, result.target_id)
         source_endpoint = cosmosdb.endpoint_url(database)
@@ -1752,7 +1813,7 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
         ctx.run.update_step(step, f"Copying documents for Cosmos DB database '{name}'")
         progress = _document_progress(ctx, step, name)
         try:
-            warnings.extend(
+            document_warnings = [
                 f"Cosmos DB database '{name}': {w}"
                 for w in cosmos_transfer.copy_documents(
                     source_endpoint=source_endpoint,
@@ -1762,7 +1823,12 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
                     tokens=ctx.tokens,
                     on_progress=progress,
                 )
-            )
+            ]
+            warnings.extend(document_warnings)
+            # Only written down when every container came across. A partly copied database
+            # has to be attempted again, and the writes are upserts, so repeating it converges.
+            if not document_warnings:
+                ctx.journal.data(database["id"], "documents")
         except cosmos_transfer.CosmosTransferError as error:
             warnings.append(
                 f"Documents for Cosmos DB database '{name}' did not copy: {error}. Its "
@@ -2701,6 +2767,28 @@ def build_plan(
         include_data=include_data,
         copy_permissions=copy_permissions,
     )
+
+
+#: The rebuild, in the order the module docstring explains. Named rather than called inline so
+#: that each phase can be recorded as it starts and finishes, which is what lets a resume know
+#: where the last attempt stopped. The ids match the step ids shown on screen.
+_REBUILD_PHASES: tuple[tuple[str, Callable[[_Context], None]], ...] = (
+    ("assessment", _report_unsupported_items),
+    ("dependencies", _check_dependencies),
+    ("workspaces", _create_workspaces),
+    ("eventhouses", _migrate_eventhouses),
+    ("lakehouses", _migrate_lakehouses),
+    ("warehouses", _migrate_warehouses),
+    ("sqldatabases", _migrate_sql_databases),
+    ("mirrored", _migrate_mirrored_databases),
+    ("shortcuts", _migrate_shortcuts_and_endpoints),
+    ("realtime", _migrate_realtime),
+    ("engineering", _migrate_engineering),
+    ("analytics", _migrate_reports_and_models),
+    ("orchestration", _migrate_orchestration),
+    ("reflexes", _migrate_reflexes),
+    ("permissions", _copy_permissions),
+)
 
 
 __all__ = [

@@ -55,12 +55,15 @@ class Journal:
     so more than one of them can finish something at the same moment.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path | None) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write(self, _kind: str, **fields: Any) -> None:
+        if self.path is None:
+            return
         record = {"t": _kind, "at": _now(), **fields}
         line = json.dumps(record, separators=(",", ":"), default=str)
         try:
@@ -107,6 +110,53 @@ class Journal:
 
     def finished(self, status: str, error: str | None = None) -> None:
         self._write(FINISHED, status=status, error=error)
+
+
+#: A journal that records nothing, for a preview or a test that has nothing to resume.
+DISCARD = Journal(None)
+
+
+class RecordingMap(dict):
+    """A dict that reports every addition as it is made.
+
+    The orchestrator adds to ``id_map`` in dozens of places, and to ``dormant`` in two. Doing
+    the recording here rather than beside each of them means a new call site cannot forget,
+    and forgetting would not fail: it would produce a resume that quietly rebinds an item to
+    something that is not there any more.
+    """
+
+    def __init__(self, record: Any, initial: Any = None) -> None:
+        # Seeded through dict's own constructor, which does not go through __setitem__: a
+        # resumed run starts with what the journal replayed, and writing all of that back
+        # would double the file every time it was picked up.
+        super().__init__(initial or {})
+        self._record = record
+
+    def __setitem__(self, key: str, value: str) -> None:
+        super().__setitem__(key, value)
+        self._record(key, value)
+
+    def update(self, other: Any = (), /, **extra: Any) -> None:
+        # dict.update does not go through __setitem__, and two callers use it to add a whole
+        # folder or pool map at once.
+        for key, value in dict(other, **extra).items():
+            self[key] = value
+
+
+class RecordingList(list):
+    """A list that reports everything added to it. Used for the run's warnings."""
+
+    def __init__(self, record: Any, initial: Any = None) -> None:
+        super().__init__(initial or [])
+        self._record = record
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        self._record(item)
+
+    def extend(self, items: Any) -> None:
+        for item in items:
+            self.append(item)
 
 
 @dataclass
@@ -244,6 +294,7 @@ def list_runs(directory: Path) -> list[Replay]:
 
 __all__ = [
     "DATA",
+    "DISCARD",
     "DORMANT",
     "FINISHED",
     "ITEM",
@@ -253,6 +304,8 @@ __all__ = [
     "WARNING",
     "WORKSPACE",
     "Journal",
+    "RecordingList",
+    "RecordingMap",
     "Replay",
     "list_runs",
     "read",
