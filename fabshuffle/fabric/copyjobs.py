@@ -14,7 +14,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn, ParamSpec
 from urllib.parse import urlsplit
 
 from fabshuffle.config import SETTINGS
@@ -39,6 +39,8 @@ MAX_STATUS_READ_FAILURES = 3
 TERMINAL_JOB_STATES = frozenset({"Completed", "Failed", "Cancelled", "Deduped"})
 SUCCESS_JOB_STATES = frozenset({"Completed"})
 RUNNING_JOB_STATES = frozenset({"NotStarted", "InProgress"})
+_SubmissionState = Literal["unknown", "created", "submitting", "submitted"]
+_CallbackArgs = ParamSpec("_CallbackArgs")
 
 
 class CopyJobFailed(RuntimeError):
@@ -312,6 +314,9 @@ class _InFlight:
     last_error: str = ""
     read_failures: int = 0
     next_poll_at: float = 0.0
+    submission_state: _SubmissionState = "unknown"
+    poll_not_before: float | None = None
+    terminal_observed: bool = False
 
     def snapshot(self) -> CopyJobRun:
         return CopyJobRun(
@@ -323,6 +328,8 @@ class _InFlight:
             label=self.spec.label,
             last_status=self.last_status,
             last_error=self.last_error,
+            submission_state=self.submission_state,
+            poll_not_before=self.poll_not_before,
         )
 
 
@@ -338,6 +345,9 @@ class CopyJobRun:
     label: str
     last_status: str = "Unknown"
     last_error: str = ""
+    submission_state: _SubmissionState = "unknown"
+    # UTC Unix seconds survive process restarts; monotonic timestamps do not.
+    poll_not_before: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,15 +392,30 @@ class CopyJobBatchIncomplete(FabricError):
         self.counts = counts
         self.warnings = list(warnings)
         for job in self.active_jobs:
+            if job.submission_state == "created":
+                outcome = "was created but has not been submitted"
+                action = "Resume using this existing Copy Job; do not recreate it."
+            elif job.last_status in TERMINAL_JOB_STATES:
+                outcome = f"ended as {job.last_status}, but checkpointing is incomplete"
+                action = "Resume this existing run to record its result before cleaning up."
+            else:
+                outcome = "completion is unknown"
+                action = "Check this run in Fabric before retrying."
             self.warnings.append(
-                f"{job.label}: completion is unknown (workspace {job.workspace_id}, "
+                f"{job.label}: {outcome} (workspace {job.workspace_id}, "
                 f"Copy Job {job.copy_job_id or 'unknown'}, instance {job.instance_id or 'unknown'}, "
                 f"last status {job.last_status})"
                 + (f": {job.last_error}" if job.last_error else "")
-                + ". Check this run in Fabric before retrying; keep its source, target and "
-                "scratch workspace until it is reconciled."
+                + f". {action} Keep its source, target and scratch workspace until it is reconciled."
             )
         for spec in self.not_started:
+            if any(
+                job.submission_state == "created"
+                and (job.workspace_id, job.item_id, job.display_name)
+                == (spec.workspace_id, spec.item_id, spec.display_name)
+                for job in self.active_jobs
+            ):
+                continue
             self.warnings.append(
                 f"{spec.label} was not started. Resume this transfer after reconciling "
                 "the unresolved Copy Jobs."
@@ -418,7 +443,10 @@ def _job_status(client: FabricClient, job: _InFlight) -> tuple[str, dict[str, An
 def _submission_rejected(error: FabricError | CopyJobFailed) -> bool:
     # A server/transport timeout does not prove that a POST was rejected.
     return (
-        isinstance(error, FabricApiError) and 400 <= error.status_code < 500 and error.status_code != 408
+        isinstance(error, FabricApiError)
+        and error.method.upper() == "POST"
+        and 400 <= error.status_code < 500
+        and error.status_code != 408
     ) or (isinstance(error, OperationFailed) and error.status == "Failed")
 
 
@@ -430,6 +458,7 @@ def run_copy_jobs(
     on_progress: Callable[[str], None] | None = None,
     on_done: Callable[[CopyJobSpec], None] | None = None,
     on_started: Callable[[CopyJobSpec, str, str], None] | None = None,
+    on_state: Callable[[CopyJobRun], None] | None = None,
     resume_jobs: Sequence[CopyJobRun] = (),
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """Run a batch of Copy Jobs together rather than one after another.
@@ -447,11 +476,16 @@ def run_copy_jobs(
     consecutive exhausted reads or the batch deadline raise ``CopyJobBatchIncomplete`` with
     all unresolved and queued work. Unknown work must be reconciled, not blindly retried.
 
-    ``on_started`` records each accepted run before polling. ``on_done`` records confirmed
-    successes only. ``resume_jobs`` adopts existing runs matching the current specs by
-    workspace, source item and display name, without creating or starting them again. The
-    caller must scope those records to the current target incarnation. Missing run IDs
-    require operator reconciliation and prevent automatic restart.
+    ``on_state`` checkpoints intent before creation, the known created item, intent before
+    submission, the accepted run with its wall-clock first-poll deadline, and terminal
+    observations. A callback failure aborts with recovery metadata without invoking another
+    callback on the error path. ``on_started`` remains available for older callers;
+    ``on_done`` records confirmed successes only.
+
+    ``resume_jobs`` adopts existing runs matching the current specs by workspace, source item
+    and display name. Only an explicit ``created`` state may submit an existing item without
+    a run ID; other missing IDs require reconciliation, never automatic recreation. The
+    caller must scope those records to the current target incarnation.
 
     Each new run's first poll honors its submission's ``Retry-After`` header independently,
     so waiting for one run never delays another that is eligible for a status read.
@@ -465,29 +499,52 @@ def run_copy_jobs(
     created: list[tuple[str, str]] = []
     warnings: list[str] = []
     in_flight: list[_InFlight] = []
+    pending: deque[_InFlight] = deque()
     succeeded = failed = failed_to_start = 0
 
     def counts() -> CopyJobCounts:
-        running = sum(job.last_status in RUNNING_JOB_STATES for job in in_flight)
+        active = [job for job in in_flight if not job.terminal_observed]
+        running = sum(job.last_status in RUNNING_JOB_STATES for job in active)
         return CopyJobCounts(
             total, succeeded, failed, failed_to_start,
-            running, len(in_flight) - running, len(queue),
+            running, len(active) - running, len(queue) + len(pending),
         )
 
-    def report() -> None:
-        if on_progress and total:
-            on_progress(counts().summary())
-
-    def stop(reason: str) -> NoReturn:
-        report()
-        raise CopyJobBatchIncomplete(
+    def stop(reason: str, *, cause: Exception | None = None) -> NoReturn:
+        error = CopyJobBatchIncomplete(
             reason,
-            active_jobs=[job.snapshot() for job in in_flight],
-            not_started=list(queue),
+            active_jobs=[job.snapshot() for job in [*in_flight, *pending]],
+            not_started=[job.spec for job in pending] + list(queue),
             created=created,
             warnings=warnings,
             counts=counts(),
         )
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    def notify(
+        name: str,
+        callback: Callable[_CallbackArgs, None],
+        *args: _CallbackArgs.args,
+        **kwargs: _CallbackArgs.kwargs,
+    ) -> None:
+        try:
+            callback(*args, **kwargs)
+        except Exception as error:
+            stop(
+                f"{name} callback failed: {type(error).__name__}: {error}. "
+                "Repair checkpoint/reporting storage before resuming these existing jobs",
+                cause=error,
+            )
+
+    def checkpoint(job: _InFlight) -> None:
+        if on_state:
+            notify("on_state", on_state, job.snapshot())
+
+    def report() -> None:
+        if on_progress and total:
+            notify("on_progress", on_progress, counts().summary())
 
     for saved in resume_jobs:
         matches = [
@@ -503,12 +560,20 @@ def run_copy_jobs(
             )
         spec = matches[0]
         queue.remove(spec)
-        in_flight.append(
-            _InFlight(
-                spec, saved.copy_job_id, saved.instance_id, saved.last_status, saved.last_error,
-                next_poll_at=time.monotonic() + SETTINGS.copy_job_poll_seconds,
-            )
+        delay = max(
+            SETTINGS.copy_job_poll_seconds,
+            (saved.poll_not_before - time.time()) if saved.poll_not_before is not None else 0.0,
         )
+        job = _InFlight(
+            spec, saved.copy_job_id, saved.instance_id, saved.last_status, saved.last_error,
+            next_poll_at=time.monotonic() + delay,
+            submission_state=saved.submission_state,
+            poll_not_before=saved.poll_not_before,
+        )
+        if saved.submission_state == "created" and saved.copy_job_id and not saved.instance_id:
+            pending.append(job)
+        else:
+            in_flight.append(job)
         if saved.copy_job_id:
             created.append((spec.workspace_id, saved.copy_job_id))
     if any(not job.copy_job_id or not job.instance_id for job in in_flight):
@@ -516,41 +581,73 @@ def run_copy_jobs(
 
     deadline = time.monotonic() + SETTINGS.copy_job_timeout_seconds
 
-    while queue or in_flight:
+    while queue or pending or in_flight:
         if time.monotonic() >= deadline:
             stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
-        while queue and len(in_flight) < limit:
+        while (queue or pending) and len(in_flight) < limit:
             if time.monotonic() >= deadline:
                 stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
-            spec = queue.popleft()
-            copy_job_id = None
-            try:
-                copy_job = create_copy_job(client, spec.workspace_id, spec.display_name, spec.content)
-                copy_job_id = copy_job["id"]
-                created.append((spec.workspace_id, copy_job_id))
+            if not pending:
+                spec = queue.popleft()
+                job = _InFlight(spec, None, None)
+                in_flight.append(job)
+                checkpoint(job)
                 if time.monotonic() >= deadline:
-                    queue.appendleft(spec)
                     stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
-                submission = _submit_copy_job(client, spec.workspace_id, copy_job_id)
-            except CopyJobBatchIncomplete:
-                raise
+                try:
+                    copy_job = create_copy_job(client, spec.workspace_id, spec.display_name, spec.content)
+                except (FabricError, CopyJobFailed) as error:
+                    if _submission_rejected(error):
+                        in_flight.remove(job)
+                        failed_to_start += 1
+                        warnings.append(
+                            f"{spec.label} did not start: {error}. Correct the reported error and retry."
+                        )
+                        continue
+                    job.last_error = str(error)
+                    stop("a creation's outcome is unknown", cause=error)
+                job.copy_job_id = copy_job["id"]
+                created.append((spec.workspace_id, copy_job["id"]))
+                job.submission_state = "created"
+                job.last_status = "NotStarted"
+                in_flight.remove(job)
+                pending.append(job)
+                checkpoint(job)
+
+            if time.monotonic() >= deadline:
+                stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
+            job = pending.popleft()
+            copy_job_id = job.copy_job_id
+            if not copy_job_id:
+                pending.appendleft(job)
+                stop("a saved creation has no item ID; reconcile it before resuming")
+            job.submission_state = "submitting"
+            job.last_status = "Unknown"
+            in_flight.append(job)
+            checkpoint(job)
+            if time.monotonic() >= deadline:
+                stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
+            try:
+                submission = _submit_copy_job(client, job.spec.workspace_id, copy_job_id)
             except (FabricError, CopyJobFailed) as error:
                 if _submission_rejected(error):
+                    in_flight.remove(job)
                     failed_to_start += 1
                     warnings.append(
-                        f"{spec.label} did not start: {error}. Correct the reported error and retry."
+                        f"{job.spec.label} did not start: {error}. Correct the reported error and retry."
                     )
                     continue
-                in_flight.append(_InFlight(spec, copy_job_id, None, last_error=str(error)))
-                stop("a submission's outcome is unknown")
-            in_flight.append(
-                _InFlight(
-                    spec, copy_job_id, submission.instance_id, "NotStarted",
-                    next_poll_at=time.monotonic() + submission.first_poll_seconds,
-                )
-            )
+                job.last_error = str(error)
+                stop("a submission's outcome is unknown", cause=error)
+            job.instance_id = submission.instance_id
+            job.last_status = "NotStarted"
+            job.last_error = ""
+            job.submission_state = "submitted"
+            job.next_poll_at = time.monotonic() + submission.first_poll_seconds
+            job.poll_not_before = time.time() + submission.first_poll_seconds
+            checkpoint(job)
             if on_started:
-                on_started(spec, copy_job_id, submission.instance_id)
+                notify("on_started", on_started, job.spec, copy_job_id, submission.instance_id)
         report()
 
         if not in_flight:
@@ -586,7 +683,7 @@ def run_copy_jobs(
                 job.next_poll_at = time.monotonic() + SETTINGS.copy_job_poll_seconds
                 continue
 
-            in_flight.remove(job)
+            job.terminal_observed = True
             if status not in SUCCESS_JOB_STATES:
                 failed += 1
                 warnings.append(
@@ -595,9 +692,12 @@ def run_copy_jobs(
                 )
             else:
                 succeeded += 1
-                if on_done:
-                    on_done(job.spec)
+            if status in SUCCESS_JOB_STATES and on_done:
+                notify("on_done", on_done, job.spec)
+            checkpoint(job)
+            in_flight.remove(job)
 
+        report()
         if any(job.read_failures >= MAX_STATUS_READ_FAILURES for job in in_flight):
             stop(
                 f"progress could not be read on {MAX_STATUS_READ_FAILURES} "

@@ -10,11 +10,19 @@ over-subscription into a failed job rather than a slow one.
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import httpx
 import pytest
 
 from fabshuffle.fabric import copyjobs
-from fabshuffle.fabric.client import FabricApiError, FabricError, FabricTransportError, OperationFailed
+from fabshuffle.fabric.client import (
+    FabricApiError,
+    FabricClient,
+    FabricError,
+    FabricTransportError,
+    OperationFailed,
+)
 
 WS = "ws-scratch"
 
@@ -636,3 +644,282 @@ def test_public_start_helper_still_returns_only_the_instance_id_without_waiting(
     client = FakeClient(retry_after={"existing": "30"})
     assert copyjobs.start_copy_job(client, WS, "existing") == "inst-existing"
     assert clock.now == 0
+
+
+@pytest.mark.parametrize("status", [403, 404, 429])
+def test_error_observing_accepted_creation_is_not_a_mutation_rejection(status, monkeypatch):
+    monkeypatch.setattr(copyjobs.SETTINGS, "max_retries", 2)
+    calls = []
+    states = []
+    tokens = Mock()
+    tokens.fabric_token.return_value = "offline-token"
+
+    def handler(request):
+        calls.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(202, headers={"x-ms-operation-id": "creation-op"})
+        return httpx.Response(
+            status, headers={"Retry-After": "0"},
+            json={"errorCode": "ObservationUnavailable", "message": "cannot read creation progress"},
+        )
+
+    with FabricClient(tokens, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+            copyjobs.run_copy_jobs(client, specs(2), concurrency=1, on_state=states.append)
+
+    error = caught.value
+    assert calls == (["POST", "GET", "GET"] if status == 429 else ["POST", "GET"])
+    assert isinstance(error.__cause__, FabricApiError)
+    assert error.__cause__.method == "GET"
+    assert error.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 0, 1, 1)
+    assert error.active_jobs[0].copy_job_id is None
+    assert error.active_jobs[0].submission_state == "unknown"
+    assert "ObservationUnavailable" in str(error)
+    assert "cannot read creation progress" in str(error)
+    assert len(states) == 1
+    assert states[0].copy_job_id is None
+
+
+def test_started_checkpoint_failure_keeps_all_accepted_ids_and_never_calls_error_progress():
+    client = FakeClient()
+    failure = OSError("checkpoint disk is full")
+    started = []
+
+    def checkpoint(spec, job_id, instance_id):
+        started.append((spec, job_id, instance_id))
+        if len(started) == 2:
+            raise failure
+
+    def no_error_callback(_message):
+        pytest.fail("A failing checkpoint must not trigger another callback while reporting the error")
+
+    batch = specs(3)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(
+            client, batch, concurrency=2, on_started=checkpoint, on_progress=no_error_callback,
+        )
+
+    error = caught.value
+    assert error.__cause__ is failure
+    assert error.created == [(WS, "job-1"), (WS, "job-2")]
+    assert [(job.copy_job_id, job.instance_id) for job in error.active_jobs] == [
+        ("job-1", "inst-job-1"), ("job-2", "inst-job-2"),
+    ]
+    assert all(job.submission_state == "submitted" for job in error.active_jobs)
+    assert all(job.poll_not_before is not None for job in error.active_jobs)
+    assert error.not_started == (batch[2],)
+    assert error.counts == copyjobs.CopyJobCounts(3, 0, 0, 0, 2, 0, 1)
+    assert all(spec.label in str(error) for spec in batch)
+    assert "checkpoint disk is full" in str(error)
+    assert client.live == {"job-1", "job-2"}
+
+
+def test_progress_callback_failure_is_not_reinvoked_or_allowed_to_mask_metadata():
+    failure = OSError("progress sink unavailable")
+    calls = []
+
+    def progress(message):
+        calls.append(message)
+        raise failure
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(FakeClient(), specs(2), concurrency=1, on_progress=progress)
+    assert len(calls) == 1
+    assert caught.value.__cause__ is failure
+    assert caught.value.active_jobs[0].instance_id == "inst-job-1"
+    assert caught.value.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 1, 0, 1)
+
+
+@pytest.mark.parametrize("phase", ["unknown", "created", "submitting", "submitted"])
+def test_state_checkpoint_failure_stops_at_the_corresponding_remote_boundary(phase):
+    failure = OSError(f"{phase} checkpoint failed")
+    client = FakeClient()
+    states = []
+    batch = specs(2)
+
+    def checkpoint(state):
+        states.append(state)
+        if state.submission_state == phase:
+            raise failure
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, concurrency=1, on_state=checkpoint)
+
+    error = caught.value
+    assert error.__cause__ is failure
+    assert error.active_jobs[0].submission_state == phase
+    assert client.next_id == (0 if phase == "unknown" else 1)
+    assert client.live == ({"job-1"} if phase == "submitted" else set())
+    assert client.polls == {}
+    assert error.not_started == (tuple(batch) if phase == "created" else (batch[1],))
+    if phase == "created":
+        assert error.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 0, 0, 2)
+
+
+def test_state_checkpoints_surround_remote_boundaries_and_terminal_checkpoint_follows_on_done(monkeypatch):
+    client = FakeClient()
+    states = []
+    done = []
+    post = client.post
+    request = client.request
+
+    def create(*args, **kwargs):
+        assert states[-1].submission_state == "unknown"
+        assert states[-1].copy_job_id is None
+        return post(*args, **kwargs)
+
+    def submit(*args, **kwargs):
+        assert states[-1].submission_state == "submitting"
+        assert states[-1].copy_job_id == "job-1"
+        assert states[-1].instance_id is None
+        return request(*args, **kwargs)
+
+    def checkpoint(state):
+        if state.last_status == "Completed":
+            assert done == specs(1)
+        states.append(state)
+
+    monkeypatch.setattr(client, "post", create)
+    monkeypatch.setattr(client, "request", submit)
+    copyjobs.run_copy_jobs(client, specs(1), on_state=checkpoint, on_done=done.append)
+
+    assert [state.submission_state for state in states] == [
+        "unknown", "created", "submitting", "submitted", "submitted",
+    ]
+    assert states[1].instance_id is None
+    assert states[3].instance_id == "inst-job-1"
+    assert states[3].poll_not_before is not None
+    assert states[-1].last_status == "Completed"
+
+
+def test_failed_success_checkpoint_retains_terminal_run_for_resume_without_recopying():
+    client = FakeClient()
+    failure = OSError("success checkpoint failed")
+    states = []
+    batch = specs(2)
+
+    def fail_checkpoint(_spec):
+        raise failure
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(
+            client, batch, concurrency=1, on_state=states.append, on_done=fail_checkpoint,
+        )
+
+    error = caught.value
+    assert error.__cause__ is failure
+    assert error.active_jobs[0].last_status == "Completed"
+    assert error.active_jobs[0].instance_id == "inst-job-1"
+    assert error.counts == copyjobs.CopyJobCounts(2, 1, 0, 0, 0, 0, 1)
+    assert states[-1].last_status == "NotStarted"
+    assert "ended as Completed, but checkpointing is incomplete" in str(error)
+    done = []
+    created, warnings = copyjobs.run_copy_jobs(
+        client, batch, concurrency=1, resume_jobs=error.active_jobs, on_done=done.append,
+    )
+    assert created == [(WS, "job-1"), (WS, "job-2")]
+    assert client.next_id == 2
+    assert done == batch
+    assert warnings == []
+
+
+@pytest.mark.parametrize("status", ["Completed", "Failed"])
+def test_terminal_state_checkpoint_failure_preserves_confirmed_result_and_remaining_work(status):
+    client = ScriptedClient({"job-1": [{"status": status}]})
+    failure = OSError("terminal checkpoint unavailable")
+    batch = specs(2)
+    done = []
+
+    def checkpoint(state):
+        if state.last_status == status:
+            raise failure
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(
+            client, batch, concurrency=1, on_state=checkpoint, on_done=done.append,
+        )
+    error = caught.value
+    assert error.__cause__ is failure
+    assert error.active_jobs[0].last_status == status
+    assert error.active_jobs[0].instance_id == "inst-job-1"
+    assert error.not_started == (batch[1],)
+    success = int(status == "Completed")
+    assert error.counts == copyjobs.CopyJobCounts(2, success, 1 - success, 0, 0, 0, 1)
+    assert done == ([batch[0]] if success else [])
+    assert len(client.started) == 1
+
+
+def test_late_creation_is_checkpointed_and_adopted_without_a_second_create(clock, monkeypatch):
+    client = FakeClient()
+    post = client.post
+    states = []
+    batch = specs(2)
+
+    def slow_create(*args, **kwargs):
+        clock.now += 11
+        return post(*args, **kwargs)
+
+    monkeypatch.setattr(client, "post", slow_create)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, concurrency=1, on_state=states.append)
+
+    error = caught.value
+    assert error.active_jobs[0].submission_state == "created"
+    assert error.active_jobs[0].copy_job_id == "job-1"
+    assert error.active_jobs[0].instance_id is None
+    assert error.not_started == tuple(batch)
+    assert error.counts == copyjobs.CopyJobCounts(2, 0, 0, 0, 0, 0, 2)
+    assert states[-1] == error.active_jobs[0]
+    assert client.live == set()
+
+    monkeypatch.setattr(client, "post", post)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 30)
+    created, warnings = copyjobs.run_copy_jobs(
+        client, batch, concurrency=1, resume_jobs=error.active_jobs,
+    )
+    assert created == [(WS, "job-1"), (WS, "job-2")]
+    assert client.next_id == 2
+    assert client.polls["job-1"] == 1
+    assert warnings == []
+
+
+def test_write_ahead_submitting_record_refuses_duplicate_start_on_resume():
+    client = FakeClient()
+    batch = specs(2)
+    saved = saved_run(batch[0], job_id="existing", instance_id=None, submission_state="submitting")
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, resume_jobs=[saved])
+    assert client.started == []
+    assert client.live == set()
+    assert caught.value.active_jobs[0].copy_job_id == "existing"
+
+
+def test_resume_preserves_wall_clock_first_poll_deadline_across_monotonic_origins(clock, monkeypatch):
+    epoch = 1_700_000_000.0
+    monkeypatch.setattr(copyjobs.time, "time", lambda: epoch + clock.now)
+    client = ScriptedClient({}, retry_after={"job-1": "60"})
+    batch = specs(2)
+    states = []
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        copyjobs.run_copy_jobs(client, batch, concurrency=1, on_state=states.append)
+    saved = caught.value.active_jobs
+    assert saved[0].poll_not_before == epoch + 60
+    assert states[-1].poll_not_before == epoch + 60
+    assert clock.now == 10
+    assert client.reads == []
+
+    monkeypatch.setattr(copyjobs.time, "monotonic", lambda: 5_000 + clock.now)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_timeout_seconds", 100)
+    get = client.get
+    polls = []
+
+    def poll(path, **kwargs):
+        polls.append((path.split("/items/")[1].split("/")[0], copyjobs.time.time()))
+        return get(path, **kwargs)
+
+    monkeypatch.setattr(client, "get", poll)
+    created, warnings = copyjobs.run_copy_jobs(client, batch, concurrency=2, resume_jobs=saved)
+    assert polls == [("job-2", epoch + 16), ("job-1", epoch + 60)]
+    assert created == [(WS, "job-1"), (WS, "job-2")]
+    assert warnings == []
