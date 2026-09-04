@@ -91,23 +91,6 @@ class MigratedItem:
     warnings: tuple[str, ...] = ()
 
 
-def default_semantic_model_names(client: FabricClient, workspace_id: str) -> set[str]:
-    """Names of semantic models Fabric creates and owns itself.
-
-    Every lakehouse and warehouse gets a default semantic model named after it. Fabric
-    provisions those alongside the parent item, so recreating them would either collide with
-    the auto-created one or produce a duplicate. There is no flag on the item that marks a
-    model as default, so they are matched by the name of their parent.
-    """
-    names: set[str] = set()
-    for item in list_items(client, workspace_id):
-        if item.get("type") in ("Lakehouse", "Warehouse"):
-            name = item.get("displayName")
-            if name:
-                names.add(name)
-    return names
-
-
 def list_of_type(
     client: FabricClient,
     workspace_id: str,
@@ -403,8 +386,17 @@ def describe_failure(
         )
 
     status = f" (HTTP {error.status_code})" if isinstance(error, FabricApiError) else ""
+    # Advice that goes alongside what the service said rather than instead of it: our reading
+    # of an error code is a guess, and the service's own words are not.
+    advice = {
+        "ItemDisplayNameAlreadyInUse": (
+            " The new workspace already holds an item of that name; delete or rename it "
+            "there, then migrate again."
+        ),
+    }.get(code, "")
+
     if said:
-        return f"{item_type} '{name}' was not migrated{status}: {said}"
+        return f"{item_type} '{name}' was not migrated{status}: {said}.{advice}".replace("..", ".")
     return (
         f"{item_type} '{name}' was not migrated{status}. Recreate it manually and check its "
         "data source bindings."
@@ -653,7 +645,6 @@ __all__ = [
     "SEMANTIC_MODEL",
     "MigratedItem",
     "classify_dataflow",
-    "default_semantic_model_names",
     "describe_failure",
     "environment_warnings",
     "list_of_type",

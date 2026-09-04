@@ -88,9 +88,15 @@ properties do not name that leader, so it is read from the follower's own cluste
 when the leader is another Fabric eventhouse. If the leader is in the workspace being
 migrated the copy follows the copy, otherwise it keeps following the original. A follower of
 an *Azure Data Explorer* database is reported instead, because the leader is identified by
-name and its cluster URI is not exposed anywhere. The default semantic model that Fabric
-creates alongside each lakehouse and warehouse is skipped too, since the target workspace
-gets its own.
+name and its cluster URI is not exposed anywhere.
+
+**Every semantic model migrates, including one named after a lakehouse or warehouse.** Those
+used to be Fabric's default semantic models, provisioned alongside their parent, and were
+skipped because the target workspace got its own. Fabric
+[stopped creating them on 5 September 2025](https://learn.microsoft.com/fabric/data-warehouse/semantic-models)
+and decoupled the existing ones into independent semantic models by 30 November 2025, so
+there is no longer an auto-created copy to collide with — and skipping one now would quietly
+lose a model somebody is using.
 
 **Dataflows only migrate when they are Gen2 (CI/CD).** The item definition APIs do not
 support Dataflow Gen1 or classic Gen2, so each dataflow is classified by probing its

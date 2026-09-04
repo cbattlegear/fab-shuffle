@@ -77,46 +77,6 @@ def make_ctx(client):
 SKIPPED = [{"id": SOURCE_DEFAULT, "displayName": "CloneTest", "type": "SemanticModel"}]
 
 
-# --------------------------------------------------- default semantic models
-
-
-def test_the_targets_own_default_model_is_mapped_to_the_sources():
-    """This is what let a report bound to a default model migrate at all."""
-    ctx = make_ctx(FakeClient())
-    warnings = orchestrator._map_default_semantic_models(ctx, SKIPPED)
-
-    assert warnings == []
-    assert ctx.id_map[SOURCE_DEFAULT] == TARGET_DEFAULT
-
-
-def test_a_default_model_that_has_not_appeared_is_reported_not_silent():
-    ctx = make_ctx(FakeClient(target_models=[]))
-    warnings = orchestrator._map_default_semantic_models(ctx, SKIPPED)
-
-    assert ctx.id_map == {}
-    assert "has not appeared in the new workspace yet" in warnings[0]
-    assert "CloneTest" in warnings[0]
-
-
-def test_nothing_to_match_is_not_a_call():
-    client = FakeClient()
-    assert orchestrator._map_default_semantic_models(make_ctx(client), []) == []
-
-
-def test_models_are_matched_by_name():
-    ctx = make_ctx(
-        FakeClient(
-            target_models=[
-                {"id": "other", "displayName": "SomethingElse", "type": "SemanticModel"},
-                {"id": TARGET_DEFAULT, "displayName": "CloneTest", "type": "SemanticModel"},
-            ]
-        )
-    )
-    orchestrator._map_default_semantic_models(ctx, SKIPPED)
-
-    assert ctx.id_map[SOURCE_DEFAULT] == TARGET_DEFAULT
-
-
 # ------------------------------------------------------- foreign workspaces
 
 

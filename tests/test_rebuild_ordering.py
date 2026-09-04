@@ -242,8 +242,11 @@ def test_source_platform_file_is_not_carried_over(fabric):
     assert all(p["path"] != ".platform" for p in fabric.definitions[model_id])
 
 
-def test_default_semantic_model_of_a_lakehouse_is_not_recreated(fabric, monkeypatch):
-    # Rename the model to match the lakehouse, making it look like the auto-created default.
+def test_a_model_sharing_its_lakehouses_name_is_still_migrated(fabric, monkeypatch):
+    """It used to be skipped as Fabric's auto-created default. Fabric stopped creating those
+    on 5 September 2025 and decoupled the existing ones by 30 November 2025, so a model with
+    that name is now just a model, and skipping it lost somebody's work."""
+
     def list_all(path, params=None, value_key="value"):
         if path == f"workspaces/{SOURCE_WS}/items":
             items = [
@@ -257,7 +260,7 @@ def test_default_semantic_model_of_a_lakehouse_is_not_recreated(fabric, monkeypa
     monkeypatch.setattr(fabric, "list_all", list_all)
     run(fabric)
 
-    assert not any(kind == "SemanticModel" for kind, _, _ in fabric.created)
+    assert any(kind == "SemanticModel" for kind, _, _ in fabric.created)
 
 
 def test_a_composite_model_is_created_after_the_model_it_reads(monkeypatch):

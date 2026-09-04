@@ -188,13 +188,21 @@ class FakeClient:
         return self.items
 
 
-def test_default_semantic_models_are_identified_by_their_parent():
+def test_a_model_named_after_a_lakehouse_is_migrated_like_any_other():
+    """Fabric stopped creating default semantic models on 5 September 2025, and decoupled the
+    existing ones by 30 November 2025, so they are now ordinary independent models.
+
+    Skipping anything named after a lakehouse or warehouse used to avoid colliding with the
+    auto-created copy in the target. There is no auto-created copy any more, so the same rule
+    silently refused to migrate a model somebody was using.
+    """
     client = FakeClient(
         [
             {"id": "1", "displayName": "bronze", "type": "Lakehouse"},
             {"id": "2", "displayName": "bronze", "type": "SemanticModel"},
-            {"id": "3", "displayName": "dw", "type": "Warehouse"},
-            {"id": "4", "displayName": "Sales Model", "type": "SemanticModel"},
+            {"id": "3", "displayName": "Sales Model", "type": "SemanticModel"},
         ]
     )
-    assert analytics.default_semantic_model_names(client, "ws") == {"bronze", "dw"}
+
+    found = {model["displayName"] for model in analytics.list_of_type(client, "ws", "SemanticModel")}
+    assert found == {"bronze", "Sales Model"}
