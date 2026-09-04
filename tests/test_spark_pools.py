@@ -1,0 +1,249 @@
+"""Custom Spark pools and workspace Spark settings.
+
+A pool belongs to the workspace it was created in, so an environment that pins one would
+otherwise land in the migrated workspace referencing a pool that does not exist. Pools are
+recreated first and their new ids go into the id map, which repoints the environment.
+"""
+
+from __future__ import annotations
+
+from fabshuffle.fabric import spark
+from fabshuffle.fabric.client import FabricApiError
+
+POOL = {
+    "id": "old-pool",
+    "name": "pool1",
+    "type": "Workspace",
+    "nodeFamily": "MemoryOptimized",
+    "nodeSize": "Small",
+    "autoScale": {"enabled": True, "minNodeCount": 1, "maxNodeCount": 2},
+    "dynamicExecutorAllocation": {"enabled": True, "minExecutors": 1, "maxExecutors": 1},
+}
+STARTER = {"id": "starter", "name": "Starter Pool", "type": "Workspace"}
+CAPACITY_POOL = {"id": "cap-pool", "name": "shared", "type": "Capacity", "nodeSize": "Large"}
+
+
+class FakeClient:
+    def __init__(self, *, fail_names: set[str] | None = None) -> None:
+        self.fail_names = fail_names or set()
+        self.posted: list[tuple[str, dict]] = []
+        self.patched: list[tuple[str, dict]] = []
+
+    def post(self, path, json=None, params=None, wait=True):
+        if json.get("name") in self.fail_names:
+            raise FabricApiError("POST", path, 400, "node size unavailable")
+        self.posted.append((path, json))
+        return {"id": f"new-{json['name']}", **json}
+
+    def patch(self, path, json=None, params=None):
+        self.patched.append((path, json))
+        return json
+
+    def list_all(self, path, params=None, value_key="value"):
+        return []
+
+    def get(self, path, params=None):
+        return {}
+
+
+# --------------------------------------------------------------------- pools
+
+
+def test_a_custom_pool_is_recreated_with_its_settings():
+    client = FakeClient()
+    id_map, created, warnings = spark.copy_pools(client, "src", "dst", pools=[POOL])
+
+    assert warnings == []
+    assert created == ["pool1"]
+    assert id_map == {"old-pool": "new-pool1"}
+
+    path, payload = client.posted[0]
+    assert path == "workspaces/dst/spark/pools"
+    assert payload["nodeFamily"] == "MemoryOptimized"
+    assert payload["autoScale"] == {"enabled": True, "minNodeCount": 1, "maxNodeCount": 2}
+    # Fabric assigns these, so sending them back would be rejected.
+    assert "id" not in payload and "type" not in payload
+
+
+def test_the_starter_pool_is_never_recreated():
+    # "Starter Pool" is a reserved name that every workspace already has.
+    client = FakeClient()
+    id_map, created, warnings = spark.copy_pools(client, "src", "dst", pools=[STARTER])
+
+    assert client.posted == []
+    assert created == [] and id_map == {} and warnings == []
+
+
+def test_a_capacity_level_pool_is_reported_rather_than_recreated():
+    client = FakeClient()
+    _, created, warnings = spark.copy_pools(client, "src", "dst", pools=[CAPACITY_POOL])
+
+    assert created == []
+    assert len(warnings) == 1
+    assert "Capacity level pool" in warnings[0]
+    assert client.posted == []
+
+
+def test_a_pool_that_cannot_be_created_is_reported_and_the_rest_continue():
+    client = FakeClient(fail_names={"pool1"})
+    other = {**POOL, "id": "old-2", "name": "pool2"}
+    id_map, created, warnings = spark.copy_pools(client, "src", "dst", pools=[POOL, other])
+
+    assert created == ["pool2"]
+    assert id_map == {"old-2": "new-pool2"}
+    assert len(warnings) == 1 and "pool1" in warnings[0]
+
+
+def test_unreadable_pools_are_not_fatal():
+    class Denied:
+        def list_all(self, path, params=None, value_key="value"):
+            raise FabricApiError("GET", path, 403, "forbidden")
+
+    assert spark.list_pools(Denied(), "src") == []
+
+
+# ------------------------------------------------------------------ settings
+
+
+def patch_named(patches, label):
+    return next((body for name, body in patches if name == label), None)
+
+
+def test_the_default_pool_is_repointed_at_the_recreated_pool():
+    settings = {
+        "pool": {
+            "customizeComputeEnabled": True,
+            "defaultPool": {"name": "pool1", "type": "Workspace", "id": "old-pool"},
+            "starterPool": {"maxNodeCount": 3, "maxExecutors": 1},
+        },
+        "automaticLog": {"enabled": True},
+        "job": {"sessionTimeoutInMinutes": 20},
+    }
+    patches, warnings = spark.build_settings_payload(settings, {"old-pool": "new-pool"})
+
+    assert warnings == []
+    assert patch_named(patches, "Spark pool settings")["pool"]["defaultPool"] == {"id": "new-pool"}
+
+    general = patch_named(patches, "general Spark settings")
+    assert general["automaticLog"] == {"enabled": True}
+    assert general["job"] == {"sessionTimeoutInMinutes": 20}
+
+    # Starter pool sizing is capped by the capacity SKU, so it is sent on its own.
+    starter = patch_named(patches, "starter pool sizing")
+    assert starter == {"pool": {"starterPool": {"maxNodeCount": 3, "maxExecutors": 1}}}
+
+
+def test_a_default_pool_that_did_not_transfer_is_dropped_and_reported():
+    settings = {"pool": {"defaultPool": {"name": "pool1", "type": "Workspace", "id": "old-pool"}}}
+    patches, warnings = spark.build_settings_payload(settings, {})
+
+    # Better to fall back to the starter pool than to point at the old region.
+    pool_patch = patch_named(patches, "Spark pool settings")
+    assert pool_patch is None or "defaultPool" not in pool_patch.get("pool", {})
+    assert len(warnings) == 1 and "falls back to the starter pool" in warnings[0]
+
+
+def test_the_starter_pool_default_is_carried_across_by_name():
+    settings = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace", "id": "x"}}}
+    patches, warnings = spark.build_settings_payload(settings, {})
+
+    assert patch_named(patches, "Spark pool settings")["pool"]["defaultPool"] == {
+        "name": "Starter Pool",
+        "type": "Workspace",
+    }
+    assert warnings == []
+
+
+def test_the_default_environment_is_deferred_not_sent_with_the_pools():
+    """The environment is referenced by name and does not exist until the engineering phase."""
+    settings = {"environment": {"name": "environment1", "runtimeVersion": "1.3"}}
+    patches, _ = spark.build_settings_payload(settings, {})
+
+    assert all("environment" not in body for _, body in patches)
+    assert spark.default_environment_patch(settings) == {
+        "environment": {"name": "environment1", "runtimeVersion": "1.3"}
+    }
+
+
+def test_an_empty_default_environment_is_not_sent():
+    assert spark.default_environment_patch({"environment": {"name": ""}}) is None
+    assert spark.default_environment_patch({}) is None
+
+
+def test_empty_settings_produce_no_patch():
+    patches, warnings = spark.build_settings_payload({}, {})
+    assert patches == [] and warnings == []
+
+
+# ------------------------------------------- skipping what already matches
+
+
+DEFAULTS = {
+    "automaticLog": {"enabled": True},
+    "highConcurrency": {"notebookInteractiveRunEnabled": True},
+    "pool": {
+        "customizeComputeEnabled": True,
+        "defaultPool": {"name": "Starter Pool", "type": "Workspace", "id": "0" * 8},
+        "starterPool": {"maxNodeCount": 10, "maxExecutors": 9},
+    },
+}
+
+
+def test_a_workspace_on_defaults_is_left_completely_alone():
+    """The new workspace already has Fabric's defaults, so nothing needs sending."""
+    patches, warnings = spark.build_settings_payload(DEFAULTS, {}, target=DEFAULTS)
+    assert patches == [] and warnings == []
+
+
+def test_starter_pool_sizing_is_skipped_when_it_already_matches():
+    # Resending the default is what produced SparkSettingsInvalidNodeCount.
+    source = {"pool": {"starterPool": {"maxNodeCount": 10, "maxExecutors": 9}}}
+    target = {"pool": {"starterPool": {"maxNodeCount": 10, "maxExecutors": 9}}}
+
+    patches, _ = spark.build_settings_payload(source, {}, target=target)
+    assert patch_named(patches, "starter pool sizing") is None
+
+
+def test_a_customised_starter_pool_is_still_sent():
+    source = {"pool": {"starterPool": {"maxNodeCount": 3, "maxExecutors": 2}}}
+    target = {"pool": {"starterPool": {"maxNodeCount": 10, "maxExecutors": 9}}}
+
+    patches, _ = spark.build_settings_payload(source, {}, target=target)
+    assert patch_named(patches, "starter pool sizing") == {
+        "pool": {"starterPool": {"maxNodeCount": 3, "maxExecutors": 2}}
+    }
+
+
+def test_only_the_sections_that_differ_are_sent():
+    source = {
+        "automaticLog": {"enabled": False},
+        "highConcurrency": {"notebookInteractiveRunEnabled": True},
+    }
+    target = {
+        "automaticLog": {"enabled": True},
+        "highConcurrency": {"notebookInteractiveRunEnabled": True},
+    }
+
+    patches, _ = spark.build_settings_payload(source, {}, target=target)
+    general = patch_named(patches, "general Spark settings")
+
+    assert general == {"automaticLog": {"enabled": False}}
+    assert "highConcurrency" not in general
+
+
+def test_the_starter_pool_default_is_not_resent_when_already_default():
+    source = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace"}}}
+    target = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace"}}}
+
+    patches, warnings = spark.build_settings_payload(source, {}, target=target)
+    assert patches == [] and warnings == []
+
+
+def test_a_recreated_custom_pool_is_still_set_as_default():
+    source = {"pool": {"defaultPool": {"name": "pool1", "type": "Workspace", "id": "old-pool"}}}
+    target = {"pool": {"defaultPool": {"name": "Starter Pool", "type": "Workspace"}}}
+
+    patches, warnings = spark.build_settings_payload(source, {"old-pool": "new"}, target=target)
+
+    assert patch_named(patches, "Spark pool settings")["pool"]["defaultPool"] == {"id": "new"}
+    assert warnings == []

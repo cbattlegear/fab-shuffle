@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+venv
+local
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+tests
+docs
+Dockerfile
+.dockerignore

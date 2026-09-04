@@ -1,0 +1,665 @@
+"""Semantic model and report migration.
+
+Both are moved by exporting their definition, rewriting every reference to a source item,
+and creating the item in the target workspace. The rewrite is what actually rebinds them:
+
+* a Direct Lake or DirectQuery semantic model embeds the SQL analytics endpoint of its
+  lakehouse or warehouse plus that item's GUID, in ``model.bim`` or ``definition/*.tmdl``;
+* a report records its semantic model as ``semanticmodelid=<guid>`` inside
+  ``definition.pbir``, or as a relative ``byPath`` reference that needs no rewriting.
+
+Because the rewrite is driven by the accumulated source-to-target id map, these must run
+*after* every item they can reference has been created. See the ordering note in
+:mod:`fabshuffle.orchestrator`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from fabshuffle.fabric.client import (
+    FabricApiError,
+    FabricClient,
+    FabricError,
+    OperationTimeout,
+)
+from fabshuffle.fabric.definitions import (
+    decode_json_part,
+    decode_payload,
+    find_part,
+    is_text_part,
+    rewrite_parts,
+    strip_part,
+)
+from fabshuffle.fabric.items import (
+    create_item,
+    get_item_definition,
+    list_items,
+    try_get_item_definition,
+)
+from fabshuffle.fabric.special_items import policy_for
+from fabshuffle.fabric.support import is_derived_type
+
+logger = logging.getLogger(__name__)
+
+SEMANTIC_MODEL = "SemanticModel"
+REPORT = "Report"
+DATA_PIPELINE = "DataPipeline"
+COPY_JOB = "CopyJob"
+NOTEBOOK = "Notebook"
+ENVIRONMENT = "Environment"
+DATAFLOW = "Dataflow"
+EVENTSTREAM = "Eventstream"
+KQL_DASHBOARD = "KQLDashboard"
+KQL_QUERYSET = "KQLQueryset"
+MIRRORED_DATABASE = "MirroredDatabase"
+GRAPHQL_API = "GraphQLApi"
+MAP = "Map"
+REFLEX = "Reflex"
+SPARK_JOB_DEFINITION = "SparkJobDefinition"
+VARIABLE_LIBRARY = "VariableLibrary"
+MOUNTED_DATA_FACTORY = "MountedDataFactory"
+GRAPH_MODEL = "GraphModel"
+GRAPH_QUERY_SET = "GraphQuerySet"
+MIRRORED_ADB_CATALOG = "MirroredAzureDatabricksCatalog"
+SNOWFLAKE_DATABASE = "SnowflakeDatabase"
+
+PBIR_PART = "definition.pbir"
+PLATFORM_PART = ".platform"
+SPARK_COMPUTE_PART = "Setting/Sparkcompute.yml"
+QUERY_METADATA_PART = "queryMetadata.json"
+
+# The definition format a Dataflow Gen2 (CI/CD) item uses. Anything else is a Gen1 dataflow
+# or a classic Gen2, neither of which the item definition APIs can move.
+CICD_DATAFLOW_FORMAT_VERSION = "202502"
+
+
+@dataclass(frozen=True, slots=True)
+class MigratedItem:
+    source_id: str
+    target_id: str
+    name: str
+    rebound_parts: int
+    # Kept so the caller can inspect what the item binds without exporting it again.
+    parts: tuple[dict[str, Any], ...] = ()
+    # Things worth telling the operator about an item that did migrate, such as a Reflex
+    # whose rules were switched off for the move.
+    warnings: tuple[str, ...] = ()
+
+
+def list_of_type(
+    client: FabricClient,
+    workspace_id: str,
+    item_type: str,
+) -> list[dict[str, Any]]:
+    """List items of one type.
+
+    Filtering is done here rather than through the ``type`` query parameter, because Fabric
+    documents that filtering by the dataflow item type does not return correct information.
+    """
+    return [
+        item
+        for item in list_items(client, workspace_id)
+        if item.get("type") == item_type and item.get("id")
+    ]
+
+
+def classify_dataflow(
+    client: FabricClient,
+    workspace_id: str,
+    item: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Decide whether a dataflow can be migrated, and return its definition if so.
+
+    Only Dataflow Gen2 (CI/CD) items work with the item definition APIs. A Gen1 dataflow, or
+    a classic Gen2, either refuses ``getDefinition`` outright or comes back without the
+    CI/CD format marker. Both are reported rather than half-migrated.
+
+    Returns ``(parts, None)`` when it can move, or ``(None, reason)`` when it cannot.
+    """
+    name = item.get("displayName") or item.get("id")
+    upgrade = (
+        "Upgrade it to a Dataflow Gen2 (CI/CD) first, with the upgrade wizard or Save As, "
+        "then migrate again"
+    )
+
+    definition = try_get_item_definition(client, workspace_id, item["id"])
+    if definition is None:
+        return None, (
+            f"Dataflow '{name}' does not support the definition APIs, so it is a Gen1 "
+            f"dataflow or a classic Gen2. {upgrade}."
+        )
+
+    parts = list(definition.get("parts") or [])
+    metadata_part = find_part(parts, QUERY_METADATA_PART)
+    if metadata_part is None:
+        return None, (
+            f"Dataflow '{name}' returned no {QUERY_METADATA_PART}, so it is not a Dataflow "
+            f"Gen2 (CI/CD). {upgrade}."
+        )
+
+    try:
+        metadata = decode_json_part(metadata_part["payload"])
+    except (ValueError, KeyError):
+        return None, f"Dataflow '{name}' has unreadable metadata, so it was left behind."
+
+    version = str(metadata.get("formatVersion") or "")
+    if version != CICD_DATAFLOW_FORMAT_VERSION:
+        return None, (
+            f"Dataflow '{name}' reports format version '{version or 'none'}' rather than "
+            f"{CICD_DATAFLOW_FORMAT_VERSION}, so it is not a Dataflow Gen2 (CI/CD). {upgrade}."
+        )
+
+    return parts, None
+
+
+def environment_warnings(
+    name: str,
+    parts: Iterable[Mapping[str, Any]],
+    *,
+    known_pool_ids: Collection[str] = (),
+) -> list[str]:
+    """Report environment settings that will not carry across.
+
+    A custom Spark pool belongs to the workspace it was created in. Pools are recreated
+    before environments are migrated, so this only fires for a pool that did not transfer and
+    therefore still points at the source workspace.
+    """
+    warnings: list[str] = []
+    compute = find_part(parts, SPARK_COMPUTE_PART)
+    if not compute:
+        return warnings
+
+    try:
+        text = decode_payload(compute["payload"]).decode("utf-8")
+    except (UnicodeDecodeError, KeyError):
+        return warnings
+
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        pool_id = value.strip()
+        if key.strip() != "instance_pool_id" or not pool_id or pool_id == "null":
+            continue
+        if pool_id in known_pool_ids:
+            continue
+        warnings.append(
+            f"Environment '{name}' pins the custom Spark pool '{pool_id}', which was not "
+            "recreated in the new workspace. Create the pool there and repoint the "
+            "environment, or it will fall back to the starter pool."
+        )
+    return warnings
+
+
+def report_binding_warning(
+    name: str,
+    parts: Iterable[Mapping[str, Any]],
+    id_map: Mapping[str, str],
+) -> str | None:
+    """Whether a report that changed nothing during the rewrite is actually a problem.
+
+    A report records its semantic model one of two ways in ``definition.pbir``. A
+    ``byConnection`` reference carries ``semanticmodelid=<guid>``, which has to be repointed.
+    A ``byPath`` reference names the model by relative path, and Fabric resolves it inside
+    the new workspace on its own, so there is nothing to rewrite and nothing to report.
+
+    Treating "nothing changed" as a failure warned about every ``byPath`` report, which is
+    the normal shape for a report stored next to its model.
+    """
+    pbir = find_part(parts, PBIR_PART)
+    if not pbir:
+        return (
+            f"Report '{name}' has no {PBIR_PART}, so its semantic model reference could not be "
+            "checked. Open it in the new workspace and confirm what it points at."
+        )
+
+    try:
+        document = decode_json_part(pbir.get("payload", ""))
+    except ValueError:
+        return (
+            f"Report '{name}' has a {PBIR_PART} that could not be read, so its semantic model "
+            "reference could not be checked. Open it in the new workspace."
+        )
+
+    reference = (document or {}).get("datasetReference") or {}
+    if reference.get("byPath"):
+        # Resolved relative to the report, so it follows it into the new workspace.
+        return None
+
+    connection = (reference.get("byConnection") or {}).get("connectionString") or ""
+    model_id = _semantic_model_id(connection)
+    if not model_id:
+        return (
+            f"Report '{name}' does not name a semantic model in a way we recognise, so it was "
+            "copied as it is. Check what it points at in the new workspace."
+        )
+    if model_id in id_map:
+        # Rewritten already, so this is not the no-op case at all.
+        return None
+    return (
+        f"Report '{name}' points at semantic model '{model_id}', which is not one that "
+        "migrated, so it still reads from the original workspace. Repoint it if that model "
+        "was meant to come across."
+    )
+
+
+def _semantic_model_id(connection_string: str) -> str:
+    for fragment in connection_string.split(";"):
+        key, _, value = fragment.partition("=")
+        if key.strip().casefold() == "semanticmodelid":
+            return value.strip()
+    return ""
+
+
+class StrandedReference(FabricError):
+    """A definition names items in this workspace that did not migrate.
+
+    Creating it anyway is not an option. Both halves of a reference are rewritten
+    independently and the workspace id is always in the map, so the pair would end up naming
+    the new workspace and an item that was never in it. Leaving the workspace id alone is no
+    better: the copy would quietly read from the workspace being migrated away from, and
+    break the day it is deleted, which is the point of the move.
+
+    So the item does not migrate, and the reason says which items it needed.
+    """
+
+    def __init__(self, needed: Sequence[str]) -> None:
+        self.needed = list(needed)
+        super().__init__(f"depends on {', '.join(self.needed)}, which did not migrate")
+
+
+def stranded_items(id_map: Mapping[str, str], source_items: Mapping[str, Any]) -> list[str]:
+    """Items of the migrating workspace that have no counterpart in the new one."""
+    return [item_id for item_id in source_items if item_id and item_id not in id_map]
+
+
+def migrate_definition_item(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    target_workspace_id: str,
+    item: Mapping[str, Any],
+    item_type: str,
+    id_map: Mapping[str, str],
+    folder_id: str | None = None,
+    parts: list[dict[str, Any]] | None = None,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
+) -> MigratedItem:
+    """Export one item, repoint its references, and recreate it in the target workspace.
+
+    ``parts`` lets a caller reuse a definition it has already fetched, which avoids a second
+    export for item types that have to be inspected before they can be migrated.
+
+    ``source_items`` is every item in the workspace being migrated, and is what lets a
+    definition depending on something that did not migrate be refused rather than created
+    half bound. See :class:`StrandedReference`.
+    """
+    name = item["displayName"]
+    policy = policy_for(item_type)
+    definition_format: str | None = policy.export_format
+
+    if parts is None:
+        definition = get_item_definition(
+            client, source_workspace_id, item["id"], fmt=policy.export_format
+        )
+        parts = list(definition.get("parts") or [])
+        definition_format = policy.export_format or definition.get("format")
+
+    needed = dangling_references(
+        parts, id_map, source_items or {}, ignore=(item.get("id", ""),)
+    )
+    if needed:
+        raise StrandedReference(needed)
+
+    rewritten, changed = rewrite_parts(parts, id_map)
+    # The source platform file carries the original logical id, and Fabric respects it when
+    # provided. Dropping it lets the new workspace mint its own identity for the item.
+    rewritten = strip_part(rewritten, PLATFORM_PART)
+
+    warnings: list[str] = []
+    if policy.prepare:
+        rewritten, warnings = policy.prepare(rewritten, source_workspace_id)
+
+    created = create_item(
+        client,
+        target_workspace_id,
+        name,
+        item_type,
+        description=item.get("description") or None,
+        parts=rewritten,
+        definition_format=definition_format,
+        folder_id=folder_id,
+    )
+    return MigratedItem(
+        source_id=item["id"],
+        target_id=created["id"],
+        name=name,
+        rebound_parts=changed,
+        parts=tuple(rewritten),
+        warnings=tuple(warnings),
+    )
+
+
+def describe_failure(
+    item_type: str,
+    name: str,
+    error: FabricError,
+    *,
+    unreachable: Sequence[str] = (),
+) -> str:
+    """Explain why one item could not be created.
+
+    Creation is a long running operation for several item types, so the interesting failure
+    can arrive either from the request or from the operation behind it. Both carry the
+    service's own error code, which says far more than a status ever does, so it is always
+    repeated back rather than being flattened into "check its data source bindings".
+
+    ``unreachable`` names workspaces the definition referred to that this service principal
+    cannot read. Where Fabric says only "UnknownError", that is usually the whole story.
+    """
+    code = getattr(error, "error_code", "")
+    detail = getattr(error, "detail", "")
+    said = " ".join(part for part in (code, detail) if part).strip()
+
+    if unreachable:
+        which = ", ".join(unreachable)
+        return (
+            f"{item_type} '{name}' was not migrated: it refers to workspace {which}, which "
+            "this service principal cannot read. Either it was deleted or access was never "
+            "granted, and Fabric will not create an item pointing at a workspace it cannot "
+            "resolve. Repoint it in the source workspace, or grant access, then migrate again."
+            + (f" The service said: {said}." if said else "")
+        )
+
+    if code == "DataSourcesValidationError":
+        return (
+            f"{item_type} '{name}' was not migrated: one of its sources uses a connection "
+            "this service principal cannot reach. Connections are tenant wide, so grant it "
+            "access to the connection in Manage Connections and Gateways, then recreate the "
+            f"{item_type.lower()}."
+        )
+    if isinstance(error, OperationTimeout):
+        return (
+            f"{item_type} '{name}' was still being created when we stopped waiting. Check the "
+            "new workspace before recreating it, in case it arrived late."
+        )
+
+    status = f" (HTTP {error.status_code})" if isinstance(error, FabricApiError) else ""
+    # Advice that goes alongside what the service said rather than instead of it: our reading
+    # of an error code is a guess, and the service's own words are not.
+    advice = {
+        "ItemDisplayNameAlreadyInUse": (
+            " The new workspace already holds an item of that name; delete or rename it "
+            "there, then migrate again."
+        ),
+    }.get(code, "")
+
+    if said:
+        return f"{item_type} '{name}' was not migrated{status}: {said}.{advice}".replace("..", ".")
+    return (
+        f"{item_type} '{name}' was not migrated{status}. Recreate it manually and check its "
+        "data source bindings."
+    )
+
+
+def _rewritten_definition(
+    client: FabricClient,
+    source_workspace_id: str,
+    item: Mapping[str, Any],
+    item_type: str,
+    id_map: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """The parts as they were sent, read back after a rejection we cannot explain.
+
+    Best effort by design: this runs while handling someone else's failure, so anything that
+    goes wrong here returns nothing rather than replacing the error we were reporting.
+    """
+    try:
+        policy = policy_for(item_type)
+        definition = get_item_definition(
+            client, source_workspace_id, item["id"], fmt=policy.export_format
+        )
+        rewritten, _ = rewrite_parts(definition.get("parts") or [], id_map)
+        return strip_part(rewritten, PLATFORM_PART)
+    except Exception:
+        # Diagnostics must never mask the failure we were reporting.
+        return []
+
+
+def _readable(parts: Iterable[Mapping[str, Any]]) -> str:
+    lines: list[str] = []
+    for candidate in parts:
+        path = candidate.get("path", "?")
+        try:
+            body = decode_payload(candidate.get("payload", "")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            body = "<binary>"
+        lines.append(f"--- {path}\n{body}")
+    return "\n".join(lines) or "<the definition could not be read back for logging>"
+
+
+def dangling_references(
+    parts: Iterable[Mapping[str, Any]],
+    id_map: Mapping[str, str],
+    source_items: Mapping[str, Mapping[str, Any]],
+    *,
+    ignore: Collection[str] = (),
+) -> list[str]:
+    """Items in the migrating workspace that a definition names but that did not migrate.
+
+    These are worth finding because of how the rewrite works. A reference is usually a
+    workspace id beside an item id, and the workspace id is always in the map, so it is
+    always rewritten. If the item beside it is not, the pair becomes the *new* workspace and
+    the *old* item: something that was never in that workspace at all.
+
+    Fabric's answer to that is not always legible. Two Copy Jobs pointing at a lakehouse in
+    another workspace were rejected with nothing but ``UnknownError``.
+
+    Only items of the workspace being migrated count. A reference to another workspace is
+    correct to leave exactly as it is, because that workspace is not moving.
+
+    ``ignore`` is for the item being migrated itself. Several item types carry their own id
+    inside their own definition, and an item is never a reason not to create itself: it is
+    not in the map yet precisely because this is the call that would put it there.
+    """
+    if not source_items:
+        return []
+
+    skip = {str(item).casefold() for item in ignore if item}
+    missing = {
+        item_id.casefold(): item
+        for item_id, item in source_items.items()
+        # A SQL analytics endpoint is created with its lakehouse, warehouse or mirrored
+        # database rather than by us, so it is never "not migrated": it arrives with its
+        # parent, under a new id that is recorded once the parent has provisioned it.
+        if item_id
+        and item_id not in id_map
+        and item_id.casefold() not in skip
+        and not is_derived_type(item.get("type") or "")
+    }
+    if not missing:
+        return []
+
+    haystack = _definition_text(parts).casefold()
+    found = [item for item_id, item in missing.items() if item_id in haystack]
+    return [
+        f"{item.get('type') or 'item'} '{item.get('displayName') or item.get('id')}'"
+        for item in sorted(found, key=lambda i: str(i.get("displayName") or i.get("id")))
+    ]
+
+
+def _definition_text(parts: Iterable[Mapping[str, Any]]) -> str:
+    chunks: list[str] = []
+    for candidate in parts:
+        payload = candidate.get("payload") or ""
+        if not payload or not is_text_part(candidate.get("path", "")):
+            continue
+        try:
+            chunks.append(decode_payload(payload).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return "\n".join(chunks)
+
+
+WORKSPACE_KEYS = frozenset(
+    {"workspaceid", "sourceworkspaceid", "targetworkspaceid", "workspaceobjectid"}
+)
+
+
+def referenced_workspaces(parts: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Every workspace a definition names, read from the keys Fabric uses for one.
+
+    Read structurally rather than by hunting for GUIDs, so an item id or an internal
+    identifier that happens to look like one is not mistaken for a workspace.
+    """
+    found: set[str] = set()
+    for candidate in parts:
+        payload = candidate.get("payload") or ""
+        if not payload or not is_text_part(candidate.get("path", "")):
+            continue
+        try:
+            document = json.loads(decode_payload(payload).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        _collect_workspaces(document, found)
+    return found
+
+
+def _collect_workspaces(node: Any, found: set[str]) -> None:
+    if isinstance(node, list):
+        for child in node:
+            _collect_workspaces(child, found)
+        return
+    if not isinstance(node, Mapping):
+        return
+    for key, value in node.items():
+        if key.lower() in WORKSPACE_KEYS and isinstance(value, str) and value:
+            found.add(value)
+        else:
+            _collect_workspaces(value, found)
+
+
+def unreachable_workspaces(
+    client: FabricClient,
+    workspace_ids: Iterable[str],
+) -> list[str]:
+    """Which of these workspaces this service principal cannot read.
+
+    A workspace that has been deleted, or that we were never given access to, cannot be
+    referenced by a new item: Fabric refuses the create and describes it only as
+    "UnknownError". Asking directly turns that into something an operator can act on.
+    """
+    unreachable: list[str] = []
+    for workspace_id in sorted(workspace_ids):
+        try:
+            client.get(f"workspaces/{workspace_id}")
+        except FabricApiError as error:
+            if error.status_code in (401, 403, 404):
+                unreachable.append(workspace_id)
+        except FabricError:
+            continue
+    return unreachable
+
+
+def migrate_items(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    target_workspace_id: str,
+    items: Iterable[Mapping[str, Any]],
+    item_type: str,
+    id_map: dict[str, str],
+    folder_map: Mapping[str, str] | None = None,
+    parts_by_id: Mapping[str, list[dict[str, Any]]] | None = None,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    on_progress: Any = None,
+) -> tuple[list[MigratedItem], list[str]]:
+    """Migrate a batch of definition-backed items, collecting per-item failures.
+
+    Each success is recorded in ``id_map`` immediately so later items in the same batch, and
+    later phases, can be rebound to it.
+
+    ``source_items`` maps every item in the workspace being migrated to its record, and is
+    used to say which of them a definition needed but did not get.
+    """
+    migrated: list[MigratedItem] = []
+    warnings: list[str] = []
+
+    for item in items:
+        name = item.get("displayName") or item.get("id")
+        if on_progress:
+            on_progress(f"Migrating {item_type} '{name}'")
+        definition_parts = (parts_by_id or {}).get(item.get("id", ""))
+        try:
+            result = migrate_definition_item(
+                client,
+                source_workspace_id=source_workspace_id,
+                target_workspace_id=target_workspace_id,
+                item=item,
+                item_type=item_type,
+                id_map=id_map,
+                folder_id=(folder_map or {}).get(item.get("folderId", "")),
+                parts=definition_parts,
+                source_items=source_items,
+            )
+        except StrandedReference as error:
+            # Refused before anything was created, so there is nothing half bound to clean up.
+            warnings.append(
+                f"{item_type} '{name}' was not migrated: it depends on "
+                f"{', '.join(error.needed)}, which did not migrate. Migrating it anyway would "
+                "either point it at something that does not exist in the new workspace, or "
+                "leave it reading from the old one, which breaks when that is deleted. "
+                "Migrate what it needs, then recreate it."
+            )
+            continue
+        except FabricError as error:
+            # Fabric answers some rejections with nothing but "UnknownError". The definition
+            # it refused is the only other evidence, so it goes to the log, and its foreign
+            # workspace references are checked: a workspace that has been deleted cannot be
+            # named by a new item, and that is a fact worth stating rather than a mystery.
+            sent = _rewritten_definition(client, source_workspace_id, item, item_type, id_map)
+            logger.warning(
+                "%s '%s' was rejected: %s\nDefinition sent:\n%s",
+                item_type,
+                name,
+                error,
+                _readable(sent),
+            )
+            gone = unreachable_workspaces(
+                client,
+                referenced_workspaces(sent) - {source_workspace_id, target_workspace_id},
+            )
+            warnings.append(describe_failure(item_type, str(name), error, unreachable=gone))
+            continue
+
+        id_map[result.source_id] = result.target_id
+        migrated.append(result)
+        warnings.extend(f"{item_type} '{result.name}': {w}" for w in result.warnings)
+
+    return migrated, warnings
+
+
+__all__ = [
+    "CICD_DATAFLOW_FORMAT_VERSION",
+    "COPY_JOB",
+    "DATAFLOW",
+    "DATA_PIPELINE",
+    "ENVIRONMENT",
+    "EVENTSTREAM",
+    "KQL_DASHBOARD",
+    "KQL_QUERYSET",
+    "MIRRORED_DATABASE",
+    "NOTEBOOK",
+    "REPORT",
+    "SEMANTIC_MODEL",
+    "MigratedItem",
+    "classify_dataflow",
+    "describe_failure",
+    "environment_warnings",
+    "list_of_type",
+    "migrate_definition_item",
+    "migrate_items",
+]
