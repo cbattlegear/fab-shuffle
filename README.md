@@ -420,8 +420,23 @@ docker build -t fab-shuffle .
 docker run --rm -p 8080:8080 fab-shuffle
 ```
 
-The image builds natively on `linux/amd64` and `linux/arm64`. Two build args exist for
-networks that block the public package feeds:
+The image supports `linux/amd64` and `linux/arm64`. Its Python base is pinned by patch
+version and multi-architecture digest; `uv.lock`, the hashed `requirements/*.txt` exports,
+and `tools.lock.json` record the dependency and external-tool versions.
+Every image build checks installed versions, imports the application, and starts it on
+loopback to check HTTP health and packaged UI assets without tenant credentials.
+
+**ARM64 builds and smoke checks are not a claim of vendor-supported SQL schema transfer.**
+[SqlPackage's Linux support list](https://learn.microsoft.com/en-us/sql/tools/sqlpackage/sqlpackage-download#supported-operating-systems)
+names x64 only. Use `--platform linux/amd64` for vendor-supported SqlPackage use. Neither
+architecture's version/import/health smoke checks exercise a live database or Fabric tenant.
+
+Current tool pins are .NET SDK **10.0.400** / runtime **10.0.11**, Microsoft ODBC and SQL
+tools **18.6.2.1-1**, SqlPackage **170.5.76**, UnpackDacPac **2026.7.15.390**, and AzCopy
+**10.32.8**. Both tools' NuGet packages include net10.0 payloads and bundle their library
+dependencies; package hashes plus the pinned SDK/runtime fix that selection.
+
+Two build args exist for networks that block the public package feeds:
 
 | Build arg | Default | Purpose |
 | --- | --- | --- |
@@ -437,6 +452,13 @@ docker build \
 
 If `sqlpackage`, `unpackdacpac`, or `azcopy` are missing at runtime, the affected item is
 reported as a warning and the rest of the migration continues.
+
+Python mirrors must serve the locked wheels unchanged: installs enforce hashes and refuse
+source distributions rather than fetching unpinned build dependencies. `PIP_INDEX_URL`
+still selects the download index; the exported requirements deliberately contain no index
+or artifact URLs. NuGet mirrors must supply the exact pinned package archives: their bytes
+are hash checked after installation as well. Missing versions and checksum mismatches fail
+the build; there is no fallback to latest.
 
 ### Configuration
 
@@ -487,13 +509,72 @@ Three gaps in the Fabric REST API are covered by external tooling bundled in the
 
 ## Development
 
+Python 3.11+ is supported. Use the checked-in resolution, not `pip install -e ".[dev]"`
+(which resolves the project's compatibility ranges afresh). In a POSIX shell:
+
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest        # tests
-.venv/bin/python -m ruff check .  # lint
-.venv/bin/python -m fabshuffle    # run the UI on http://localhost:8080
+source .venv/bin/activate
+python -m pip install --require-hashes --only-binary=:all: -r requirements/bootstrap.txt
+python -m uv pip sync --require-hashes --only-binary=:all: requirements/bootstrap.txt requirements/build.txt requirements/dev.txt
+python -m uv pip install --no-build-isolation --no-deps -e .
+python scripts/lock_dependencies.py --check
+python -m pytest -q
+python -m ruff check .
+python -m fabshuffle
 ```
+
+On Windows, activate with `.venv\Scripts\Activate.ps1` instead of `source`, then run the
+same `python` commands. Linux also needs `unixodbc` installed for `pyodbc` imports.
+`uv.lock` is universal, not a Windows freeze: exports retain platform markers, including
+`uvloop` only on supported non-Windows platforms. Third-party wheels are required; a
+platform/Python combination without a locked wheel fails explicitly and needs a reviewed
+dependency refresh rather than an uncontrolled source build.
+
+### Deliberate release upgrades
+
+Review dependency and tool updates at least monthly, and promptly for security fixes. A
+scheduled image rebuild does **not** update the pins. Make updates on a branch:
+
+1. Use the locked development environment above. For a selected dependency run
+   `python -m uv lock --upgrade-package NAME==VERSION`; use `python -m uv lock --upgrade`
+   only for a deliberate full refresh. Preserve `requires-python` and platform support.
+   To update the resolver/installer, edit the exact `lock` group pins and
+   `tool.uv.required-version` together, install that exact uv version into this isolated
+   environment, and regenerate. To update the build backend, change both
+   `build-system.requires` and the `build` group. The lock includes their transitives.
+2. Run `python scripts/lock_dependencies.py` to regenerate all four hashed exports.
+   Re-run the install/sync commands above and
+   `python scripts/lock_dependencies.py --check`. Commit `pyproject.toml`, `uv.lock`, and
+   the exports together. Do not edit generated hashes or replace them with `pip freeze`.
+3. Review `tools.lock.json` and the Dockerfile base digest using the official upstream
+   release metadata linked in the manifest's `sources`. Select each exact version's
+   `Filename`/`SHA256` stanza from both Microsoft package indexes, including the SDK's
+   Microsoft runtime/host/targeting-pack dependency closure. For NuGet, download the exact
+   `.nupkg` from the official flat-container feed, compare its SHA-512 with the catalog,
+   and record its SHA-256. Use the versioned AzCopy release assets and their published
+   `digest` values, never an evergreen download link. Verify both architectures' downloads
+   and hashes before changing pins. Resolve the Python image's multi-architecture digest
+   with `docker buildx imagetools inspect python:VERSION-bookworm`.
+   Check the Microsoft Learn per-tool pages
+   for supported architectures and runtime changes, not assumptions about roll-forward.
+   The Docker workflow also pins action SHAs, cosign, Buildx, BuildKit, and QEMU; review
+   those explicitly rather than letting a setup action download latest.
+4. Run `python -m pytest -q` and `python -m ruff check .` **before** building.
+   Build a unique local tag with
+   `docker build --platform linux/amd64 -t fab-shuffle:release-review-UNIQUE .`;
+   repeat for `linux/arm64` with a different tag on an ARM runner or under emulation.
+   Both builds must pass the embedded CLI/import/HTTP smoke checks. Do not push from the
+   refresh procedure. The existing `v*.*.*` release workflow still controls publication,
+   semver tags, `latest`, and signing.
+
+The reproducibility boundary is **dependency/artifact selection**, not byte-for-byte OCI
+images. The base image is immutable, Python wheels are hash checked, and external tool
+inputs are pinned. Debian apt repositories and OS dependency packages are not fully
+snapshotted; their transitive updates, maintainer scripts, timestamps, and hosted runner
+updates can change image bytes. A withdrawn pinned artifact makes the build fail until an
+operator deliberately refreshes it. For an identical deployed image, retain and run its
+published digest rather than rebuilding a tag.
 
 ## Planned features
 

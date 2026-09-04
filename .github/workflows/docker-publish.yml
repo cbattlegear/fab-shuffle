@@ -23,9 +23,12 @@ env:
 
 
 jobs:
-  build:
+  validate:
+    uses: ./.github/workflows/tests.yml
 
-    runs-on: ubuntu-latest
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -42,18 +45,24 @@ jobs:
       - name: Install cosign
         if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        # No cosign-release pin: the version came from one, it went stale at v2.2.4 while
-        # cosign reached v3, and the installer SHA above already fixes which cosign we get.
+        with:
+          cosign-release: 'v3.0.6'
 
       # arm64 is built under emulation, which binfmt must be registered for.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
 
       # Set up BuildKit Docker container builder to be able to build
       # multi-platform images and export cache
       # https://github.com/docker/setup-buildx-action
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.37.0
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
 
       # Login against a Docker registry except on PR
       # https://github.com/docker/login-action

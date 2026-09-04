@@ -1,0 +1,147 @@
+{
+  "reviewed_on": "2026-09-04",
+  "sources": [
+    "https://packages.microsoft.com/debian/12/prod/dists/bookworm/main/binary-amd64/Packages",
+    "https://packages.microsoft.com/debian/12/prod/dists/bookworm/main/binary-arm64/Packages",
+    "https://api.github.com/repos/Azure/azure-storage-azcopy/releases/tags/v10.32.8",
+    "https://api.nuget.org/v3/catalog0/data/2026.08.25.17.38.28/microsoft.sqlpackage.170.5.76.json",
+    "https://api.nuget.org/v3/catalog0/data/2026.07.15.08.32.27/unpackdacpac.2026.7.15.390.json"
+  ],
+  "dotnet_sdk_version": "10.0.400",
+  "apt_packages": {
+    "dotnet-sdk-10.0": "10.0.400-1",
+    "dotnet-host": "10.0.11-1",
+    "dotnet-hostfxr-10.0": "10.0.11-1",
+    "dotnet-runtime-deps-10.0": "10.0.11-1",
+    "dotnet-runtime-10.0": "10.0.11-1",
+    "dotnet-targeting-pack-10.0": "10.0.11-1",
+    "dotnet-apphost-pack-10.0": "10.0.11-1",
+    "aspnetcore-runtime-10.0": "10.0.11-1",
+    "aspnetcore-targeting-pack-10.0": "10.0.11-1",
+    "msodbcsql18": "18.6.2.1-1",
+    "mssql-tools18": "18.6.2.1-1"
+  },
+  "apt_artifacts": {
+    "amd64": {
+      "dotnet-runtime-deps-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-runtime-deps-10.0/dotnet-runtime-deps-10.0_10.0.11-1_amd64.deb",
+        "sha256": "0d65a0a886e6c1d7257c253af81c24f82800ddadc172427089804223c4ce65eb"
+      },
+      "dotnet-hostfxr-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-hostfxr-10.0/dotnet-hostfxr-10.0_10.0.11-1_amd64.deb",
+        "sha256": "3d019e677ea2c976246df262a064def729d64e9338b1abd3ba2e7cec36937a3b"
+      },
+      "aspnetcore-targeting-pack-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/a/aspnetcore-targeting-pack-10.0/aspnetcore-targeting-pack-10.0_10.0.11-1_amd64.deb",
+        "sha256": "49fc3392eadf3fa4c48da4c81ed639ec9ed231e53d5dd425a04abcb8b22762a7"
+      },
+      "dotnet-runtime-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-runtime-10.0/dotnet-runtime-10.0_10.0.11-1_amd64.deb",
+        "sha256": "2fe21a581d608e1370367b0daf52136dc379febe4662cbf4e1599edb85822580"
+      },
+      "mssql-tools18": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/m/mssql-tools18/mssql-tools18_18.6.2.1-1_amd64.deb",
+        "sha256": "8685523bc60cfafb70c7d354046d012edc82bbb20efd3e90dcb3b2bd98b6a770"
+      },
+      "aspnetcore-runtime-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/a/aspnetcore-runtime-10.0/aspnetcore-runtime-10.0_10.0.11-1_amd64.deb",
+        "sha256": "ba3b8af8de8744942ad8073fe21b2ea17b295cbaaf3a4e7c9bd7c0796c935f98"
+      },
+      "dotnet-targeting-pack-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-targeting-pack-10.0/dotnet-targeting-pack-10.0_10.0.11-1_amd64.deb",
+        "sha256": "19ed2ea510143eac785b513f6e987f909c5a436c527b645417df8807985a1488"
+      },
+      "msodbcsql18": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/m/msodbcsql18/msodbcsql18_18.6.2.1-1_amd64.deb",
+        "sha256": "73438bb02bc26fb3d1c3d8cac36b3c26cb11629dbd0a3784990fc3235331b334"
+      },
+      "dotnet-sdk-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-sdk-10.0/dotnet-sdk-10.0_10.0.400-1_amd64.deb",
+        "sha256": "e42c102495d7f4813880a7c29fa02f1f58544e3a08099968c48858e218b1b6c8"
+      },
+      "dotnet-host": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-host/dotnet-host_10.0.11-1_amd64.deb",
+        "sha256": "ba4047cfe4ac6bb6c8cc7bd66725ba3c5d7dca237d61dc2fa651322f1c82d642"
+      },
+      "dotnet-apphost-pack-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-apphost-pack-10.0/dotnet-apphost-pack-10.0_10.0.11-1_amd64.deb",
+        "sha256": "b00712332658ba461cb1eb7a187251734486d1cff9d54a8c41d44b7c6cee8269"
+      }
+    },
+    "arm64": {
+      "dotnet-host": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-host/dotnet-host_10.0.11-1_arm64.deb",
+        "sha256": "9f87de218281dc9afd0d39320be270c65bf98a0d76e2be71bcb5a9464d9d26d1"
+      },
+      "dotnet-targeting-pack-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-targeting-pack-10.0/dotnet-targeting-pack-10.0_10.0.11-1_arm64.deb",
+        "sha256": "f3cbc9ab4f5988d4824b1fa0d514d25883718d46a3dc444dedcc3e45cf6d7d36"
+      },
+      "mssql-tools18": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/m/mssql-tools18/mssql-tools18_18.6.2.1-1_arm64.deb",
+        "sha256": "3b5500e9cd26633839fc0671b17edbf6a15e254df431efb11dd7389e12ea0e41"
+      },
+      "msodbcsql18": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/m/msodbcsql18/msodbcsql18_18.6.2.1-1_arm64.deb",
+        "sha256": "0bc57ab4afc9f452aaeba5aa2bac09cd8d27cd7f997ca794403d179343c2b86e"
+      },
+      "aspnetcore-runtime-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/a/aspnetcore-runtime-10.0/aspnetcore-runtime-10.0_10.0.11-1_arm64.deb",
+        "sha256": "4d8658153f32b62e877feb6ace20772ab3e91fa670da7fad8178d2e4424060c4"
+      },
+      "dotnet-sdk-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-sdk-10.0/dotnet-sdk-10.0_10.0.400-1_arm64.deb",
+        "sha256": "4028a6be249df5044c4e3be48ad5bbd08e78a6f6822942da1fc46e3dc8ab6330"
+      },
+      "aspnetcore-targeting-pack-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/a/aspnetcore-targeting-pack-10.0/aspnetcore-targeting-pack-10.0_10.0.11-1_arm64.deb",
+        "sha256": "f5f6bb0abe77bf46feaf3adc88c5c3aa531e5c2c4818d9b97f087a4f336f1df4"
+      },
+      "dotnet-runtime-deps-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-runtime-deps-10.0/dotnet-runtime-deps-10.0_10.0.11-1_arm64.deb",
+        "sha256": "2e50b85ab3cfae9b32d3b12063b40e7b20ef13d86bf311c8beb5b34fc41130e7"
+      },
+      "dotnet-apphost-pack-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-apphost-pack-10.0/dotnet-apphost-pack-10.0_10.0.11-1_arm64.deb",
+        "sha256": "4b428b110b294f2c5f91be79b5d0b89ac1982397f32a135bf15cace3e1b3031e"
+      },
+      "dotnet-runtime-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-runtime-10.0/dotnet-runtime-10.0_10.0.11-1_arm64.deb",
+        "sha256": "73e423d64e88f8e565087a279064dc3842fc38418765e69586b205406f299e5d"
+      },
+      "dotnet-hostfxr-10.0": {
+        "url": "https://packages.microsoft.com/debian/12/prod/pool/main/d/dotnet-hostfxr-10.0/dotnet-hostfxr-10.0_10.0.11-1_arm64.deb",
+        "sha256": "64e34c2582865a0d973614c9db01daa15718797c903f0a2dc8d8137a067a906f"
+      }
+    }
+  },
+  "nuget_tools": {
+    "microsoft.sqlpackage": {
+      "version": "170.5.76",
+      "sha256": "658f702933db4f0969626ec392c197dba3ad2bc05ad3cb3bc04dffe4c17037d8"
+    },
+    "unpackdacpac": {
+      "version": "2026.7.15.390",
+      "sha256": "664cb566efcbf1fe596c35cff3ef3b0a11d85c420dfc0b06d65598597973ba43"
+    }
+  },
+  "azcopy": {
+    "version": "10.32.8",
+    "artifacts": {
+      "amd64": {
+        "url": "https://github.com/Azure/azure-storage-azcopy/releases/download/v10.32.8/azcopy_linux_amd64_10.32.8.tar.gz",
+        "sha256": "a95277dbc265912cefdddbaf251aa99ec648cb18ba657e8788066357a9022dc3"
+      },
+      "arm64": {
+        "url": "https://github.com/Azure/azure-storage-azcopy/releases/download/v10.32.8/azcopy_linux_arm64_10.32.8.tar.gz",
+        "sha256": "50e6e58a109f2afd64376b5b003973ff213fbfdec795fe81a95b208982061d9b"
+      }
+    }
+  },
+  "version_commands": [
+    [["sqlpackage", "/Version"], "170.5.76"],
+    [["unpackdacpac", "--version"], "2026.7.15.390"],
+    [["azcopy", "--version"], "10.32.8"],
+    [["bcp", "-v"], "18.6.0002.1"]
+  ]
+}
