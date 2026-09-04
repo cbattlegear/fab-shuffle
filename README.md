@@ -61,8 +61,8 @@ copies everything it supports.
 | Notebook | ✅ | n/a | Default lakehouse and environment attachment rebound |
 | Environment | ✅ | n/a | Libraries and Spark settings; needs publishing afterwards |
 | Dataflow Gen2 (CI/CD) | ✅ | n/a | Rebound to migrated items |
-| Data pipeline | ✅ | n/a | Rebound to migrated items; connections reused and checked |
-| Copy Job | ✅ | n/a | Rebound to migrated items; connections reused and checked |
+| Data pipeline | ✅ | n/a | Rebound to migrated items and replacement connections |
+| Copy Job | ✅ | n/a | Rebound to migrated items and replacement connections |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
 | Workspace folders | ✅ | n/a | Hierarchy recreated, and items placed back into it |
 | Custom Spark pools | ✅ | n/a | Recreated, and environments repointed at them |
@@ -194,10 +194,23 @@ holds **Owner** on it, which is the only one of the three connection roles (`Use
 
 Once the migrated items exist, Fab Shuffle recreates those connections against them and puts
 the new connection id in the id map, so every item migrated afterwards binds to the
-replacement. This is only automatic when the credential type needs no secret —
-`WorkspaceIdentity` or `Anonymous` — because Fabric never returns an existing connection's
-credentials. Anything else, including every gateway connection, is reported with the target
-to build it against.
+replacement. Automatic creation requires a shareable cloud SQL connection with a verified
+`server;database` path shape, and a credential type that needs no secret (`WorkspaceIdentity`
+or `Anonymous`) and is reported by the tenant. Fabric never returns an existing connection's
+credentials. Other connectors' rendered paths cannot safely be inverted into creation
+parameters without a documented format; they and secret-bearing or gateway connections
+require an operator-created replacement.
+
+For a manual replacement, the warning gives the exact name
+`<original name> (Fab Shuffle <target workspace ID>)`, connector type, and target path.
+Create it in **Manage connections and gateways**, enter the credentials and grant the service
+principal User access, then retry. The retry adopts only a matching name, connector,
+connectivity type and migrated path; a name alone is not proof. Previously recorded
+replacements are read back and verified, not blindly reused.
+
+An item with a known source-bound connection is not created until its replacement exists.
+This includes mirrors and shortcuts that run before the connection phase: retry those after
+the required stores and connections have been created. External connections are unchanged.
 
 Connections that migrated items merely *use* are left alone and checked instead, reporting:
 
@@ -205,6 +218,19 @@ Connections that migrated items merely *use* are left alone and checked instead,
 - **personal cloud** connections, which cannot be shared;
 - connections routed through a **gateway**. A virtual network gateway in particular stays in
   its original region, so it may no longer be the right path to the data.
+
+### Airflow files
+
+Airflow configuration and supported UTF-8 text files are checked before creating the target
+job. Known literal workspace/item GUIDs and endpoint/path references are rebound; known
+unmapped dependencies refuse creation and name what must migrate first. Text uses the same
+extension allowlist as item definitions, including Python, JSON, YAML, SQL and plain text.
+Binary and other opaque files are preserved byte-for-byte. Unreadable or oversized files
+must be fixed before retrying.
+
+This is literal-reference checking, not arbitrary Python analysis. Review references built
+dynamically from environment variables, imports, string fragments or opaque supporting
+files before running the new job.
 
 ### Dependency checking
 

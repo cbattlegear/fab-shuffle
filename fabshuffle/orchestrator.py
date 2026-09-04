@@ -28,6 +28,8 @@ items created by an *earlier* phase:
 7. ``connections``  recreate connections that point into the source workspace, aimed at the
    items just created. Their new ids go into the id map, so everything after this binds to
    them. A connection's target cannot be changed in place, so this is a replacement.
+   Earlier consumers (mirrors and shortcuts) refuse unresolved source-bound connections;
+   retry them after the replacement exists rather than creating a source-bound copy.
 8. ``realtime``     eventstreams, KQL querysets, and KQL dashboards. They read the
    eventhouses and data stores above, and an eventstream sources from connections.
 9. ``engineering``  environments, then notebooks, then dataflows, then Spark job definitions,
@@ -136,7 +138,7 @@ def inward_connection_summary(prerequisites: list[connections.ConnectionPrerequi
     named = sorted({p.connection_name or p.connection_id for p in prerequisites})
     return (
         f"{len(prerequisites)} connection(s) point at items in this workspace and will need to "
-        "be repointed by hand after the migration, because Fabric does not allow a "
+        "be replaced before their consumers can migrate, because Fabric does not allow a "
         f"connection's target to be changed: {', '.join(named)}."
     )
 
@@ -198,6 +200,8 @@ class _Context:
     # their replication switched off so a copy does not start doing the original's work in a
     # second region. Keyed to why, so a shortcut that fails against one can say so.
     dormant: dict[str, str] = field(default_factory=dict)
+    # Do not duplicate an inherited connection merely because access to it was lost.
+    unverified_connections: set[str] = field(default_factory=set)
     # What an earlier attempt at this run already did, when this is a resume. ``None`` on a
     # first attempt, which is what makes every "have we done this already" check answer no.
     prior: journal_module.Replay | None = None
@@ -1001,6 +1005,10 @@ def _check_dependencies(ctx: _Context) -> None:
     ctx.run.start_step(step, "Checking dependencies between items")
     ctx.run.raise_if_cancelled()
 
+    # Source-bound connections and endpoint aliases must be known even when relations are
+    # unavailable. Early data-store consumers use the same missing-reference guard.
+    _load_source_references(ctx)
+
     migrated = (ctx.assessment.migrated if ctx.assessment else []) or []
     if not migrated:
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to check")
@@ -1055,6 +1063,69 @@ def _check_dependencies(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 1
+
+
+def _load_source_references(ctx: _Context) -> None:
+    source_id = ctx.plan.source_workspace_id
+    types = {item.get("type") for item in ctx.source_items.values()}
+    for item_type, read in (
+        ("Lakehouse", data_stores.list_lakehouses),
+        ("Warehouse", data_stores.list_warehouses),
+        ("Eventhouse", eventhouses.list_eventhouses),
+        ("MirroredDatabase", data_stores.list_mirrored_databases),
+        ("SQLDatabase", sqldatabases.list_sql_databases),
+    ):
+        if item_type not in types:
+            continue
+        for item in read(ctx.client, source_id):
+            if item.get("id"):
+                ctx.source_items[item["id"]] = {**item, "type": item_type}
+    identifiers = {source_id, *analytics.reference_identifiers(ctx.source_items)}
+    for connection in connections.list_connections(ctx.client):
+        path = (connection.get("connectionDetails") or {}).get("path") or ""
+        if not connection.get("id") or not any(
+            key.casefold() in path.casefold() for key in identifiers if key
+        ):
+            continue
+        source_connection_id = connection["id"]
+        ctx.source_items[source_connection_id] = {**connection, "type": "Connection"}
+        # A journaled ID is not proof that a tenant-scoped connection still exists, is
+        # readable, or targets the expected path. Validate before early consumers use it.
+        mapped_key = next(
+            (key for key in ctx.id_map if key.casefold() == source_connection_id.casefold()), None
+        )
+        if mapped_key is None:
+            continue
+        target_id = ctx.id_map[mapped_key]
+        rewrite = definitions.build_rewriter(ctx.id_map)
+        new_path = rewrite(path) if rewrite else path
+        needed = analytics.dangling_references(
+            [definitions.part("connection.txt", path)], ctx.id_map, ctx.source_items,
+            ignore=(source_connection_id,),
+        )
+        try:
+            target = ctx.client.get(f"connections/{target_id}")
+        except FabricError as error:
+            ctx.invalidate_mapping(mapped_key)
+            ctx.unverified_connections.add(source_connection_id)
+            ctx.warnings.append(
+                f"Connection '{connection.get('displayName')}' replacement {target_id} "
+                f"could not be verified: {error}. Grant access or restore it, then retry."
+            )
+            continue
+        if needed or connections.same_path(path, new_path) or not connections.matches_replacement(
+            target, connection, new_path
+        ):
+            ctx.invalidate_mapping(mapped_key)
+            ctx.warnings.append(
+                f"Connection '{connection.get('displayName')}' replacement {target_id} no longer "
+                "matches its migrated target. Restore the replacement against the migrated "
+                "store, then retry; dependent items will not be created with the old binding."
+            )
+            continue
+        if mapped_key != source_connection_id:
+            del ctx.id_map[mapped_key]
+            ctx.id_map[source_connection_id] = target_id
 
 
 def _create_workspaces(ctx: _Context) -> None:
@@ -1586,6 +1657,13 @@ def _map_sql_endpoint(
     for key in ("connectionString", "id"):
         source_value = source_endpoint.get(key)
         target_value = target_endpoint.get(key)
+        if source_value:
+            known = analytics.reference_identifiers(ctx.source_items).get(source_value)
+            ctx.source_items.setdefault(source_value, dict(known) if known else {
+                "id": source_endpoint.get("id") or source_value,
+                "type": "SQLEndpoint",
+                "displayName": source_endpoint.get("displayName") or source_endpoint.get("id"),
+            })
         if source_value and target_value:
             ctx.map_alias(source_value, target_value, owner)
 
@@ -2338,9 +2416,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
         source = next((db for db in databases if db["id"] == result.source_id), {})
         source_endpoint = data_stores.mirrored_database_sql_endpoint(source)
         target_endpoint = data_stores.mirrored_database_sql_endpoint(target)
-        for key in ("connectionString", "id"):
-            if source_endpoint.get(key) and target_endpoint.get(key):
-                ctx.map_alias(source_endpoint[key], target_endpoint[key], result.source_id)
+        _map_sql_endpoint(ctx, source_endpoint, target_endpoint, owner=result.source_id)
 
         was = running.get(result.source_id)
         state = f"was {was} in the source workspace" if was else "could not be read"
@@ -2425,6 +2501,14 @@ def _migrate_snowflake_databases(
             continue
 
         try:
+            payload_parts = [definitions.part("snowflake.json", payload)]
+            needed = analytics.dangling_references(
+                payload_parts, ctx.id_map, ctx.source_items, ignore=(item["id"],)
+            )
+            if needed:
+                raise analytics.StrandedReference(needed)
+            rewritten, _ = definitions.rewrite_parts(payload_parts, ctx.id_map)
+            payload = definitions.decode_json_part(rewritten[0]["payload"])
             created = items_module.create_item(
                 ctx.client,
                 ctx.target_workspace_id,
@@ -2463,11 +2547,11 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
     # Names for the items in the source workspace, so a shortcut pointing at something that
     # did not migrate can say which item that was rather than quoting a GUID.
-    source_items = {
+    source_items = {**ctx.source_items, **{
         item["id"]: item
         for item in list_items(ctx.client, ctx.plan.source_workspace_id)
         if item.get("id")
-    }
+    }}
 
     # KQL table shortcuts can target lakehouses, warehouses, or other KQL databases, so they
     # are only safe to create now that every one of those exists.
@@ -2585,6 +2669,135 @@ def _transfer_endpoint_schemas(
 
 
 # --------------------------------------------------------------------- phase 7
+
+
+def _migrate_connections(ctx: _Context) -> None:
+    step = "connections"
+    ctx.run.start_step(step, "Replacing connections that target the source workspace")
+    ctx.run.raise_if_cancelled()
+    sources = [item for item in ctx.source_items.values() if item.get("type") == "Connection"]
+    if not sources:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No known source-bound connections")
+        return
+
+    warnings: list[str] = []
+    try:
+        known = ctx.client.list_all("connections")
+    except FabricError as error:
+        warnings.append(
+            f"Connection replacements could not be inspected: {error}. "
+            "Grant the service principal access to connections, then retry."
+        )
+        ctx.warnings.extend(warnings)
+        ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Connections require attention", warnings)
+        return
+
+    metadata: dict[str, dict[str, Any]] | None = None
+    replaced = 0
+    for source in sources:
+        ctx.run.raise_if_cancelled()
+        source_id = source["id"]
+        if source_id in ctx.unverified_connections:
+            warnings.append(
+                f"Connection '{source.get('displayName')}' has an unreadable prior replacement. "
+                "Restore this service principal's access to it, then retry; no duplicate was created."
+            )
+            continue
+        path = (source.get("connectionDetails") or {}).get("path") or ""
+        name = connections.replacement_name(source, ctx.target_workspace_id)
+        needed = analytics.dangling_references(
+            [definitions.part("connection.txt", path)], ctx.id_map, ctx.source_items,
+            ignore=(source_id,),
+        )
+        rewrite = definitions.build_rewriter(ctx.id_map)
+        new_path = rewrite(path) if rewrite else path
+        if needed or connections.same_path(path, new_path):
+            warnings.append(
+                f"Connection '{source.get('displayName')}' was not replaced: its target "
+                f"still needs {', '.join(needed) or 'a complete source-to-target mapping'}. "
+                "Migrate that store and its endpoint, then retry."
+            )
+            continue
+
+        instruction = (
+            f"Create connection '{name}' with type "
+            f"'{(source.get('connectionDetails') or {}).get('type')}', connectivity "
+            f"'{source.get('connectivityType')}' and target '{new_path}' "
+            "in Manage connections and gateways, enter its credentials, grant this service "
+            "principal User access, then retry. Dependent items are left uncreated until "
+            "that replacement is available."
+        )
+        mapped_key = next((key for key in ctx.id_map if key.casefold() == source_id.casefold()), None)
+        if mapped_key:
+            target_id = ctx.id_map[mapped_key]
+            try:
+                candidate = ctx.client.get(f"connections/{target_id}")
+            except FabricError as error:
+                ctx.invalidate_mapping(mapped_key)
+                warnings.append(f"Replacement {target_id} could not be verified: {error}. {instruction}")
+                continue
+            if connections.matches_replacement(candidate, source, new_path):
+                replaced += 1
+                continue
+            ctx.invalidate_mapping(mapped_key)
+            warnings.append(f"Replacement {target_id} has the wrong target. {instruction}")
+            continue
+
+        candidates = [
+            candidate for candidate in known
+            if candidate.get("displayName") == name
+            and connections.matches_replacement(candidate, source, new_path)
+        ]
+        if len(candidates) > 1:
+            warnings.append(
+                f"More than one connection is named '{name}'; keep one replacement. {instruction}"
+            )
+            continue
+        if candidates:
+            ctx.id_map[source_id] = candidates[0]["id"]
+            replaced += 1
+            continue
+
+        connection_type = (source.get("connectionDetails") or {}).get("type") or ""
+        if metadata is None:
+            try:
+                metadata = connections.supported_types(ctx.client)
+            except FabricError as error:
+                warnings.append(f"Connection creation metadata could not be read: {error}. {instruction}")
+                continue
+        supported = metadata.get(connection_type)
+        reason = connections.can_recreate(source, supported)
+        payload = None if reason else connections.build_creation_payload(
+            source, new_path, supported, display_name=name
+        )
+        if not payload:
+            warnings.append(
+                f"Connection '{source.get('displayName')}' "
+                f"{reason or 'has a path whose creation parameters cannot be reconstructed safely'}. "
+                + instruction
+            )
+            continue
+        ctx.run.update_step(step, f"Replacing connection '{source.get('displayName')}'")
+        try:
+            created = connections.create_connection(ctx.client, payload)
+            if not connections.matches_replacement(created, source, new_path):
+                raise FabricError("the created connection did not return the expected ID, type and target")
+        except FabricError as error:
+            warnings.append(
+                f"Connection '{source.get('displayName')}' was not replaced: {error}. {instruction}"
+            )
+            continue
+        ctx.id_map[source_id] = created["id"]
+        known.append(created)
+        replaced += 1
+        _, sharing_warnings = connections.copy_role_assignments(
+            ctx.client, source_connection_id=source_id, target_connection_id=created["id"],
+            client_id=ctx.principal.client_id,
+        )
+        warnings.extend(sharing_warnings)
+
+    ctx.warnings.extend(warnings)
+    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Resolved {replaced} connection(s)", warnings)
 
 
 def _migrate_realtime(ctx: _Context) -> None:
@@ -2899,9 +3112,8 @@ def _migrate_orchestration(ctx: _Context) -> None:
     can read a lakehouse, refresh a semantic model, or invoke another pipeline, so every one
     of those has to exist and be in the id map first.
 
-    Connections are deliberately not recreated. They are tenant scoped, so the same
-    connection id resolves from the new workspace, and the API never returns credentials so a
-    faithful copy is impossible anyway. Instead the ones each item binds are checked.
+    Source-bound connections must already have replacements. Genuinely external connections
+    remain tenant scoped and the ones each item binds are checked.
     """
     step = "orchestration"
     ctx.run.start_step(step, "Migrating data pipelines, Copy Jobs, and Airflow jobs")
@@ -2989,6 +3201,20 @@ def _migrate_airflow_jobs(
                 ctx.client, ctx.plan.source_workspace_id, job["id"]
             )
             parts = definitions.strip_part(definition.get("parts") or [], airflow.PLATFORM_PART)
+            needed = analytics.dangling_references(
+                parts, ctx.id_map, ctx.source_items, ignore=(job["id"],)
+            )
+            if needed:
+                raise analytics.StrandedReference(needed)
+            prepared_files = airflow.preflight_files(
+                ctx.client,
+                source_workspace_id=ctx.plan.source_workspace_id,
+                source_job_id=job["id"],
+                job_name=name,
+                id_map=ctx.id_map,
+                source_items=ctx.source_items,
+                on_progress=progress,
+            )
             rewritten, _ = definitions.rewrite_parts(parts, ctx.id_map)
             rewritten = airflow.retarget_location(rewritten, ctx.plan.capacity_display_region)
 
@@ -3033,6 +3259,7 @@ def _migrate_airflow_jobs(
             target_job_id=target_id,
             job_name=name,
             on_progress=progress,
+            prepared_files=prepared_files,
         )
         warnings.extend(file_warnings)
         if not file_warnings:
@@ -3249,6 +3476,7 @@ _REBUILD_PHASES: tuple[tuple[str, Callable[[_Context], None]], ...] = (
     ("sqldatabases", _migrate_sql_databases),
     ("mirrored", _migrate_mirrored_databases),
     ("shortcuts", _migrate_shortcuts_and_endpoints),
+    ("connections", _migrate_connections),
     ("realtime", _migrate_realtime),
     ("engineering", _migrate_engineering),
     ("analytics", _migrate_reports_and_models),
