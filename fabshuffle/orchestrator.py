@@ -2308,16 +2308,16 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
     reports = analytics.list_of_type(ctx.client, source_id, analytics.REPORT)
 
     # Lakehouses and warehouses bring their own default semantic model, so the target
-    # workspace already has one under the same name.
+    # workspace already has one under the same name. It is not recreated, but it is a
+    # different item with a different id, and reports bind to it.
     default_names = analytics.default_semantic_model_names(ctx.client, source_id)
     skipped = [model for model in models if model["displayName"] in default_names]
     models = [model for model in models if model["displayName"] not in default_names]
+    warnings: list[str] = _map_default_semantic_models(ctx, skipped)
 
     if not models and not reports:
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No semantic models or reports to migrate")
         return
-
-    warnings: list[str] = []
 
     def progress(message: str) -> None:
         ctx.run.update_step(step, message)
@@ -2364,8 +2364,6 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
         and (message := analytics.report_binding_warning(item.name, item.parts, ctx.id_map))
     ]
     warnings.extend(unbound)
-    if skipped:
-        logger.info("Skipped %s default semantic model(s)", len(skipped))
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
@@ -2379,7 +2377,54 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
 # --------------------------------------------------------------------- phase 7
 
 
+def _map_default_semantic_models(
+    ctx: _Context,
+    skipped: list[dict[str, Any]],
+) -> list[str]:
+    """Point the source's default semantic models at the ones Fabric made in the target.
+
+    Every lakehouse and warehouse comes with a semantic model named after it, created by
+    Fabric rather than by anyone. We do not recreate those: the target has its own, already
+    reading the target's tables, and creating a second would collide on the name.
+
+    But it is a *different item with a different id*, and reports bind to it by id. Leaving
+    it out of the map meant a report reading a default model had a reference to something
+    that, as far as the migration was concerned, did not exist — so it was refused.
+
+    Matched by name, which is the only thing the two have in common, and safe because that
+    name is what identifies a model as the default in the first place.
+    """
+    if not skipped:
+        return []
+
+    ctx.run.update_step("analytics", "Matching up the default semantic models")
+    target_models = {
+        model["displayName"]: model["id"]
+        for model in analytics.list_of_type(
+            ctx.client, ctx.target_workspace_id, analytics.SEMANTIC_MODEL
+        )
+        if model.get("displayName") and model.get("id")
+    }
+
+    warnings: list[str] = []
+    for model in skipped:
+        name = model["displayName"]
+        target_id = target_models.get(name)
+        if target_id:
+            ctx.id_map[model["id"]] = target_id
+            continue
+        warnings.append(
+            f"The default semantic model for '{name}' has not appeared in the new workspace "
+            "yet, so anything reading it could not be repointed. It is created by Fabric "
+            "alongside its lakehouse or warehouse; check the new workspace and rebind by hand."
+        )
+
+    logger.info("Matched %s default semantic model(s)", len(skipped) - len(warnings))
+    return warnings
+
+
 def _migrate_orchestration(ctx: _Context) -> None:
+
     """Recreate data pipelines, Copy Jobs, and Apache Airflow jobs.
 
     These run last of the content phases because they orchestrate everything else: a pipeline

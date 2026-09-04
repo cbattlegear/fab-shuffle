@@ -15,6 +15,7 @@ Because the rewrite is driven by the accumulated source-to-target id map, these 
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -362,7 +363,7 @@ def describe_failure(
     name: str,
     error: FabricError,
     *,
-    needed: Sequence[str] = (),
+    unreachable: Sequence[str] = (),
 ) -> str:
     """Explain why one item could not be created.
 
@@ -371,19 +372,21 @@ def describe_failure(
     service's own error code, which says far more than a status ever does, so it is always
     repeated back rather than being flattened into "check its data source bindings".
 
-    ``needed`` names items in this workspace the definition referred to that did not migrate.
-    Where Fabric says only "UnknownError", that is usually the whole story.
+    ``unreachable`` names workspaces the definition referred to that this service principal
+    cannot read. Where Fabric says only "UnknownError", that is usually the whole story.
     """
     code = getattr(error, "error_code", "")
     detail = getattr(error, "detail", "")
+    said = " ".join(part for part in (code, detail) if part).strip()
 
-    if needed:
-        missing = ", ".join(needed)
+    if unreachable:
+        which = ", ".join(unreachable)
         return (
-            f"{item_type} '{name}' was not migrated: it refers to {missing}, which did not "
-            "migrate, so the reference points at the new workspace where they do not exist. "
-            "Migrate those first, then recreate it."
-            + (f" The service said: {' '.join(p for p in (code, detail) if p)}." if code or detail else "")
+            f"{item_type} '{name}' was not migrated: it refers to workspace {which}, which "
+            "this service principal cannot read. Either it was deleted or access was never "
+            "granted, and Fabric will not create an item pointing at a workspace it cannot "
+            "resolve. Repoint it in the source workspace, or grant access, then migrate again."
+            + (f" The service said: {said}." if said else "")
         )
 
     if code == "DataSourcesValidationError":
@@ -400,7 +403,6 @@ def describe_failure(
         )
 
     status = f" (HTTP {error.status_code})" if isinstance(error, FabricApiError) else ""
-    said = " ".join(part for part in (code, detail) if part).strip()
     if said:
         return f"{item_type} '{name}' was not migrated{status}: {said}"
     return (
@@ -498,6 +500,66 @@ def _definition_text(parts: Iterable[Mapping[str, Any]]) -> str:
     return "\n".join(chunks)
 
 
+WORKSPACE_KEYS = frozenset(
+    {"workspaceid", "sourceworkspaceid", "targetworkspaceid", "workspaceobjectid"}
+)
+
+
+def referenced_workspaces(parts: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Every workspace a definition names, read from the keys Fabric uses for one.
+
+    Read structurally rather than by hunting for GUIDs, so an item id or an internal
+    identifier that happens to look like one is not mistaken for a workspace.
+    """
+    found: set[str] = set()
+    for candidate in parts:
+        payload = candidate.get("payload") or ""
+        if not payload or not is_text_part(candidate.get("path", "")):
+            continue
+        try:
+            document = json.loads(decode_payload(payload).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        _collect_workspaces(document, found)
+    return found
+
+
+def _collect_workspaces(node: Any, found: set[str]) -> None:
+    if isinstance(node, list):
+        for child in node:
+            _collect_workspaces(child, found)
+        return
+    if not isinstance(node, Mapping):
+        return
+    for key, value in node.items():
+        if key.lower() in WORKSPACE_KEYS and isinstance(value, str) and value:
+            found.add(value)
+        else:
+            _collect_workspaces(value, found)
+
+
+def unreachable_workspaces(
+    client: FabricClient,
+    workspace_ids: Iterable[str],
+) -> list[str]:
+    """Which of these workspaces this service principal cannot read.
+
+    A workspace that has been deleted, or that we were never given access to, cannot be
+    referenced by a new item: Fabric refuses the create and describes it only as
+    "UnknownError". Asking directly turns that into something an operator can act on.
+    """
+    unreachable: list[str] = []
+    for workspace_id in sorted(workspace_ids):
+        try:
+            client.get(f"workspaces/{workspace_id}")
+        except FabricApiError as error:
+            if error.status_code in (401, 403, 404):
+                unreachable.append(workspace_id)
+        except FabricError:
+            continue
+    return unreachable
+
+
 def migrate_items(
     client: FabricClient,
     *,
@@ -550,9 +612,10 @@ def migrate_items(
             )
             continue
         except FabricError as error:
-            # Fabric answers some rejections with nothing but "UnknownError", which leaves
-            # the operator and us with nowhere to go. The payload it refused is the only
-            # other evidence there is, so it goes to the log rather than being lost.
+            # Fabric answers some rejections with nothing but "UnknownError". The definition
+            # it refused is the only other evidence, so it goes to the log, and its foreign
+            # workspace references are checked: a workspace that has been deleted cannot be
+            # named by a new item, and that is a fact worth stating rather than a mystery.
             sent = _rewritten_definition(client, source_workspace_id, item, item_type, id_map)
             logger.warning(
                 "%s '%s' was rejected: %s\nDefinition sent:\n%s",
@@ -561,7 +624,11 @@ def migrate_items(
                 error,
                 _readable(sent),
             )
-            warnings.append(describe_failure(item_type, str(name), error))
+            gone = unreachable_workspaces(
+                client,
+                referenced_workspaces(sent) - {source_workspace_id, target_workspace_id},
+            )
+            warnings.append(describe_failure(item_type, str(name), error, unreachable=gone))
             continue
 
         id_map[result.source_id] = result.target_id
