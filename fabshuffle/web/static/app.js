@@ -10,6 +10,7 @@ const state = {
   preview: null,
   runId: null,
   events: null,
+  readiness: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -17,7 +18,7 @@ const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
 // ------------------------------------------------------------------ plumbing
 
-async function api(path, { method = "GET", body } = {}) {
+async function api(path, { method = "GET", body, signal, download = false } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (state.sessionId) headers["X-Fab-Shuffle-Session"] = state.sessionId;
 
@@ -25,8 +26,10 @@ async function api(path, { method = "GET", body } = {}) {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
 
+  if (download && response.ok) return response.blob();
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
@@ -127,6 +130,7 @@ $("#sign-out").addEventListener("click", async () => {
     /* signing out locally is enough */
   }
   if (state.events) state.events.close();
+  resetReadiness();
   Object.assign(state, {
     sessionId: null, capacity: null, workspace: null, workspaces: [],
     preview: null, runId: null, events: null,
@@ -651,19 +655,28 @@ const RUN_MESSAGES = {
 
 function watchRun(runId) {
   if (state.events) state.events.close();
+  state.runId = runId;
+  resetReadiness(runId);
   const url = `/api/runs/${runId}/events?session_id=${encodeURIComponent(state.sessionId)}`;
   const events = new EventSource(url);
   state.events = events;
 
-  events.onmessage = (message) => renderRun(JSON.parse(message.data));
+  events.onmessage = (message) => {
+    if (state.events === events) renderRun(JSON.parse(message.data));
+  };
   events.onerror = () => {
     events.close();
+    if (state.events !== events) return;
     // The stream ends when the run finishes; fall back to a single fetch for the final state.
-    api(`/api/runs/${runId}`).then(renderRun).catch(() => {});
+    api(`/api/runs/${runId}`).then((run) => {
+      if (state.events === events) renderRun(run);
+    }).catch(() => {});
   };
 }
 
 function renderRun(run) {
+  if (run.id && run.id !== state.runId) return;
+  observeReadiness(run);
   const banner = $("#run-banner");
   banner.className = `run-banner ${run.status}`;
   const spinner = run.status === "running" ? '<span class="spin">◐</span> ' : "";
@@ -717,6 +730,321 @@ function renderRun(run) {
   $("#retry-run").hidden = !finished || !run.targetWorkspace || !leftSomething;
 }
 
+// ---------------------------------------------------------- cutover readiness
+
+const READINESS_LABELS = { ready: "Ready", needs_attention: "Needs attention", unknown: "Unknown" };
+const READINESS_PAGE_SIZE = 25;
+const READINESS_REFRESH_MS = 500;
+
+function readinessState(value) {
+  return Object.hasOwn(READINESS_LABELS, value) ? value : "unknown";
+}
+
+function resetReadiness(runId = null) {
+  const previous = state.readiness;
+  if (previous) {
+    clearTimeout(previous.timer);
+    previous.controller?.abort();
+    previous.downloadController?.abort();
+  }
+  state.readiness = runId ? {
+    runId, report: null, revision: undefined, runStatus: null, version: 0,
+    pending: false, urgent: false, timer: null, controller: null,
+    lastFetch: Date.now(), error: "", downloadError: "", downloadController: null,
+    page: 1, filter: "all", search: "",
+  } : null;
+  $("#readiness-filter").value = "all";
+  $("#readiness-search").value = "";
+  $("#readiness-items").replaceChildren();
+  $("#readiness-limits").replaceChildren();
+  $("#readiness-controls").hidden = true;
+  $("#readiness-pagination").hidden = true;
+  $("#readiness-results").textContent = "";
+  $("#readiness-empty").hidden = true;
+  renderReadinessStatus();
+  if (state.readiness) scheduleReadiness();
+}
+
+function observeReadiness(run) {
+  const current = state.readiness;
+  if (!current || current.runId !== state.runId) return;
+  const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
+  const finishedNow = terminal && current.runStatus !== run.status;
+  const changed = current.runStatus === null || current.revision !== run.readinessRevision;
+  current.runStatus = run.status;
+  current.revision = run.readinessRevision;
+  if (changed || finishedNow) {
+    current.version += 1;
+    scheduleReadiness(finishedNow);
+  }
+}
+
+function scheduleReadiness(immediate = false) {
+  const current = state.readiness;
+  if (!current) return;
+  current.pending = true;
+  current.urgent ||= immediate;
+  if (immediate) {
+    clearTimeout(current.timer);
+    current.timer = null;
+  }
+  // Serialize requests. A revision received mid-fetch invalidates that response and
+  // queues one trailing fetch; the final snapshot bypasses the normal throttle.
+  if (!current.controller && current.timer === null) {
+    const delay = current.urgent ? 0 : Math.max(0, READINESS_REFRESH_MS - (Date.now() - current.lastFetch));
+    current.timer = setTimeout(() => fetchReadiness(current), delay);
+  }
+  renderReadinessStatus();
+}
+
+async function fetchReadiness(current) {
+  if (state.readiness !== current || state.runId !== current.runId) return;
+  current.timer = null;
+  current.pending = false;
+  current.urgent = false;
+  current.lastFetch = Date.now();
+  current.error = "";
+  const version = current.version;
+  current.controller = new AbortController();
+  renderReadinessStatus();
+  try {
+    const report = await api(`/api/runs/${encodeURIComponent(current.runId)}/readiness`, {
+      signal: current.controller.signal,
+    });
+    if (state.readiness !== current || version !== current.version) return;
+    if (report.schemaVersion !== 1 || report.runId !== current.runId || !Array.isArray(report.items)) {
+      throw new Error("The readiness report has an unsupported format. Reload the application and retry.");
+    }
+    current.report = report;
+    renderReadinessItems();
+    $("#readiness-limits").replaceChildren();
+    (report.limits || []).forEach((limit) => {
+      $("#readiness-limits").appendChild(readinessElement("li", limit));
+    });
+  } catch (error) {
+    if (state.readiness === current && version === current.version && error.name !== "AbortError") {
+      current.error = error.message;
+    }
+  } finally {
+    if (state.readiness === current) {
+      current.controller = null;
+      if (current.pending) scheduleReadiness(current.urgent);
+      renderReadinessStatus();
+    }
+  }
+}
+
+function renderReadinessStatus() {
+  const current = state.readiness;
+  $("#cutover-readiness").hidden = !current;
+  $(".readiness-jump").hidden = !current;
+  if (!current) return;
+  const report = current.report;
+  const loading = Boolean(current.controller || current.pending);
+  const reportedState = current.error ? "unknown" : readinessState(report?.state);
+  const label = READINESS_LABELS[reportedState];
+  const overall = $("#readiness-overall");
+  overall.textContent = report || current.error ? label : "Not yet assessed";
+  overall.className = `readiness-state ${reportedState}`;
+  $("#readiness-jump").textContent = `Cutover readiness: ${report || current.error ? label : "loading…"}`;
+  $("#readiness-counts").textContent = report
+    ? `${report.counts?.ready ?? 0} ready · ${report.counts?.needs_attention ?? 0} need attention · ` +
+      `${report.counts?.unknown ?? 0} unknown${current.error ? " (last loaded snapshot)" : ""}`
+    : "";
+  $("#readiness-status").textContent = current.error
+    ? (report ? "The latest report could not be loaded. Items below are from the last loaded snapshot."
+      : "Readiness could not be established. Retry loading the report.")
+    : loading
+      ? (report ? "Updating readiness… Showing the last loaded snapshot." : "Loading readiness report…")
+      : ["pending", "running"].includes(current.runStatus)
+        ? "The migration is still running. Readiness will update as evidence is recorded."
+        : "Readiness report loaded.";
+  $("#readiness-error").textContent = current.error;
+  $("#readiness-error").hidden = !current.error;
+  $("#readiness-retry").hidden = !current.error;
+  $("#readiness-retry").disabled = loading;
+  $("#readiness-loading").hidden = Boolean(report) || !loading;
+  $("#readiness-scope").hidden = !(report?.limits || []).length;
+  $("#readiness-export").disabled = !report || Boolean(current.downloadController);
+  $("#readiness-export").textContent = current.downloadController
+    ? "Exporting…" : "Export full report (JSON)";
+  $("#readiness-download-error").textContent = current.downloadError;
+  $("#readiness-download-error").hidden = !current.downloadError;
+}
+
+function readinessElement(tag, text, className) {
+  const element = document.createElement(tag);
+  if (text !== undefined && text !== null) element.textContent = String(text);
+  if (className) element.className = className;
+  return element;
+}
+
+function readinessTextList(parent, heading, entries) {
+  if (!entries?.length) return;
+  if (heading) parent.appendChild(readinessElement("h5", heading));
+  const list = readinessElement("ul", null, "readiness-text-list");
+  entries.forEach((entry) => list.appendChild(readinessElement("li", entry)));
+  parent.appendChild(list);
+}
+
+function readinessItem(item, key, open) {
+  const itemState = readinessState(item.state);
+  const row = readinessElement("li", null, "readiness-item");
+  row.dataset.readinessKey = key;
+  const header = readinessElement("div", null, "readiness-item-header");
+  const identity = readinessElement("div");
+  identity.appendChild(readinessElement("h4", item.name || item.sourceId || "Unnamed item"));
+  const disposition = { created: "Created", adopted: "Adopted", refreshed: "Refreshed", unknown: "Unknown disposition" };
+  const dispositionLabel = Object.hasOwn(disposition, item.disposition)
+    ? disposition[item.disposition] : disposition.unknown;
+  identity.appendChild(readinessElement("p", `${item.itemType || "Unknown type"} · ${dispositionLabel}`, "hint"));
+  header.appendChild(identity);
+  header.appendChild(readinessElement("span", READINESS_LABELS[itemState], `readiness-state ${itemState}`));
+  row.appendChild(header);
+  const fallback = {
+    ready: "Recorded checks passed. Review the report scope before cutover.",
+    needs_attention: "Outstanding work needs review before cutover.",
+    unknown: "Readiness has not been established for this item.",
+  };
+  readinessTextList(row, null, item.reasons?.length ? item.reasons : [fallback[itemState]]);
+  readinessTextList(row, "Operator actions", item.actions?.length ? item.actions
+    : itemState !== "ready" ? ["Verify this item in the target workspace before cutover."] : []);
+  readinessTextList(row, "Unresolved references", item.unresolvedReferences);
+
+  const details = readinessElement("details", null, "readiness-evidence");
+  details.open = open;
+  const summary = readinessElement("summary", "Evidence and references");
+  summary.setAttribute("aria-label", `Evidence and references for ${item.name || item.sourceId || "unnamed item"}`);
+  details.appendChild(summary);
+  const identifiers = readinessElement("dl", null, "readiness-identifiers");
+  [
+    ["Source item", item.sourceId], ["Target item", item.targetId],
+    ["Source workspace", item.sourceWorkspaceId], ["Target workspace", item.targetWorkspaceId],
+  ].forEach(([name, value]) => {
+    identifiers.appendChild(readinessElement("dt", name));
+    identifiers.appendChild(readinessElement("dd", value || "Not recorded"));
+  });
+  details.appendChild(identifiers);
+  const steps = readinessElement("ul", null, "readiness-evidence-steps");
+  (item.steps || []).forEach((step) => {
+    const entry = readinessElement("li");
+    const labels = { succeeded: "Succeeded", failed: "Failed", skipped: "Skipped", unknown: "Unknown" };
+    const stepState = Object.hasOwn(labels, step.state) ? labels[step.state] : labels.unknown;
+    entry.appendChild(readinessElement("strong", `${step.step || "Unspecified step"} · ${stepState}`));
+    [
+      ["Reason", step.reason], ["Action", step.action], ["Error code", step.errorCode],
+      ["Service message", step.message], ["Attempt", step.attemptId], ["Target item", step.targetId],
+    ].forEach(([name, value]) => {
+      if (value) entry.appendChild(readinessElement("p", `${name}: ${value}`));
+    });
+    steps.appendChild(entry);
+  });
+  details.appendChild(steps.children.length ? steps
+    : readinessElement("p", "No step evidence recorded.", "hint"));
+  row.appendChild(details);
+  return row;
+}
+
+function renderReadinessItems() {
+  const current = state.readiness;
+  if (!current?.report) return;
+  const list = $("#readiness-items");
+  const focusedRow = list.contains(document.activeElement)
+    ? document.activeElement.closest("[data-readiness-key]")?.dataset.readinessKey : null;
+  const openKeys = new Set(Array.from(list.children)
+    .filter((row) => row.querySelector("details")?.open).map((row) => row.dataset.readinessKey));
+  const needle = current.search.trim().toLocaleLowerCase();
+  const items = current.report.items.map((item, index) => ({
+    item, key: item.sourceId ? `source:${item.sourceId}` : item.targetId ? `target:${item.targetId}` : `index:${index}`,
+  })).filter(({ item }) => {
+    if (current.filter !== "all" && readinessState(item.state) !== current.filter) return false;
+    const searchable = [
+      item.name, item.itemType, item.sourceId, item.targetId, item.sourceWorkspaceId, item.targetWorkspaceId,
+      ...(item.reasons || []), ...(item.actions || []), ...(item.unresolvedReferences || []),
+    ];
+    return !needle || searchable.some((value) => String(value || "").toLocaleLowerCase().includes(needle));
+  });
+  const pages = Math.max(1, Math.ceil(items.length / READINESS_PAGE_SIZE));
+  current.page = Math.max(1, Math.min(current.page, pages));
+  const start = (current.page - 1) * READINESS_PAGE_SIZE;
+  const visible = items.slice(start, start + READINESS_PAGE_SIZE);
+  list.replaceChildren(...visible.map(({ item, key }) => readinessItem(item, key, openKeys.has(key))));
+  $("#readiness-controls").hidden = !current.report.items.length;
+  $("#readiness-results").textContent = items.length
+    ? `Showing ${start + 1}–${Math.min(start + READINESS_PAGE_SIZE, items.length)} of ${items.length} ` +
+      `items${items.length !== current.report.items.length ? ` (${current.report.items.length} total)` : ""}`
+    : "0 items shown";
+  $("#readiness-empty").hidden = Boolean(items.length);
+  $("#readiness-empty").textContent = current.report.items.length
+    ? "No items match these filters. Choose All states or change your search."
+    : "No item evidence is recorded for this run. Review the report scope and validate the target before cutover.";
+  $("#readiness-pagination").hidden = pages === 1;
+  $("#readiness-page").textContent = `Page ${current.page} of ${pages}`;
+  $("#readiness-previous").disabled = current.page === 1;
+  $("#readiness-next").disabled = current.page === pages;
+  if (focusedRow) {
+    const replacement = Array.from(list.children).find((row) => row.dataset.readinessKey === focusedRow);
+    (replacement?.querySelector("summary") || $("#readiness-results")).focus({ preventScroll: true });
+  }
+}
+
+$("#readiness-filter").addEventListener("change", (event) => {
+  if (!state.readiness) return;
+  state.readiness.filter = event.target.value;
+  state.readiness.page = 1;
+  renderReadinessItems();
+});
+
+$("#readiness-search").addEventListener("input", (event) => {
+  if (!state.readiness) return;
+  state.readiness.search = event.target.value;
+  state.readiness.page = 1;
+  renderReadinessItems();
+});
+
+[["#readiness-previous", -1], ["#readiness-next", 1]].forEach(([selector, direction]) => {
+  $(selector).addEventListener("click", () => {
+    if (!state.readiness) return;
+    state.readiness.page += direction;
+    renderReadinessItems();
+    $("#readiness-results").focus({ preventScroll: true });
+  });
+});
+
+$("#readiness-retry").addEventListener("click", () => scheduleReadiness(true));
+
+$("#readiness-export").addEventListener("click", async () => {
+  const current = state.readiness;
+  if (!current?.report || current.downloadController) return;
+  current.downloadController = new AbortController();
+  current.downloadError = "";
+  renderReadinessStatus();
+  try {
+    const blob = await api(`/api/runs/${encodeURIComponent(current.runId)}/readiness?download=true`, {
+      download: true, signal: current.downloadController.signal,
+    });
+    if (state.readiness !== current) return;
+    const url = URL.createObjectURL(blob);
+    const link = readinessElement("a");
+    link.href = url;
+    link.download = `fab-shuffle-readiness-${current.runId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    if (state.readiness === current && error.name !== "AbortError") {
+      current.downloadError = `Export failed: ${error.message} Try Export full report again.`;
+    }
+  } finally {
+    if (state.readiness === current) {
+      current.downloadController = null;
+      renderReadinessStatus();
+    }
+  }
+});
+
 $("#retry-run").addEventListener("click", async () => {
   const button = $("#retry-run");
   busy(button, true, "Starting…");
@@ -761,6 +1089,7 @@ $("#cleanup-run").addEventListener("click", async () => {
 
 $("#start-over").addEventListener("click", () => {
   if (state.events) state.events.close();
+  resetReadiness();
   state.runId = null;
   state.events = null;
   state.workspace = null;

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import queue
+import re
 import secrets
 import threading
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,7 @@ from fabshuffle.fabric.support import (
     assess_workspace,
     supports_large_semantic_models,
 )
+from fabshuffle.lifecycle import ItemOutcome, contract_for, readiness_report
 from fabshuffle.orchestrator import (
     MigrationPlan,
     _plan_record,
@@ -407,6 +409,16 @@ def create_app() -> FastAPI:
     async def get_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:
         return _require_run(run_id).snapshot()
 
+    @app.get("/api/runs/{run_id}/readiness")
+    async def get_readiness(
+        run_id: str, download: bool = False, _: Session = Depends(require_session),
+    ) -> JSONResponse:
+        report = await asyncio.to_thread(_readiness, run_id)
+        headers = {"Cache-Control": "no-store"}
+        if download:
+            headers["Content-Disposition"] = f'attachment; filename="cutover-{run_id}.json"'
+        return JSONResponse(report, headers=headers)
+
     @app.get("/api/resumable")
     async def resumable(_: Session = Depends(require_session)) -> dict[str, Any]:
         """Runs that stopped without finishing, from their journals on disk.
@@ -511,6 +523,44 @@ def create_app() -> FastAPI:
 
 
 # ------------------------------------------------------------------- utilities
+
+
+def _readiness(run_id: str) -> dict[str, Any]:
+    # Validate even for in-memory runs: the id is also used in the download filename.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid run ID")
+    path = SETTINGS.journal_for(run_id)
+    run = REGISTRY.get(run_id)
+    if run is not None:
+        return readiness_report(
+            run.lifecycle.snapshot(), run_id=run_id, lineage_id=run.lineage_id,
+            run_status=run.status.value, inventory_complete=run.inventory_complete,
+            attempts=run.readiness_attempts,
+        )
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No run or saved journal for that run")
+    replay = journal.read(path)
+    outcomes = dict(replay.outcomes)
+    for source, item in replay.items.items():
+        outcomes.setdefault(source, ItemOutcome(
+            source, item["name"], item["type"],
+            str(replay.plan.get("source_workspace_id") or ""), replay.target_workspace_id,
+            item["target"], required=list(contract_for(item["type"]).required),
+        ))
+    return readiness_report(
+        outcomes, run_id=run_id, lineage_id=replay.lineage_id,
+        run_status=replay.status or "interrupted",
+        inventory_complete=replay.inventory_complete and not replay.damaged_lines,
+        attempts=_readiness_attempts(replay),
+    )
+
+
+def _readiness_attempts(replay: journal.Replay | None) -> list[dict[str, Any]]:
+    # Run errors can echo arbitrary inputs. Per-item evidence contains only sanitized errors.
+    return [
+        {key: attempt.get(key, "") for key in ("run_id", "status", "last_phase")}
+        for attempt in replay.attempts
+    ] if replay else []
 
 
 def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:

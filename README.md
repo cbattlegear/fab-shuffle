@@ -133,6 +133,41 @@ settings are only patched where they actually differ from the new workspace's ow
 so a workspace that never customised them is left alone and never trips the capacity's node
 count limits.
 
+### Cutover readiness (advisory)
+
+The progress/results screen separates **migration completion** from **cutover readiness**.
+A successful run can still leave data uncopied, dependencies unresolved, or activation work
+for the operator. Readiness never changes the run's success, cancellation or failure status.
+
+| State | Meaning |
+| --- | --- |
+| Ready | Every required migration step has recorded success for this target incarnation. |
+| Needs attention | Recorded failures, skipped work, unresolved dependencies or manual activation remain. |
+| Unknown | Evidence is missing, stale or insufficient, including legacy journals. |
+
+Filter or search the per-item report to see source/target identities, created/adopted/refreshed
+dispositions, step evidence and operator actions. Data and file options skipped at admission
+remain visible. An explicitly empty table/file inventory is different from an unmeasured copy.
+Environment publishing, mirroring startup, Activator rule enablement, catalog auto-sync and
+graph refresh remain operator tasks, not side effects of generating a report.
+
+**Ready is not permission to delete the source.** This report does not perform row-count/hash
+reconciliation, live execution or activation checks, permission parity, external dependency
+availability checks, or source-change consistency checks. Semantic model data/refresh readiness
+is unknown until checked outside this tool. Evidence describes migration-time observations,
+not the target's current live state.
+
+**Export JSON** downloads the full report, independently of visible filters, without external
+services. The same authenticated snapshot is available at
+`GET /api/runs/{run_id}/readiness`; add `?download=true` for an attachment and use the existing
+`X-Fab-Shuffle-Session` header. Saved journals support this endpoint after a process restart.
+No definition payloads or credentials are included. Retention follows the run journals.
+
+The journal retains target-bound evidence and attempt identities. Recovery invalidates
+readiness when a target or dependency changes, preserving older evidence as history instead
+of promoting it into the recreated item. Recovery checkpoints still decide what is safe to
+repeat; they are not a substitute for missing lifecycle evidence.
+
 ### Dependency order
 
 Phase order is load bearing. Each phase records the source-to-target ids it created in an id

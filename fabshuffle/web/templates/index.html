@@ -185,6 +185,7 @@
     <section class="panel" data-stage="progress" hidden>
       <h2>Migration progress</h2>
       <div id="run-banner" class="run-banner"></div>
+      <p class="readiness-jump" hidden><a id="readiness-jump" href="#cutover-readiness">Review cutover readiness</a></p>
       <ol id="step-list" class="steps"></ol>
       <div id="run-warnings" class="warnings" hidden>
         <h3>Warnings</h3>
@@ -196,6 +197,51 @@
         <button class="secondary" id="retry-run" hidden>Retry what did not migrate</button>
         <button class="primary" id="start-over" hidden>Start another migration</button>
       </div>
+
+      <section id="cutover-readiness" class="readiness" aria-labelledby="readiness-title" tabindex="-1" hidden>
+        <div class="readiness-heading">
+          <h3 id="readiness-title">Cutover readiness</h3>
+          <button type="button" class="secondary" id="readiness-export" disabled>Export full report (JSON)</button>
+        </div>
+        <p class="hint readiness-advisory">
+          Migration completion is not cutover readiness. This report reflects recorded migration
+          evidence, not a live health check. Validate the target before switching traffic or deleting the source.
+        </p>
+        <div class="readiness-summary">
+          <strong id="readiness-overall" class="readiness-state unknown">Not yet assessed</strong>
+          <span id="readiness-counts"></span>
+        </div>
+        <p id="readiness-status" class="hint" role="status" aria-live="polite"></p>
+        <p id="readiness-error" class="readiness-error" role="alert" hidden></p>
+        <button type="button" class="secondary" id="readiness-retry" hidden>Retry loading report</button>
+        <p id="readiness-download-error" class="readiness-error" role="alert" hidden></p>
+        <div id="readiness-loading" class="readiness-loading" aria-hidden="true" hidden><span></span><span></span></div>
+        <details id="readiness-scope" class="readiness-scope" hidden>
+          <summary>What this report does and does not check</summary>
+          <ul id="readiness-limits"></ul>
+        </details>
+        <div id="readiness-controls" class="readiness-controls" hidden>
+          <label for="readiness-filter">Readiness state
+            <select id="readiness-filter">
+              <option value="all">All states</option>
+              <option value="needs_attention">Needs attention</option>
+              <option value="unknown">Unknown</option>
+              <option value="ready">Ready</option>
+            </select>
+          </label>
+          <label for="readiness-search">Search items
+            <input id="readiness-search" type="search" placeholder="Name, type, ID, reason or action" />
+          </label>
+        </div>
+        <p id="readiness-results" class="hint readiness-results" tabindex="-1" role="status" aria-live="polite"></p>
+        <p id="readiness-empty" class="hint" hidden></p>
+        <ul id="readiness-items" class="readiness-items" aria-label="Item readiness"></ul>
+        <nav id="readiness-pagination" class="readiness-pagination" aria-label="Readiness result pages" hidden>
+          <button type="button" class="secondary" id="readiness-previous">Previous</button>
+          <span id="readiness-page"></span>
+          <button type="button" class="secondary" id="readiness-next">Next</button>
+        </nav>
+      </section>
     </section>
   </main>
 
