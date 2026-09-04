@@ -122,6 +122,44 @@ def workspace_capacity_sku(client: FabricClient, workspace: Mapping[str, Any]) -
         return ""
 
 
+def unreadable_source_capacity(client: FabricClient, workspace: Mapping[str, Any]) -> str:
+    """The workspace's own capacity id when that capacity cannot be read, otherwise ``""``.
+
+    Reading a capacity that has been deleted answers ``401 PowerBINotAuthorizedException`` —
+    the same answer a capacity somebody else owns gives — so a deleted capacity and an
+    inaccessible one cannot be told apart here, and this deliberately does not try.
+    """
+    capacity_id = workspace.get("capacityId")
+    if not capacity_id:
+        return ""
+    try:
+        get_capacity(client, capacity_id)
+    except FabricApiError:
+        return str(capacity_id)
+    return ""
+
+
+def stranded_on_deleted_capacity(workspace: Mapping[str, Any]) -> bool:
+    """Whether a workspace claims a finished capacity assignment without naming the capacity.
+
+    ``GET /workspaces/{id}`` returns ``capacityId``, ``capacityRegion`` and
+    ``oneLakeEndpoints`` for a workspace on a live capacity, and drops all three — while
+    still reporting ``capacityAssignmentProgress: "Completed"`` — once that capacity has been
+    deleted. ``GET /admin/workspaces/{id}`` still returns the dead id, so the assignment is
+    real; it is the capacity behind it that has gone.
+
+    Verified against a tenant whose trial capacity had expired: three workspaces reported
+    ``Completed`` with no ``capacityId``, and ``assignToCapacity`` answered
+    ``400 AssignWorkspaceToCapacityFailed`` for every one of them.
+
+    A workspace that has never been assigned reports ``capacityAssignmentProgress`` of
+    ``"NotStarted"`` or nothing at all, so it is not caught here.
+    """
+    if workspace.get("capacityId"):
+        return False
+    return str(workspace.get("capacityAssignmentProgress") or "") == "Completed"
+
+
 # ------------------------------------------------------------------- workspaces
 
 

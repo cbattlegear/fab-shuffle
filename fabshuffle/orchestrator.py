@@ -158,6 +158,10 @@ class MigrationPlan:
     capacity_sku: str = ""
     strategy: Strategy = Strategy.REBUILD
     capacity_warning: str | None = None
+    # The source workspace reports a finished capacity assignment but names no capacity, so
+    # the capacity behind it has been deleted. Recorded at plan time because the reassign
+    # path needs it to explain a failed assignment.
+    source_capacity_deleted: bool = False
     include_files: bool = True
     include_data: bool = True
     copy_permissions: bool = True
@@ -491,11 +495,24 @@ def _reassign_capacity(ctx: _Context) -> None:
         ctx.run.update_step(step, f"Assigning workspace to '{ctx.plan.capacity_name}'")
         try:
             workspaces.assign_to_capacity(ctx.client, workspace_id, ctx.plan.capacity_id)
-        except Exception:
+        except Exception as error:
             ctx.run.update_step(step, "Assignment failed, restoring large semantic model storage")
             warnings.extend(_restore_large_models(ctx, pbi, converted))
             ctx.warnings.extend(warnings)
             ctx.run.finish_step(step, StepStatus.FAILED, "Capacity assignment failed", warnings)
+            if ctx.plan.source_capacity_deleted:
+                # Fabric's message names the target capacity and says only that the
+                # assignment failed, which sends the operator looking at the wrong end of the
+                # move. The service's own words are kept first; this is added alongside.
+                raise RuntimeError(
+                    f"{error}\n\n"
+                    f"'{ctx.plan.source_workspace_name}' is still assigned to a capacity that "
+                    "has been deleted, so Fabric will not move it to another one. Restore a "
+                    "capacity in the region the workspace was created in and assign the "
+                    "workspace to it, then run this migration again. If that region's capacity "
+                    "cannot be restored, the content has to be recreated in a new workspace "
+                    "instead."
+                ) from error
             raise
 
         if converted:
@@ -2943,6 +2960,7 @@ def build_plan(
         ),
         strategy=strategy,
         capacity_warning=capacity_warning,
+        source_capacity_deleted=workspaces.stranded_on_deleted_capacity(workspace),
         include_files=include_files,
         include_data=include_data,
         copy_permissions=copy_permissions,
