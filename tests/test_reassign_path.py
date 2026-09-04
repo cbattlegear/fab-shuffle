@@ -154,3 +154,41 @@ def test_failed_assignment_restores_large_storage(monkeypatch):
 
     assert run.status == RunStatus.FAILED
     assert fake.conversions == [("Big", powerbi.SMALL), ("Big", powerbi.LARGE)]
+
+
+def test_a_stranded_workspace_explains_why_the_assignment_was_refused(monkeypatch):
+    """Fabric blames the target capacity, which sends the operator to the wrong end."""
+    fake = FakePowerBi([small("A")])
+    service_error = (
+        "POST .../assignToCapacity failed with HTTP 400: "
+        '{"errorCode":"AssignWorkspaceToCapacityFailed",'
+        '"message":"Workspace capacity assignment was failed"}'
+    )
+
+    def explode(client, workspace_id, capacity_id):
+        raise RuntimeError(service_error)
+
+    monkeypatch.setattr(orchestrator.workspaces, "assign_to_capacity", explode)
+    plan = make_plan()
+    plan.source_capacity_deleted = True
+    run = run_reassign(monkeypatch, fake, plan=plan)
+
+    assert run.status == RunStatus.FAILED
+    # What the service said is kept, and the interpretation is added alongside it.
+    assert "AssignWorkspaceToCapacityFailed" in run.error
+    assert "capacity that has been deleted" in run.error
+    assert "Restore a capacity in the region" in run.error
+
+
+def test_an_ordinary_assignment_failure_is_not_blamed_on_a_deleted_capacity(monkeypatch):
+    fake = FakePowerBi([small("A")])
+
+    def explode(client, workspace_id, capacity_id):
+        raise RuntimeError("capacity is full")
+
+    monkeypatch.setattr(orchestrator.workspaces, "assign_to_capacity", explode)
+    run = run_reassign(monkeypatch, fake, plan=make_plan())
+
+    assert run.status == RunStatus.FAILED
+    assert "capacity is full" in run.error
+    assert "deleted" not in run.error
