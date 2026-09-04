@@ -17,7 +17,11 @@ CASE_SENSITIVE_COLLATION = "Latin1_General_100_BIN2_UTF8"
 # A metadata refresh is flaky, and a table it does not sync is invisible on the endpoint
 # until something built on it fails to deploy. Cheap to ask again, expensive to miss.
 REFRESH_ATTEMPTS = 3
+# A table that reports Failure may recover, so it is worth a real pause. A table that reports
+# NotRun is usually just current already, which is the normal steady state of a healthy
+# endpoint, so asking again costs a moment rather than most of a minute.
 REFRESH_WAIT_SECONDS = 20
+REFRESH_NOT_RUN_WAIT_SECONDS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,12 +195,13 @@ def refresh_sql_endpoint_metadata(
         if not pending:
             return result
         if attempt < attempts:
-            if on_progress:
+            failed = [table for table in pending if table.get("status") == "Failure"]
+            if failed and on_progress:
                 on_progress(
-                    f"{len(pending)} table(s) have not synced onto the SQL endpoint, "
+                    f"{len(failed)} table(s) failed to sync onto the SQL endpoint, "
                     f"refreshing again (attempt {attempt} of {attempts})"
                 )
-            time.sleep(REFRESH_WAIT_SECONDS)
+            time.sleep(REFRESH_WAIT_SECONDS if failed else REFRESH_NOT_RUN_WAIT_SECONDS)
     return result
 
 
@@ -233,34 +238,31 @@ def unsynced_tables(response: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def sync_failures(response: Mapping[str, Any]) -> list[str]:
-    """What to tell the operator about tables that never synced, after the last attempt.
+    """Tables the endpoint could not sync, once the retries are done.
 
     A table that is not on the endpoint is invisible, so whatever reads it fails to deploy
     with an error naming the reader: ``CREATE VIEW v AS SELECT * FROM t`` comes back as
     ``42S02`` and nothing anywhere points at ``t``.
 
-    A failure and a table that never ran are reported differently, because only the first
-    comes with a reason and the second may simply have been up to date already.
+    Only ``Failure`` is reported. ``NotRun`` is worth another attempt, because the operation
+    genuinely did not run, but it is also the ordinary answer for a table that was already
+    current — which on a healthy endpoint is most of them. Reporting it named nearly every
+    table in the workspace and buried the two lines that mattered.
     """
     messages: list[str] = []
     for table in unsynced_tables(response):
+        if table.get("status") != "Failure":
+            continue
+        error = table.get("error") or {}
+        said = " ".join(
+            part for part in (error.get("errorCode"), error.get("message")) if part
+        ).strip()
         name = table.get("tableName") or "an unnamed table"
-        if table.get("status") == "Failure":
-            error = table.get("error") or {}
-            said = " ".join(
-                part for part in (error.get("errorCode"), error.get("message")) if part
-            ).strip()
-            messages.append(
-                f"table '{name}' did not sync onto the SQL endpoint"
-                + (f": {said}" if said else "")
-                + ". Anything reading it, such as a view, will not deploy either."
-            )
-        else:
-            messages.append(
-                f"table '{name}' was not synced onto the SQL endpoint after several "
-                "attempts. It may already have been up to date; if a view over it failed to "
-                "deploy, refresh the endpoint in the new workspace and apply that view again."
-            )
+        messages.append(
+            f"table '{name}' did not sync onto the SQL endpoint"
+            + (f": {said}" if said else "")
+            + ". Anything reading it, such as a view, will not deploy either."
+        )
     return messages
 
 

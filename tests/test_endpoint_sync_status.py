@@ -61,12 +61,13 @@ def test_not_run_counts_as_not_synced():
     assert unsynced_tables({"value": [table("Orders", "Success")]}) == []
 
 
-def test_a_table_that_never_ran_is_reported_differently_from_one_that_failed():
-    failures = sync_failures({"value": [table("Orders", "NotRun")]})
+def test_a_table_that_never_ran_is_retried_but_not_reported():
+    """NotRun is the ordinary answer for a table that was already current.
 
-    assert "was not synced" in failures[0]
-    # It may simply have been current already, so the wording does not claim a failure.
-    assert "may already have been up to date" in failures[0]
+    Reporting it named nearly every table in the workspace and buried the lines that
+    mattered, so it earns another attempt but not a warning.
+    """
+    assert sync_failures({"value": [table("Orders", "NotRun")]}) == []
 
 
 def test_a_failure_without_an_error_still_names_the_table():
@@ -156,7 +157,35 @@ def test_retrying_stops_rather_than_going_round_forever(monkeypatch):
     result = refresh(client, attempts=3)
 
     assert client.calls == 3
-    assert len(sync_failures(result)) == 1
+    # Retried, but silent: NotRun is what an already current table says.
+    assert sync_failures(result) == []
+
+
+def test_waiting_is_short_when_nothing_actually_failed(monkeypatch):
+    """NotRun is the steady state of a healthy endpoint, so it must not cost a real pause."""
+    from fabshuffle.fabric import data_stores
+
+    waited: list[float] = []
+    monkeypatch.setattr(data_stores.time, "sleep", waited.append)
+
+    refresh(FakeClient([{"value": [table("Orders", "NotRun")]}]), attempts=3)
+    assert waited == [
+        data_stores.REFRESH_NOT_RUN_WAIT_SECONDS,
+        data_stores.REFRESH_NOT_RUN_WAIT_SECONDS,
+    ]
+
+
+def test_waiting_is_longer_when_a_table_failed(monkeypatch):
+    from fabshuffle.fabric import data_stores
+
+    waited: list[float] = []
+    monkeypatch.setattr(data_stores.time, "sleep", waited.append)
+
+    refresh(
+        FakeClient([{"value": [table("Orders", "Failure", {"errorCode": "X", "message": "y"})]}]),
+        attempts=2,
+    )
+    assert waited == [data_stores.REFRESH_WAIT_SECONDS]
 
 
 def test_the_last_result_is_the_one_reported(monkeypatch):
@@ -171,14 +200,26 @@ def test_the_last_result_is_the_one_reported(monkeypatch):
     assert "second" in sync_failures(refresh(client, attempts=2))[0]
 
 
-def test_progress_says_it_is_trying_again(monkeypatch):
+def test_progress_says_it_is_trying_again_after_a_failure(monkeypatch):
     monkeypatch.setattr("fabshuffle.fabric.data_stores.time.sleep", lambda _s: None)
     seen = []
-    client = FakeClient([{"value": [table("Orders", "NotRun")]}])
+    client = FakeClient(
+        [{"value": [table("Orders", "Failure", {"errorCode": "X", "message": "y"})]}]
+    )
 
     refresh(client, attempts=2, on_progress=seen.append)
 
     assert "refreshing again (attempt 1 of 2)" in seen[0]
+
+
+def test_progress_is_silent_when_a_table_merely_did_not_run(monkeypatch):
+    """Otherwise the step line churns through every already-current table for no reason."""
+    monkeypatch.setattr("fabshuffle.fabric.data_stores.time.sleep", lambda _s: None)
+    seen = []
+
+    refresh(FakeClient([{"value": [table("Orders", "NotRun")]}]), attempts=2, on_progress=seen.append)
+
+    assert seen == []
 
 
 def test_an_endpoint_that_refuses_the_call_is_not_retried_to_death(monkeypatch):
