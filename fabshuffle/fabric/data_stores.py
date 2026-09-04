@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +13,11 @@ from fabshuffle.fabric.items import is_system_item
 
 CASE_INSENSITIVE_COLLATION = "Latin1_General_100_CI_AS_KS_WS_SC_UTF8"
 CASE_SENSITIVE_COLLATION = "Latin1_General_100_BIN2_UTF8"
+
+# A metadata refresh is flaky, and a table it does not sync is invisible on the endpoint
+# until something built on it fails to deploy. Cheap to ask again, expensive to miss.
+REFRESH_ATTEMPTS = 3
+REFRESH_WAIT_SECONDS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,8 +166,46 @@ def refresh_sql_endpoint_metadata(
     sql_endpoint_id: str,
     *,
     timeout_minutes: int = 20,
+    attempts: int = REFRESH_ATTEMPTS,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Force the SQL analytics endpoint to pick up newly created tables and shortcuts."""
+    """Force the SQL analytics endpoint to pick up newly created tables and shortcuts.
+
+    A long running operation, so the client waits for it to settle. Settling is not the same
+    as succeeding: the result carries a status *per table*, and the call reports success
+    while individual tables failed to sync or were never attempted.
+
+    That is worth retrying rather than reporting, because it is flaky in practice and because
+    a table missing from the endpoint is not a visible problem until something built on it
+    fails to deploy, naming the view rather than the table.
+
+    The retry is a whole refresh rather than one scoped to the tables that did not sync.
+    Scoping means naming a schema, and Fabric resolves those against the default schema for
+    an item that is not schema enabled, reporting anything else as ``DeltaTableNotFound`` —
+    so a selective retry can invent failures that were not there.
+    """
+    result: dict[str, Any] = {}
+    for attempt in range(1, max(1, attempts) + 1):
+        result = _refresh_once(client, workspace_id, sql_endpoint_id, timeout_minutes)
+        pending = unsynced_tables(result)
+        if not pending:
+            return result
+        if attempt < attempts:
+            if on_progress:
+                on_progress(
+                    f"{len(pending)} table(s) have not synced onto the SQL endpoint, "
+                    f"refreshing again (attempt {attempt} of {attempts})"
+                )
+            time.sleep(REFRESH_WAIT_SECONDS)
+    return result
+
+
+def _refresh_once(
+    client: FabricClient,
+    workspace_id: str,
+    sql_endpoint_id: str,
+    timeout_minutes: int,
+) -> dict[str, Any]:
     body = {"timeout": {"timeUnit": "Minutes", "value": timeout_minutes}}
     try:
         return client.post(
@@ -172,6 +217,51 @@ def refresh_sql_endpoint_metadata(
         if error.status_code in (400, 404):
             return {"status": "Skipped", "reason": error.body[:400]}
         raise
+
+
+def unsynced_tables(response: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Tables the refresh did not confirm as synced.
+
+    ``Failure`` and ``NotRun`` both count. Only ``Success`` says the endpoint can see the
+    table, and ``NotRun`` says in as many words that the operation did not run.
+    """
+    return [
+        table
+        for table in response.get("value") or []
+        if table.get("status") and table.get("status") != "Success"
+    ]
+
+
+def sync_failures(response: Mapping[str, Any]) -> list[str]:
+    """What to tell the operator about tables that never synced, after the last attempt.
+
+    A table that is not on the endpoint is invisible, so whatever reads it fails to deploy
+    with an error naming the reader: ``CREATE VIEW v AS SELECT * FROM t`` comes back as
+    ``42S02`` and nothing anywhere points at ``t``.
+
+    A failure and a table that never ran are reported differently, because only the first
+    comes with a reason and the second may simply have been up to date already.
+    """
+    messages: list[str] = []
+    for table in unsynced_tables(response):
+        name = table.get("tableName") or "an unnamed table"
+        if table.get("status") == "Failure":
+            error = table.get("error") or {}
+            said = " ".join(
+                part for part in (error.get("errorCode"), error.get("message")) if part
+            ).strip()
+            messages.append(
+                f"table '{name}' did not sync onto the SQL endpoint"
+                + (f": {said}" if said else "")
+                + ". Anything reading it, such as a view, will not deploy either."
+            )
+        else:
+            messages.append(
+                f"table '{name}' was not synced onto the SQL endpoint after several "
+                "attempts. It may already have been up to date; if a view over it failed to "
+                "deploy, refresh the endpoint in the new workspace and apply that view again."
+            )
+    return messages
 
 
 def wait_for_sql_endpoint(
@@ -252,6 +342,7 @@ __all__ = [
     "mirrored_database_sql_endpoint",
     "mirroring_status",
     "refresh_sql_endpoint_metadata",
+    "sync_failures",
     "wait_for_sql_endpoint",
     "warehouse_connection_string",
 ]

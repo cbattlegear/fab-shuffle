@@ -1677,7 +1677,7 @@ def _copy_sql_database_tables(
                     tables=tables,
                     tokens=ctx.tokens,
                     scratch_dir=ctx.scratch_dir / f"bcp-{source['id']}",
-                    on_progress=_bulk_copy_progress(ctx, step, name),
+                    on_progress=_bulk_copy_progress(ctx, step, f"SQL database '{name}'"),
                 )
             )
         except bulkcopy.BulkCopyError as error:
@@ -1686,8 +1686,9 @@ def _copy_sql_database_tables(
     return warnings
 
 
-def _bulk_copy_progress(ctx: _Context, step: str, name: str) -> Callable[[str], None]:
-    return lambda message: ctx.run.update_step(step, f"SQL database '{name}': {message}")
+def _bulk_copy_progress(ctx: _Context, step: str, label: str) -> Callable[[str], None]:
+    """Bind the label now, rather than reading it from the loop when the callback runs."""
+    return lambda message: ctx.run.update_step(step, f"{label}: {message}")
 
 
 def _document_progress(ctx: _Context, step: str, name: str) -> Any:
@@ -2014,7 +2015,18 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
         # and everything that binds to one is migrated after this phase.
         _map_sql_endpoint(ctx, data_stores.lakehouse_sql_endpoint(lakehouse), endpoint)
         if endpoint.get("id"):
-            data_stores.refresh_sql_endpoint_metadata(ctx.client, ctx.target_workspace_id, endpoint["id"])
+            refreshed = data_stores.refresh_sql_endpoint_metadata(
+                ctx.client,
+                ctx.target_workspace_id,
+                endpoint["id"],
+                on_progress=_bulk_copy_progress(ctx, step, f"Lakehouse '{name}'"),
+            )
+            # The refresh reports success while individual tables failed to sync, and a table
+            # that did not sync is invisible to the schema deploy that follows.
+            warnings.extend(
+                f"Lakehouse '{name}' SQL endpoint: {failure}"
+                for failure in data_stores.sync_failures(refreshed)
+            )
 
         source_endpoint = data_stores.lakehouse_sql_endpoint(lakehouse).get("connectionString")
         target_endpoint = endpoint.get("connectionString")
