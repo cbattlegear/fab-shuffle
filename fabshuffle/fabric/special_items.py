@@ -167,8 +167,8 @@ def spark_job_warnings(parts: Iterable[Mapping[str, Any]], source_workspace_id: 
 class ItemPolicy:
     """What an item type needs beyond exporting a definition and creating it again.
 
-    ``export_format`` asks for a specific definition format. ``prepare`` runs after the ids
-    have been rewritten and may change the parts, returning any warning worth showing.
+    ``export_format`` asks for a specific definition format. ``prepare`` inspects the source
+    before ids are rewritten and may change the parts, returning any warning worth showing.
     """
 
     export_format: str | None = None
