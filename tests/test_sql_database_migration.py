@@ -156,6 +156,7 @@ def test_the_server_address_is_mapped_so_later_items_rebind(monkeypatch):
 
     assert ctx.id_map[SOURCE_DB] == TARGET_DB
     assert ctx.id_map[SOURCE_SERVER] == TARGET_SERVER
+    assert ctx.id_map["RegionBounceTest-1111"] == "RegionBounceTest-2222"
 
 
 

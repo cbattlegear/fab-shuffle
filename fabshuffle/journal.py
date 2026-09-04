@@ -129,7 +129,7 @@ class Journal:
 
     def data(self, item_id: str, kind: str, key: str = "", *, target_id: str = "") -> None:
         """Data that has finished moving for an item, optionally one table or container."""
-        self._write(DATA, item=item_id, kind=kind, key=key, target=target_id)
+        self._write(DATA, item=item_id, kind=kind, key=key, target=target_id, strict=True)
 
     def invalidate(self, sources: Iterable[str], *, refresh: Iterable[str] = ()) -> None:
         self._write(INVALIDATED, sources=list(sources), refresh=list(refresh), strict=True)

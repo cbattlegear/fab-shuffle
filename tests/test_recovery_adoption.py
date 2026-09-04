@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from fabshuffle import journal, orchestrator
-from fabshuffle.fabric.definitions import part
+from fabshuffle.fabric.definitions import decode_json_part, part
 from fabshuffle.run import MigrationRun
 from fabshuffle.transfer import kql
 
@@ -186,6 +186,32 @@ def test_snowflake_mixed_adoption_only_creates_missing_item(tmp_path):
     assert [item["displayName"] for item in client.created] == ["new"]
     assert ctx.id_map["existing"] == "target-existing"
     assert ctx.id_map["new"] == "new-snowflake"
+
+
+def test_adopted_snowflake_refreshes_a_replaced_connection_in_place(tmp_path):
+    class Client:
+        def __init__(self):
+            self.updates = []
+
+        def post(self, path, json=None, **kwargs):
+            if path.endswith("/getDefinition"):
+                return {"definition": {"parts": []}}
+            assert path.endswith("existing-target/updateDefinition")
+            self.updates.append(json)
+            return {}
+
+    client = Client()
+    ctx = context(tmp_path, client, {"sf-source": "existing-target", "conn-source": "new-connection"})
+    ctx.refresh_needed.add("sf-source")
+    item = {"id": "sf-source", "displayName": "Snow", "properties": {
+        "snowflakeDatabaseName": "database", "connectionId": "conn-source",
+    }}
+    orchestrator._migrate_snowflake_databases(ctx, "mirrored", [item], lambda _: None)
+    updated = client.updates[0]["definition"]["parts"][0]
+    assert updated["path"] == "SnowflakeDatabaseProperties.json"
+    assert decode_json_part(updated["payload"])["connectionId"] == "new-connection"
+    assert ctx.id_map["sf-source"] == "existing-target"
+    assert "sf-source" not in ctx.refresh_needed
 
 
 def test_spark_mapping_change_durably_rechecks_retained_consumers(tmp_path):

@@ -180,6 +180,8 @@ def test_resume_adopts_cosmos_and_continues_documents(monkeypatch):
     assert not any(path.endswith("/items") for path, _ in client.posts)
     assert len(copies) == 1
     assert copies[0]["target_endpoint"] == "https://dst.xyz.cosmos.fabric.microsoft.com:443/"
+    assert ctx.id_map["src.xyz.cosmos.fabric.microsoft.com"] == "dst.xyz.cosmos.fabric.microsoft.com"
+    assert ctx.id_map["CosmosTestItem"] == "CosmosTestItem"
 
 
 def test_resume_adopts_cosmos_without_repeating_finished_documents(monkeypatch):

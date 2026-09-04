@@ -2132,6 +2132,10 @@ def _migrate_sql_databases(ctx: _Context) -> None:
         target_server = sqldatabases.server_fqdn(target)
         if source_server and target_server:
             ctx.map_alias(source_server, target_server, database["id"])
+        source_catalog = sqldatabases.database_name(database)
+        target_catalog = sqldatabases.database_name(target)
+        if source_catalog and target_catalog:
+            ctx.map_alias(source_catalog, target_catalog, database["id"])
         migrated += 1
 
         ctx.run.update_step(step, f"Applying schema to SQL database '{name}'")
@@ -2303,10 +2307,15 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
         migrated += 1
 
         target = cosmosdb.get_cosmos_database(ctx.client, ctx.target_workspace_id, target_id)
+        ctx.source_items[database["id"]] = {**database, "type": cosmosdb.COSMOS_DB_DATABASE}
         source_endpoint = cosmosdb.endpoint_url(database)
         target_endpoint = cosmosdb.endpoint_url(target)
         if source_endpoint and target_endpoint:
             ctx.map_alias(source_endpoint, target_endpoint, database["id"])
+        for read_property in (cosmosdb.server_fqdn, cosmosdb.database_name):
+            source_value, target_value = read_property(database), read_property(target)
+            if source_value and target_value:
+                ctx.map_alias(source_value, target_value, database["id"])
         if not ctx.plan.include_data:
             continue
         if ctx.already_copied(database["id"], "documents"):
@@ -2479,8 +2488,7 @@ def _migrate_snowflake_databases(
     for item in items:
         name = item["displayName"]
         progress(f"Migrating SnowflakeDatabase '{name}'")
-        if ctx.already_created(item["id"]):
-            continue
+        adopted = ctx.already_created(item["id"])
 
         parts: list[dict[str, Any]] = []
         try:
@@ -2494,6 +2502,11 @@ def _migrate_snowflake_databases(
 
         payload = special_items.snowflake_creation_payload(item, parts)
         if not payload:
+            if adopted:
+                raise ResumeRefused(
+                    f"SnowflakeDatabase '{name}' cannot be verified because its database name "
+                    "and connection could not be read. Restore access and resume before using it."
+                )
             warnings.append(
                 f"SnowflakeDatabase '{name}' was not migrated because the database name and "
                 "connection it uses could not be read. Recreate it by hand."
@@ -2509,6 +2522,15 @@ def _migrate_snowflake_databases(
                 raise analytics.StrandedReference(needed)
             rewritten, _ = definitions.rewrite_parts(payload_parts, ctx.id_map)
             payload = definitions.decode_json_part(rewritten[0]["payload"])
+            if adopted:
+                if item["id"] in ctx.refresh_needed:
+                    items_module.update_item_definition(
+                        ctx.client, ctx.target_workspace_id, ctx.id_map[item["id"]],
+                        [definitions.part(special_items.SNOWFLAKE_PROPERTIES_PART, payload)],
+                    )
+                    ctx.journal.refresh([item["id"]], required=False)
+                    ctx.refresh_needed.discard(item["id"])
+                continue
             created = items_module.create_item(
                 ctx.client,
                 ctx.target_workspace_id,
@@ -2519,6 +2541,11 @@ def _migrate_snowflake_databases(
                 folder_id=ctx.id_map.get(item.get("folderId", "")),
             )
         except FabricError as error:
+            if adopted:
+                raise ResumeRefused(
+                    f"SnowflakeDatabase '{name}' could not be rebound. Resolve the error and "
+                    f"resume before using it: {error}"
+                ) from error
             warnings.append(analytics.describe_failure(analytics.SNOWFLAKE_DATABASE, name, error))
             continue
 
