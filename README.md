@@ -316,6 +316,11 @@ adopted; data that had finished moving is left alone. Anything the journal claim
 no longer there is built again, because the journal records what an attempt *did*, not what is
 there now.
 
+The same machinery retries a run that *did* finish but left items behind — a connection that
+was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
+what did not migrate** on the progress screen, and only the missing items are attempted. The
+scratch workspace it deleted on the way out is rebuilt automatically.
+
 Two things follow from this:
 
 - **Resuming needs you to sign in again.** Credentials are never written down, so nothing can

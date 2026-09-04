@@ -288,11 +288,13 @@ def run_migration(
                 context.dormant.update(prior.dormant)
                 context.warnings.extend(notes)
                 context.target_workspace_id = prior.target_workspace_id
-                context.scratch_workspace_id = prior.scratch_workspace_id
+                context.scratch_workspace_id = surviving_scratch(
+                    client, prior.scratch_workspace_id
+                )
                 if prior.target_workspace_id:
                     book.workspace("target", prior.target_workspace_id)
-                if prior.scratch_workspace_id:
-                    book.workspace("scratch", prior.scratch_workspace_id)
+                if context.scratch_workspace_id:
+                    book.workspace("scratch", context.scratch_workspace_id)
 
             if plan.strategy is Strategy.REASSIGN:
                 _reassign_capacity(context)
@@ -405,6 +407,24 @@ def verify_prior(
             "again."
         )
     return kept, notes
+
+
+def surviving_scratch(client: FabricClient, scratch_workspace_id: str) -> str:
+    """The earlier attempt's scratch workspace, if it is still there.
+
+    A run that finished tidily deleted its own scratch workspace, so retrying the items it
+    left behind finds the id recorded but nothing at the end of it. Returning empty makes the
+    workspace phase build a new one rather than aim Copy Jobs at a workspace that has gone.
+    """
+    if not scratch_workspace_id:
+        return ""
+    try:
+        workspaces.get_workspace(client, scratch_workspace_id)
+    except FabricApiError as error:
+        if error.status_code in (403, 404):
+            return ""
+        raise
+    return scratch_workspace_id
 
 
 # --------------------------------------------------------------- reassign path

@@ -711,7 +711,27 @@ function renderRun(run) {
   $("#cancel-run").hidden = finished;
   $("#start-over").hidden = !finished;
   $("#cleanup-run").hidden = !finished || run.cleanupDone || !run.scratchWorkspace;
+  // Only worth offering when the run got far enough to build a workspace and still left
+  // something behind. A clean run has nothing to retry.
+  const leftSomething = (run.summary?.warnings || []).length > 0;
+  $("#retry-run").hidden = !finished || !run.targetWorkspace || !leftSomething;
 }
+
+$("#retry-run").addEventListener("click", async () => {
+  const button = $("#retry-run");
+  busy(button, true, "Starting…");
+  try {
+    // The same path as picking up an interrupted run: everything already in the new
+    // workspace is adopted, so only what did not make it is attempted again.
+    const result = await api(`/api/runs/${state.runId}/resume`, { method: "POST" });
+    state.runId = result.runId;
+    watchRun(result.runId);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    busy(button, false);
+  }
+});
 
 $("#cancel-run").addEventListener("click", async () => {
   const button = $("#cancel-run");

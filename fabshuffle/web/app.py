@@ -395,11 +395,10 @@ def create_app() -> FastAPI:
         if not await asyncio.to_thread(path.is_file):
             raise HTTPException(status_code=404, detail="No journal for that run")
         replay = await asyncio.to_thread(journal.read, path)
-        if replay.status:
-            raise HTTPException(
-                status_code=409,
-                detail="That run finished. There is nothing to pick up.",
-            )
+        # A finished run may be picked up too. That is how the items it left behind are
+        # retried: the target workspace and everything already in it are adopted, so only
+        # what did not make it the first time is attempted. Its scratch workspace was deleted
+        # on the way out, and the workspace phase notices and builds another.
         try:
             plan = plan_from_journal(replay)
         except ValueError as error:

@@ -79,6 +79,9 @@ class FakeFabric:
             return {"items": [], "relations": edges, "workspaces": []}
         if path.endswith("/spark/settings"):
             return {}
+        # A resume checks the scratch workspace is still there before aiming Copy Jobs at it.
+        if path in (f"workspaces/{TARGET_WS}", "workspaces/ws-scratch"):
+            return {"id": path.split("/")[1]}
         if path == f"workspaces/{TARGET_WS}/lakehouses/lh-new":
             return {
                 "id": "lh-new",
@@ -333,6 +336,37 @@ def test_resuming_into_a_workspace_that_has_gone_is_refused(fabric, monkeypatch)
     assert second.status == RunStatus.FAILED
     assert "cannot be read any more" in second.error
     assert "Start the migration again" in second.error
+
+
+def test_a_scratch_workspace_that_was_cleaned_up_is_replaced(fabric):
+    """A run that finished tidily deleted its own scratch workspace on the way out.
+
+    Retrying the items it left behind must notice, or the Copy Jobs would be aimed at a
+    workspace that is not there.
+    """
+    first = attempt()
+    assert first.status == RunStatus.SUCCEEDED, first.error
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    assert replay.scratch_workspace_id
+
+    def missing(client, workspace_id):
+        raise orchestrator.FabricApiError("GET", f"workspaces/{workspace_id}", 404, "NotFound")
+
+    original = orchestrator.workspaces.get_workspace
+    orchestrator.workspaces.get_workspace = missing
+    try:
+        assert orchestrator.surviving_scratch(fabric, replay.scratch_workspace_id) == ""
+    finally:
+        orchestrator.workspaces.get_workspace = original
+
+
+def test_a_scratch_workspace_that_is_still_there_is_reused(fabric):
+    original = orchestrator.workspaces.get_workspace
+    orchestrator.workspaces.get_workspace = lambda client, workspace_id: {"id": workspace_id}
+    try:
+        assert orchestrator.surviving_scratch(fabric, "ws-scratch") == "ws-scratch"
+    finally:
+        orchestrator.workspaces.get_workspace = original
 
 
 def test_the_plan_survives_the_round_trip(fabric):

@@ -213,12 +213,33 @@ def test_resuming_a_run_nobody_has_a_journal_for_is_404(client: TestClient, sess
     assert response.status_code == 404
 
 
-def test_resuming_a_run_that_finished_is_refused(client: TestClient, session_id: str, journal_dir):
+def test_resuming_a_run_that_finished_is_allowed(client: TestClient, session_id: str, journal_dir):
+    """It used to be refused. Retrying the items a run left behind reads the same journal."""
     run_id = write_journal(finished=True)
     response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
 
-    assert response.status_code == 409
-    assert "nothing to pick up" in response.json()["detail"]
+    assert response.status_code == 200
+
+
+def test_resuming_a_run_that_finished_retries_what_it_left_behind(
+    client: TestClient, session_id: str, monkeypatch, journal_dir
+):
+    """A finished run is picked up too: that is how the items it could not move are retried."""
+    seen = {}
+
+    def fake_migration(run, principal, plan, cleanup=True, prior=None):
+        seen["prior"] = prior
+        run.mark_finished(RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(web, "run_migration", fake_migration)
+    run_id = write_journal(finished=True)
+
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+
+    assert response.status_code == 200
+    # Everything the first run did is inherited, so only what is missing gets attempted.
+    assert seen["prior"].id_map["lh-src"] == "lh-new"
+    assert seen["prior"].status == "succeeded"
 
 
 def test_a_journal_that_never_recorded_a_plan_is_refused(client: TestClient, session_id: str, journal_dir):
