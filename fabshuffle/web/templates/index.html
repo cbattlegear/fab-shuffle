@@ -58,6 +58,15 @@
     <section class="panel" data-stage="capacity" hidden>
       <h2>Pick the target capacity</h2>
       <p class="hint">The new workspace is created on this capacity, which determines the target region.</p>
+      <div id="resumable" class="warnings" hidden>
+        <h3>Unfinished migrations</h3>
+        <p class="hint">
+          These stopped partway, most likely because the container was restarted. Picking one
+          up carries on from where it got to instead of building the workspace again.
+        </p>
+        <ul></ul>
+      </div>
+
       <div id="leftovers" class="warnings" hidden>
         <h3>Leftover scratch workspaces</h3>
         <p class="hint">Earlier runs did not finish cleaning up. These hold only temporary Copy Jobs.</p>
