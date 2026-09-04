@@ -124,8 +124,11 @@ def test_external_shortcut_target_is_preserved():
             },
         },
     }
-    remapped = shortcuts.remap_shortcut_target(shortcut, {"conn-1": "should-not-be-used"})
-    assert remapped["target"]["adlsGen2"]["connectionId"] == "conn-1"
+    remapped = shortcuts.remap_shortcut_target(shortcut, {})
+    assert remapped["target"]["adlsGen2"] == shortcut["target"]["adlsGen2"]
+    replaced = shortcuts.remap_shortcut_target(shortcut, {"conn-1": "verified-replacement"})
+    assert replaced["target"]["adlsGen2"]["connectionId"] == "verified-replacement"
+    assert shortcut["target"]["adlsGen2"]["connectionId"] == "conn-1"
 
 
 # ------------------------------------------------------------------ eventhouse

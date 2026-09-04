@@ -326,8 +326,18 @@ class RunRegistry:
             active = self._active(lineage, target)
             if active:
                 raise RunConflict(active.id, "Wait for the related migration to finish before cleanup.")
+            latest = journal.latest_runs(directory) if directory is not None else []
+            superseded = {ancestor for replay in latest for ancestor in replay.ancestors}
+            for attempt in self._runs.values():
+                if attempt.id not in superseded and attempt.summary.get("unresolvedCopyJobs") and (
+                    not run or self._related(attempt, lineage, target)
+                ):
+                    raise RunConflict(
+                        attempt.id, "Unfinished Copy Jobs may still be running. Reconcile their "
+                        "recorded IDs before deleting the scratch workspace."
+                    )
             if directory is not None:
-                for replay in journal.latest_runs(directory):
+                for replay in latest:
                     if replay.copy_jobs and (
                         not run or replay.lineage_id == lineage or (
                             target and replay.target_workspace_id == target

@@ -141,14 +141,28 @@ def test_an_empty_or_missing_journal_is_not_an_error(tmp_path):
     assert not journal.read(tmp_path / "empty.jsonl").interrupted
 
 
-def test_a_journal_that_cannot_be_written_does_not_stop_the_migration(tmp_path):
-    """Losing the ability to resume is bad. Taking down a running migration for it is worse."""
+def test_a_noncritical_warning_that_cannot_be_written_does_not_stop_the_migration(tmp_path):
     unwritable = tmp_path / "sub" / "run.jsonl"
     j = journal.Journal(unwritable)
     unwritable.parent.rmdir()
 
     # No raise.
-    j.item("a", "b", "Notebook", "Ingest")
+    j.warning("A diagnostic warning")
+
+
+def test_critical_resource_checkpoints_propagate_persistence_failure(tmp_path):
+    import pytest
+
+    book = journal.Journal(tmp_path / "missing" / "run.jsonl")
+    book.path.parent.rmdir()
+    for write in (
+        lambda: book.workspace("target", "target-workspace"),
+        lambda: book.item("source", "target", "Notebook", "Ingest"),
+        lambda: book.mapping("source", "target"),
+        lambda: book.data("source", "tables", target_id="target"),
+    ):
+        with pytest.raises(OSError):
+            write()
 
 
 # -------------------------------------------------------------- compatibility

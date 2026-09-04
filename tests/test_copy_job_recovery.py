@@ -34,10 +34,14 @@ def test_lost_progress_is_durable_and_resume_polls_without_starting_again(tmp_pa
     ctx = make_context(tmp_path)
     creates, starts = [], []
     monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
     monkeypatch.setattr(
         copyjobs, "create_copy_job", lambda *a: creates.append(a) or {"id": "copy"}
     )
-    monkeypatch.setattr(copyjobs, "start_copy_job", lambda *a: starts.append(a) or "instance")
+    monkeypatch.setattr(
+        copyjobs, "_submit_copy_job",
+        lambda *a: starts.append(a) or copyjobs._CopyJobSubmission("instance", 0),
+    )
 
     def unavailable(client, job):
         # Admission of the remote run must be durable before the first progress read.
@@ -45,6 +49,8 @@ def test_lost_progress_is_durable_and_resume_polls_without_starting_again(tmp_pa
         record = replay.copy_jobs[("lakehouse", "copy-lakehouse")]
         assert record["target"] == "target-lakehouse"
         assert record["job"]["instance_id"] == "instance"
+        assert record["job"]["submission_state"] == "submitted"
+        assert record["job"]["poll_not_before"] is not None
         raise FabricApiError("GET", "progress", 503, '{"errorCode":"CapacityUnavailable","message":"retry"}')
 
     monkeypatch.setattr(copyjobs, "_job_status", unavailable)
@@ -108,7 +114,11 @@ def test_confirmed_failures_are_cleared_while_unresolved_jobs_are_preserved(tmp_
 
     def partial(client, specs, **kwargs):
         for candidate in specs:
-            kwargs["on_started"](candidate, candidate.display_name, "instance")
+            kwargs["on_state"](copyjobs.CopyJobRun(
+                workspace_id=candidate.workspace_id, copy_job_id=candidate.display_name,
+                instance_id="instance", item_id=candidate.item_id,
+                display_name=candidate.display_name, label=candidate.label, submission_state="submitted",
+            ))
         raise copyjobs.CopyJobBatchIncomplete(
             "progress unavailable",
             active_jobs=[copyjobs.CopyJobRun(
@@ -143,3 +153,70 @@ def test_source_rename_still_adopts_its_outstanding_job(tmp_path, monkeypatch):
     replay = journal.read(second.journal.path)
     assert replay.copy_jobs == {}
     assert replay.data_is_done("lakehouse", "tables")
+
+
+def test_unwritable_intent_journal_prevents_any_remote_mutation(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    ctx.journal.path = tmp_path / "missing-directory" / "attempt.jsonl"
+    monkeypatch.setattr(
+        copyjobs, "create_copy_job", lambda *a: pytest.fail("cannot create without durable intent"),
+    )
+    monkeypatch.setattr(
+        copyjobs, "_submit_copy_job", lambda *a: pytest.fail("cannot submit without durable intent"),
+    )
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [spec()], "lakehouse")
+    assert caught.value.active_jobs[0].copy_job_id is None
+    assert caught.value.active_jobs[0].instance_id is None
+    assert isinstance(caught.value.__cause__, OSError)
+
+
+def test_accepted_job_ids_survive_a_failed_completion_checkpoint(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    created = []
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: created.append(a) or {"id": "copy"})
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *a: copyjobs._CopyJobSubmission("instance", 0))
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *a: ("Completed", {"status": "Completed"}))
+
+    def failed_checkpoint(*args, **kwargs):
+        raise OSError("data checkpoint disk full")
+
+    monkeypatch.setattr(ctx.journal, "data", failed_checkpoint)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete) as caught:
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [spec()], "lakehouse")
+    assert caught.value.active_jobs[0].instance_id == "instance"
+    replay = journal.read(ctx.journal.path)
+    saved = replay.copy_jobs[("lakehouse", "copy-lakehouse")]["job"]
+    assert saved["last_status"] == "Completed"
+    assert saved["submission_state"] == "submitted"
+    assert not replay.data_is_done("lakehouse", "tables")
+
+    second = make_context(tmp_path, prior=replay)
+    orchestrator._run_copy_jobs(second, "lakehouses", [spec()], "lakehouse")
+    assert len(created) == 1
+    final = journal.read(second.journal.path)
+    assert final.copy_jobs == {}
+    assert final.data_is_done("lakehouse", "tables")
+
+
+def test_created_but_unsubmitted_job_is_started_without_recreation(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    ctx.journal.copy_job({
+        "workspace_id": "scratch", "copy_job_id": "copy", "instance_id": None,
+        "item_id": "lakehouse", "display_name": "copy-lakehouse", "label": "Lakehouse",
+        "submission_state": "created", "poll_not_before": None,
+    }, target_id="target-lakehouse")
+    second = make_context(tmp_path, prior=journal.read(ctx.journal.path))
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: pytest.fail("already created"))
+    submissions = []
+    monkeypatch.setattr(
+        copyjobs, "_submit_copy_job",
+        lambda *a: submissions.append(a) or copyjobs._CopyJobSubmission("instance", 0),
+    )
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *a: ("Completed", {"status": "Completed"}))
+    assert orchestrator._run_copy_jobs(second, "lakehouses", [spec()], "lakehouse") == []
+    assert submissions == [(second.client, "scratch", "copy")]
+    assert journal.read(second.journal.path).copy_jobs == {}

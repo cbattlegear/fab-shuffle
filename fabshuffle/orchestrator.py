@@ -337,7 +337,8 @@ def run_migration(
                         del prior.copy_jobs[key]
                         context.active_copy_jobs.pop(key, None)
                         continue
-                    if not job.get("copy_job_id") or not job.get("instance_id"):
+                    created_only = job.get("submission_state") == "created" and job.get("copy_job_id")
+                    if not created_only and (not job.get("copy_job_id") or not job.get("instance_id")):
                         raise ResumeRefused(
                             f"Copy Job '{job.get('label')}' has an unconfirmed submission. "
                             "Check and stop it in the scratch workspace before resolving its "
@@ -1757,18 +1758,18 @@ def _run_copy_jobs(
     )
     def remember(job: copyjobs.CopyJobRun) -> None:
         record = {"job": asdict(job), "target": ctx.id_map.get(job.item_id, ""), "active": True}
-        ctx.journal.copy_job(record["job"], target_id=record["target"])
         ctx.active_copy_jobs[(job.item_id, job.display_name)] = record
+        ctx.journal.copy_job(record["job"], target_id=record["target"])
 
-    def started(spec: copyjobs.CopyJobSpec, copy_job_id: str, instance_id: str) -> None:
-        remember(copyjobs.CopyJobRun(
-            workspace_id=spec.workspace_id, copy_job_id=copy_job_id, instance_id=instance_id,
-            item_id=spec.item_id, display_name=spec.display_name, label=spec.label,
-        ))
+    def state(job: copyjobs.CopyJobRun) -> None:
+        if job.last_status in copyjobs.TERMINAL_JOB_STATES and job.instance_id:
+            ctx.journal.copy_job(asdict(job), target_id=ctx.id_map.get(job.item_id, ""), active=False)
+            ctx.active_copy_jobs.pop((job.item_id, job.display_name), None)
+        else:
+            remember(job)
 
     def done(spec: copyjobs.CopyJobSpec) -> None:
         ctx.data_copied(spec.item_id, "tables")
-        clear(spec)
 
     def clear(spec: copyjobs.CopyJobSpec) -> None:
         key = (spec.item_id, spec.display_name)
@@ -1791,18 +1792,23 @@ def _run_copy_jobs(
             concurrency=concurrent,
             on_progress=lambda message: ctx.run.update_step(step, message),
             on_done=done,
-            on_started=started,
+            on_state=state,
             resume_jobs=resume_jobs,
         )
     except copyjobs.CopyJobBatchIncomplete as error:
+        ctx.run.summary["unresolvedCopyJobs"] = [asdict(job) for job in error.active_jobs]
         ctx.copy_job_ids.extend(error.created)
         ctx.warnings.extend(error.warnings)
-        for job in error.active_jobs:
-            remember(job)
-        unresolved = {(job.item_id, job.display_name) for job in error.active_jobs}
-        for spec in specs:
-            if (spec.item_id, spec.display_name) not in unresolved:
-                clear(spec)
+        try:
+            for job in error.active_jobs:
+                remember(job)
+            unresolved = {(job.item_id, job.display_name) for job in error.active_jobs}
+            for spec in specs:
+                if (spec.item_id, spec.display_name) not in unresolved:
+                    clear(spec)
+        except OSError as persistence_error:
+            error.add_note(f"Recovery metadata could not be persisted: {persistence_error}")
+            raise error from persistence_error
         raise
     for spec in specs:
         clear(spec)

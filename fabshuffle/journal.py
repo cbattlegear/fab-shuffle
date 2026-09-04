@@ -117,15 +117,15 @@ class Journal:
         self._write(PHASE, phase=phase, state="finished")
 
     def workspace(self, role: str, workspace_id: str, name: str = "") -> None:
-        self._write(WORKSPACE, role=role, id=workspace_id, name=name)
+        self._write(WORKSPACE, role=role, id=workspace_id, name=name, strict=True)
 
     def item(self, source_id: str, target_id: str, item_type: str, name: str) -> None:
         """One item created in the target workspace, and the mapping it establishes."""
-        self._write(ITEM, source=source_id, target=target_id, type=item_type, name=name)
+        self._write(ITEM, source=source_id, target=target_id, type=item_type, name=name, strict=True)
 
     def mapping(self, source: str, target: str, *, owner: str = "") -> None:
         """An id_map entry that is not an item: an endpoint, a server name, a cluster URI."""
-        self._write(MAPPING, source=source, target=target, owner=owner)
+        self._write(MAPPING, source=source, target=target, owner=owner, strict=True)
 
     def data(self, item_id: str, kind: str, key: str = "", *, target_id: str = "") -> None:
         """Data that has finished moving for an item, optionally one table or container."""

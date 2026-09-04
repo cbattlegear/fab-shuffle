@@ -383,6 +383,51 @@ def test_completed_checkpoint_reconciles_crash_before_job_record_clear(fabric, m
     assert journal.read(SETTINGS.journal_for(second.id)).copy_jobs == {}
 
 
+def test_failed_terminal_state_write_is_reconciled_after_a_durable_data_checkpoint(
+    fabric, monkeypatch
+):
+    copyjobs = orchestrator.copyjobs
+    created = []
+    fabric.created.append(("Lakehouse", "bronze", "lh-new"))
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: created.append(a) or {"id": "copy"})
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *a: copyjobs._CopyJobSubmission("instance", 0))
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *a: ("Completed", {"status": "Completed"}))
+
+    def setup(ctx):
+        ctx.target_workspace_id = TARGET_WS
+        ctx.scratch_workspace_id = "ws-scratch"
+        ctx.id_map[LAKEHOUSE] = "lh-new"
+        ctx.journal.workspace("target", TARGET_WS)
+        ctx.journal.workspace("scratch", "ws-scratch")
+
+    def transfer(ctx):
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [copyjobs.CopyJobSpec(
+            workspace_id="ws-scratch", display_name="copy", content={}, label="Lakehouse", item_id=LAKEHOUSE,
+        )], "lakehouse")
+
+    monkeypatch.setattr(orchestrator, "_REBUILD_PHASES", (("workspaces", setup), ("lakehouses", transfer)))
+    record = journal.Journal.copy_job
+
+    def terminal_disk_failure(self, job, *, target_id, active=True):
+        if not active:
+            raise OSError("terminal state could not be persisted")
+        return record(self, job, target_id=target_id, active=active)
+
+    monkeypatch.setattr(journal.Journal, "copy_job", terminal_disk_failure)
+    first = attempt()
+    assert first.status == RunStatus.FAILED
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    assert replay.data_is_done(LAKEHOUSE, "tables")
+    assert replay.copy_jobs[(LAKEHOUSE, "copy")]["job"]["last_status"] == "Completed"
+    monkeypatch.setattr(journal.Journal, "copy_job", record)
+    second = attempt(prior=replay)
+    assert second.status == RunStatus.SUCCEEDED, second.error
+    assert len(created) == 1
+    assert journal.read(SETTINGS.journal_for(second.id)).copy_jobs == {}
+
+
 def test_changed_target_refreshes_existing_consumers_even_after_another_interruption(
     fabric, monkeypatch
 ):
