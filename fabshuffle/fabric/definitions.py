@@ -16,6 +16,14 @@ PLATFORM_SCHEMA = (
     "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json"
 )
 EMPTY_LOGICAL_ID = "00000000-0000-0000-0000-000000000000"
+GUID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def identity_key(value: str) -> str:
+    """Canonicalize GUID identities without changing case-sensitive paths or names."""
+    return value.lower() if GUID_PATTERN.fullmatch(value) else value
 
 # Definition parts Fab Shuffle rewrites references inside. Anything else (images, custom
 # visuals, packaged libraries such as .whl/.jar/.tar.gz, other binary resources) is copied
@@ -192,6 +200,7 @@ def strip_part(parts: Iterable[Mapping[str, Any]], path: str) -> list[dict[str, 
 
 
 __all__ = [
+    "GUID_PATTERN",
     "TEXT_SUFFIXES",
     "build_rewriter",
     "decode_json_part",
@@ -199,6 +208,7 @@ __all__ = [
     "definition",
     "encode_payload",
     "find_part",
+    "identity_key",
     "is_text_part",
     "part",
     "platform_part",

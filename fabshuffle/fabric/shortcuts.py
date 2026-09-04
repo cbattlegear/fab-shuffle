@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.definitions import identity_key
 
 
 def list_shortcuts(client: FabricClient, workspace_id: str, item_id: str) -> list[dict[str, Any]]:
@@ -77,8 +78,8 @@ def remap_shortcut_target(
 ) -> dict[str, Any]:
     """Rewrite a shortcut so internal OneLake targets point at the migrated items.
 
-    Only ``oneLake`` targets are rewritten. External targets (ADLS, S3, GCS, ...) reference a
-    tenant-level ``connectionId`` that is region agnostic, so they are copied verbatim.
+    OneLake identities and proven replacement connection IDs are rewritten. Paths and
+    genuinely external connections are preserved.
     """
     remapped = {
         "path": shortcut.get("path"),
@@ -89,25 +90,63 @@ def remap_shortcut_target(
 
 
 def _remap_target(target: Mapping[str, Any], id_map: Mapping[str, str]) -> dict[str, Any]:
+    identities = {identity_key(key): value for key, value in id_map.items()}
     result: dict[str, Any] = {}
     for target_type, settings in target.items():
         # ``type`` is a discriminator string the create API does not accept back.
         if target_type == "type" or not isinstance(settings, Mapping):
             continue
         if target_type == "oneLake":
+            workspace_id = settings.get("workspaceId") or ""
+            if identity_key(workspace_id) not in identities:
+                result[target_type] = dict(settings)
+                continue
             result[target_type] = {
                 **settings,
-                "workspaceId": id_map.get(settings.get("workspaceId", ""), settings.get("workspaceId")),
-                "itemId": id_map.get(settings.get("itemId", ""), settings.get("itemId")),
+                "workspaceId": identities.get(
+                    identity_key(settings.get("workspaceId") or ""), settings.get("workspaceId")
+                ),
+                "itemId": identities.get(
+                    identity_key(settings.get("itemId") or ""), settings.get("itemId")
+                ),
             }
         else:
             result[target_type] = dict(settings)
+            connection_id = settings.get("connectionId")
+            if isinstance(connection_id, str):
+                result[target_type]["connectionId"] = identities.get(
+                    identity_key(connection_id), connection_id
+                )
     return result
 
 
 def _target_kind(target: Mapping[str, Any]) -> str:
     """The single target key a shortcut carries, such as ``oneLake`` or ``adlsGen2``."""
     return next((key for key in target if key != "type"), "")
+
+
+def _unmigrated_connection(
+    shortcut: Mapping[str, Any],
+    id_map: Mapping[str, str],
+    source_items: Mapping[str, Mapping[str, Any]] | None,
+) -> str | None:
+    identities = {identity_key(key): value for key, value in id_map.items()}
+    items = {identity_key(key): value for key, value in (source_items or {}).items()}
+    for settings in (shortcut.get("target") or {}).values():
+        if not isinstance(settings, Mapping):
+            continue
+        connection_id = settings.get("connectionId") or ""
+        item = items.get(identity_key(connection_id)) or {}
+        replacement = identities.get(identity_key(connection_id))
+        if item.get("type") == "Connection" and (
+            not replacement or identity_key(replacement) == identity_key(connection_id)
+        ):
+            return (
+                f"connection '{item.get('displayName') or connection_id}' still targets the "
+                "source workspace. Create its replacement against the migrated store and "
+                "retry the migration"
+            )
+    return None
 
 
 def onelake_item_id(shortcut: Mapping[str, Any]) -> str:
@@ -141,9 +180,17 @@ def unmigrated_target(
 
     workspace_id = settings.get("workspaceId") or ""
     item_id = settings.get("itemId") or ""
-    if workspace_id != source_workspace_id or not item_id:
+    if identity_key(workspace_id) != identity_key(source_workspace_id) or not item_id:
         return None
-    return None if item_id in id_map else str(item_id)
+    identities = {identity_key(key): value for key, value in id_map.items()}
+    replacement = identities.get(identity_key(item_id))
+    workspace = identities.get(identity_key(workspace_id))
+    return (
+        None
+        if replacement and identity_key(replacement) != identity_key(item_id)
+        and workspace and identity_key(workspace) != identity_key(workspace_id)
+        else str(item_id)
+    )
 
 
 def describe_unmigrated(
@@ -165,7 +212,8 @@ def _describe_item(
     item_id: str,
     source_items: Mapping[str, Mapping[str, Any]] | None,
 ) -> str:
-    item = (source_items or {}).get(item_id) or {}
+    items = {identity_key(key): value for key, value in (source_items or {}).items()}
+    item = items.get(identity_key(item_id)) or {}
     if item.get("displayName"):
         return f"{item.get('type') or 'item'} '{item['displayName']}'"
     return f"the item {item_id}"
@@ -279,6 +327,10 @@ def copy_shortcuts(
 
     for shortcut in list_shortcuts(client, source_workspace_id, source_item_id):
         name = str(shortcut.get("name"))
+        connection_problem = _unmigrated_connection(shortcut, id_map, source_items)
+        if connection_problem:
+            warnings.append(f"Shortcut '{name}' was not created: {connection_problem}.")
+            continue
         missing = unmigrated_target(shortcut, id_map, source_workspace_id)
         if missing:
             warnings.append(describe_unmigrated(name, missing, source_items))
@@ -293,7 +345,9 @@ def copy_shortcuts(
             created += 1
         except FabricApiError as error:
             source_id = onelake_item_id(shortcut)
-            reason = (dormant or {}).get(source_id)
+            reason = {identity_key(k): v for k, v in (dormant or {}).items()}.get(
+                identity_key(source_id)
+            )
             warnings.append(
                 describe_dormant(
                     name,
@@ -391,6 +445,10 @@ def copy_table_shortcuts(
 
     for shortcut in source:
         name = str(shortcut.get("name"))
+        connection_problem = _unmigrated_connection(shortcut, id_map, source_items)
+        if connection_problem:
+            warnings.append(f"KQL table shortcut '{name}' was not created: {connection_problem}.")
+            continue
         missing = unmigrated_target(shortcut, id_map, source_workspace_id)
         if missing:
             warnings.append(
@@ -416,7 +474,9 @@ def copy_table_shortcuts(
             created += 1
         except FabricApiError as error:
             source_id = onelake_item_id(shortcut)
-            reason = (dormant or {}).get(source_id)
+            reason = {identity_key(k): v for k, v in (dormant or {}).items()}.get(
+                identity_key(source_id)
+            )
             warnings.append(
                 describe_dormant(
                     name,

@@ -28,6 +28,7 @@ from fabshuffle.fabric.client import (
     OperationTimeout,
 )
 from fabshuffle.fabric.definitions import (
+    GUID_PATTERN,
     build_rewriter,
     decode_json_part,
     decode_payload,
@@ -518,7 +519,13 @@ def dangling_references(
         if item_id
         and (
             item_id.casefold() not in mapped
-            or mapped[item_id.casefold()].casefold() == item_id.casefold()
+            or (
+                mapped[item_id.casefold()].casefold() == item_id.casefold()
+                and (
+                    GUID_PATTERN.fullmatch(item_id)
+                    or item_id.casefold() == str(item.get("id") or "").casefold()
+                )
+            )
         )
         and item_id.casefold() not in skip
     }
@@ -529,7 +536,7 @@ def dangling_references(
     # replacements before looking for the identifiers that are still unresolved.
     mask = build_rewriter({
         key: "\x00" for key in id_map
-        if key and id_map[key] and key.casefold() != id_map[key].casefold()
+        if key and id_map[key] and key.casefold() not in missing
     })
     text = _definition_text(parts)
     haystack = (mask(text) if mask else text).casefold()
