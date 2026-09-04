@@ -541,10 +541,10 @@ def dangling_references(
     text = _definition_text(parts)
     haystack = (mask(text) if mask else text).casefold()
     found = [item for item_id, item in missing.items() if item_id in haystack]
-    return sorted({
+    return list(dict.fromkeys(
         f"{item.get('type') or 'item'} '{item.get('displayName') or item.get('id')}'"
-        for item in found
-    })
+        for item in sorted(found, key=lambda item: str(item.get("displayName") or item.get("id")))
+    ))
 
 
 def _definition_text(parts: Iterable[Mapping[str, Any]]) -> str:
