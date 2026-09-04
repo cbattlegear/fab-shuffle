@@ -237,6 +237,9 @@ class CopyJobSpec:
     display_name: str
     content: dict[str, Any]
     label: str
+    # The source item whose data this moves, so a caller can write down that it is done and
+    # not spend hours doing it again. Not needed to run the job.
+    item_id: str = ""
 
 
 @dataclass(slots=True)
@@ -260,6 +263,7 @@ def run_copy_jobs(
     *,
     concurrency: int | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_done: Callable[[CopyJobSpec], None] | None = None,
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """Run a batch of Copy Jobs together rather than one after another.
 
@@ -270,6 +274,10 @@ def run_copy_jobs(
     Concurrency is bounded, and deliberately low. A Copy Job runs on the target capacity, so
     a dozen at once on a small SKU is not a dozen times faster; Fabric queues them, and past
     a point turns the over-subscription into a failed job rather than a slow one.
+
+    ``on_done`` is called for each job that finished cleanly, and only those, so a caller can
+    record what it will not need to repeat. A job that failed, timed out, or could not be read
+    is left unrecorded on purpose: it has to be attempted again.
 
     Returns the ids of the jobs that were created, so the caller can clean them up, and a
     warning for each one that did not finish cleanly.
@@ -332,6 +340,8 @@ def run_copy_jobs(
                     f"{job.spec.label} did not copy: the job ended as {status}"
                     + (f": {reason.get('message') or reason}" if reason else "")
                 )
+            elif on_done:
+                on_done(job.spec)
         in_flight = still_running
 
         if in_flight and time.monotonic() > deadline:

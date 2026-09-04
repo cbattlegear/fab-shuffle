@@ -262,6 +262,13 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .warnings button { margin-top: 0.75rem; }
 #leftovers { margin-top: 0; margin-bottom: 1.25rem; }
 
+/* Each unfinished run is a small record with its own action, not a bullet point. */
+#resumable { margin-top: 0; margin-bottom: 1.25rem; }
+#resumable ul { list-style: none; padding-left: 0; }
+#resumable li { padding: 0.6rem 0; border-top: 1px solid var(--border); }
+#resumable li:first-child { border-top: none; padding-top: 0; }
+#resumable li button { margin-top: 0.4rem; }
+
 .warnings.danger { border-color: rgba(229, 100, 107, 0.5); background: rgba(229, 100, 107, 0.1); }
 .warnings.danger h3 { color: var(--danger); }
 

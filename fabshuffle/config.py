@@ -69,5 +69,18 @@ class Settings:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    @property
+    def journal_dir(self) -> Path:
+        """Where run journals live.
+
+        Deliberately a sibling of the per-run scratch directories rather than a child of one:
+        ``cleanup_run`` deletes those when a run succeeds, and a finished run's journal is what
+        makes retrying the items it left behind possible.
+        """
+        return self.scratch_root / "journal"
+
+    def journal_for(self, run_id: str) -> Path:
+        return self.journal_dir / f"{run_id}.jsonl"
+
 
 SETTINGS = Settings()

@@ -17,8 +17,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from fabshuffle import __version__
+from fabshuffle import __version__, journal
 from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
+from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import workspaces
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.items import list_items
@@ -35,6 +36,7 @@ from fabshuffle.orchestrator import (
     default_target_name,
     dependency_warnings,
     grant_script,
+    plan_from_journal,
     portal_instructions,
     run_migration,
 )
@@ -366,6 +368,58 @@ def create_app() -> FastAPI:
     async def get_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:
         return _require_run(run_id).snapshot()
 
+    @app.get("/api/resumable")
+    async def resumable(_: Session = Depends(require_session)) -> dict[str, Any]:
+        """Runs that stopped without finishing, from their journals on disk.
+
+        Read from disk rather than from the run registry on purpose: the runs worth offering
+        back are exactly the ones this process has no memory of, because it was restarted.
+        """
+
+        def work() -> list[dict[str, Any]]:
+            return [_resumable_dict(replay) for replay in journal.list_runs(SETTINGS.journal_dir)
+                    if replay.interrupted]
+
+        return {"runs": await asyncio.to_thread(work)}
+
+    @app.post("/api/runs/{run_id}/resume")
+    async def resume(
+        run_id: str,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        """Pick up an interrupted run, in a new run that starts from the old one's journal."""
+        path = SETTINGS.journal_for(run_id)
+        # Existence of the file, not of a plan inside it: a journal that exists but says
+        # nothing useful is a different problem from one that was never written, and the
+        # operator should be told which.
+        if not await asyncio.to_thread(path.is_file):
+            raise HTTPException(status_code=404, detail="No journal for that run")
+        replay = await asyncio.to_thread(journal.read, path)
+        # A finished run may be picked up too. That is how the items it left behind are
+        # retried: the target workspace and everything already in it are adopted, so only
+        # what did not make it the first time is attempted. Its scratch workspace was deleted
+        # on the way out, and the workspace phase notices and builds another.
+        try:
+            plan = plan_from_journal(replay)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+        run = REGISTRY.add(
+            MigrationRun(
+                source_workspace_name=plan.source_workspace_name,
+                capacity_name=plan.capacity_name,
+            )
+        )
+        thread = threading.Thread(
+            target=run_migration,
+            args=(run, session.principal, plan),
+            kwargs={"cleanup": replay.cleanup, "prior": replay},
+            name=f"fab-shuffle-{run.id}",
+            daemon=True,
+        )
+        thread.start()
+        return {"runId": run.id, "plan": _plan_dict(plan), "resumedFrom": run_id}
+
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:
         run = _require_run(run_id)
@@ -443,6 +497,28 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
         "includeData": plan.include_data,
         "includeFiles": plan.include_files,
         "copyPermissions": plan.copy_permissions,
+    }
+
+
+def _resumable_dict(replay: journal.Replay) -> dict[str, Any]:
+    """One interrupted run, as much as can be told without asking Fabric anything.
+
+    Everything here comes from the journal on disk, so the list can be shown before the
+    operator has signed in to anything the run touched.
+    """
+    plan = replay.plan
+    return {
+        "runId": replay.run_id,
+        "startedAt": replay.created_at,
+        "sourceWorkspaceName": plan.get("source_workspace_name") or "",
+        "targetWorkspaceName": plan.get("target_workspace_name") or "",
+        "capacityName": plan.get("capacity_name") or "",
+        "capacityRegion": plan.get("capacity_region") or "",
+        "targetWorkspaceId": replay.target_workspace_id,
+        # What it managed before it stopped, which is what the operator is deciding about.
+        "itemsCreated": len(replay.items) or len(replay.id_map),
+        "lastPhase": replay.phases_started[-1] if replay.phases_started else "",
+        "warnings": len(replay.warnings),
     }
 
 

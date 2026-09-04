@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
 
+from fabshuffle import journal
 from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.config import SETTINGS
 from fabshuffle.orchestrator import MigrationPlan
 from fabshuffle.run import REGISTRY, RunStatus, StepStatus
 from fabshuffle.web import app as web
@@ -144,3 +147,130 @@ def test_cleanup_is_refused_while_a_run_is_in_flight(client: TestClient, session
     cancelled = client.post(f"/api/runs/{run_id}/cancel", headers=auth(session_id))
     assert cancelled.status_code == 200
     assert REGISTRY.get(run_id).cancelled is True
+
+
+# ------------------------------------------------------- picking up an old run
+
+
+@pytest.fixture
+def journal_dir(tmp_path, monkeypatch):
+    """A journal directory of this test's own.
+
+    The session-wide one accumulates a file for every run the whole suite starts, so a test
+    about which runs are offered back has to be looking at a directory it controls.
+    """
+    monkeypatch.setattr(SETTINGS, "scratch_root", tmp_path)
+    return SETTINGS.journal_dir
+
+
+def write_journal(*, finished=False, plan=True):
+    """A journal on disk, as a previous run of the container would have left it."""
+    run_id = uuid.uuid4().hex
+    book = journal.Journal(SETTINGS.journal_for(run_id))
+    if plan:
+        book.run_created(
+            {
+                "source_workspace_id": "ws-1",
+                "source_workspace_name": "Sales",
+                "target_workspace_name": "Sales-westeurope",
+                "capacity_id": "cap-1",
+                "capacity_name": "F64",
+                "capacity_region": "westeurope",
+            },
+            cleanup=True,
+        )
+    else:
+        book.run_created({}, cleanup=True)
+    book.workspace("target", "ws-target", "Sales-westeurope")
+    book.phase_started("lakehouses")
+    book.item("lh-src", "lh-new", "Lakehouse", "bronze")
+    if finished:
+        book.finished("succeeded")
+    return run_id
+
+
+def test_the_resumable_list_needs_a_session(client: TestClient):
+    assert client.get("/api/resumable").status_code == 401
+
+
+def test_only_runs_that_never_finished_are_offered_back(client: TestClient, session_id: str, journal_dir):
+    interrupted = write_journal()
+    write_journal(finished=True)
+
+    listed = client.get("/api/resumable", headers=auth(session_id)).json()["runs"]
+
+    assert [entry["runId"] for entry in listed] == [interrupted]
+    entry = listed[0]
+    assert entry["sourceWorkspaceName"] == "Sales"
+    assert entry["targetWorkspaceName"] == "Sales-westeurope"
+    assert entry["targetWorkspaceId"] == "ws-target"
+    assert entry["itemsCreated"] == 1
+    assert entry["lastPhase"] == "lakehouses"
+
+
+def test_resuming_a_run_nobody_has_a_journal_for_is_404(client: TestClient, session_id: str):
+    response = client.post("/api/runs/nope/resume", headers=auth(session_id))
+    assert response.status_code == 404
+
+
+def test_resuming_a_run_that_finished_is_allowed(client: TestClient, session_id: str, journal_dir):
+    """It used to be refused. Retrying the items a run left behind reads the same journal."""
+    run_id = write_journal(finished=True)
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+
+    assert response.status_code == 200
+
+
+def test_resuming_a_run_that_finished_retries_what_it_left_behind(
+    client: TestClient, session_id: str, monkeypatch, journal_dir
+):
+    """A finished run is picked up too: that is how the items it could not move are retried."""
+    seen = {}
+
+    def fake_migration(run, principal, plan, cleanup=True, prior=None):
+        seen["prior"] = prior
+        run.mark_finished(RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(web, "run_migration", fake_migration)
+    run_id = write_journal(finished=True)
+
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+
+    assert response.status_code == 200
+    # Everything the first run did is inherited, so only what is missing gets attempted.
+    assert seen["prior"].id_map["lh-src"] == "lh-new"
+    assert seen["prior"].status == "succeeded"
+
+
+def test_a_journal_that_never_recorded_a_plan_is_refused(client: TestClient, session_id: str, journal_dir):
+    run_id = write_journal(plan=False)
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+
+    assert response.status_code == 409
+    assert "does not say what it was migrating" in response.json()["detail"]
+
+
+def test_resuming_hands_the_migration_the_earlier_attempt(
+    client: TestClient, session_id: str, monkeypatch, journal_dir
+):
+    """The plan comes back from the journal, and so does everything already done."""
+    seen = {}
+
+    def fake_migration(run, principal, plan, cleanup=True, prior=None):
+        seen["plan"] = plan
+        seen["prior"] = prior
+        seen["cleanup"] = cleanup
+        run.mark_finished(RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(web, "run_migration", fake_migration)
+    run_id = write_journal()
+
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+
+    assert response.status_code == 200
+    assert response.json()["resumedFrom"] == run_id
+    # A new run id: the old one is a record, not something to write over.
+    assert response.json()["runId"] != run_id
+    assert seen["plan"].target_workspace_name == "Sales-westeurope"
+    assert seen["prior"].id_map["lh-src"] == "lh-new"
+    assert seen["prior"].target_workspace_id == "ws-target"

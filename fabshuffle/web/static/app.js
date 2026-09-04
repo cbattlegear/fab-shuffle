@@ -109,6 +109,7 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#sign-out").hidden = false;
     await loadCapacities();
     loadLeftovers();
+    loadResumable();
     // Needed by the restore-access control on this same step.
     loadWorkspaces().then(fillWorkspaceSelects).catch(() => {});
     goTo("capacity");
@@ -170,6 +171,55 @@ $("#capacity-next").addEventListener("click", async () => {
 
 // Run state lives in memory, so a restarted container loses track of a scratch workspace
 // that was never cleaned up. Surface any leftovers right after sign-in.
+async function loadResumable() {
+  try {
+    const { runs } = await api("/api/resumable");
+    const container = $("#resumable");
+    container.hidden = !runs.length;
+    if (!runs.length) return;
+
+    const list = container.querySelector("ul");
+    list.innerHTML = "";
+    runs.forEach((run) => {
+      const item = document.createElement("li");
+
+      const what = document.createElement("div");
+      what.textContent = `${run.sourceWorkspaceName} → ${run.targetWorkspaceName}`;
+      item.appendChild(what);
+
+      const detail = document.createElement("div");
+      detail.className = "hint";
+      const started = run.startedAt ? new Date(run.startedAt).toLocaleString() : "an earlier run";
+      const built = run.itemsCreated === 1 ? "1 item" : `${run.itemsCreated} items`;
+      detail.textContent = `Started ${started}. Got as far as ${run.lastPhase || "the beginning"}, ${built} built.`;
+      item.appendChild(detail);
+
+      const button = document.createElement("button");
+      button.className = "secondary";
+      button.textContent = "Pick it up";
+      button.addEventListener("click", () => resumeRun(run.runId, button));
+      item.appendChild(button);
+
+      list.appendChild(item);
+    });
+  } catch (_) {
+    // Offering an old run back is a convenience; never block sign-in on it.
+  }
+}
+
+async function resumeRun(runId, button) {
+  busy(button, true, "Starting…");
+  try {
+    const result = await api(`/api/runs/${runId}/resume`, { method: "POST" });
+    state.runId = result.runId;
+    goTo("progress");
+    watchRun(result.runId);
+  } catch (error) {
+    showError(error.message);
+    busy(button, false);
+  }
+}
+
 async function loadLeftovers() {
   try {
     const { workspaces } = await api("/api/scratch-workspaces");
@@ -661,7 +711,27 @@ function renderRun(run) {
   $("#cancel-run").hidden = finished;
   $("#start-over").hidden = !finished;
   $("#cleanup-run").hidden = !finished || run.cleanupDone || !run.scratchWorkspace;
+  // Only worth offering when the run got far enough to build a workspace and still left
+  // something behind. A clean run has nothing to retry.
+  const leftSomething = (run.summary?.warnings || []).length > 0;
+  $("#retry-run").hidden = !finished || !run.targetWorkspace || !leftSomething;
 }
+
+$("#retry-run").addEventListener("click", async () => {
+  const button = $("#retry-run");
+  busy(button, true, "Starting…");
+  try {
+    // The same path as picking up an interrupted run: everything already in the new
+    // workspace is adopted, so only what did not make it is attempted again.
+    const result = await api(`/api/runs/${state.runId}/resume`, { method: "POST" });
+    state.runId = result.runId;
+    watchRun(result.runId);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    busy(button, false);
+  }
+});
 
 $("#cancel-run").addEventListener("click", async () => {
   const button = $("#cancel-run");

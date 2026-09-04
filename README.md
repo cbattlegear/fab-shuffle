@@ -303,6 +303,35 @@ nothing else about the migration differs.
 Credentials are held in the container's memory for the life of the session and are never
 written to disk.
 
+#### Picking up a migration that stopped
+
+Rebuilding a large workspace takes hours, so a run keeps a journal of what it has done: the
+plan it was given, every item it created, and every table and file set it moved. If the
+container is restarted, or a step fails, the unfinished run is offered back on the capacity
+screen the next time you sign in. Picking it up reuses the workspace it was building and
+carries on, rather than starting again.
+
+A resumed run redoes as little as possible. Items that are still in the new workspace are
+adopted; data that had finished moving is left alone. Anything the journal claims but that is
+no longer there is built again, because the journal records what an attempt *did*, not what is
+there now.
+
+The same machinery retries a run that *did* finish but left items behind — a connection that
+was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
+what did not migrate** on the progress screen, and only the missing items are attempted. The
+scratch workspace it deleted on the way out is rebuilt automatically.
+
+Two things follow from this:
+
+- **Resuming needs you to sign in again.** Credentials are never written down, so nothing can
+  restart a migration on its own. This is deliberate.
+- **Journals live on the volume**, under `local/journal`. They hold workspace and item ids and
+  names — the same things the screen shows — and no credentials. The hundred most recent are
+  kept.
+
+Without a mounted volume the journal goes when the container does, and there is nothing to
+pick up. That is the main reason the `docker run` line above mounts one.
+
 The service principal also needs the **"Service principals can use Fabric APIs"** tenant
 setting for Power BI, since the reassignment path calls the Power BI semantic model APIs and
 must be able to update those models.

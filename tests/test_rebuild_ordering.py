@@ -7,11 +7,13 @@ each phase feeds the next, are exercised together rather than unit by unit.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
-from fabshuffle import orchestrator
+from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
+from fabshuffle.config import SETTINGS
 from fabshuffle.fabric.definitions import decode_payload, part
 from fabshuffle.fabric.support import Strategy
 from fabshuffle.run import MigrationRun, RunStatus
@@ -77,6 +79,9 @@ class FakeFabric:
             return {"items": [], "relations": edges, "workspaces": []}
         if path.endswith("/spark/settings"):
             return {}
+        # A resume checks the scratch workspace is still there before aiming Copy Jobs at it.
+        if path in (f"workspaces/{TARGET_WS}", "workspaces/ws-scratch"):
+            return {"id": path.split("/")[1]}
         if path == f"workspaces/{TARGET_WS}/lakehouses/lh-new":
             return {
                 "id": "lh-new",
@@ -100,6 +105,15 @@ class FakeFabric:
                 {"id": LAKEHOUSE, "displayName": "bronze", "type": "Lakehouse"},
                 {"id": MODEL, "displayName": "Sales Model", "type": "SemanticModel"},
                 {"id": REPORT, "displayName": "Sales", "type": "Report"},
+            ]
+            return [i for i in items if not item_type or i["type"] == item_type]
+
+        if path == f"workspaces/{TARGET_WS}/items":
+            # What this fake has built so far, which is what a resume checks its journal
+            # against before trusting it.
+            items = [
+                {"id": new_id, "displayName": name, "type": kind}
+                for kind, name, new_id in self.created
             ]
             return [i for i in items if not item_type or i["type"] == item_type]
 
@@ -206,6 +220,238 @@ def test_phases_run_in_dependency_order(fabric):
         "reflexes",
         "permissions",
     ]
+
+
+# ---------------------------------------------------------------- resuming a run
+
+
+@contextmanager
+def dies_at(phase_id):
+    """Run with one phase throwing, leaving the run interrupted partway through.
+
+    The phase table is swapped directly rather than through monkeypatch, because the resume
+    has to happen with the table put back but the fixture's fake Fabric still in place, and
+    ``monkeypatch.undo`` would take both away.
+    """
+    original = orchestrator._REBUILD_PHASES
+
+    def explode(_ctx):
+        raise RuntimeError("the container went away")
+
+    orchestrator._REBUILD_PHASES = tuple(
+        (name, explode if name == phase_id else fn) for name, fn in original
+    )
+    try:
+        yield
+    finally:
+        orchestrator._REBUILD_PHASES = original
+
+
+def attempt(plan=None, prior=None):
+    migration = MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64")
+    orchestrator.run_migration(
+        migration, PRINCIPAL, plan or make_plan(), cleanup=False, prior=prior
+    )
+    return migration
+
+
+def interrupted_then_resumed(phase_id):
+    """Run until ``phase_id`` throws, then pick it up from its journal. Returns both runs."""
+    with dies_at(phase_id):
+        first = attempt()
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+    return first, second, replay
+
+
+def test_a_resumed_run_does_not_build_anything_twice(fabric):
+    """The whole point. A second attempt finishes the job instead of starting it again."""
+    with dies_at("analytics"):
+        first = attempt()
+    assert first.status == RunStatus.FAILED
+    built_before = list(fabric.created)
+    assert built_before, "the first attempt should have got something done"
+
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+
+    assert second.status == RunStatus.SUCCEEDED, second.error
+    # Nothing the first attempt built was built again.
+    names = [(kind, name) for kind, name, _ in fabric.created]
+    assert len(names) == len(set(names)), f"something was created twice: {names}"
+    # And the run went further than it did the first time.
+    assert len(fabric.created) > len(built_before)
+
+
+def test_a_resumed_run_reuses_the_workspace_rather_than_making_another(fabric):
+    """Creating a second workspace would abandon everything the first attempt built."""
+    _first, second, _replay = interrupted_then_resumed("lakehouses")
+
+    assert second.snapshot()["targetWorkspace"]["id"] == TARGET_WS
+    step = next(s for s in second.snapshot()["steps"] if s["id"] == "workspaces")
+    assert "Reusing" in step["detail"]
+
+
+def test_a_resumed_run_still_rebinds_correctly(fabric):
+    """A model carried across attempts must still point at the new endpoint, not the source."""
+    _first, second, _replay = interrupted_then_resumed("analytics")
+    assert second.status == RunStatus.SUCCEEDED, second.error
+
+    model_id = next(new_id for kind, _, new_id in fabric.created if kind == "SemanticModel")
+    payload = next(p for p in fabric.definitions[model_id] if p["path"] == "model.bim")
+    text = decode_payload(payload["payload"]).decode()
+    # Rebound through the id map the first attempt wrote down and this one read back.
+    assert TARGET_ENDPOINT in text and SOURCE_ENDPOINT not in text
+
+
+def test_an_item_deleted_between_attempts_is_built_again(fabric):
+    """The journal says what was done, not what is there now. Reality wins."""
+    with dies_at("analytics"):
+        first = attempt()
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    # Somebody removed the lakehouse from the new workspace in between.
+    fabric.created = [entry for entry in fabric.created if entry[0] != "Lakehouse"]
+
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+
+    assert second.status == RunStatus.SUCCEEDED, second.error
+    assert any(kind == "Lakehouse" for kind, _, _ in fabric.created)
+    assert any("no longer in the new workspace" in w for w in second.summary["warnings"])
+
+
+def test_resuming_into_a_workspace_that_has_gone_is_refused(fabric, monkeypatch):
+    """Rebuilding into a workspace that is not there would be worse than saying so."""
+    with dies_at("analytics"):
+        first = attempt()
+    replay = journal.read(SETTINGS.journal_for(first.id))
+
+    def gone(path, params=None, value_key="value"):
+        if path == f"workspaces/{TARGET_WS}/items":
+            raise orchestrator.FabricApiError("GET", path, 404, "WorkspaceNotFound")
+        return FakeFabric.list_all(fabric, path, params, value_key)
+
+    monkeypatch.setattr(fabric, "list_all", gone)
+    second = attempt(orchestrator.plan_from_journal(replay), prior=replay)
+
+    assert second.status == RunStatus.FAILED
+    assert "cannot be read any more" in second.error
+    assert "Start the migration again" in second.error
+
+
+def test_a_scratch_workspace_that_was_cleaned_up_is_replaced(fabric):
+    """A run that finished tidily deleted its own scratch workspace on the way out.
+
+    Retrying the items it left behind must notice, or the Copy Jobs would be aimed at a
+    workspace that is not there.
+    """
+    first = attempt()
+    assert first.status == RunStatus.SUCCEEDED, first.error
+    replay = journal.read(SETTINGS.journal_for(first.id))
+    assert replay.scratch_workspace_id
+
+    def missing(client, workspace_id):
+        raise orchestrator.FabricApiError("GET", f"workspaces/{workspace_id}", 404, "NotFound")
+
+    original = orchestrator.workspaces.get_workspace
+    orchestrator.workspaces.get_workspace = missing
+    try:
+        assert orchestrator.surviving_scratch(fabric, replay.scratch_workspace_id) == ""
+    finally:
+        orchestrator.workspaces.get_workspace = original
+
+
+def test_a_scratch_workspace_that_is_still_there_is_reused(fabric):
+    original = orchestrator.workspaces.get_workspace
+    orchestrator.workspaces.get_workspace = lambda client, workspace_id: {"id": workspace_id}
+    try:
+        assert orchestrator.surviving_scratch(fabric, "ws-scratch") == "ws-scratch"
+    finally:
+        orchestrator.workspaces.get_workspace = original
+
+
+def test_the_plan_survives_the_round_trip(fabric):
+    """A resume must not have to ask the operator for the plan a second time."""
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert orchestrator.plan_from_journal(replay) == make_plan()
+
+
+def test_a_journal_with_no_plan_cannot_be_resumed():
+    with pytest.raises(ValueError, match="does not say what it was migrating"):
+        orchestrator.plan_from_journal(journal.Replay())
+
+
+# ------------------------------------------------------------------- the journal
+
+
+def test_a_run_writes_down_enough_to_be_picked_up(fabric):
+    """The whole point of the journal: what a later attempt needs in order to skip ahead."""
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert replay.plan["source_workspace_id"] == SOURCE_WS
+    assert replay.target_workspace_id == TARGET_WS
+    # Every phase that ran is recorded as finished, in the order it ran.
+    assert replay.phases_started[:3] == ["assessment", "dependencies", "workspaces"]
+    assert "analytics" in replay.phases_finished
+    assert replay.status == RunStatus.SUCCEEDED.value
+
+
+def test_the_journal_maps_every_item_that_was_created(fabric):
+    """id_map is what later phases rewrite definitions through, so it has to survive intact.
+
+    Nothing may be created without being written down: an item missing from the journal is one
+    a resume would build a second time, under a name that is already taken.
+    """
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    recorded = set(replay.id_map.values())
+    for kind, name, new_id in fabric.created:
+        assert new_id in recorded, f"{kind} '{name}' was created but never recorded"
+
+    # And the bindings the rebuild test depends on are the ones that came back.
+    assert replay.id_map[LAKEHOUSE] == "lh-new"
+    assert replay.id_map[SOURCE_WS] == TARGET_WS
+
+
+def test_the_journal_records_endpoints_as_well_as_items(fabric):
+    """A semantic model rebinds through the endpoint name, not only through the item id."""
+    migration = run(fabric)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert replay.id_map.get(SOURCE_ENDPOINT) == TARGET_ENDPOINT
+
+
+def test_a_run_that_died_records_no_ending(fabric, monkeypatch):
+    """A run with no ending is exactly the one worth offering back, and how it is recognised."""
+
+    def explode(_ctx):
+        raise RuntimeError("the capacity went away")
+
+    # Patched in the phase table rather than on the module: the table holds the functions
+    # themselves, taken when it was defined, so rebinding the name would have no effect.
+    monkeypatch.setattr(
+        orchestrator,
+        "_REBUILD_PHASES",
+        tuple(
+            (name, explode if name == "realtime" else fn)
+            for name, fn in orchestrator._REBUILD_PHASES
+        ),
+    )
+
+    migration = MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64")
+    orchestrator.run_migration(migration, PRINCIPAL, make_plan(), cleanup=False)
+    replay = journal.read(SETTINGS.journal_for(migration.id))
+
+    assert migration.status == RunStatus.FAILED
+    assert replay.interrupted
+    assert not replay.status
+    # What it got through is still there to be picked up.
+    assert "lakehouses" in replay.phases_finished
+    assert "realtime" not in replay.phases_finished
+    assert replay.target_workspace_id == TARGET_WS
 
 
 def test_data_items_are_created_before_the_models_that_read_them(fabric):
