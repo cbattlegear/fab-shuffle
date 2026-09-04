@@ -25,6 +25,7 @@ from fabshuffle.fabric.definitions import (
     is_text_part,
     part,
 )
+from fabshuffle.lifecycle import EvidenceState, ItemLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +239,15 @@ def retarget_location(parts: list[dict[str, Any]], region: str) -> list[dict[str
     return [part(config["path"], document) if p is config else p for p in parts]
 
 
-def configuration_warnings(parts: list[dict[str, Any]], job_name: str) -> list[str]:
+def configuration_warnings(
+    parts: list[dict[str, Any]], job_name: str, *, lifecycle: ItemLifecycle | None = None,
+) -> list[str]:
     """Settings that travel but will not work until someone acts on them."""
+    if lifecycle:
+        lifecycle.step(
+            "configuration", EvidenceState.UNKNOWN, "Airflow configuration has not been inspected.",
+            action="Inspect the target job configuration before running it.",
+        )
     config = _config_part(parts)
     if not config:
         return []
@@ -250,6 +258,14 @@ def configuration_warnings(parts: list[dict[str, Any]], job_name: str) -> list[s
     if not isinstance(document, dict):
         return []
 
+    if lifecycle:
+        lifecycle.step(
+            "configuration", EvidenceState.SKIPPED if document.get("secrets") else EvidenceState.SUCCEEDED,
+            "Secret values were not transferred." if document.get("secrets")
+            else "Configuration inspected; no omitted secret values identified.",
+            action="Re-enter the target Airflow job's secrets before running it."
+            if document.get("secrets") else "",
+        )
     warnings: list[str] = []
     if document.get("secrets"):
         warnings.append(

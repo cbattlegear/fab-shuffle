@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fabshuffle.fabric.definitions import decode_json_part, find_part, part, replace_part
+from fabshuffle.lifecycle import EvidenceState, ItemLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,8 @@ class ItemPolicy:
 
     export_format: str | None = None
     prepare: Callable[[list[dict[str, Any]], str], tuple[list[dict[str, Any]], list[str]]] | None = None
+    activation: str = ""
+    observe: Callable[[ItemLifecycle, list[dict[str, Any]], str], None] | None = None
 
 
 def _prepare_catalog(
@@ -210,12 +213,71 @@ def _prepare_spark_job(
     return parts, spark_job_warnings(parts, source_workspace_id)
 
 
+def _observe_catalog(
+    outcome: ItemLifecycle, parts: list[dict[str, Any]], _source_workspace: str,
+) -> None:
+    payload = find_part(parts, ADB_CATALOG_PART)
+    disabled = payload and decode_json_part(payload["payload"]).get("autoSync") == "Disabled"
+    outcome.step(
+        "activation", EvidenceState.SKIPPED if disabled else EvidenceState.UNKNOWN,
+        "Catalog definition has autoSync disabled." if disabled else "Catalog sync state is unmeasured.",
+        action="Review the target catalog and enable autoSync only when ready to cut over.",
+    )
+
+
+def _observe_reflex(
+    outcome: ItemLifecycle, parts: list[dict[str, Any]], _source_workspace: str,
+) -> None:
+    payload = find_part(parts, REFLEX_ENTITIES_PART)
+    entities = decode_json_part(payload["payload"]) if payload else None
+    if not isinstance(entities, list):
+        outcome.step(
+            "activation", EvidenceState.UNKNOWN, "No readable Activator rule inventory.",
+            action="Inspect the target Activator rules before enabling any actions.",
+        )
+        return
+    rules = [
+        (entity.get("payload") or {}).get("definition") or {}
+        for entity in entities if isinstance(entity, dict)
+        and isinstance(entity.get("payload"), dict)
+    ]
+    rules = [rule for rule in rules if isinstance(rule, dict) and rule.get("type") == "Rule"]
+    outcome.step(
+        "activation", EvidenceState.SKIPPED if rules else EvidenceState.SUCCEEDED,
+        f"{len(rules)} Activator rule(s) left stopped." if rules else "No Activator rules found.",
+        action="Review and enable the target Activator rules only at cutover." if rules else "",
+    )
+
+
+def _observe_spark_job(
+    outcome: ItemLifecycle, parts: list[dict[str, Any]], source_workspace: str,
+) -> None:
+    if spark_job_warnings(parts, source_workspace):
+        outcome.step(
+            "files", EvidenceState.UNKNOWN, "The job references files outside its inline definition.",
+            action="Verify the job's executable and libraries in the target; upload missing files "
+            "and repoint the job before running it.",
+        )
+
+
 POLICIES: dict[str, ItemPolicy] = {
-    "MirroredAzureDatabricksCatalog": ItemPolicy(prepare=_prepare_catalog),
-    "Reflex": ItemPolicy(prepare=_prepare_reflex),
-    "SparkJobDefinition": ItemPolicy(
-        export_format=SPARK_JOB_DEFINITION_FORMAT, prepare=_prepare_spark_job
+    # Activation instructions describe operations this migrator deliberately does not perform.
+    # Learn: environment/items/publish-environment; mirroreddatabase/mirroring/start-mirroring;
+    # articles/item-management/definitions/{reflex,mirrored-azuredatabricks-unitycatalog}-definition.
+    "Environment": ItemPolicy(activation="Publish the target environment before running its consumers."),
+    "GraphModel": ItemPolicy(activation="Refresh the target graph model and verify it before querying."),
+    "MirroredDatabase": ItemPolicy(
+        activation="Start mirroring in the target when ready to cut over, then verify replicated data."
     ),
+    "MirroredAzureDatabricksCatalog": ItemPolicy(
+        prepare=_prepare_catalog, observe=_observe_catalog,
+    ),
+    "Reflex": ItemPolicy(prepare=_prepare_reflex, observe=_observe_reflex),
+    "SparkJobDefinition": ItemPolicy(
+        export_format=SPARK_JOB_DEFINITION_FORMAT, prepare=_prepare_spark_job,
+        observe=_observe_spark_job,
+    ),
+    "SemanticModel": ItemPolicy(),
 }
 
 

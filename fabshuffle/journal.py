@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from fabshuffle.lifecycle import ItemOutcome
+
 logger = logging.getLogger(__name__)
 
 # Record kinds. Strings rather than an enum because they are written to disk and read back by
@@ -47,6 +49,8 @@ INVALIDATED = "invalidated"
 REFRESH = "refresh"
 COPY_JOB = "copy_job"
 FOLLOWER = "follower"
+OUTCOME = "outcome"
+INVENTORY = "inventory"
 
 #: How many run journals to keep. They are small, but the directory sits on a volume that
 #: outlives the container and nothing else ever removes them.
@@ -77,7 +81,8 @@ class Journal:
         line = json.dumps(record, separators=(",", ":"), default=str)
         try:
             with self._lock, self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+                # A partial advisory write must not swallow the next strict recovery record.
+                handle.write("\n" + line + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError as error:
@@ -152,6 +157,12 @@ class Journal:
     def finished(self, status: str, error: str | None = None) -> None:
         self._write(FINISHED, status=status, error=error)
 
+    def outcome(self, record: dict[str, Any]) -> None:
+        self._write(OUTCOME, item=record)
+
+    def inventory(self) -> None:
+        self._write(INVENTORY)
+
 
 #: A journal that records nothing, for a preview or a test that has nothing to resume.
 DISCARD = Journal(None)
@@ -220,6 +231,8 @@ class Replay:
     refresh_needed: set[str] = field(default_factory=set)
     copy_jobs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     follower_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
+    outcomes: dict[str, ItemOutcome] = field(default_factory=dict)
+    inventory_complete: bool = False
     # Source item id -> what was created for it. A superset of the item entries in id_map,
     # carrying the type and name so a resume can say what it is skipping.
     items: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -277,6 +290,9 @@ def _state_records(replay: Replay) -> list[dict[str, Any]]:
         {"t": FOLLOWER, "source": source, **binding}
         for source, binding in replay.follower_bindings.items()
     )
+    records.extend({"t": OUTCOME, "item": item.record()} for item in replay.outcomes.values())
+    if replay.inventory_complete:
+        records.append({"t": INVENTORY})
     return records
 
 
@@ -285,6 +301,13 @@ def read(path: Path) -> Replay:
     replay = Replay(run_id=path.stem, lineage_id=path.stem)
     for record in _records(path, replay):
         _apply(replay, record)
+    if replay.damaged_lines:
+        replay.inventory_complete = False
+        for outcome in replay.outcomes.values():
+            outcome.invalidate(
+                replay.run_id, target_lost=False,
+                reason="Journal contains incomplete records; previous evidence is uncertain.",
+            )
     return replay
 
 
@@ -335,6 +358,7 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
         source = str(record.get("source") or "")
         target = str(record.get("target") or "")
         if source and target:
+            _retarget_outcome(replay, source, target)
             replay.id_map[source] = target
             replay.items[source] = {
                 "target": target,
@@ -345,6 +369,7 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
         source = str(record.get("source") or "")
         target = str(record.get("target") or "")
         if source and target:
+            _retarget_outcome(replay, source, target)
             replay.id_map[source] = target
             if record.get("owner"):
                 replay.mapping_owners[source] = str(record["owner"])
@@ -369,10 +394,16 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
             key: target for key, target in replay.data_targets.items() if key[0] not in sources
         }
         replay.refresh_needed.update(record.get("refresh") or [])
+        for source in sources | set(record.get("refresh") or []):
+            if source in replay.outcomes:
+                replay.outcomes[source].invalidate(replay.run_id, target_lost=source in sources)
     elif kind == REFRESH:
         sources = set(record.get("sources") or [])
         if record.get("required", True):
             replay.refresh_needed.update(sources)
+            for source in sources:
+                if source in replay.outcomes:
+                    replay.outcomes[source].invalidate(replay.run_id, target_lost=False)
         else:
             replay.refresh_needed.difference_update(sources)
     elif kind == COPY_JOB:
@@ -397,7 +428,23 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
     elif kind == FINISHED:
         replay.status = str(record.get("status") or "")
         replay.error = record.get("error")
+    elif kind == OUTCOME:
+        try:
+            outcome = ItemOutcome.from_record(record["item"])
+        except (KeyError, TypeError, ValueError):
+            replay.damaged_lines += 1
+        else:
+            replay.outcomes[outcome.sourceId] = outcome
+    elif kind == INVENTORY:
+        replay.inventory_complete = True
     # An unknown kind is ignored on purpose, so an older build can read a newer journal.
+
+
+def _retarget_outcome(replay: Replay, source: str, target: str) -> None:
+    outcome = replay.outcomes.get(source)
+    if outcome and outcome.targetId and outcome.targetId != target:
+        outcome.invalidate(replay.run_id, target_lost=True)
+        outcome.targetId = target
 
 
 def list_runs(directory: Path) -> list[Replay]:

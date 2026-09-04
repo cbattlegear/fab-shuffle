@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fabshuffle import journal
+from fabshuffle.lifecycle import Lifecycle
 
 
 class StepStatus(StrEnum):
@@ -88,6 +89,15 @@ class MigrationRun:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._subscribers: list[queue.Queue[dict[str, Any] | None]] = []
+        self.readiness_revision = 0
+        self.inventory_complete = False
+        self.readiness_attempts: list[dict[str, Any]] = []
+        self.lifecycle = Lifecycle(attempt_id=self.id, changed=self.readiness_changed)
+
+    def readiness_changed(self) -> None:
+        # The next normal progress event carries only a revision, not the item list.
+        with self._lock:
+            self.readiness_revision += 1
 
     # ------------------------------------------------------------------- steps
 
@@ -188,6 +198,7 @@ class MigrationRun:
                 "cleanupDone": self.cleanup_done,
                 "summary": dict(self.summary),
                 "steps": [step.as_dict() for step in self._steps],
+                "readinessRevision": self.readiness_revision,
             }
 
     # -------------------------------------------------------------- event feed

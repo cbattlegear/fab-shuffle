@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 from fabshuffle.auth import TokenProvider
+from fabshuffle.lifecycle import CopyOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,7 @@ def copy_documents(
     target_database: str,
     tokens: TokenProvider,
     on_progress: Callable[[str], None] | None = None,
+    on_complete: Callable[[CopyOutcome], None] | None = None,
 ) -> list[str]:
     """Copy every document in every container. Returns per-container warnings.
 
@@ -124,15 +126,19 @@ def copy_documents(
     except exceptions.CosmosHttpResponseError as error:
         raise CosmosTransferError(_describe(error)) from error
 
+    total_copied = 0
     for name in containers:
         if on_progress:
             on_progress(f"Copying documents in container '{name}'")
         try:
             copied = _copy_container(source, target, name, on_progress)
+            total_copied += copied
             logger.debug("Copied %s documents into %s", copied, name)
         except exceptions.CosmosHttpResponseError as error:
             warnings.append(f"Documents in container '{name}' did not copy: {_describe(error)}")
 
+    if not warnings and on_complete:
+        on_complete(CopyOutcome("documents", empty=total_copied == 0))
     return warnings
 
 

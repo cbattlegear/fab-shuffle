@@ -15,6 +15,7 @@ from pathlib import Path
 
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.config import SETTINGS
+from fabshuffle.lifecycle import CopyOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def copy_files(
     principal: ServicePrincipal,
     scratch_dir: Path,
     on_progress: Callable[[str], None] | None = None,
-) -> None:
+) -> CopyOutcome:
     """Stage ``Files/`` from the source lakehouse locally, then upload to the target."""
     staging = scratch_dir / "files"
     if staging.exists():
@@ -59,11 +60,12 @@ def copy_files(
         if not any(staging.iterdir()):
             if on_progress:
                 on_progress("No files to transfer")
-            return
+            return CopyOutcome("files", empty=True)
 
         if on_progress:
             on_progress("Uploading OneLake files")
         _azcopy(["copy", f"{staging}/*", target_files_path, "--recursive"], principal)
+        return CopyOutcome("files", empty=False)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
