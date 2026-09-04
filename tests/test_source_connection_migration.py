@@ -246,3 +246,45 @@ def test_manual_adoption_requires_connector_and_connectivity_identity(fabric, mi
     fabric.tenant_connections.append(replacement)
     rebuild(fabric)
     assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
+
+
+@pytest.mark.parametrize("catalog_mapped", [False, True])
+def test_generated_sql_catalog_mapping_allows_verified_manual_connection_adoption(fabric, catalog_mapped):
+    source_catalog = "Orders-aaaabbbb-2222-3333-4444-555566667777"
+    target_catalog = "Orders-bbbbcccc-2222-3333-4444-555566667777"
+    fabric.source_connection["connectionDetails"]["path"] = f"{SOURCE_ENDPOINT};{source_catalog}"
+    fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
+    fabric.tenant_connections.append(connection(
+        id=REPLACEMENT, displayName=connections.replacement_name(fabric.source_connection, TARGET_WS),
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};{target_catalog}"},
+        credentialDetails={"credentialType": "Basic"},
+    ))
+    ctx = orchestrator._Context(
+        client=fabric, tokens=object(), principal=PRINCIPAL, plan=make_plan(),
+        run=MigrationRun(source_workspace_name="src", capacity_name="F64"), scratch_dir=None,
+        target_workspace_id=TARGET_WS,
+        source_items={
+            "sql-item": {
+                "id": "sql-item", "type": "SQLDatabase", "displayName": "Orders",
+                "properties": {"serverFqdn": SOURCE_ENDPOINT, "databaseName": source_catalog},
+            },
+            CONNECTION: {**fabric.source_connection, "type": "Connection"},
+        },
+        id_map={
+            SOURCE_WS: TARGET_WS, "sql-item": "sql-new", SOURCE_ENDPOINT: TARGET_ENDPOINT,
+            **({source_catalog: target_catalog} if catalog_mapped else {}),
+        },
+    )
+    orchestrator._migrate_connections(ctx)
+    orchestrator._migrate_realtime(ctx)
+    orchestrator._migrate_orchestration(ctx)
+    assert not fabric.connection_creates
+    if catalog_mapped:
+        assert ctx.id_map[CONNECTION] == REPLACEMENT
+        assert {kind for kind, _, _ in fabric.created} == {"Eventstream", "DataPipeline"}
+        for _, _, target_id in fabric.created:
+            payload = decode_json_part(fabric.definitions[target_id][0]["payload"])
+            assert payload["connectionId"] == REPLACEMENT
+    else:
+        assert CONNECTION not in ctx.id_map and not fabric.created
+        assert any("Orders" in warning for warning in ctx.warnings)

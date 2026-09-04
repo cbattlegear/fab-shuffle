@@ -72,6 +72,31 @@ def write_file(
     )
 
 
+def preflight_references(
+    parts: list[dict[str, Any]],
+    *,
+    source_job_id: str,
+    job_name: str,
+    id_map: Mapping[str, str],
+    source_items: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Refuse operational self references unless an existing target ID can replace them."""
+    own_item = {
+        source_job_id: {"id": source_job_id, "type": APACHE_AIRFLOW_JOB, "displayName": job_name},
+    }
+    if analytics.dangling_references(parts, id_map, own_item):
+        paths = ", ".join(str(candidate.get("path") or "?") for candidate in parts)
+        raise FabricError(
+            f"Apache Airflow job '{job_name}' contains its own source job ID in {paths}. "
+            "The new job ID is not available before creation. Remove hardcoded self references "
+            "from the source configuration or DAG, retry, then configure the destination job ID "
+            "before running it"
+        )
+    needed = analytics.dangling_references(parts, id_map, source_items)
+    if needed:
+        raise analytics.StrandedReference(needed)
+
+
 def preflight_files(
     client: FabricClient,
     *,
@@ -114,12 +139,13 @@ def preflight_files(
                     f"Apache Airflow job '{job_name}': '{file_path}' is not UTF-8; "
                     "convert this text file to UTF-8, then retry"
                 ) from error
-            needed = analytics.dangling_references(
-                [part(file_path, content)], id_map, source_items,
-                ignore=(source_job_id,),
+            preflight_references(
+                [part(file_path, content)],
+                source_job_id=source_job_id,
+                job_name=job_name,
+                id_map=id_map,
+                source_items=source_items,
             )
-            if needed:
-                raise analytics.StrandedReference([f"{name} (file '{file_path}')" for name in needed])
             content = (rewrite(text) if rewrite else text).encode("utf-8")
         prepared.append((file_path, content))
     return prepared
@@ -247,6 +273,7 @@ __all__ = [
     "copy_files",
     "list_files",
     "preflight_files",
+    "preflight_references",
     "read_file",
     "retarget_location",
     "write_file",

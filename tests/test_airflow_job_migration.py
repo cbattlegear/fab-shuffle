@@ -351,3 +351,49 @@ def test_copying_without_preflight_or_reference_context_is_refused():
     )
     assert count == 0 and not client.written
     assert "preflighted files" in warnings[0]
+
+
+@pytest.mark.parametrize("where", ["config", "dag", "both"])
+def test_fresh_job_self_references_are_refused_before_creation(where):
+    job = {**JOB_ITEM, "id": NOTEBOOK_GUID}
+    config = {"environmentVariables": {"JOB_ID": NOTEBOOK_GUID.upper()}} if where != "dag" else {}
+    client = FakeClient(config=config)
+    if where != "config":
+        client.contents["dags/my_dag.py"] = (
+            f"url = 'https://api.fabric.microsoft.com/v1/workspaces/{SOURCE_GUID}"
+            f"/items/{NOTEBOOK_GUID.upper()}'"
+        ).encode()
+    ctx = make_ctx(client)
+    ctx.id_map[SOURCE_GUID] = TARGET_GUID
+    ctx.source_items[job["id"]] = job
+    count, warnings = orchestrator._migrate_airflow_jobs(
+        ctx, "orchestration", [job], lambda _m: None,
+    )
+    assert count == 0 and not client.created and not client.written
+    assert job["id"] not in ctx.id_map
+    assert "own source job ID" in warnings[0]
+    assert "Remove hardcoded self references" in warnings[0]
+    assert "retry" in warnings[0]
+
+
+def test_existing_target_self_references_are_preflighted_and_rebound():
+    client = FakeClient(files=[{"filePath": "dags/my_dag.py"}])
+    literal = f"/workspaces/{SOURCE_GUID}/items/{NOTEBOOK_GUID.upper()}"
+    client.contents["dags/my_dag.py"] = literal.encode()
+    mapping = {SOURCE_GUID: TARGET_GUID, NOTEBOOK_GUID: NEW_NOTEBOOK_GUID}
+    config = [part("ApacheAirflowJob.json", {"environmentVariables": {"JOB_ID": NOTEBOOK_GUID}})]
+    airflow.preflight_references(
+        config, source_job_id=NOTEBOOK_GUID, job_name="NightlyDags", id_map=mapping,
+        source_items={},
+    )
+    prepared = airflow.preflight_files(
+        client, source_workspace_id=SOURCE_GUID, source_job_id=NOTEBOOK_GUID,
+        job_name="NightlyDags", id_map=mapping, source_items={},
+    )
+    count, warnings = airflow.copy_files(
+        client, source_workspace_id=SOURCE_GUID, source_job_id=NOTEBOOK_GUID,
+        target_workspace_id=TARGET_GUID, target_job_id=NEW_NOTEBOOK_GUID,
+        job_name="NightlyDags", prepared_files=prepared,
+    )
+    assert count == 1 and not warnings
+    assert client.written[0][1] == f"/workspaces/{TARGET_GUID}/items/{NEW_NOTEBOOK_GUID}".encode()

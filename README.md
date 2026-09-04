@@ -228,6 +228,11 @@ extension allowlist as item definitions, including Python, JSON, YAML, SQL and p
 Binary and other opaque files are preserved byte-for-byte. Unreadable or oversized files
 must be fixed before retrying.
 
+Literal references to a fresh job's own source ID are refused too: its destination ID is
+not available before creation. Remove those hardcoded self references, retry, then configure
+the destination job ID before running it. An adopted job with a known destination ID can
+have its literal self references rebound.
+
 This is literal-reference checking, not arbitrary Python analysis. Review references built
 dynamically from environment variables, imports, string fragments or opaque supporting
 files before running the new job.

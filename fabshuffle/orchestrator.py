@@ -3228,11 +3228,13 @@ def _migrate_airflow_jobs(
                 ctx.client, ctx.plan.source_workspace_id, job["id"]
             )
             parts = definitions.strip_part(definition.get("parts") or [], airflow.PLATFORM_PART)
-            needed = analytics.dangling_references(
-                parts, ctx.id_map, ctx.source_items, ignore=(job["id"],)
+            airflow.preflight_references(
+                parts,
+                source_job_id=job["id"],
+                job_name=name,
+                id_map=ctx.id_map,
+                source_items=ctx.source_items,
             )
-            if needed:
-                raise analytics.StrandedReference(needed)
             prepared_files = airflow.preflight_files(
                 ctx.client,
                 source_workspace_id=ctx.plan.source_workspace_id,
