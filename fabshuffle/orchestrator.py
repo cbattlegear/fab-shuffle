@@ -2550,6 +2550,70 @@ def _migrate_dataflows(
 # --------------------------------------------------------------------- phase 8
 
 
+def _restore_large_semantic_models(ctx: _Context, step: str) -> list[str]:
+    """Set rebuilt models back to the large storage format their source used.
+
+    Fabric creates every semantic model on its default small (``Abf``) storage format, so a
+    source model that used the large (``PremiumFiles``) format silently arrives downgraded on
+    a rebuild unless it is set back. Confirmed against Microsoft Learn, "Large semantic models
+    in Power BI Premium": ``Abf`` is the documented default and ``PremiumFiles`` is the large
+    format, and setting ``targetStorageMode`` to it enables large storage. The reassign path
+    converts large models down for the move and back afterwards; the rebuild path recreates
+    the models, so it has to re-enable the format itself.
+
+    Failures are collected as actionable warnings rather than raised: every item has already
+    migrated, so a model left small is worth reporting, not worth undoing a completed run over.
+    """
+    with powerbi.PowerBiClient(ctx.tokens) as pbi:
+        try:
+            source_models = pbi.list_semantic_models(ctx.plan.source_workspace_id)
+        except powerbi.PowerBiError as error:
+            return [
+                "Could not read the source semantic models' storage formats, so any that used "
+                "the large (PremiumFiles) format may have been left on the small (Abf) format in "
+                f"the new workspace. Check each model's storage format by hand: {error}"
+            ]
+
+        # Only a model that actually migrated has a target to restore. One that did not is
+        # already reported by migrate_items, so it is skipped rather than warned about twice.
+        large_targets: list[tuple[powerbi.SemanticModel, str]] = []
+        for model in source_models:
+            if not model.is_large:
+                continue
+            target_id = ctx.id_map.get(model.id)
+            if target_id:
+                large_targets.append((model, target_id))
+
+        if not large_targets:
+            return []
+
+        names = ", ".join(sorted(f"'{model.name}'" for model, _ in large_targets))
+        if not supports_large_semantic_models(ctx.plan.capacity_region):
+            # The reassign path refuses this up front, but on a rebuild the workspace is
+            # already built, so the honest outcome is a warning naming what was downgraded.
+            return [
+                f"Semantic model(s) {names} used the large storage format, but the target region "
+                f"'{ctx.plan.capacity_region}' does not support large semantic models, so they "
+                "were recreated on the small (Abf) storage format. Re-run the migration "
+                "targeting a capacity in a region that supports large semantic models if the "
+                "large format is required."
+            ]
+
+        warnings: list[str] = []
+        for model, target_id in large_targets:
+            ctx.run.raise_if_cancelled()
+            ctx.run.update_step(step, f"Restoring large storage format for '{model.name}'")
+            try:
+                pbi.set_storage_mode(ctx.target_workspace_id, target_id, powerbi.LARGE)
+            except powerbi.PowerBiError as error:
+                warnings.append(
+                    f"Semantic model '{model.name}' was recreated on the small (Abf) storage "
+                    "format in the new workspace; its source used the large (PremiumFiles) "
+                    f"format. Re-enable large storage on it manually: {error}"
+                )
+        return warnings
+
+
 def _migrate_reports_and_models(ctx: _Context) -> None:
     """Recreate semantic models and reports, rebound to the items in the new workspace.
 
@@ -2593,6 +2657,12 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
         on_progress=progress,
     )
     warnings.extend(model_warnings)
+
+    # A rebuilt model is created on Fabric's default small (Abf) storage format, so restore
+    # the large (PremiumFiles) format wherever the source used it. migrate_items only moves
+    # the definition; it never touches storage format.
+    if models:
+        warnings.extend(_restore_large_semantic_models(ctx, step))
 
     ctx.run.raise_if_cancelled()
 
