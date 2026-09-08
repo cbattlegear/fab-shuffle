@@ -187,6 +187,26 @@ def test_an_explicit_connection_mapping_is_validated_and_used_to_bind_consumers(
     assert journal.read(SETTINGS.journal_for(run.id)).id_map[CONNECTION] == REPLACEMENT
 
 
+def test_explicit_same_tenant_external_mapping_is_not_silently_ignored(fabric):
+    external_target = "ddddaaaa-1111-2222-3333-444455556666"
+    fabric.tenant_connections.extend([
+        connection(id=REPLACEMENT, connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"}),
+        connection(
+            id=external_target, connectionDetails={"type": "SQL", "path": "external.example.com;other"},
+        ),
+    ])
+    run = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT, EXTERNAL: external_target})
+    assert run.status is RunStatus.SUCCEEDED
+    assert not any(kind == "Connection" for kind, _, _ in fabric.created)
+    consumers = [
+        target_id for kind, _, target_id in fabric.created if kind in {"DataPipeline", "Eventstream"}
+    ]
+    assert consumers
+    for target_id in consumers:
+        payload = decode_json_part(fabric.definitions[target_id][0]["payload"])
+        assert payload["externalReferences"]["connection"] == external_target
+
+
 def test_resume_preserves_a_previously_validated_mapping(fabric):
     fabric.tenant_connections.append(connection(
         id=REPLACEMENT, displayName="Bronze SQL (dest)",

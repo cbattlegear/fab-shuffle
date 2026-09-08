@@ -20,6 +20,7 @@ import pytest
 from fabshuffle import orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import analytics, powerbi
+from fabshuffle.lifecycle import EvidenceState
 from fabshuffle.run import CancelledError, MigrationRun, StepStatus
 
 PRINCIPAL = ServicePrincipal("tenant", "client", "secret")
@@ -76,7 +77,9 @@ class FakePowerBi:
             raise powerbi.PowerBiError(f"HTTP 400: cannot enable large storage on {model_id}")
         self.storage_calls.append((workspace_id, model_id, storage_mode))
 
-    def convert(self, workspace_id, model, storage_mode, *, on_progress=None) -> None:
+    def convert(self, workspace_id, model, storage_mode, *, on_progress=None, check_cancelled=None) -> None:
+        if check_cancelled:
+            check_cancelled()
         self.set_storage_mode(workspace_id, model.id, storage_mode)
 
 
@@ -202,20 +205,15 @@ def test_a_target_already_on_the_large_format_is_left_alone(monkeypatch):
     assert fake.storage_calls == []
 
 
-def test_an_unsupported_target_region_warns_and_makes_no_call(monkeypatch):
+def test_an_unlisted_region_does_not_replace_the_services_response(monkeypatch):
     fake = FakePowerBi([large("sm_sales", "sm-src")])
     monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
 
     ctx = make_ctx(region="nowhereland", id_map={"sm-src": "sm-tgt"})
     warnings = orchestrator._restore_large_semantic_models(ctx, "analytics")
 
-    assert fake.storage_calls == []
-    assert len(warnings) == 1
-    # Names the item and the region, and points at the fix.
-    assert "'sm_sales'" in warnings[0]
-    assert "nowhereland" in warnings[0]
-    assert "does not support large semantic models" in warnings[0]
-    assert "Re-run the migration" in warnings[0]
+    assert fake.storage_calls == [("ws-target", "sm-tgt", powerbi.LARGE)]
+    assert warnings == []
 
 
 def test_a_failure_setting_the_mode_warns_but_does_not_raise(monkeypatch):
@@ -231,6 +229,7 @@ def test_a_failure_setting_the_mode_warns_but_does_not_raise(monkeypatch):
     assert "Re-enable large storage" in warnings[0]
     # The service's own words are repeated, not predicted.
     assert "HTTP 400: cannot enable large storage on sm-tgt" in warnings[0]
+    assert ctx.run.lifecycle.get("sm-src").steps["storage"].state is EvidenceState.FAILED
 
 
 def test_a_failure_confirming_the_targets_current_format_warns_but_does_not_raise(monkeypatch):
@@ -265,12 +264,16 @@ def test_failing_to_read_the_source_formats_warns_instead_of_raising(monkeypatch
     monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
 
     ctx = make_ctx(id_map={"sm-src": "sm-tgt"})
+    ctx.source_items["sm-src"] = {
+        "id": "sm-src", "displayName": "Source model", "type": analytics.SEMANTIC_MODEL,
+    }
     warnings = orchestrator._restore_large_semantic_models(ctx, "analytics")
 
     assert fake.storage_calls == []
     assert len(warnings) == 1
     assert "Check each model's storage format by hand" in warnings[0]
     assert "HTTP 403" in warnings[0]
+    assert ctx.run.lifecycle.get("sm-src").steps["storage"].state is EvidenceState.UNKNOWN
 
 
 def test_cancellation_stops_before_any_target_write(monkeypatch):
@@ -283,9 +286,19 @@ def test_cancellation_stops_before_any_target_write(monkeypatch):
     with pytest.raises(CancelledError):
         orchestrator._restore_large_semantic_models(ctx, "analytics")
 
-    # The source was still read (nothing destructive happens on that side), but the target
-    # was never touched once the cancellation was noticed.
+    assert fake.listed == []
     assert fake.storage_calls == []
+
+
+def test_unknown_source_format_is_not_assumed_small(monkeypatch):
+    source = powerbi.SemanticModel("sm-src", "Unknown", powerbi.SMALL, "", storage_mode_known=False)
+    fake = FakePowerBi([source])
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
+    ctx = make_ctx(id_map={"sm-src": "sm-tgt"})
+    warnings = orchestrator._restore_large_semantic_models(ctx, "analytics")
+    assert fake.storage_calls == []
+    assert "no format was inferred" in warnings[0]
+    assert ctx.run.lifecycle.get("sm-src").steps["storage"].state is EvidenceState.UNKNOWN
 
 
 # ------------------------------------------------- wired into the rebuild phase
@@ -329,18 +342,18 @@ def test_rebuild_phase_restores_large_format_and_succeeds(monkeypatch):
     assert ctx.run.snapshot()["steps"][-1]["status"] == StepStatus.SUCCEEDED.value
 
 
-def test_rebuild_phase_threads_the_downgrade_warning_from_an_unsupported_region(monkeypatch):
+def test_rebuild_phase_reports_actual_conversion_failure_for_unlisted_region(monkeypatch):
     source = [{"id": "sm-src", "displayName": "sm_sales", "type": "SemanticModel"}]
     _stub_analytics(monkeypatch, source)
 
-    fake = FakePowerBi([large("sm_sales", "sm-src")])
+    fake = FakePowerBi([large("sm_sales", "sm-src")], fail_on_target="sm-tgt")
     monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
 
     ctx = make_ctx(region="nowhereland")
     orchestrator._migrate_reports_and_models(ctx)
 
     assert fake.storage_calls == []
-    assert any("does not support large semantic models" in w for w in ctx.warnings)
+    assert any("HTTP 400: cannot enable large storage" in w for w in ctx.warnings)
 
 
 @pytest.mark.parametrize("region", ["centralus", "nowhereland"])

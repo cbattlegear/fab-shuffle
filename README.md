@@ -207,6 +207,11 @@ and decoupled the existing ones into independent semantic models by 30 November 
 there is no longer an auto-created copy to collide with — and skipping one now would quietly
 lose a model somebody is using.
 
+On a rebuild, models whose source uses large (`PremiumFiles`) storage have that setting
+confirmed or restored in the destination. A destination already configured as large is left
+alone. Missing source format metadata and failures are reported explicitly, with storage
+evidence in the cutover report; importing a definition does not prove data/query readiness.
+
 **Dataflows only migrate when they are Gen2 (CI/CD).** The item definition APIs do not
 support Dataflow Gen1 or classic Gen2, so each dataflow is classified by probing its
 definition — Fabric documents that filtering the item list by dataflow type does not return

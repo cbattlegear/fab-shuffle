@@ -77,7 +77,7 @@ from uuid import UUID
 
 from fabshuffle import concurrency
 from fabshuffle import journal as journal_module
-from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
     airflow,
@@ -1465,8 +1465,9 @@ def _load_source_references(ctx: _Context) -> None:
         if not connection_id or connection_id.casefold() not in referenced_connections:
             continue
         path = (connection.get("connectionDetails") or {}).get("path") or ""
-        if not ctx.plan.cross_tenant and not any(
-            key.casefold() in path.casefold() for key in identifiers if key
+        if (
+            not ctx.plan.cross_tenant and connection_id.casefold() not in ctx.plan.connection_mappings
+            and not any(key.casefold() in path.casefold() for key in identifiers if key)
         ):
             # Referenced, but not pointing back into this workspace: a standard external
             # connection that is reused unchanged, with nothing here for the operator to do.
@@ -3077,9 +3078,9 @@ def _validate_connection_mappings(ctx: _Context) -> None:
     as complete as it will be before anything that could bind the connection - starting with
     mirrored databases, which can bind one directly - is created.
 
-    Nothing is created, adopted by name, or deleted here, in any mode: a connection id is
-    tenant scoped, so it resolves unchanged from the migrated workspace, and the API never
-    returns an existing connection's credentials, so a faithful copy is never possible anyway.
+    Nothing is created, adopted by name, or deleted here, in any mode. Ordinary same-tenant
+    connections are reused; cross-tenant identities require explicit mappings. No credentials
+    or connection definitions are inferred from a tenant-wide source-target scan.
     A mapping that does not hold up is refused and its id map entry withdrawn, so a dependent
     item is refused too rather than built against a stale binding.
     """
@@ -3127,9 +3128,7 @@ def _validate_connection_mappings(ctx: _Context) -> None:
             )
             continue
         if (
-            needed
-            or (not ctx.plan.cross_tenant and connections.same_path(path, new_path))
-            or not connections.matches_replacement(target, connection, new_path)
+            needed or not connections.matches_replacement(target, connection, new_path)
         ):
             ctx.invalidate_mapping(mapped_key)
             warnings.append(
@@ -3580,7 +3579,7 @@ def _migrate_realtime(ctx: _Context) -> None:
     All three read from the real-time items built earlier: a queryset and a dashboard target
     an eventhouse cluster URI, and an eventstream routes into lakehouses, eventhouses, and
     other items while sourcing from connections. So this runs after the data stores, the
-    eventhouses, and the connection replacements.
+    eventhouses, and any validated operator-supplied connection mappings.
     """
     step = "realtime"
     ctx.run.start_step(step, "Migrating eventstreams, querysets, and dashboards")
@@ -3814,75 +3813,75 @@ def _migrate_dataflows(
 def _restore_large_semantic_models(ctx: _Context, step: str) -> list[str]:
     """Set rebuilt models back to the large storage format their source used.
 
-    Fabric creates every new semantic model on its default small (``Abf``) storage format;
-    Microsoft Learn's "Large semantic models in Power BI Premium" documents ``Abf`` as the
-    default, ``PremiumFiles`` as the large format, and setting ``targetStorageMode`` as what
-    enables it - and its own PowerShell walkthrough notes the change "can take a few seconds"
-    to actually apply, i.e. the request is accepted before the conversion physically lands.
-    So a source model on the large format silently arrives downgraded on a rebuild unless it
-    is set back, and a bare PATCH response is not proof that happened.
-
-    The reassign path converts large models down and back on the *same* workspace with a
-    single set of tokens; the rebuild path recreates the models in a different workspace that,
-    for a cross-tenant migration, belongs to a different tenant altogether. The source is
-    always read with the source's own tokens and the target is always written with the
-    target's - the same split every other rebuild phase in this file uses - never one client
-    for both. This reuses ``PowerBiClient.convert``, the same PATCH-then-poll the reassign
-    path already relies on to confirm a conversion, rather than trusting an unpolled PATCH. A
-    target already on the large format - a resumed run that already fixed it - is left alone.
-
-    Failures are collected as actionable warnings rather than raised: every item has already
-    migrated by the time this runs, so a model left small is worth reporting, not worth
-    undoing a completed run over.
+    Abf is the usual default, but workspaces can default to PremiumFiles. Read the actual
+    target setting rather than assuming every rebuilt model was downgraded. Source reads
+    and destination changes use their respective identities; failures remain actionable
+    evidence, and a cached region list never substitutes for the service's response.
+    https://learn.microsoft.com/power-bi/enterprise/service-premium-large-models
     """
+    ctx.run.raise_if_cancelled()
     with powerbi.PowerBiClient(ctx.tokens) as source_pbi:
         try:
             source_models = source_pbi.list_semantic_models(ctx.plan.source_workspace_id)
-        except powerbi.PowerBiError as error:
-            return [
+        except (powerbi.PowerBiError, AuthError) as error:
+            message = (
                 "Could not read the source semantic models' storage formats, so any that used "
-                "the large (PremiumFiles) format may have been left on the small (Abf) format "
-                f"in the new workspace. Check each model's storage format by hand: {error}"
-            ]
+                "the large (PremiumFiles) format could not be checked in the new workspace. "
+                f"Check each model's storage format by hand: {error}"
+            )
+            for source_id, item in list(ctx.source_items.items()):
+                if (
+                    source_id == item.get("id") and item.get("type") == analytics.SEMANTIC_MODEL
+                    and source_id in ctx.id_map
+                ):
+                    ctx.lifecycle(item, analytics.SEMANTIC_MODEL).step(
+                        "storage", EvidenceState.UNKNOWN, "Source storage format could not be read.",
+                        action=message, error=error,
+                    )
+            return [message]
 
-    # Only a model that actually migrated has a target to restore. One that did not is
-    # already reported by migrate_items, so it is skipped rather than warned about twice.
+    warnings: list[str] = []
     large_targets: list[tuple[powerbi.SemanticModel, str]] = []
     for model in source_models:
-        if not model.is_large:
-            continue
         target_id = ctx.id_map.get(model.id)
-        if target_id:
+        if not target_id:
+            continue
+        if not model.storage_mode_known:
+            message = (
+                f"Semantic model '{model.name}' did not report its source storage format. "
+                "Check the source and destination format settings; no format was inferred."
+            )
+            ctx.lifecycle({
+                "id": model.id, "displayName": model.name, "type": analytics.SEMANTIC_MODEL,
+            }).step(
+                "storage", EvidenceState.UNKNOWN, "Source storage format was not reported.", action=message,
+            )
+            warnings.append(message)
+        elif model.is_large:
             large_targets.append((model, target_id))
 
     if not large_targets:
-        return []
+        return warnings
 
-    names = ", ".join(sorted(f"'{model.name}'" for model, _ in large_targets))
-    if not supports_large_semantic_models(ctx.plan.capacity_region):
-        # The reassign path refuses this up front, but on a rebuild the workspace is already
-        # built, so the honest outcome is a warning naming what was left downgraded.
-        return [
-            f"Semantic model(s) {names} used the large storage format, but the target region "
-            f"'{ctx.plan.capacity_region}' does not support large semantic models, so they "
-            "were recreated on the small (Abf) storage format. Re-run the migration targeting "
-            "a capacity in a region that supports large semantic models if the large format is "
-            "required."
-        ]
-
-    warnings: list[str] = []
     with powerbi.PowerBiClient(ctx.destination_tokens) as target_pbi:
         for model, target_id in large_targets:
             ctx.run.raise_if_cancelled()
+            evidence = ctx.lifecycle({
+                "id": model.id, "displayName": model.name, "type": analytics.SEMANTIC_MODEL,
+            })
+            evidence.step("storage", EvidenceState.UNKNOWN, "Destination large storage setting not checked.")
             try:
                 current = target_pbi.get_semantic_model(ctx.target_workspace_id, target_id)
                 if current is not None and current.is_large:
-                    continue  # Already restored, most likely by an earlier attempt at this run.
+                    evidence.step(
+                        "storage", EvidenceState.SUCCEEDED, "Destination already reports PremiumFiles.",
+                    )
+                    continue
                 ctx.run.update_step(step, f"Restoring large storage format for '{model.name}'")
                 target_model = powerbi.SemanticModel(
                     id=target_id,
                     name=model.name,
-                    storage_mode=current.storage_mode if current else powerbi.SMALL,
+                    storage_mode=current.storage_mode if current else "",
                     content_provider=model.content_provider,
                 )
                 target_pbi.convert(
@@ -3890,13 +3889,23 @@ def _restore_large_semantic_models(ctx: _Context, step: str) -> list[str]:
                     target_model,
                     powerbi.LARGE,
                     on_progress=lambda message: ctx.run.update_step(step, message),
+                    check_cancelled=ctx.run.raise_if_cancelled,
                 )
-            except powerbi.PowerBiError as error:
-                warnings.append(
-                    f"Semantic model '{model.name}' was recreated on the small (Abf) storage "
-                    "format in the new workspace; its source used the large (PremiumFiles) "
-                    f"format. Re-enable large storage on it manually: {error}"
+                evidence.step(
+                    "storage", EvidenceState.SUCCEEDED, "Destination reports targetStorageMode=PremiumFiles.",
                 )
+            except (powerbi.PowerBiError, AuthError) as error:
+                message = (
+                    f"Semantic model '{model.name}' requires large (PremiumFiles) storage, but "
+                    f"the destination setting could not be confirmed or restored: {error}. "
+                    "Re-enable large storage manually after checking destination ownership "
+                    "and capacity support."
+                )
+                evidence.step(
+                    "storage", EvidenceState.FAILED, "Large storage setting could not be restored.",
+                    action=message, error=error,
+                )
+                warnings.append(message)
     return warnings
 
 
@@ -3944,9 +3953,8 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
     )
     warnings.extend(model_warnings)
 
-    # A rebuilt model is created on Fabric's default small (Abf) storage format, so restore
-    # the large (PremiumFiles) format wherever the source used it. migrate_items only moves
-    # the definition; it never touches storage format.
+    # Definition import does not preserve the source's storage setting. Confirm or restore
+    # PremiumFiles where needed without assuming the target workspace's default format.
     if models:
         warnings.extend(_restore_large_semantic_models(ctx, step))
 
