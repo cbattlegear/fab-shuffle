@@ -122,35 +122,21 @@ def workspace_capacity_sku(client: FabricClient, workspace: Mapping[str, Any]) -
         return ""
 
 
-def unreadable_source_capacity(client: FabricClient, workspace: Mapping[str, Any]) -> str:
-    """The workspace's own capacity id when that capacity cannot be read, otherwise ``""``.
+def unresolved_capacity_assignment(workspace: Mapping[str, Any]) -> bool:
+    """Whether a workspace reports a finished capacity assignment without naming a capacity.
 
-    Reading a capacity that has been deleted answers ``401 PowerBINotAuthorizedException`` —
-    the same answer a capacity somebody else owns gives — so a deleted capacity and an
-    inaccessible one cannot be told apart here, and this deliberately does not try.
-    """
-    capacity_id = workspace.get("capacityId")
-    if not capacity_id:
-        return ""
-    try:
-        get_capacity(client, capacity_id)
-    except FabricApiError:
-        return str(capacity_id)
-    return ""
-
-
-def stranded_on_deleted_capacity(workspace: Mapping[str, Any]) -> bool:
-    """Whether a workspace claims a finished capacity assignment without naming the capacity.
-
-    ``GET /workspaces/{id}`` returns ``capacityId``, ``capacityRegion`` and
-    ``oneLakeEndpoints`` for a workspace on a live capacity, and drops all three — while
-    still reporting ``capacityAssignmentProgress: "Completed"`` — once that capacity has been
-    deleted. ``GET /admin/workspaces/{id}`` still returns the dead id, so the assignment is
-    real; it is the capacity behind it that has gone.
-
-    Verified against a tenant whose trial capacity had expired: three workspaces reported
-    ``Completed`` with no ``capacityId``, and ``assignToCapacity`` answered
-    ``400 AssignWorkspaceToCapacityFailed`` for every one of them.
+    ``GET /workspaces/{id}`` documents ``capacityId`` as part of ``WorkspaceInfo`` and
+    ``capacityAssignmentProgress: "Completed"`` as "last capacity assignment operation was
+    completed successfully" (Microsoft Learn's Get Workspace reference), but does not say
+    ``capacityId`` is guaranteed present, and does not document what a missing one means.
+    This combination - assignment reported complete, no capacity named - was observed live
+    against a tenant whose trial capacity had expired: three workspaces showed exactly this
+    shape, and ``assignToCapacity`` on each answered
+    ``400 AssignWorkspaceToCapacityFailed``. That is one plausible explanation (the capacity
+    behind the assignment was deleted or an expired trial expired), not a confirmed one; the
+    API gives no way to distinguish "deleted" from an otherwise-incomplete read here, and
+    other causes are not ruled out. Treat this as a hint worth mentioning alongside a real
+    assignment failure, not as proof.
 
     A workspace that has never been assigned reports ``capacityAssignmentProgress`` of
     ``"NotStarted"`` or nothing at all, so it is not caught here.
@@ -412,5 +398,6 @@ __all__ = [
     "list_scratch_workspaces",
     "list_workspaces",
     "scratch_workspace_name",
+    "unresolved_capacity_assignment",
     "workspace_capacity_sku",
 ]

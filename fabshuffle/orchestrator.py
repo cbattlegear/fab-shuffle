@@ -171,10 +171,11 @@ class MigrationPlan:
     capacity_sku: str = ""
     strategy: Strategy = Strategy.REBUILD
     capacity_warning: str | None = None
-    # The source workspace reports a finished capacity assignment but names no capacity, so
-    # the capacity behind it has been deleted. Recorded at plan time because the reassign
-    # path needs it to explain a failed assignment.
-    source_capacity_deleted: bool = False
+    # The source workspace reports a finished capacity assignment but names no capacity - an
+    # observed shape, not a documented guarantee, that a deleted or expired-trial capacity can
+    # produce (see workspaces.unresolved_capacity_assignment). Recorded at plan time so the
+    # reassign path can offer it as a possible explanation if the assignment then fails.
+    source_capacity_id_missing: bool = False
     include_files: bool = True
     include_data: bool = True
     copy_permissions: bool = True
@@ -873,17 +874,26 @@ def _reassign_capacity(ctx: _Context) -> None:
             warnings.extend(_restore_large_models(ctx, pbi, converted))
             ctx.warnings.extend(warnings)
             ctx.run.finish_step(step, StepStatus.FAILED, "Capacity assignment failed", warnings)
-            if ctx.plan.source_capacity_deleted:
-                # Fabric's message names the target capacity and says only that the
-                # assignment failed, which sends the operator looking at the wrong end of the
-                # move. The service's own words are kept first; this is added alongside.
+            if (
+                ctx.plan.source_capacity_id_missing
+                and isinstance(error, FabricApiError)
+                and error.error_code == "AssignWorkspaceToCapacityFailed"
+            ):
+                # Fabric's own error names the *target* capacity and says only that the
+                # assignment failed, which can send the operator looking at the wrong end of
+                # the move. The service's own words are kept first, unchanged; what follows is
+                # this tool's interpretation of an observed shape, not something the service
+                # confirmed, so it is offered as a possibility to check rather than a cause or
+                # a fix that is known to work.
                 raise RuntimeError(
                     f"{error}\n\n"
-                    f"'{ctx.plan.source_workspace_name}' is still assigned to a capacity that "
-                    "has been deleted, so Fabric will not move it to another one. Restore a "
-                    "capacity in the region the workspace was created in and assign the "
-                    "workspace to it, then run this migration again. If that region's capacity "
-                    "cannot be restored, the content has to be recreated in a new workspace "
+                    f"'{ctx.plan.source_workspace_name}' reports a completed capacity "
+                    "assignment but names no capacity, which a deleted capacity or an expired "
+                    "trial can produce - worth checking on the source workspace's assignment. "
+                    "If a capacity is restored in the region the workspace was created in and "
+                    "the workspace is assigned to it, retrying this migration may succeed, but "
+                    "that recovery has not been confirmed here. If the region's capacity "
+                    "cannot be restored, the content may need recreating in a new workspace "
                     "instead."
                 ) from error
             raise
@@ -4327,7 +4337,7 @@ def build_plan(
         ),
         strategy=strategy,
         capacity_warning=capacity_warning,
-        source_capacity_deleted=workspaces.stranded_on_deleted_capacity(workspace),
+        source_capacity_id_missing=workspaces.unresolved_capacity_assignment(workspace),
         include_files=include_files,
         include_data=include_data,
         copy_permissions=copy_permissions and not cross_tenant,
