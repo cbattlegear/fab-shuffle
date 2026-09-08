@@ -2182,7 +2182,8 @@ def _copy_lakehouse_tables(
                         tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
                         max_staging_bytes=SETTINGS.max_staging_bytes,
                         exclude_paths=_shortcut_exclusions(ctx, lakehouse["id"], "Tables"),
-                        kind="lakehouse", cancel_requested=lambda: ctx.run.cancelled,
+                        kind="lakehouse", scratch_dir=ctx.scratch_dir / f"delta-{lakehouse['id']}",
+                        cancel_requested=lambda: ctx.run.cancelled,
                         on_progress=_bulk_copy_progress(ctx, step, lakehouse["displayName"]),
                     )
                 ctx.data_copied(lakehouse["id"], "lakehouse", outcome=outcome)
@@ -2455,6 +2456,7 @@ def _lakehouse_file_job(
                     tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
                     max_staging_bytes=SETTINGS.max_staging_bytes,
                     exclude_paths=_shortcut_exclusions(ctx, lakehouse["id"], "Files"),
+                    scratch_dir=ctx.scratch_dir / f"delta-files-{lakehouse['id']}",
                     cancel_requested=lambda: ctx.run.cancelled,
                     on_progress=_bulk_copy_progress(ctx, "lakehouses", name),
                 )

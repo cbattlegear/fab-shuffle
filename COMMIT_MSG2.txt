@@ -1,0 +1,43 @@
+Pin paired Delta preflight staging to the run's own scratch directory
+
+fabshuffle/transfer/delta.py's preflight() stages checkpoint files under
+scratch_dir, falling back to Path.cwd() when the caller passes None. That
+fallback is fine for a short CLI invocation but wrong for this tool, which
+runs as a long-lived server: it has no meaningful "current directory" to
+stage temporary files in, and anything it did stage there would sit outside
+the run-scoped scratch_dir that cleanup_run already knows how to remove.
+
+Neither paired copy_tree_streaming call site in orchestrator.py passed
+scratch_dir at all, so both silently took that Path.cwd() fallback. The
+Tables/ call site (_copy_lakehouse_tables) always ran preflight and so was
+always affected. The Files/ call site (_lakehouse_file_job) only became
+affected once the previous commit made preflight run unconditionally there
+too, which is what surfaced this as a live, not just theoretical, gap during
+final integration.
+
+Fixed by passing scratch_dir=ctx.scratch_dir / f"delta-{lakehouse['id']}" for
+Tables/ and ctx.scratch_dir / f"delta-files-{lakehouse['id']}" for Files/,
+matching the naming convention already used by the other scratch-backed
+transfers in this file (schema-{id}, bcp-{id}, lakehouse-{id} for the
+same-tenant azcopy path). The two subdirectories are kept distinct so a
+table copy and a file copy for the same lakehouse never contend over, or
+race the temp-directory cleanup of, the same staging path.
+
+Added tests/test_lakehouse_delta_scratch_dir.py: two tests construct a
+minimal paired _Context, monkeypatch file_transfer.copy_tree_streaming to
+capture its kwargs, and assert the captured scratch_dir is the expected
+subdirectory of ctx.scratch_dir (and is never Path.cwd()). Confirmed by
+temporarily reverting the orchestrator.py change that both tests then fail
+with KeyError: 'scratch_dir', so they genuinely reproduce the bug rather
+than just exercising the fixed code path.
+
+Full suite: 1683 passed. ruff check: clean. lock_dependencies.py --check:
+clean. Image fab-shuffle:cross-tenant-d8c98095 (linux/amd64) rebuilt on this
+change; its in-build smoke test passed, and a temporary loopback container
+confirmed a live HTTP 200 from /api/health before being removed. No live
+tenant credentials were used or sought; two-tenant service qualification
+remains unverified.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: 53f3fdae-4a58-42a0-b77f-48d498d594a1
