@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 
-from fabshuffle import orchestrator
+import pytest
+
+from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import airflow
 from fabshuffle.fabric.client import FabricApiError
@@ -36,13 +38,14 @@ class FakeClient:
         self.written: list[tuple[str, bytes]] = []
         self.requests: list[tuple[str, str, dict]] = []
         self.created: list[dict] = []
+        self.contents: dict[str, bytes] = {}
 
     def list_all(self, path, params=None, value_key="value"):
         if path == f"workspaces/{SOURCE_WS}/items":
             return [JOB_ITEM]
         if path.endswith("/files"):
             if self.flags.get("list_fails"):
-                raise FabricApiError("GET", path, 403, "{}")
+                raise FabricApiError("GET", path, 403, '{"errorCode":"Denied","message":"grant file access"}')
             assert (params or {}).get("beta") == "true", "the file APIs are beta"
             return self.files
         return []
@@ -72,7 +75,7 @@ class FakeClient:
                 pass
 
             response = Response()
-            response.content = b"print('hello')"
+            response.content = self.contents.get(path.rsplit("/files/", 1)[-1], b"print('hello')")
             return response
         if self.flags.get("write_fails"):
             raise FabricApiError("PUT", path, 400, "{}")
@@ -177,6 +180,40 @@ def test_dag_files_are_copied_into_the_new_job():
     assert content == b"print('hello')"
 
 
+def test_resume_adopts_airflow_and_continues_incomplete_files():
+    client = FakeClient()
+    ctx = make_ctx(client)
+    ctx.prior = journal.Replay(id_map={JOB: NEW_JOB})
+    ctx.id_map.update(ctx.prior.id_map)
+    migrated, _ = orchestrator._migrate_airflow_jobs(ctx, "orchestration", [JOB_ITEM], lambda _: None)
+    assert migrated == 1
+    assert client.created == []
+    assert client.written[0][0] == (
+        f"workspaces/{TARGET_WS}/apacheAirflowJobs/{NEW_JOB}/files/dags/my_dag.py"
+    )
+
+
+def test_resume_keeps_finished_airflow_files():
+    client = FakeClient()
+    ctx = make_ctx(client)
+    ctx.prior = journal.Replay(id_map={JOB: NEW_JOB}, data_done={(JOB, "airflow-files", "")})
+    ctx.id_map.update(ctx.prior.id_map)
+    orchestrator._migrate_airflow_jobs(ctx, "orchestration", [JOB_ITEM], lambda _: None)
+    assert client.created == client.written == []
+
+
+def test_rebinding_airflow_refreshes_even_previously_finished_files():
+    client = FakeClient()
+    ctx = make_ctx(client)
+    ctx.prior = journal.Replay(id_map={JOB: NEW_JOB}, data_done={(JOB, "airflow-files", "")})
+    ctx.id_map.update(ctx.prior.id_map)
+    ctx.refresh_needed.add(JOB)
+    orchestrator._migrate_airflow_jobs(ctx, "orchestration", [JOB_ITEM], lambda _: None)
+    assert client.created == []
+    assert len(client.written) == 1
+    assert JOB not in ctx.refresh_needed
+
+
 def test_every_file_request_marks_itself_as_beta():
     client = FakeClient()
     migrate(client)
@@ -191,14 +228,12 @@ def test_a_path_with_characters_needing_encoding_is_encoded():
     assert client.written[0][0].endswith("/files/dags/my%20dag%2B1.py")
 
 
-def test_a_job_whose_files_cannot_be_listed_says_it_has_no_dags():
+def test_a_job_whose_files_cannot_be_listed_is_not_created():
     client = FakeClient(list_fails=True)
     _, migrated, warnings = migrate(client)
 
-    # The item still exists, so the failure has to be loud: an Airflow job with no DAGs is
-    # not obviously broken until someone runs it.
-    assert migrated == 1
-    assert any("it has no DAGs" in w for w in warnings)
+    assert migrated == 0 and client.created == []
+    assert any("Denied" in w and "grant file access" in w for w in warnings)
 
 
 def test_one_file_failing_does_not_stop_the_others():
@@ -246,3 +281,119 @@ def test_a_job_that_cannot_be_created_is_reported_and_the_phase_goes_on():
     assert migrated == 0
     assert any("NightlyDags" in w for w in warnings)
     assert client.written == []
+
+
+SOURCE_GUID = "aaaabbbb-1111-2222-3333-444455556666"
+TARGET_GUID = "bbbbcccc-1111-2222-3333-444455556666"
+NOTEBOOK_GUID = "ccccdddd-1111-2222-3333-444455556666"
+NEW_NOTEBOOK_GUID = "ddddeeee-1111-2222-3333-444455556666"
+
+
+def test_literal_urls_config_and_binary_files_are_preflighted_before_create():
+    client = FakeClient(
+        files=[{"filePath": "dags/main.py"}, {"filePath": "libs/data.bin"}],
+        config={"environmentVariables": {"WORKSPACE": SOURCE_GUID, "NOTEBOOK": NOTEBOOK_GUID}},
+    )
+    literal = f"https://api.fabric.microsoft.com/v1/workspaces/{SOURCE_GUID.upper()}/items/{NOTEBOOK_GUID}"
+    client.contents = {"dags/main.py": literal.encode(), "libs/data.bin": b"\xff" + literal.encode()}
+    ctx = make_ctx(client)
+    ctx.id_map.update({SOURCE_GUID: TARGET_GUID, NOTEBOOK_GUID: NEW_NOTEBOOK_GUID})
+    ctx.source_items[NOTEBOOK_GUID] = {
+        "id": NOTEBOOK_GUID, "displayName": "Daily notebook", "type": "Notebook",
+    }
+    count, warnings = orchestrator._migrate_airflow_jobs(
+        ctx, "orchestration", [JOB_ITEM], lambda _m: None
+    )
+    assert count == 1
+    assert sent_config(client)["environmentVariables"] == {
+        "WORKSPACE": TARGET_GUID, "NOTEBOOK": NEW_NOTEBOOK_GUID,
+    }
+    assert client.written[0][1] == literal.replace(
+        SOURCE_GUID.upper(), TARGET_GUID
+    ).replace(NOTEBOOK_GUID, NEW_NOTEBOOK_GUID).encode()
+    assert client.written[1][1] == client.contents["libs/data.bin"]
+    assert not any("did not copy" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("in_config", [False, True])
+def test_an_unmapped_literal_dependency_prevents_job_creation(in_config):
+    client = FakeClient(config={"notebookId": NOTEBOOK_GUID} if in_config else {})
+    client.contents["dags/my_dag.py"] = (
+        b"print('hello')" if in_config else
+        f"run_notebook('{SOURCE_GUID}', '{NOTEBOOK_GUID.upper()}')".encode()
+    )
+    ctx = make_ctx(client)
+    ctx.id_map[SOURCE_GUID] = TARGET_GUID
+    ctx.source_items[NOTEBOOK_GUID] = {
+        "id": NOTEBOOK_GUID, "displayName": "Daily notebook", "type": "Notebook",
+    }
+    count, warnings = orchestrator._migrate_airflow_jobs(
+        ctx, "orchestration", [JOB_ITEM], lambda _m: None
+    )
+    assert count == 0 and client.created == [] and client.written == []
+    assert "Daily notebook" in warnings[0] and "retry" in warnings[0]
+    assert JOB not in ctx.id_map
+
+
+def test_an_unreadable_text_file_prevents_job_creation():
+    client = FakeClient()
+    client.contents["dags/my_dag.py"] = b"\xff"
+    _, count, warnings = migrate(client)
+    assert count == 0 and not client.created
+    assert "UTF-8" in warnings[0]
+
+
+def test_copying_without_preflight_or_reference_context_is_refused():
+    client = FakeClient()
+    count, warnings = airflow.copy_files(
+        client, source_workspace_id=SOURCE_WS, source_job_id=JOB,
+        target_workspace_id=TARGET_WS, target_job_id=NEW_JOB, job_name="NightlyDags",
+    )
+    assert count == 0 and not client.written
+    assert "preflighted files" in warnings[0]
+
+
+@pytest.mark.parametrize("where", ["config", "dag", "both"])
+def test_fresh_job_self_references_are_refused_before_creation(where):
+    job = {**JOB_ITEM, "id": NOTEBOOK_GUID}
+    config = {"environmentVariables": {"JOB_ID": NOTEBOOK_GUID.upper()}} if where != "dag" else {}
+    client = FakeClient(config=config)
+    if where != "config":
+        client.contents["dags/my_dag.py"] = (
+            f"url = 'https://api.fabric.microsoft.com/v1/workspaces/{SOURCE_GUID}"
+            f"/items/{NOTEBOOK_GUID.upper()}'"
+        ).encode()
+    ctx = make_ctx(client)
+    ctx.id_map[SOURCE_GUID] = TARGET_GUID
+    ctx.source_items[job["id"]] = job
+    count, warnings = orchestrator._migrate_airflow_jobs(
+        ctx, "orchestration", [job], lambda _m: None,
+    )
+    assert count == 0 and not client.created and not client.written
+    assert job["id"] not in ctx.id_map
+    assert "own source job ID" in warnings[0]
+    assert "Remove hardcoded self references" in warnings[0]
+    assert "retry" in warnings[0]
+
+
+def test_existing_target_self_references_are_preflighted_and_rebound():
+    client = FakeClient(files=[{"filePath": "dags/my_dag.py"}])
+    literal = f"/workspaces/{SOURCE_GUID}/items/{NOTEBOOK_GUID.upper()}"
+    client.contents["dags/my_dag.py"] = literal.encode()
+    mapping = {SOURCE_GUID: TARGET_GUID, NOTEBOOK_GUID: NEW_NOTEBOOK_GUID}
+    config = [part("ApacheAirflowJob.json", {"environmentVariables": {"JOB_ID": NOTEBOOK_GUID}})]
+    airflow.preflight_references(
+        config, source_job_id=NOTEBOOK_GUID, job_name="NightlyDags", id_map=mapping,
+        source_items={},
+    )
+    prepared = airflow.preflight_files(
+        client, source_workspace_id=SOURCE_GUID, source_job_id=NOTEBOOK_GUID,
+        job_name="NightlyDags", id_map=mapping, source_items={},
+    )
+    count, warnings = airflow.copy_files(
+        client, source_workspace_id=SOURCE_GUID, source_job_id=NOTEBOOK_GUID,
+        target_workspace_id=TARGET_GUID, target_job_id=NEW_NOTEBOOK_GUID,
+        job_name="NightlyDags", prepared_files=prepared,
+    )
+    assert count == 1 and not warnings
+    assert client.written[0][1] == f"/workspaces/{TARGET_GUID}/items/{NEW_NOTEBOOK_GUID}".encode()

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -30,6 +30,13 @@ dev = [
     "respx>=0.21",
     "ruff>=0.7",
 ]
+
+[dependency-groups]
+build = ["setuptools==84.0.0", "wheel==0.48.0"]
+lock = ["pip==26.2.1", "uv==0.12.9"]
+
+[tool.uv]
+required-version = "==0.12.9"
 
 [tool.setuptools.packages.find]
 include = ["fabshuffle*"]

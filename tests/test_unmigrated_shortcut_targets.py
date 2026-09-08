@@ -7,6 +7,8 @@ item id does not, so Fabric is asked for an item that was never in that workspac
 
 from __future__ import annotations
 
+import pytest
+
 from fabshuffle.fabric import shortcuts
 from fabshuffle.fabric.client import FabricApiError
 
@@ -250,3 +252,91 @@ def test_without_that_context_the_generic_message_is_used():
 def test_the_item_a_shortcut_points_at_is_read_before_remapping():
     assert shortcuts.onelake_item_id(onelake(SOURCE_WS, MIGRATED_MIRROR)) == MIGRATED_MIRROR
     assert shortcuts.onelake_item_id({"name": "x"}) == ""
+
+
+GUID_WS = "aaaaBBBB-1234-5678-90ab-cdef12345678"
+GUID_ITEM = "bbbbCCCC-1234-5678-90ab-cdef12345678"
+GUID_TARGET = "ddddEEEE-1234-5678-90ab-cdef12345678"
+
+
+@pytest.mark.parametrize("copy_fn", [shortcuts.copy_shortcuts, shortcuts.copy_table_shortcuts])
+@pytest.mark.parametrize("workspace", [GUID_WS.lower(), GUID_WS.upper(), GUID_WS])
+@pytest.mark.parametrize("item", [GUID_ITEM.lower(), GUID_ITEM.upper(), GUID_ITEM])
+@pytest.mark.parametrize("present", [True, False])
+def test_guid_casing_cannot_bypass_rebinding_or_refusal(copy_fn, workspace, item, present):
+    original = onelake(workspace, item, path="Tables/CaseSensitive/SomeTable")
+    client = FakeClient([original])
+    id_map = {GUID_WS.lower(): GUID_TARGET, "Tables/CaseSensitive/SomeTable": "wrong"}
+    if present:
+        id_map[GUID_ITEM.lower()] = "item-new"
+    count, warnings = copy_fn(
+        client, GUID_WS.lower(), "source", GUID_TARGET, "target", id_map,
+        source_items={GUID_ITEM.lower(): {"type": "Lakehouse", "displayName": "Bronze"}},
+    )
+    if present:
+        assert (count, warnings) == (1, [])
+        assert client.created[0]["target"]["oneLake"] == {
+            "workspaceId": GUID_TARGET, "itemId": "item-new",
+            "path": "Tables/CaseSensitive/SomeTable",
+        }
+    else:
+        assert count == 0 and not client.created
+        assert "Lakehouse 'Bronze'" in warnings[0]
+
+
+@pytest.mark.parametrize("copy_fn", [shortcuts.copy_shortcuts, shortcuts.copy_table_shortcuts])
+def test_external_workspace_stays_unchanged_even_with_an_item_mapping(copy_fn):
+    original = onelake(GUID_TARGET.upper(), GUID_ITEM.upper())
+    client = FakeClient([original])
+    count, warnings = copy_fn(
+        client, GUID_WS, "source", "new-ws", "new-item",
+        {GUID_WS.lower(): "new-ws", GUID_ITEM.lower(): "new-item"},
+    )
+    assert (count, warnings) == (1, [])
+    assert client.created[0]["target"]["oneLake"] == original["target"]["oneLake"]
+
+
+@pytest.mark.parametrize("copy_fn", [shortcuts.copy_shortcuts, shortcuts.copy_table_shortcuts])
+def test_mixed_case_dormant_target_has_the_named_diagnostic(copy_fn):
+    client = RefusingClient([onelake(GUID_WS.upper(), GUID_ITEM.upper())])
+    count, warnings = copy_fn(
+        client, GUID_WS.lower(), "source", "new-ws", "new-item",
+        {GUID_WS.lower(): "new-ws", GUID_ITEM.lower(): "new-item"},
+        source_items={GUID_ITEM.lower(): {"type": "MirroredDatabase", "displayName": "Mirror"}},
+        dormant={GUID_ITEM.lower(): "has not started. Start replication."},
+    )
+    assert count == 0
+    assert "Mirror" in warnings[0] and "Start replication" in warnings[0]
+    assert "InvalidPath path not found" in warnings[0]
+
+
+@pytest.mark.parametrize("copy_fn", [shortcuts.copy_shortcuts, shortcuts.copy_table_shortcuts])
+@pytest.mark.parametrize("mapped", [False, True])
+def test_source_bound_connection_shortcuts_require_a_replacement(copy_fn, mapped):
+    original = {
+        "name": "bound", "path": "Tables",
+        "target": {"adlsGen2": {"connectionId": GUID_ITEM.upper(), "path": "CaseSensitive"}},
+    }
+    client = FakeClient([original])
+    count, warnings = copy_fn(
+        client, GUID_WS, "source", "new-ws", "new-item",
+        {GUID_ITEM.lower(): "new-connection"} if mapped else {},
+        source_items={GUID_ITEM.lower(): {"type": "Connection", "displayName": "Source store"}},
+    )
+    if mapped:
+        assert count == 1 and not warnings
+        assert client.created[0]["target"]["adlsGen2"]["connectionId"] == "new-connection"
+        assert client.created[0]["target"]["adlsGen2"]["path"] == "CaseSensitive"
+    else:
+        assert count == 0 and not client.created
+        assert "Source store" in warnings[0] and "retry" in warnings[0]
+
+
+@pytest.mark.parametrize("copy_fn", [shortcuts.copy_shortcuts, shortcuts.copy_table_shortcuts])
+def test_a_mapped_item_without_its_workspace_mapping_is_not_copied(copy_fn):
+    client = FakeClient([onelake(GUID_WS, GUID_ITEM)])
+    count, warnings = copy_fn(
+        client, GUID_WS.lower(), "source", "new-ws", "target", {GUID_ITEM.lower(): "new-item"},
+    )
+    assert count == 0 and not client.created
+    assert warnings

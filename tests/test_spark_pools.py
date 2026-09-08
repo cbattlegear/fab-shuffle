@@ -102,6 +102,56 @@ def test_unreadable_pools_are_not_fatal():
     assert spark.list_pools(Denied(), "src") == []
 
 
+def test_resume_adopts_the_recorded_pool_id_not_its_display_name(monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(
+        client, "list_all", lambda path: [{"id": "existing", "name": "renamed", "type": "Workspace"}]
+    )
+    mappings = []
+    result = spark.copy_pools(
+        client, "src", "dst", pools=[POOL], prior_map={"old-pool": "existing"},
+        on_mapped=lambda source, target: mappings.append((source, target)),
+    )
+    assert result == ({"old-pool": "existing"}, [], [])
+    assert mappings == [("old-pool", "existing")]
+    assert client.posted == []
+
+
+def test_missing_pool_mapping_is_invalidated_before_recreation():
+    client = FakeClient()
+    missing = []
+    result = spark.copy_pools(
+        client, "src", "dst", pools=[POOL], prior_map={"old-pool": "deleted"},
+        on_missing=missing.append,
+    )
+    assert missing == ["old-pool"]
+    assert result[0] == {"old-pool": "new-pool1"}
+
+
+def test_resume_does_not_treat_unreadable_target_pools_as_absent(monkeypatch):
+    import pytest
+
+    client = FakeClient()
+
+    def denied(path):
+        raise FabricApiError("GET", path, 403, '{"errorCode":"AccessDenied","message":"grant access"}')
+
+    monkeypatch.setattr(client, "list_all", denied)
+    with pytest.raises(FabricApiError, match="AccessDenied"):
+        spark.copy_pools(client, "src", "dst", pools=[POOL], prior_map={"old-pool": "existing"})
+    assert client.posted == []
+
+
+def test_pool_free_resume_does_not_require_the_target_pool_api(monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(
+        client, "list_all", lambda path: (_ for _ in ()).throw(AssertionError("unnecessary pool lookup")),
+    )
+    assert spark.copy_pools(
+        client, "src", "dst", pools=[], prior_map={"workspace": "target", "lakehouse": "target-lh"},
+    ) == ({}, [], [])
+
+
 # ------------------------------------------------------------------ settings
 
 

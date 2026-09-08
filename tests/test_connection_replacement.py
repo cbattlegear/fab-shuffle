@@ -139,7 +139,7 @@ def test_an_ambiguous_creation_method_is_refused():
     assert connections.build_creation_payload(source, "value", ambiguous, display_name="x") is None
 
 
-def test_a_single_creation_method_is_used_even_when_unnamed_after_the_type():
+def test_an_undocumented_path_encoding_requires_a_manual_replacement():
     single = {
         "type": "Thing",
         "creationMethods": [{"name": "OnlyWay", "parameters": [{"name": "x", "required": True}]}],
@@ -148,4 +148,4 @@ def test_a_single_creation_method_is_used_even_when_unnamed_after_the_type():
     source = connection(connectionDetails={"type": "Thing", "path": "value"})
     payload = connections.build_creation_payload(source, "value", single, display_name="x")
 
-    assert payload["connectionDetails"]["creationMethod"] == "OnlyWay"
+    assert payload is None

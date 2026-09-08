@@ -1,12 +1,7 @@
 """Connection references inside item definitions.
 
-Connections are tenant scoped: the same connection id resolves from any workspace, in any
-region, so a migrated pipeline or Copy Job keeps working without being repointed. They also
-cannot be recreated faithfully, because the API never returns credentials, only the
-credential *type*.
-
-So Fab Shuffle does not copy connections. It checks the ones a migrated item references and
-reports the cases that will not work in the new workspace.
+External connections stay tenant scoped. Connections targeting the source workspace need
+a proven replacement before consumers can migrate; existing secrets are never exported.
 """
 
 from __future__ import annotations
@@ -18,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
-from fabshuffle.fabric.definitions import decode_payload, is_text_part
+from fabshuffle.fabric.definitions import GUID_PATTERN, decode_payload, is_text_part
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +99,7 @@ def list_connections(client: FabricClient) -> list[dict[str, Any]]:
         return client.list_all("connections")
     except FabricApiError as error:
         if error.status_code in (401, 403):
-            logger.info("Service principal cannot list connections: HTTP %s", error.status_code)
+            logger.info("Service principal cannot list connections: %s", error)
             return []
         raise
 
@@ -308,7 +303,7 @@ def copy_role_assignments(
             copied += 1
         except FabricApiError as error:
             name = principal.get("displayName") or principal_id
-            failed.append(f"{name} ({role}, HTTP {error.status_code})")
+            failed.append(f"{name} ({role}, {error})")
 
     warnings: list[str] = []
     if failed:
@@ -407,12 +402,7 @@ class Replacement:
 
 
 def supported_types(client: FabricClient) -> dict[str, dict[str, Any]]:
-    try:
-        types = client.list_all("connections/supportedConnectionTypes")
-    except FabricApiError as error:
-        if error.status_code in (401, 403):
-            return {}
-        raise
+    types = client.list_all("connections/supportedConnectionTypes")
     return {entry["type"]: entry for entry in types if entry.get("type")}
 
 
@@ -493,12 +483,23 @@ def build_creation_payload(
     if not method:
         return None
 
+    # Learn's Get/Create Connection examples document SQL's server;database path.
+    # Other connectors' rendered paths are opaque: declaration order is not proof of an
+    # inverse encoding. Require a manual replacement rather than inventing parameters.
+    # https://learn.microsoft.com/rest/api/fabric/core/connections/get-connection
+    if connection_type != "SQL" or method.get("name") != "SQL":
+        return None
+    declared = method.get("parameters") or []
+    if [parameter.get("name") for parameter in declared] != ["server", "database"]:
+        return None
+    if any(parameter.get("dataType") != "Text" for parameter in declared):
+        return None
     parameters = build_parameters(new_path, method)
     if not parameters:
         return None
 
     credentials = connection.get("credentialDetails") or {}
-    return {
+    payload = {
         "connectivityType": connection.get("connectivityType"),
         "displayName": display_name,
         "privacyLevel": connection.get("privacyLevel") or "Organizational",
@@ -514,6 +515,37 @@ def build_creation_payload(
             "credentials": {"credentialType": credentials.get("credentialType")},
         },
     }
+    for key in ("allowConnectionUsageInGateway", "allowUsageInUserControlledCode"):
+        if key in connection:
+            payload[key] = connection[key]
+    return payload
+
+
+def replacement_name(connection: Mapping[str, Any], target_workspace_id: str) -> str:
+    """Stable name lets a retry adopt an operator-created or unjournaled replacement."""
+    return f"{connection.get('displayName') or connection['id']} (Fab Shuffle {target_workspace_id})"
+
+
+def same_path(left: str, right: str) -> bool:
+    """Only GUID casing is immaterial; paths may contain case-sensitive components."""
+    return GUID_PATTERN.sub(lambda m: m.group().lower(), left) == GUID_PATTERN.sub(
+        lambda m: m.group().lower(), right
+    )
+
+
+def matches_replacement(
+    candidate: Mapping[str, Any],
+    source: Mapping[str, Any],
+    new_path: str,
+) -> bool:
+    details = candidate.get("connectionDetails") or {}
+    return bool(
+        candidate.get("id")
+        and candidate["id"].casefold() != str(source.get("id") or "").casefold()
+        and candidate.get("connectivityType") == source.get("connectivityType")
+        and details.get("type") == (source.get("connectionDetails") or {}).get("type")
+        and same_path(details.get("path") or "", new_path)
+    )
 
 
 def create_connection(client: FabricClient, payload: Mapping[str, Any]) -> dict[str, Any]:

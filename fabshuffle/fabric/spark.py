@@ -11,7 +11,7 @@ Pools therefore have to be created before the engineering phase runs.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from fabshuffle.fabric.client import FabricApiError, FabricClient
@@ -68,12 +68,27 @@ def copy_pools(
     target_workspace_id: str,
     *,
     pools: Iterable[Mapping[str, Any]] | None = None,
+    prior_map: Mapping[str, str] | None = None,
+    on_mapped: Callable[[str, str], None] | None = None,
+    on_missing: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """Recreate the source workspace's custom pools.
 
     Returns the old id to new id map, the names created, and any warnings.
     """
     source = list(pools) if pools is not None else list_pools(client, source_workspace_id)
+    recorded_pools = {
+        pool["id"]: prior_map[pool["id"]]
+        for pool in source
+        if prior_map and pool.get("id") in prior_map and pool.get("name") != STARTER_POOL
+        and (not pool.get("type") or pool["type"] == WORKSPACE_POOL_TYPE)
+    }
+    # Unlike workspace items, pools have their own enumeration endpoint. A failed read
+    # cannot establish absence, so do not use list_pools' preview-friendly empty fallback.
+    existing = {
+        pool["id"] for pool in client.list_all(f"workspaces/{target_workspace_id}/spark/pools")
+        if pool.get("id")
+    } if recorded_pools else set()
 
     id_map: dict[str, str] = {}
     created: list[str] = []
@@ -90,18 +105,29 @@ def copy_pools(
                 "target capacity if items depend on it."
             )
             continue
+        source_id = pool.get("id") or ""
+        target_id = recorded_pools.get(source_id)
+        if target_id in existing:
+            id_map[source_id] = target_id
+            if on_mapped:
+                on_mapped(source_id, target_id)
+            continue
+        if target_id and on_missing:
+            on_missing(source_id)
 
         try:
             new_pool = create_pool(client, target_workspace_id, pool)
         except FabricApiError as error:
             warnings.append(
-                f"Spark pool '{name}' could not be recreated (HTTP {error.status_code}). "
-                f"Its node size may not be available on the target capacity."
+                f"Spark pool '{name}' could not be recreated: {error}. "
+                "Resolve the service error and retry before running items that use this pool."
             )
             continue
 
         if pool.get("id") and new_pool.get("id"):
             id_map[pool["id"]] = new_pool["id"]
+            if on_mapped:
+                on_mapped(pool["id"], new_pool["id"])
         created.append(name)
 
     return id_map, created, warnings

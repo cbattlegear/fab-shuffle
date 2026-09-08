@@ -13,12 +13,19 @@ job root (``dags/my_dag.py``), so there is no folder tree to walk.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import quote
 
-from fabshuffle.fabric.client import FabricApiError, FabricClient
-from fabshuffle.fabric.definitions import decode_json_part, part
+from fabshuffle.fabric import analytics
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
+from fabshuffle.fabric.definitions import (
+    build_rewriter,
+    decode_json_part,
+    is_text_part,
+    part,
+)
+from fabshuffle.lifecycle import EvidenceState, ItemLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +34,7 @@ APACHE_AIRFLOW_JOB = "ApacheAirflowJob"
 BETA = {"beta": "true"}
 PLATFORM_PART = ".platform"
 
-# Any file bigger than this is skipped rather than pulled through memory. DAGs are source
-# files; something this large is data that does not belong in the job definition.
+# Refuse a job containing a larger file rather than pulling it through memory.
 MAX_FILE_BYTES = 25 * 1024 * 1024
 
 
@@ -67,6 +73,85 @@ def write_file(
     )
 
 
+def preflight_references(
+    parts: list[dict[str, Any]],
+    *,
+    source_job_id: str,
+    job_name: str,
+    id_map: Mapping[str, str],
+    source_items: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Refuse operational self references unless an existing target ID can replace them."""
+    own_item = {
+        source_job_id: {"id": source_job_id, "type": APACHE_AIRFLOW_JOB, "displayName": job_name},
+    }
+    if analytics.dangling_references(parts, id_map, own_item):
+        paths = ", ".join(str(candidate.get("path") or "?") for candidate in parts)
+        raise FabricError(
+            f"Apache Airflow job '{job_name}' contains its own source job ID in {paths}. "
+            "The new job ID is not available before creation. Remove hardcoded self references "
+            "from the source configuration or DAG, retry, then configure the destination job ID "
+            "before running it"
+        )
+    needed = analytics.dangling_references(parts, id_map, source_items)
+    if needed:
+        raise analytics.StrandedReference(needed)
+
+
+def preflight_files(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    source_job_id: str,
+    job_name: str,
+    id_map: Mapping[str, str],
+    source_items: Mapping[str, Mapping[str, Any]],
+    on_progress: Callable[[str], None] | None = None,
+) -> list[tuple[str, bytes]]:
+    """Read and rebind supported UTF-8 files before creating a job.
+
+    Literal known IDs and endpoint/path strings only: this does not evaluate Python,
+    environment lookups, imported packages, or dynamically assembled references.
+    """
+    prepared: list[tuple[str, bytes]] = []
+    rewrite = build_rewriter(id_map)
+    for entry in list_files(client, source_workspace_id, source_job_id):
+        file_path = entry.get("filePath")
+        if not file_path:
+            raise FabricError(f"Apache Airflow job '{job_name}' returned a file without a path")
+        if (entry.get("sizeInBytes") or 0) > MAX_FILE_BYTES:
+            raise FabricError(
+                f"Apache Airflow job '{job_name}': '{file_path}' is larger than "
+                f"{MAX_FILE_BYTES // (1024 * 1024)} MB; move it out of the job, then retry"
+            )
+        if on_progress:
+            on_progress(f"Inspecting '{file_path}' for Apache Airflow job '{job_name}'")
+        content = read_file(client, source_workspace_id, source_job_id, file_path)
+        if len(content) > MAX_FILE_BYTES:
+            raise FabricError(
+                f"Apache Airflow job '{job_name}': '{file_path}' exceeds the file size limit; "
+                "move it out of the job, then retry"
+            )
+        if is_text_part(file_path):
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise FabricError(
+                    f"Apache Airflow job '{job_name}': '{file_path}' is not UTF-8; "
+                    "convert this text file to UTF-8, then retry"
+                ) from error
+            preflight_references(
+                [part(file_path, content)],
+                source_job_id=source_job_id,
+                job_name=job_name,
+                id_map=id_map,
+                source_items=source_items,
+            )
+            content = (rewrite(text) if rewrite else text).encode("utf-8")
+        prepared.append((file_path, content))
+    return prepared
+
+
 def copy_files(
     client: FabricClient,
     *,
@@ -76,44 +161,41 @@ def copy_files(
     target_job_id: str,
     job_name: str,
     on_progress: Callable[[str], None] | None = None,
+    prepared_files: list[tuple[str, bytes]] | None = None,
+    id_map: Mapping[str, str] | None = None,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[int, list[str]]:
-    """Copy a job's DAGs and supporting files. Returns how many moved, and what did not.
-
-    A job whose files cannot be listed at all is reported loudly: the copy looks complete in
-    the item list, and an Airflow job with no DAGs is not obviously broken until someone
-    tries to run it.
-    """
+    """Upload preflighted files, or preflight with explicit reference context first."""
     try:
-        files = list_files(client, source_workspace_id, source_job_id)
-    except FabricApiError as error:
+        if prepared_files is None and (id_map is None or source_items is None):
+            raise FabricError("file copying requires preflighted files or a migration reference map")
+        files = prepared_files if prepared_files is not None else preflight_files(
+            client,
+            source_workspace_id=source_workspace_id,
+            source_job_id=source_job_id,
+            job_name=job_name,
+            id_map=id_map or {},
+            source_items=source_items or {},
+            on_progress=on_progress,
+        )
+    except FabricError as error:
         return 0, [
-            f"Apache Airflow job '{job_name}' was created, but its files could not be listed "
-            f"(HTTP {error.status_code}), so it has no DAGs. Copy them across by hand."
+            f"Apache Airflow job '{job_name}': files could not be prepared: {error}. "
+            "Fix the source files or access, then retry."
         ]
 
     copied = 0
     warnings: list[str] = []
-    for entry in files:
-        file_path = entry.get("filePath")
-        if not file_path:
-            continue
-        if (entry.get("sizeInBytes") or 0) > MAX_FILE_BYTES:
-            warnings.append(
-                f"Apache Airflow job '{job_name}': '{file_path}' is larger than "
-                f"{MAX_FILE_BYTES // (1024 * 1024)} MB and was not copied."
-            )
-            continue
-
+    for file_path, content in files:
         if on_progress:
             on_progress(f"Copying '{file_path}' for Apache Airflow job '{job_name}'")
         try:
-            content = read_file(client, source_workspace_id, source_job_id, file_path)
             write_file(client, target_workspace_id, target_job_id, file_path, content)
             copied += 1
         except FabricApiError as error:
             warnings.append(
                 f"Apache Airflow job '{job_name}': '{file_path}' did not copy "
-                f"(HTTP {error.status_code}). Copy it across by hand."
+                f"({error}). Fix file access and retry."
             )
 
     return copied, warnings
@@ -157,8 +239,15 @@ def retarget_location(parts: list[dict[str, Any]], region: str) -> list[dict[str
     return [part(config["path"], document) if p is config else p for p in parts]
 
 
-def configuration_warnings(parts: list[dict[str, Any]], job_name: str) -> list[str]:
+def configuration_warnings(
+    parts: list[dict[str, Any]], job_name: str, *, lifecycle: ItemLifecycle | None = None,
+) -> list[str]:
     """Settings that travel but will not work until someone acts on them."""
+    if lifecycle:
+        lifecycle.step(
+            "configuration", EvidenceState.UNKNOWN, "Airflow configuration has not been inspected.",
+            action="Inspect the target job configuration before running it.",
+        )
     config = _config_part(parts)
     if not config:
         return []
@@ -169,6 +258,14 @@ def configuration_warnings(parts: list[dict[str, Any]], job_name: str) -> list[s
     if not isinstance(document, dict):
         return []
 
+    if lifecycle:
+        lifecycle.step(
+            "configuration", EvidenceState.SKIPPED if document.get("secrets") else EvidenceState.SUCCEEDED,
+            "Secret values were not transferred." if document.get("secrets")
+            else "Configuration inspected; no omitted secret values identified.",
+            action="Re-enter the target Airflow job's secrets before running it."
+            if document.get("secrets") else "",
+        )
     warnings: list[str] = []
     if document.get("secrets"):
         warnings.append(
@@ -179,8 +276,8 @@ def configuration_warnings(parts: list[dict[str, Any]], job_name: str) -> list[s
     if isinstance(variables, dict) and variables:
         warnings.append(
             f"Apache Airflow job '{job_name}' sets {len(variables)} environment variable(s). "
-            "They are copied as they are, so check any that name a workspace, an item, or a "
-            "region: those still point at the old workspace."
+            "Known literal references are rebound. Review dynamically constructed references "
+            "and region settings before running it."
         )
     return warnings
 
@@ -191,6 +288,8 @@ __all__ = [
     "configuration_warnings",
     "copy_files",
     "list_files",
+    "preflight_files",
+    "preflight_references",
     "read_file",
     "retarget_location",
     "write_file",

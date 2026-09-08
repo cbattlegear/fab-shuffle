@@ -48,13 +48,14 @@ def test_the_status_is_still_shown() -> None:
     assert "HTTP 400" in analytics.describe_failure("CopyJob", "copyjob1", error)
 
 
-def test_an_unparseable_body_falls_back_to_the_old_advice() -> None:
+def test_an_unparseable_body_keeps_the_service_detail_and_retry_advice() -> None:
     error = FabricApiError("POST", "/items", 400, "<html>gateway error</html>")
 
     message = analytics.describe_failure("DataPipeline", "p", error)
 
     assert "HTTP 400" in message
-    assert "Recreate it manually" in message
+    assert "<html>gateway error</html>" in message
+    assert "then retry" in message
 
 
 def test_a_nested_error_body_is_still_read() -> None:

@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +29,8 @@ from fabshuffle.fabric.client import (
     OperationTimeout,
 )
 from fabshuffle.fabric.definitions import (
+    GUID_PATTERN,
+    build_rewriter,
     decode_json_part,
     decode_payload,
     find_part,
@@ -40,9 +43,10 @@ from fabshuffle.fabric.items import (
     get_item_definition,
     list_items,
     try_get_item_definition,
+    update_item_definition,
 )
 from fabshuffle.fabric.special_items import policy_for
-from fabshuffle.fabric.support import is_derived_type
+from fabshuffle.lifecycle import Disposition, EvidenceState, ItemLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +258,45 @@ def _semantic_model_id(connection_string: str) -> str:
     return ""
 
 
+def _record_report_binding(parts: list[dict[str, Any]], lifecycle: ItemLifecycle) -> None:
+    payload = find_part(parts, PBIR_PART)
+    try:
+        document = decode_json_part(payload.get("payload", "")) if payload else {}
+    except ValueError:
+        document = {}
+    reference = document.get("datasetReference") if isinstance(document, dict) else None
+    connection = reference.get("byConnection") if isinstance(reference, dict) else None
+    model_id = _semantic_model_id(str(connection.get("connectionString") or "")) if isinstance(
+        connection, dict
+    ) else ""
+    lifecycle.step(
+        "binding", EvidenceState.SUCCEEDED if model_id else EvidenceState.UNKNOWN,
+        "Report definition names its semantic model; source IDs are checked by rebinding."
+        if model_id else "The report's semantic model binding could not be resolved by inspection.",
+        action="" if model_id else "Open the target report and verify its semantic model before cutover.",
+    )
+
+
+def referenced_item_ids(
+    parts: Iterable[Mapping[str, Any]], source_items: Mapping[str, Mapping[str, Any]],
+    *, id_map: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Attribute item/endpoint aliases to their owning item without retaining definition text."""
+    text = _definition_text(parts).casefold()
+    owners: dict[str, str] = {}
+    for item_id, item in source_items.items():
+        if item.get("type") == "SQLEndpoint":
+            continue
+        for identifier in reference_identifiers({item_id: item}):
+            owners[identifier.casefold()] = str(item.get("id") or item_id)
+    result = set()
+    for identifier, item in reference_identifiers(source_items).items():
+        target = (id_map or {}).get(identifier)
+        if identifier.casefold() in text or (target and target.casefold() in text):
+            result.add(owners.get(identifier.casefold(), str(item.get("id") or identifier)))
+    return result
+
+
 class StrandedReference(FabricError):
     """A definition names items in this workspace that did not migrate.
 
@@ -287,6 +330,8 @@ def migrate_definition_item(
     folder_id: str | None = None,
     parts: list[dict[str, Any]] | None = None,
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    target_id: str | None = None,
+    lifecycle: ItemLifecycle | None = None,
 ) -> MigratedItem:
     """Export one item, repoint its references, and recreate it in the target workspace.
 
@@ -300,42 +345,73 @@ def migrate_definition_item(
     name = item["displayName"]
     policy = policy_for(item_type)
     definition_format: str | None = policy.export_format
+    if lifecycle:
+        # Declare known obligations before any successful create/update evidence can persist.
+        if policy.activation:
+            lifecycle.step(
+                "activation", EvidenceState.SKIPPED, "Activation was not performed by this migration.",
+                action=policy.activation,
+            )
+        if item_type == SEMANTIC_MODEL:
+            lifecycle.step(
+                "data", EvidenceState.UNKNOWN, "Model data/refresh readiness was not measured.",
+                action="Inspect the target model's storage mode, refresh imported data if needed, "
+                "and verify queries against its target sources.",
+            )
 
-    if parts is None:
-        definition = get_item_definition(
-            client, source_workspace_id, item["id"], fmt=policy.export_format
+    with lifecycle.operation("export", "Definition exported.") if lifecycle else nullcontext():
+        if parts is None:
+            definition = get_item_definition(
+                client, source_workspace_id, item["id"], fmt=policy.export_format
+            )
+            parts = list(definition.get("parts") or [])
+            definition_format = policy.export_format or definition.get("format")
+
+    with lifecycle.operation("rebind", "Known source references rewritten.") if lifecycle else nullcontext():
+        needed = dangling_references(
+            parts, id_map, source_items or {}, ignore=(item.get("id", ""),)
         )
-        parts = list(definition.get("parts") or [])
-        definition_format = policy.export_format or definition.get("format")
+        if lifecycle:
+            lifecycle.references(
+                referenced_item_ids(parts, source_items or {}),
+                needed,
+            )
+        if needed:
+            raise StrandedReference(needed)
 
-    needed = dangling_references(
-        parts, id_map, source_items or {}, ignore=(item.get("id", ""),)
-    )
-    if needed:
-        raise StrandedReference(needed)
+        warnings: list[str] = []
+        if policy.prepare:
+            parts, warnings = policy.prepare(parts, source_workspace_id)
 
-    rewritten, changed = rewrite_parts(parts, id_map)
-    # The source platform file carries the original logical id, and Fabric respects it when
-    # provided. Dropping it lets the new workspace mint its own identity for the item.
-    rewritten = strip_part(rewritten, PLATFORM_PART)
+        if lifecycle and policy.observe:
+            policy.observe(lifecycle, parts, source_workspace_id)
+        if lifecycle and item_type == REPORT:
+            _record_report_binding(parts, lifecycle)
+        rewritten, changed = rewrite_parts(parts, id_map)
+        # Drop the source logical identity rather than asking Fabric to reuse it.
+        rewritten = strip_part(rewritten, PLATFORM_PART)
 
-    warnings: list[str] = []
-    if policy.prepare:
-        rewritten, warnings = policy.prepare(rewritten, source_workspace_id)
-
-    created = create_item(
-        client,
-        target_workspace_id,
-        name,
-        item_type,
-        description=item.get("description") or None,
-        parts=rewritten,
-        definition_format=definition_format,
-        folder_id=folder_id,
-    )
+    disposition = Disposition.REFRESHED if target_id else Disposition.CREATED
+    with lifecycle.operation("definition", "Definition applied.") if lifecycle else nullcontext():
+        if target_id:
+            update_item_definition(
+                client, target_workspace_id, target_id, rewritten,
+                definition_format=definition_format,
+            )
+        else:
+            created = create_item(
+                client, target_workspace_id, name, item_type,
+                description=item.get("description") or None,
+                parts=rewritten, definition_format=definition_format, folder_id=folder_id,
+            )
+            target_id = created["id"]
+        if lifecycle:
+            lifecycle.resolve(target_id, target_workspace_id, disposition)
+    if lifecycle:
+        lifecycle.complete()
     return MigratedItem(
         source_id=item["id"],
-        target_id=created["id"],
+        target_id=target_id,
         name=name,
         rebound_parts=changed,
         parts=tuple(rewritten),
@@ -379,7 +455,12 @@ def describe_failure(
             f"{item_type} '{name}' was not migrated: one of its sources uses a connection "
             "this service principal cannot reach. Connections are tenant wide, so grant it "
             "access to the connection in Manage Connections and Gateways, then recreate the "
-            f"{item_type.lower()}."
+            f"{item_type.lower()}. The service said: {said}."
+        )
+    if isinstance(error, StrandedReference):
+        return (
+            f"{item_type} '{name}' was not migrated: {error}. "
+            "Migrate or replace what it needs, then retry."
         )
     if isinstance(error, OperationTimeout):
         return (
@@ -400,8 +481,8 @@ def describe_failure(
     if said:
         return f"{item_type} '{name}' was not migrated{status}: {said}.{advice}".replace("..", ".")
     return (
-        f"{item_type} '{name}' was not migrated{status}. Recreate it manually and check its "
-        "data source bindings."
+        f"{item_type} '{name}' was not migrated{status}: {error}. "
+        "Fix the reported source or access problem, then retry."
     )
 
 
@@ -441,6 +522,33 @@ def _readable(parts: Iterable[Mapping[str, Any]]) -> str:
     return "\n".join(lines) or "<the definition could not be read back for logging>"
 
 
+def reference_identifiers(
+    source_items: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Known source identities, including endpoints that can be missing from the item list."""
+    identifiers: dict[str, Mapping[str, Any]] = {}
+    for item_id, item in source_items.items():
+        if item_id:
+            identifiers[item_id] = item
+        properties = item.get("properties") or {}
+        endpoint = properties.get("sqlEndpointProperties") or {}
+        for key in ("id", "connectionString"):
+            if endpoint.get(key):
+                identifiers[endpoint[key]] = {
+                    "type": "SQLEndpoint",
+                    "displayName": item.get("displayName") or item_id,
+                    "id": endpoint.get("id") or item_id,
+                }
+        for key in (
+            "connectionString", "connectionInfo", "serverFqdn", "queryServiceUri",
+            "ingestionServiceUri", "databaseName",
+        ):
+            value = properties.get(key)
+            if isinstance(value, str) and value:
+                identifiers[value] = item
+    return identifiers
+
+
 def dangling_references(
     parts: Iterable[Mapping[str, Any]],
     id_map: Mapping[str, str],
@@ -469,26 +577,40 @@ def dangling_references(
         return []
 
     skip = {str(item).casefold() for item in ignore if item}
+    mapped = {key.casefold(): value for key, value in id_map.items() if key and value}
+    identifiers = reference_identifiers(source_items)
     missing = {
         item_id.casefold(): item
-        for item_id, item in source_items.items()
-        # A SQL analytics endpoint is created with its lakehouse, warehouse or mirrored
-        # database rather than by us, so it is never "not migrated": it arrives with its
-        # parent, under a new id that is recorded once the parent has provisioned it.
+        for item_id, item in identifiers.items()
         if item_id
-        and item_id not in id_map
+        and (
+            item_id.casefold() not in mapped
+            or (
+                mapped[item_id.casefold()].casefold() == item_id.casefold()
+                and (
+                    GUID_PATTERN.fullmatch(item_id)
+                    or item_id.casefold() == str(item.get("id") or "").casefold()
+                )
+            )
+        )
         and item_id.casefold() not in skip
-        and not is_derived_type(item.get("type") or "")
     }
     if not missing:
         return []
 
-    haystack = _definition_text(parts).casefold()
+    # A complete mapped endpoint may itself contain a source GUID. Mask complete known
+    # replacements before looking for the identifiers that are still unresolved.
+    mask = build_rewriter({
+        key: "\x00" for key in id_map
+        if key and id_map[key] and key.casefold() not in missing
+    })
+    text = _definition_text(parts)
+    haystack = (mask(text) if mask else text).casefold()
     found = [item for item_id, item in missing.items() if item_id in haystack]
-    return [
+    return list(dict.fromkeys(
         f"{item.get('type') or 'item'} '{item.get('displayName') or item.get('id')}'"
-        for item in sorted(found, key=lambda i: str(i.get("displayName") or i.get("id")))
-    ]
+        for item in sorted(found, key=lambda item: str(item.get("displayName") or item.get("id")))
+    ))
 
 
 def _definition_text(parts: Iterable[Mapping[str, Any]]) -> str:
@@ -575,7 +697,9 @@ def migrate_items(
     folder_map: Mapping[str, str] | None = None,
     parts_by_id: Mapping[str, list[dict[str, Any]]] | None = None,
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    existing_targets: Mapping[str, str] | None = None,
     on_progress: Any = None,
+    on_lifecycle: Callable[[Mapping[str, Any], str], ItemLifecycle] | None = None,
 ) -> tuple[list[MigratedItem], list[str]]:
     """Migrate a batch of definition-backed items, collecting per-item failures.
 
@@ -593,6 +717,7 @@ def migrate_items(
         if on_progress:
             on_progress(f"Migrating {item_type} '{name}'")
         definition_parts = (parts_by_id or {}).get(item.get("id", ""))
+        evidence = on_lifecycle(item, item_type) if on_lifecycle else None
         try:
             result = migrate_definition_item(
                 client,
@@ -604,6 +729,8 @@ def migrate_items(
                 folder_id=(folder_map or {}).get(item.get("folderId", "")),
                 parts=definition_parts,
                 source_items=source_items,
+                target_id=(existing_targets or {}).get(item.get("id", "")),
+                **({"lifecycle": evidence} if evidence else {}),
             )
         except StrandedReference as error:
             # Refused before anything was created, so there is nothing half bound to clean up.
