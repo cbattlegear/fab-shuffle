@@ -1,23 +1,34 @@
-"""Cross-cluster KQL data movement.
+"""KQL data movement, using cross-cluster queries only for the legacy same-tenant path.
 
-Fabric has no REST API that copies KQL table data between eventhouses, so this uses the
-Kusto control plane directly: ``.set-or-replace`` with a cross-cluster query pulls each
-table from the source cluster into the target.
+Paired-principal moves stream source queries into destination-authenticated ingestion.
+They never ask the destination to query the source and leave target update policies stopped.
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 import re
 import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any, NotRequired, TypedDict
+from urllib.parse import quote
 
-from azure.kusto.data import ClientRequestProperties, KustoClient, KustoConnectionStringBuilder
+from azure.kusto.data import ClientRequestProperties, DataFormat, KustoClient, KustoConnectionStringBuilder
 from azure.kusto.data.exceptions import KustoServiceError
 
 from fabshuffle.auth import ServicePrincipal
+from fabshuffle.lifecycle import CopyOutcome
+from fabshuffle.transfer.common import (
+    DEFAULT_MAX_STAGING_BYTES,
+    StagingBudgetError,
+    check_budget,
+    check_cancelled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +41,16 @@ MAX_ATTEMPTS = 5
 INGEST_TIMEOUT = timedelta(hours=1)
 # Tables Fabric manages itself; re-ingesting them corrupts the target database.
 SYSTEM_TABLE_PREFIXES = ("$",)
+
+
+class KqlTransferError(RuntimeError):
+    """A table was not completely read and ingested."""
+
+
+class DatabaseCopyResult(TypedDict):
+    tables: int
+    rows: int
+    warnings: NotRequired[list[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +117,7 @@ def _ident(name: str) -> str:
     Fabric names its KQL databases after the item GUID, which starts with a digit often
     enough that an unquoted identifier is a parse error.
     """
-    return "[" + '"' + name.replace('"', '\\"') + '"' + "]"
+    return "[" + json.dumps(name, ensure_ascii=False) + "]"
 
 
 def list_tables(
@@ -124,9 +145,17 @@ def copy_database(
     target_cluster_uri: str,
     database: str,
     principal: ServicePrincipal,
+    target_principal: ServicePrincipal | None = None,
+    source_database: str | None = None,
+    target_database: str | None = None,
+    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    cancel_requested: Callable[[], bool] | None = None,
+    on_copied: Callable[[str], None] | None = None,
+    on_complete: Callable[[CopyOutcome], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
     exclude: Collection[str] = (),
     on_progress: Callable[[str], None] | None = None,
-) -> dict[str, int]:
+) -> DatabaseCopyResult:
     """Copy every table from the source database into the same-named target database.
 
     Both URIs must be *query* endpoints: cross-cluster ``.set-or-replace`` is executed on the
@@ -135,9 +164,24 @@ def copy_database(
 
     ``exclude`` names tables that must not be copied, which is how table shortcuts are kept
     out: their data belongs to the shortcut target, and the shortcut is recreated separately.
+    ``source_database`` and ``target_database`` override the legacy ``database`` name, so
+    paired callers can supply the actual Fabric KQL database item IDs independently.
     """
-    tables = list_tables(source_cluster_uri, database, principal, exclude=exclude)
+    if target_principal is not None:
+        return copy_database_streaming(
+            source_cluster_uri=source_cluster_uri, target_cluster_uri=target_cluster_uri,
+            database=database, source_database=source_database, target_database=target_database,
+            principal=principal,
+            target_principal=target_principal, max_staging_bytes=max_staging_bytes,
+            cancel_requested=cancel_requested, exclude=exclude, on_progress=on_progress,
+            on_copied=on_copied, on_complete=on_complete, on_warning=on_warning,
+        )
+    check_cancelled(cancel_requested)
+    origin = source_database or database
+    tables = list_tables(source_cluster_uri, origin, principal, exclude=exclude)
     if not tables:
+        if on_complete:
+            on_complete(CopyOutcome("kql", empty=True))
         return {"tables": 0, "rows": 0}
 
     total_rows = 0
@@ -146,14 +190,19 @@ def copy_database(
         properties.set_option(ClientRequestProperties.request_timeout_option_name, INGEST_TIMEOUT)
 
         for table in tables:
+            check_cancelled(cancel_requested)
             if on_progress:
-                on_progress(f"Ingesting {database}.{table}")
+                on_progress(f"Ingesting {origin}.{table}")
             command = (
                 f".set-or-replace {table} with(distributed=true) <| "
-                f"cluster('{source_cluster_uri}').database('{database}').{table}"
+                f"cluster('{source_cluster_uri}').database('{origin}').{table}"
             )
-            total_rows += _execute_with_retry(target, database, command, properties, table)
+            total_rows += _execute_with_retry(target, target_database or database, command, properties, table)
+            if on_copied:
+                on_copied(table)
 
+    if on_complete:
+        on_complete(CopyOutcome("kql", empty=total_rows == 0))
     return {"tables": len(tables), "rows": total_rows}
 
 
@@ -184,4 +233,375 @@ def _execute_with_retry(
     return 0
 
 
-__all__ = ["FollowerSource", "copy_database", "follower_source", "list_tables"]
+def _stream_properties() -> ClientRequestProperties:
+    properties = ClientRequestProperties()
+    properties.set_option(ClientRequestProperties.request_timeout_option_name, INGEST_TIMEOUT)
+    properties.set_option("notruncation", True)
+    properties.set_option("results_progressive_enabled", False)
+    properties.set_option("query_results_cache_max_age", timedelta(0))
+    properties.set_option("request_block_row_level_security", True)
+    return properties
+
+
+def _table_data(table: str) -> str:
+    # table() prefers the physical table over a same-named function; explicitly include cold data.
+    # https://learn.microsoft.com/kusto/query/table-function
+    return f'table({json.dumps(table)}, "all")'
+
+
+def _count(client: KustoClient, database: str, table: str) -> int:
+    response = client.execute_query(
+        database, f"{_table_data(table)} | count", _stream_properties(),
+    )
+    return int(next(iter(response.primary_results[0]))[0])
+
+
+def _csv_row(values: list[Any]) -> bytes:
+    text = io.StringIO(newline="")
+    csv.writer(text, lineterminator="\r\n").writerow([
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(value, (dict, list, bool)) else value
+        for value in values
+    ])
+    return text.getvalue().encode("utf-8")
+
+
+def _policy_rules(value: Any, entity: str) -> list[dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    try:
+        rules = json.loads(value)
+    except (ValueError, TypeError) as exc:
+        raise KqlTransferError(
+            f"KQL returned an unreadable update policy for {entity}: {exc}. Inspect the target policy."
+        ) from exc
+    if rules is None:
+        return []
+    if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+        raise KqlTransferError(f"KQL returned an unrecognized update policy for {entity}; inspect it.")
+    return rules
+
+
+def _require_quiet_target(target: KustoClient, database: str) -> None:
+    # A later source-table load can append through a policy into a table already checkpointed
+    # earlier. Check every target policy before any writes, not only the table being loaded.
+    # https://learn.microsoft.com/kusto/management/show-table-update-policy-command
+    response = target.execute_mgmt(database, ".show table * policy update")
+    active: list[str] = []
+    for row in response.primary_results[0]:
+        policy = _policy_rules(row["Policy"], str(row["EntityName"]))
+        if any(rule.get("IsEnabled") is not False for rule in policy):
+            active.append(str(row["EntityName"]))
+    if active:
+        raise KqlTransferError(
+            f"Target update policies are active on {', '.join(active)}. Set IsEnabled=false "
+            "in those target tables' update policies before retrying; replaying rows while "
+            "they run can duplicate data in already-copied tables."
+        )
+
+
+def _update_policy(target: KustoClient, database: str, table: str) -> list[dict[str, Any]]:
+    response = target.execute_mgmt(database, f".show table {_ident(table)} policy update")
+    rows = list(response.primary_results[0])
+    if not rows:
+        return []
+    if len(rows) != 1:
+        raise KqlTransferError(f"KQL returned multiple update policies for {database}.{table}; inspect it.")
+    return _policy_rules(rows[0]["Policy"], f"{database}.{table}")
+
+
+def _writable_policy(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # This read-only field is set by Fabric for the target caller, not imported as an identity.
+    # https://learn.microsoft.com/kusto/management/alter-table-update-policy-command
+    return [
+        {key: value for key, value in rule.items() if key != "OwnerPrincipalDetails"}
+        for rule in rules
+    ]
+
+
+def _stop_target_policies(
+    target: KustoClient,
+    database: str,
+    *,
+    on_warning: Callable[[str], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Leave all destination update rules stopped, without editing exported KQL or rule logic."""
+    check_cancelled(cancel_requested)
+    response = target.execute_mgmt(database, ".show tables | project TableName")
+    tables = [str(row["TableName"]) for row in response.primary_results[0]]
+    stopped: list[str] = []
+    warnings: list[str] = []
+    for table in tables:
+        check_cancelled(cancel_requested)
+        if table.startswith(SYSTEM_TABLE_PREFIXES):
+            continue
+        rules = _update_policy(target, database, table)
+        if not rules:
+            continue
+        desired = [{**rule, "IsEnabled": False} for rule in _writable_policy(rules)]
+        if any(rule.get("IsEnabled") is not False for rule in rules):
+            # Obfuscate the string in Kusto's command logs: a policy query may contain secrets.
+            serialized = json.dumps(desired, ensure_ascii=False, separators=(",", ":"))
+            literal = "h" + json.dumps(serialized, ensure_ascii=False)
+            check_cancelled(cancel_requested)
+            target.execute_mgmt(
+                database, f".alter table {_ident(table)} policy update {literal}",
+            )
+            check_cancelled(cancel_requested)
+            actual = _writable_policy(_update_policy(target, database, table))
+            if actual != desired:
+                raise KqlTransferError(
+                    f"Target update policy for {database}.{table} was not preserved in its stopped state. "
+                    "Inspect the target policy and set IsEnabled=false before retrying; no rows were copied."
+                )
+        message = (
+            f"Update policies on target KQL table {database}.{table} remain stopped. After cutover, "
+            f"inspect '.show table {_ident(table)} policy update' and use '.alter table "
+            f"{_ident(table)} policy update' with IsEnabled=true only for rules you intend to resume."
+        )
+        stopped.append(table)
+        warnings.append(message)
+        if on_warning:
+            on_warning(message)
+        elif on_progress:
+            on_progress(message)
+    check_cancelled(cancel_requested)
+    _require_quiet_target(target, database)
+    return stopped, warnings
+
+
+def stop_update_policies(
+    cluster_uri: str,
+    database: str,
+    principal: ServicePrincipal,
+    on_progress: Callable[[str], None] | None = None,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Stop destination update policies and return their table names for activation tracking.
+
+    Call after every destination schema application, including replay. Nonempty policies
+    that are already disabled are included so retries retain the manual activation context.
+    Rule logic/settings are preserved; only IsEnabled is disabled and service-owned
+    OwnerPrincipalDetails is omitted from writes. No source client is opened.
+    """
+    check_cancelled(cancel_requested)
+    with _client(cluster_uri, principal) as target:
+        tables, _ = _stop_target_policies(
+            target, database, on_progress=on_progress, cancel_requested=cancel_requested,
+        )
+    return tables
+
+
+def stop_target_update_policies(
+    target: KustoClient,
+    database: str,
+    *,
+    on_warning: Callable[[str], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Stop destination update policies and return actionable warnings."""
+    _, warnings = _stop_target_policies(
+        target, database, on_warning=on_warning, on_progress=on_progress,
+        cancel_requested=cancel_requested,
+    )
+    return warnings
+
+
+def stop_database_update_policies(
+    *,
+    target_cluster_uri: str,
+    target_database: str,
+    target_principal: ServicePrincipal,
+    on_warning: Callable[[str], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Stop destination policies independently of data copying, including schema-only moves."""
+    check_cancelled(cancel_requested)
+    with _client(target_cluster_uri, target_principal) as target:
+        return stop_target_update_policies(
+            target, target_database, on_warning=on_warning, on_progress=on_progress,
+            cancel_requested=cancel_requested,
+        )
+
+
+def _stream_table(
+    source: KustoClient, target: KustoClient, database: str, target_database: str,
+    table: str, max_staging_bytes: int, cancel_requested: Callable[[], bool] | None,
+) -> int:
+    properties = _stream_properties()
+    expected = _count(source, database, table)
+    source_schema = source.execute_query(
+        database, f"{_table_data(table)} | take 0", properties,
+    ).primary_results[0]
+    target_schema = target.execute_query(
+        target_database, f"{_table_data(table)} | take 0", properties,
+    ).primary_results[0]
+
+    def signature(result: Any) -> list[tuple[str, str]]:
+        return [(c.column_name, c.column_type) for c in result.columns]
+
+    if signature(source_schema) != signature(target_schema):
+        raise KqlTransferError(
+            f"KQL table {table} has a different target schema; deploy its source schema and retry."
+        )
+    check_cancelled(cancel_requested)
+    _require_quiet_target(target, target_database)
+    target.execute_mgmt(target_database, f".clear table {_ident(table)} data")
+    response = source.execute_streaming_query(
+        database, _table_data(table), timeout=INGEST_TIMEOUT, properties=properties,
+    )
+    limit = min(max_staging_bytes, 1024 * 1024)
+    payload = bytearray()
+    count = 0
+    primary_seen = False
+    completed = False
+
+    def ingest() -> None:
+        if payload:
+            check_cancelled(cancel_requested)
+            _require_quiet_target(target, target_database)
+            # The data SDK exposes the documented streaming-ingest REST API; unlike
+            # .ingest inline this is a supported production ingestion path.
+            target.execute_streaming_ingest(
+                quote(target_database, safe=""), quote(table, safe=""),
+                stream=io.BytesIO(payload), blob_url=None, stream_format=DataFormat.CSV,
+            )
+            payload.clear()
+
+    # The current SDK's high-level iterator drops DataSetCompletion, including HasErrors.
+    # Consume its incremental wire parser to validate those flags and preserve datetime
+    # precision (the typed row adapter converts them to Python's microsecond datetime).
+    # https://learn.microsoft.com/kusto/api/rest/response-v2
+    for frame in response.streamed_data:
+        check_cancelled(cancel_requested)
+        frame_type = getattr(frame["FrameType"], "name", frame["FrameType"])
+        if completed:
+            raise KqlTransferError(f"KQL returned frames after completion for {table}.")
+        if frame_type == "DataTable":
+            if frame.get("TableKind") != "PrimaryResult":
+                for _ in frame["Rows"]:
+                    pass
+                continue
+            if primary_seen:
+                raise KqlTransferError(f"KQL returned multiple primary results for table {table}.")
+            primary_seen = True
+            names = [column["ColumnName"] for column in frame["Columns"]]
+            columns = [(c["ColumnName"], c["ColumnType"]) for c in frame["Columns"]]
+            if columns != signature(source_schema):
+                raise KqlTransferError(
+                    f"KQL table {table} changed schema during transfer; freeze writes and retry."
+                )
+            for row in frame["Rows"]:
+                check_cancelled(cancel_requested)
+                if len(row) != len(names):
+                    raise KqlTransferError(f"KQL returned an incomplete row for table {table}.")
+                encoded = _csv_row(row)
+                if len(encoded) > limit:
+                    raise StagingBudgetError(
+                        f"A KQL row in {table} requires {len(encoded)} bytes, above the "
+                        f"{limit}-byte streaming batch limit. Increase the staging budget "
+                        "or use an operator-managed queued ingestion for oversized rows."
+                    )
+                if len(payload) + len(encoded) > limit:
+                    ingest()
+                payload.extend(encoded)
+                count += 1
+        elif frame_type == "DataSetCompletion":
+            if frame.get("HasErrors") is not False or frame.get("Cancelled") is not False:
+                raise KqlTransferError(
+                    f"KQL source query for {table} did not complete: "
+                    f"{json.dumps(frame.get('OneApiErrors', frame), default=str)}"
+                )
+            completed = True
+    if not completed or not primary_seen:
+        raise KqlTransferError(f"KQL source stream for {table} ended without complete result evidence.")
+    if count != expected:
+        raise KqlTransferError(
+            f"KQL table {table} source count={expected}, streamed={count}; keep writes frozen and retry."
+        )
+    ingest()
+    actual = _count(target, target_database, table)
+    if actual != expected:
+        raise KqlTransferError(
+            f"KQL table {table} source count={expected}, target={actual}. "
+            "Stop target writers/update policies and retry the full table."
+        )
+    _require_quiet_target(target, target_database)
+    return count
+
+
+def copy_database_streaming(
+    *,
+    source_cluster_uri: str,
+    target_cluster_uri: str,
+    database: str,
+    principal: ServicePrincipal,
+    target_principal: ServicePrincipal,
+    source_database: str | None = None,
+    target_database: str | None = None,
+    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    exclude: Collection[str] = (),
+    on_progress: Callable[[str], None] | None = None,
+    on_copied: Callable[[str], None] | None = None,
+    on_complete: Callable[[CopyOutcome], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> DatabaseCopyResult:
+    """Stream a frozen KQL database through this client, never through a target-side source query.
+
+    No disk is used. Requests are at most 1 MiB (below streaming ingestion's 4 MiB limit).
+    Supply source/target database item IDs via ``source_database``/``target_database``;
+    the existing ``database`` argument remains their backwards-compatible default.
+    Source and destination external writers must remain frozen. Target update policies are
+    stopped and verified before any row copies and remain stopped after completion; actionable
+    warnings are returned and optionally emitted through ``on_warning``. Destination tables
+    must already exist. Any failure leaves that table uncheckpointed; retry clears and reloads
+    the whole table instead of repeating an append with uncertain completion.
+    https://learn.microsoft.com/kusto/api/rest/streaming-ingest
+    https://learn.microsoft.com/kusto/management/clear-table-data-command
+    """
+    check_budget(max_staging_bytes)
+    check_cancelled(cancel_requested)
+    origin = source_database or database
+    destination = target_database or database
+    if source_cluster_uri == target_cluster_uri and origin == destination:
+        raise KqlTransferError("Source and destination KQL databases must differ.")
+    tables = list_tables(source_cluster_uri, origin, principal, exclude=exclude)
+    rows = 0
+    with (
+        _client(source_cluster_uri, principal) as source,
+        _client(target_cluster_uri, target_principal) as target,
+    ):
+        warnings = stop_target_update_policies(
+            target, destination, on_warning=on_warning, on_progress=on_progress,
+            cancel_requested=cancel_requested,
+        )
+        for table in tables:
+            check_cancelled(cancel_requested)
+            if on_progress:
+                on_progress(f"Streaming KQL table {origin}.{table}")
+            rows += _stream_table(
+                source, target, origin, destination, table, max_staging_bytes, cancel_requested,
+            )
+            check_cancelled(cancel_requested)
+            if on_copied:
+                on_copied(table)
+    outcome = CopyOutcome("kql", empty=rows == 0)
+    if on_complete:
+        on_complete(outcome)
+    result: DatabaseCopyResult = {"tables": len(tables), "rows": rows}
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+__all__ = [
+    "DatabaseCopyResult", "FollowerSource", "KqlTransferError", "copy_database", "copy_database_streaming",
+    "follower_source", "list_tables", "stop_database_update_policies", "stop_target_update_policies",
+    "stop_update_policies",
+]

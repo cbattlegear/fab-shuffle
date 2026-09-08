@@ -138,6 +138,14 @@ class FabricClient:
 
     # ------------------------------------------------------------------ plumbing
 
+    def tenant_id(self) -> str:
+        """The tenant authenticated by this client, used before owned-resource cleanup."""
+        return self._tokens.tenant_id()
+
+    @property
+    def application_id(self) -> str:
+        return self._tokens.principal.client_id
+
     def close(self) -> None:
         self._http.close()
 

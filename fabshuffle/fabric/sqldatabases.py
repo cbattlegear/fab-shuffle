@@ -97,6 +97,7 @@ def copy_schema(
     source_id: str,
     target_workspace_id: str,
     target_id: str,
+    target_client: FabricClient | None = None,
 ) -> None:
     """Apply the source database's schema to its copy.
 
@@ -107,7 +108,12 @@ def copy_schema(
 
     The source ``.platform`` part is dropped, as everywhere else: it carries the original
     item's logical id, and leaving it in makes the copy claim to be the original.
+
+    Exports use ``client``; updates and their operations use ``target_client`` when supplied.
+    The opaque dacpac is not inspected for security identities or permissions. Callers that
+    must exclude source security must use a separately sanitized schema transfer instead.
     """
+    destination = client if target_client is None else target_client
     definition = get_item_definition(
         client, source_workspace_id, source_id, fmt=DEFINITION_FORMAT
     )
@@ -115,7 +121,7 @@ def copy_schema(
     if not parts:
         return
 
-    client.post(
+    destination.post(
         f"workspaces/{target_workspace_id}/sqlDatabases/{target_id}/updateDefinition",
         json={"definition": {"format": DEFINITION_FORMAT, "parts": parts}},
     )

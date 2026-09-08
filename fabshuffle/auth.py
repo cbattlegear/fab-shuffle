@@ -7,7 +7,8 @@ import binascii
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from uuid import UUID
 
 import msal
 
@@ -29,7 +30,7 @@ class AuthError(RuntimeError):
 class ServicePrincipal:
     tenant_id: str
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)
 
     def redacted(self) -> dict[str, str]:
         return {"tenant_id": self.tenant_id, "client_id": self.client_id}
@@ -93,6 +94,23 @@ class TokenProvider:
         """Fail fast at login time rather than midway through a migration."""
         self.fabric_token()
 
+    def tenant_id(self) -> str:
+        """Resolve the tenant for this provider, not an ambient user's signed-in tenant.
+
+        A directory domain and its GUID can identify the same tenant. Prefer the ``tid``
+        in our own acquired token; an explicit directory GUID also works if that claim
+        is absent. Neither value grants access: Fabric still authorizes every request.
+        https://learn.microsoft.com/entra/identity-platform/access-token-claims-reference
+        """
+        tenant = token_claim(self.fabric_token(), "tid") or self.principal.tenant_id
+        try:
+            return str(UUID(tenant))
+        except ValueError as error:
+            raise AuthError(
+                "Could not identify the authenticated tenant. Sign in using its directory "
+                "tenant GUID rather than a domain name."
+            ) from error
+
     def object_id(self) -> str:
         """This service principal's object id in the tenant, from its own token.
 
@@ -109,8 +127,8 @@ def token_claim(token: str, name: str) -> str:
     """Read one claim from a JWT without validating it.
 
     The token is one this process just obtained for itself, so there is nothing to verify
-    against and nothing is trusted on the strength of it: the value is only used to fill in
-    a script for the operator to read.
+    against. Claims identify our configured tenant or fill in an operator script; they do
+    not authorize requests or accept caller-supplied bearer tokens.
     """
     try:
         payload = token.split(".")[1]
@@ -121,6 +139,8 @@ def token_claim(token: str, name: str) -> str:
     try:
         claims = json.loads(base64.urlsafe_b64decode(padded))
     except (ValueError, binascii.Error):
+        return ""
+    if not isinstance(claims, dict):
         return ""
     value = claims.get(name)
     return str(value) if value else ""

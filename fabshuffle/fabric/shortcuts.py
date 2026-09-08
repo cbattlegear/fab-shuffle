@@ -6,8 +6,9 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
+from fabshuffle.fabric import analytics
 from fabshuffle.fabric.client import FabricApiError, FabricClient
-from fabshuffle.fabric.definitions import identity_key
+from fabshuffle.fabric.definitions import identity_key, part
 from fabshuffle.lifecycle import EvidenceState, ItemLifecycle
 
 
@@ -131,6 +132,8 @@ def _unmigrated_connection(
     shortcut: Mapping[str, Any],
     id_map: Mapping[str, str],
     source_items: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    strict_references: bool = False,
 ) -> str | None:
     identities = {identity_key(key): value for key, value in id_map.items()}
     items = {identity_key(key): value for key, value in (source_items or {}).items()}
@@ -140,6 +143,13 @@ def _unmigrated_connection(
         connection_id = settings.get("connectionId") or ""
         item = items.get(identity_key(connection_id)) or {}
         replacement = identities.get(identity_key(connection_id))
+        if strict_references and connection_id and (
+            not replacement or identity_key(replacement) == identity_key(connection_id)
+        ):
+            return (
+                f"connection '{item.get('displayName') or connection_id}' has no destination mapping. "
+                "Create or select a connection in the destination tenant and supply its mapping, then retry"
+            )
         if item.get("type") == "Connection" and (
             not replacement or identity_key(replacement) == identity_key(connection_id)
         ):
@@ -447,6 +457,24 @@ def _source_connection_ids(
     return connections
 
 
+def _with_connection_references(
+    source: Iterable[Mapping[str, Any]],
+    source_items: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Mapping[str, Any]]:
+    references = dict(source_items or {})
+    known = {identity_key(key) for key in references}
+    for shortcut in source:
+        for settings in (shortcut.get("target") or {}).values():
+            if not isinstance(settings, Mapping):
+                continue
+            connection_id = settings.get("connectionId")
+            if isinstance(connection_id, str) and connection_id and identity_key(connection_id) not in known:
+                references[connection_id] = {
+                    "id": connection_id, "type": "Connection", "displayName": connection_id,
+                }
+    return references
+
+
 def copy_shortcuts(
     client: FabricClient,
     source_workspace_id: str,
@@ -458,22 +486,34 @@ def copy_shortcuts(
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
     dormant: Mapping[str, str] | None = None,
     lifecycle: ItemLifecycle | None = None,
+    target_client: FabricClient | None = None,
+    cross_tenant: bool = False,
+    strict_references: bool | None = None,
 ) -> tuple[int, list[str]]:
     """Recreate every shortcut from a source item onto its migrated counterpart.
 
     ``dormant`` maps a source item id to why its copy has no data yet, for the items that are
     migrated switched off. Used only to explain a failure, never to predict one.
+
+    Source inventory uses ``client``; creates use ``target_client`` when supplied.
+    ``cross_tenant`` requires destination connection mappings and workspace read evidence.
     """
+    destination = client if target_client is None else target_client
+    strict = cross_tenant or bool(strict_references)
     created = 0
     warnings: list[str] = []
 
     with _ShortcutEvidence(lifecycle).operation() as evidence:
         source = list_shortcuts(client, source_workspace_id, source_item_id)
+        if strict:
+            source_items = _with_connection_references(source, source_items)
         evidence.total = len(source)
         for shortcut in source:
             evidence.observe(shortcut, source_workspace_id, source_items)
             name = str(shortcut.get("name"))
-            connection_problem = _unmigrated_connection(shortcut, id_map, source_items)
+            connection_problem = _unmigrated_connection(
+                shortcut, id_map, source_items, strict_references=strict,
+            )
             if connection_problem:
                 message = f"Shortcut '{name}' was not created: {connection_problem}."
                 warnings.append(message)
@@ -501,7 +541,13 @@ def copy_shortcuts(
                 )
                 continue
             try:
-                create_shortcut(client, target_workspace_id, target_item_id, remapped)
+                if strict:
+                    analytics.validate_cross_tenant_identities([part("shortcut.json", remapped)])
+                    analytics.validate_target_workspaces(
+                        destination, [part("shortcut.json", remapped)],
+                        source_workspace_id=source_workspace_id,
+                    )
+                create_shortcut(destination, target_workspace_id, target_item_id, remapped)
                 created += 1
             except FabricApiError as error:
                 source_id = onelake_item_id(shortcut)
@@ -599,8 +645,13 @@ def copy_table_shortcuts(
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
     dormant: Mapping[str, str] | None = None,
     lifecycle: ItemLifecycle | None = None,
+    target_client: FabricClient | None = None,
+    cross_tenant: bool = False,
+    strict_references: bool | None = None,
 ) -> tuple[int, list[str]]:
     """Recreate a KQL database's table shortcuts against the migrated items."""
+    destination = client if target_client is None else target_client
+    strict = cross_tenant or bool(strict_references)
     created = 0
     warnings: list[str] = []
 
@@ -610,11 +661,15 @@ def copy_table_shortcuts(
             if shortcuts is not None
             else list_table_shortcuts(client, source_workspace_id, source_database_id)
         )
+        if strict:
+            source_items = _with_connection_references(source, source_items)
         evidence.total = len(source)
         for shortcut in source:
             evidence.observe(shortcut, source_workspace_id, source_items)
             name = str(shortcut.get("name"))
-            connection_problem = _unmigrated_connection(shortcut, id_map, source_items)
+            connection_problem = _unmigrated_connection(
+                shortcut, id_map, source_items, strict_references=strict,
+            )
             if connection_problem:
                 message = f"KQL table shortcut '{name}' was not created: {connection_problem}."
                 warnings.append(message)
@@ -642,8 +697,14 @@ def copy_table_shortcuts(
                 )
                 continue
             try:
+                if strict:
+                    analytics.validate_cross_tenant_identities([part("shortcut.json", {"target": target})])
+                    analytics.validate_target_workspaces(
+                        destination, [part("shortcut.json", {"target": target})],
+                        source_workspace_id=source_workspace_id,
+                    )
                 create_table_shortcut(
-                    client,
+                    destination,
                     target_workspace_id,
                     target_database_id,
                     {

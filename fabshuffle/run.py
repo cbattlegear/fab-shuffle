@@ -7,6 +7,7 @@ import queue
 import threading
 import uuid
 from collections.abc import Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -71,6 +72,7 @@ class MigrationRun:
         self.lineage_id = self.id
         self.resumed_from = ""
         self.journal_started = False
+        self.plan: dict[str, Any] = {}
         self.source_workspace_name = source_workspace_name
         self.capacity_name = capacity_name
         self.status = RunStatus.PENDING
@@ -245,20 +247,47 @@ class RunRegistry:
         self._runs: dict[str, MigrationRun] = {}
         self._lock = threading.Lock()
         self._claims: set[str] = set()
-        self._cleaning: set[str] = set()
+        self._cleaning: set[str | tuple[str, ...]] = set()
 
     @staticmethod
-    def _related(run: MigrationRun, lineage_id: str, target_id: str) -> bool:
-        target = (run.target_workspace or {}).get("id")
-        return run.lineage_id == lineage_id or bool(target_id and target == target_id)
+    def _related(
+        run: MigrationRun, lineage_id: str, target_id: str, plan: dict[str, Any] | None = None,
+        scratch_id: str = "",
+    ) -> bool:
+        plan = plan or {}
+        owned = {
+            journal.target_scope(run.plan, workspace["id"])
+            for workspace in (run.target_workspace, run.scratch_workspace)
+            if workspace and workspace.get("id")
+        }
+        requested = {
+            journal.target_scope(plan, workspace) for workspace in (target_id, scratch_id) if workspace
+        }
+        return (
+            run.lineage_id == lineage_id and journal.binding_scope(run.plan) == journal.binding_scope(plan)
+        ) or bool(owned.intersection(requested))
 
-    def _active(self, lineage_id: str = "", target_id: str = "") -> MigrationRun | None:
+    def _active(
+        self, lineage_id: str = "", target_id: str = "", plan: dict[str, Any] | None = None,
+        scratch_id: str = "",
+    ) -> MigrationRun | None:
         for run in self._runs.values():
             if (
                 run.id in self._claims or run.status in (RunStatus.PENDING, RunStatus.RUNNING)
-            ) and (not lineage_id or self._related(run, lineage_id, target_id)):
+            ) and (not lineage_id or self._related(run, lineage_id, target_id, plan, scratch_id)):
                 return run
         return None
+
+    @staticmethod
+    def _cleanup_keys(
+        plan: dict[str, Any], lineage: str, target: str, scratch: str = "",
+    ) -> set[tuple[str, ...]]:
+        keys = {("lineage", *journal.binding_scope(plan), lineage)}
+        keys.update(
+            ("workspace", *journal.target_scope(plan, workspace))
+            for workspace in (target, scratch) if workspace
+        )
+        return keys
 
     def admit(
         self, run: MigrationRun, *, directory: Path, plan: dict[str, Any],
@@ -270,23 +299,52 @@ class RunRegistry:
         Persisted ancestry makes old attempt URLs unusable even after a process restart.
         """
         with self._lock:
+            journal.tenant_binding(plan)
             if prior:
-                prior = journal.read(directory / f"{prior.run_id}.jsonl")
+                recorded = journal.read(directory / f"{prior.run_id}.jsonl")
+                if not recorded.plan:
+                    raise journal.TenantBindingError(
+                        "The original journal is missing from this tenant pair's directory. "
+                        "Select the original source and destination sign-in."
+                    )
+                journal.validate_resume_plan(plan, prior)
+                journal.validate_resume_plan(plan, recorded)
+                if (
+                    prior.target_workspace_id != recorded.target_workspace_id
+                    or prior.scratch_workspace_id != recorded.scratch_workspace_id
+                ):
+                    raise journal.TenantBindingError(
+                        "The requested recovery workspaces differ from the durable journal."
+                    )
+                prior = recorded
             lineage = (prior.lineage_id or prior.run_id) if prior else run.id
             target = prior.target_workspace_id if prior else ""
-            active = self._active(lineage, target)
+            active = self._active(lineage, target, plan, prior.scratch_workspace_id if prior else "")
             if active:
                 raise RunConflict(active.id, "This migration already has an active attempt.")
-            if "*" in self._cleaning or lineage in self._cleaning or target in self._cleaning:
+            keys = self._cleanup_keys(
+                plan, lineage, target, prior.scratch_workspace_id if prior else "",
+            )
+            if "*" in self._cleaning or self._cleaning.intersection(keys):
                 raise RunConflict(run.id, "Wait for workspace cleanup to finish before starting.")
             if prior:
                 for replay in journal.list_runs(directory):
+                    if replay.ownership_error:
+                        continue
                     if (
-                        prior.run_id in replay.ancestors
+                        (
+                            journal.binding_scope(replay.plan) == journal.binding_scope(plan)
+                            and prior.run_id in replay.ancestors
+                        )
                         or (
                             replay.run_id != prior.run_id
-                            and (replay.lineage_id == lineage or (
-                                target and replay.target_workspace_id == target
+                            and ((
+                                replay.lineage_id == lineage
+                                and journal.binding_scope(replay.plan) == journal.binding_scope(plan)
+                            ) or (
+                                target and replay.target_workspace_id
+                                and journal.target_scope(replay.plan, replay.target_workspace_id)
+                                == journal.target_scope(plan, target)
                             ))
                             and replay.created_at > prior.created_at
                         )
@@ -298,10 +356,13 @@ class RunRegistry:
                 plan, cleanup=cleanup, prior=prior
             )
             run.journal_started = True
+            run.plan = deepcopy(plan)
             run.lineage_id = lineage
             run.resumed_from = prior.run_id if prior else ""
             if target:
                 run.target_workspace = {"id": target, "displayName": prior.target_workspace_name}
+            if prior and prior.scratch_workspace_id:
+                run.scratch_workspace = {"id": prior.scratch_workspace_id}
             self._runs[run.id] = run
             self._claims.add(run.id)
         return prior
@@ -310,38 +371,82 @@ class RunRegistry:
         with self._lock:
             self._claims.discard(run_id)
 
-    def resumable(self, directory: Path) -> list[journal.Replay]:
+    def resumable(self, directory: Path, **expected_identity: str) -> list[journal.Replay]:
+        """Offer only runs bound to the caller's ordered tenant/application pair."""
         with self._lock:
             latest: list[journal.Replay] = []
             for replay in journal.latest_runs(directory):
+                try:
+                    journal.validate_replay_binding(replay, **expected_identity)
+                except journal.TenantBindingError:
+                    continue
                 lineage = replay.lineage_id or replay.run_id
                 target = replay.target_workspace_id
+                keys = self._cleanup_keys(replay.plan, lineage, target, replay.scratch_workspace_id)
                 if (
                     replay.interrupted
-                    and not self._active(lineage, target)
+                    and not self._active(lineage, target, replay.plan, replay.scratch_workspace_id)
                     and "*" not in self._cleaning
-                    and lineage not in self._cleaning and target not in self._cleaning
+                    and not self._cleaning.intersection(keys)
                 ):
                     latest.append(replay)
             return latest
 
     @contextlib.contextmanager
     def cleanup_claim(
-        self, run: MigrationRun | None = None, *, directory: Path | None = None
+        self, run: MigrationRun | None = None, *, directory: Path | None = None,
+        **expected_identity: str,
     ) -> Iterator[None]:
         """Serialize manual cleanup with admission, including cleanup through an ancestor."""
+        if run is None and journal.tenant_binding(expected_identity):
+            raise journal.TenantBindingError(
+                "Paired cleanup must name a recorded run; global name-prefix cleanup is not permitted."
+            )
+        plan = run.plan if run else {}
+        paired = journal.validate_tenant_binding(plan, **expected_identity)
         lineage = run.lineage_id if run else ""
         target = str((run.target_workspace or {}).get("id") or "") if run else ""
-        keys = {lineage, target} - {""} if run else {"*"}
+        scratch = str((run.scratch_workspace or {}).get("id") or "") if run else ""
+        keys = self._cleanup_keys(plan, lineage, target, scratch) if run else {"*"}
         with self._lock:
-            active = self._active(lineage, target)
+            if paired:
+                if directory is None:
+                    raise journal.TenantBindingError(
+                        "Paired cleanup requires the recorded journal directory."
+                    )
+                recorded = journal.read(directory / f"{run.id}.jsonl")
+                journal.validate_replay_binding(recorded, **expected_identity)
+                journal.validate_resume_plan(plan, recorded)
+                if target and target != recorded.target_workspace_id:
+                    raise journal.TenantBindingError(
+                        "The cleanup destination does not match the recorded workspace."
+                    )
+                if scratch and scratch != recorded.owned_workspace_id(
+                    "scratch", tenant_id=expected_identity["target_tenant_id"],
+                    client_id=expected_identity["target_client_id"],
+                ):
+                    raise journal.TenantBindingError(
+                        "The scratch workspace is not owned by this run; refusing cleanup."
+                    )
+            active = self._active(lineage, target, plan, scratch)
             if active:
                 raise RunConflict(active.id, "Wait for the related migration to finish before cleanup.")
             latest = journal.latest_runs(directory) if directory is not None else []
-            superseded = {ancestor for replay in latest for ancestor in replay.ancestors}
+            if not paired and any(replay.tenant_binding for replay in latest):
+                raise journal.TenantBindingError(
+                    "Paired cleanup must name a recorded run and its original tenant/application pair; "
+                    "global name-prefix cleanup is not permitted."
+                )
+            superseded = {
+                (journal.binding_scope(replay.plan), ancestor)
+                for replay in latest if not replay.ownership_error for ancestor in replay.ancestors
+            }
             for attempt in self._runs.values():
-                if attempt.id not in superseded and attempt.summary.get("unresolvedCopyJobs") and (
-                    not run or self._related(attempt, lineage, target)
+                if (
+                    (journal.binding_scope(attempt.plan), attempt.id) not in superseded
+                    and attempt.summary.get("unresolvedCopyJobs")
+                ) and (
+                    not run or self._related(attempt, lineage, target, plan, scratch)
                 ):
                     raise RunConflict(
                         attempt.id, "Unfinished Copy Jobs may still be running. Reconcile their "
@@ -349,9 +454,20 @@ class RunRegistry:
                     )
             if directory is not None:
                 for replay in latest:
+                    if replay.ownership_error:
+                        raise journal.TenantBindingError(replay.ownership_error)
                     if replay.copy_jobs and (
-                        not run or replay.lineage_id == lineage or (
-                            target and replay.target_workspace_id == target
+                        not run or (
+                            replay.lineage_id == lineage
+                            and journal.binding_scope(replay.plan) == journal.binding_scope(plan)
+                        ) or (
+                            target and replay.target_workspace_id
+                            and journal.target_scope(replay.plan, replay.target_workspace_id)
+                            == journal.target_scope(plan, target)
+                        ) or (
+                            scratch and replay.scratch_workspace_id
+                            and journal.target_scope(replay.plan, replay.scratch_workspace_id)
+                            == journal.target_scope(plan, scratch)
                         )
                     ):
                         raise RunConflict(

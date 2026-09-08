@@ -21,6 +21,7 @@ dependencies = [
     "azure-kusto-data>=4.6",
     "azure-cosmos>=4.9",
     "pyodbc>=5.2",
+    "pyarrow>=18",
 ]
 
 [project.optional-dependencies]

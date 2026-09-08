@@ -9,21 +9,24 @@ import queue
 import re
 import secrets
 import threading
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from fabshuffle import __version__, journal
 from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric import workspaces
-from fabshuffle.fabric.client import FabricApiError, FabricClient
-from fabshuffle.fabric.items import list_items
+from fabshuffle.fabric import analytics, connections, definitions, migration_refs, relations, workspaces
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
+from fabshuffle.fabric.items import get_item_definition, list_items
 from fabshuffle.fabric.powerbi import PowerBiClient, PowerBiError
 from fabshuffle.fabric.support import (
     Strategy,
@@ -57,13 +60,28 @@ SESSION_HEADER = "X-Fab-Shuffle-Session"
 # --------------------------------------------------------------------- sessions
 
 
-@dataclass
+@dataclass(frozen=True)
 class Session:
-    """One signed-in service principal. Credentials never leave this process."""
+    """Immutable source and optional destination sign-ins, pinned for each attempt."""
 
     id: str
     principal: ServicePrincipal
     tokens: TokenProvider
+    target_tokens: TokenProvider | None = None
+    source_tenant_id: str = ""
+    target_tenant_id: str = ""
+
+    @property
+    def destination_tokens(self) -> TokenProvider:
+        return self.target_tokens if self.target_tokens is not None else self.tokens
+
+    @property
+    def paired(self) -> bool:
+        return self.target_tokens is not None
+
+    @property
+    def cross_tenant(self) -> bool:
+        return self.paired and self.source_tenant_id != self.target_tenant_id
 
 
 class SessionStore:
@@ -71,8 +89,19 @@ class SessionStore:
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
 
-    def create(self, principal: ServicePrincipal, tokens: TokenProvider) -> Session:
-        session = Session(id=secrets.token_urlsafe(32), principal=principal, tokens=tokens)
+    def create(
+        self, principal: ServicePrincipal, tokens: TokenProvider, *,
+        target_tokens: TokenProvider | None = None,
+    ) -> Session:
+        source_tenant_id = target_tenant_id = ""
+        if target_tokens is not None:
+            source_tenant_id = _endpoint_tenant_id(tokens, "Source")
+            target_tenant_id = _endpoint_tenant_id(target_tokens, "Destination")
+        session = Session(
+            id=secrets.token_urlsafe(32), principal=principal, tokens=tokens,
+            target_tokens=target_tokens, source_tenant_id=source_tenant_id,
+            target_tenant_id=target_tenant_id,
+        )
         with self._lock:
             self._sessions[session.id] = session
         return session
@@ -91,6 +120,13 @@ class SessionStore:
 SESSIONS = SessionStore()
 
 
+def _endpoint_tenant_id(tokens: TokenProvider, side: str) -> str:
+    try:
+        return tokens.tenant_id()
+    except AuthError as error:
+        raise AuthError(f"{side} tenant identification failed: {error}") from error
+
+
 def require_session(
     session_id: str | None = Header(default=None, alias=SESSION_HEADER),
 ) -> Session:
@@ -98,6 +134,42 @@ def require_session(
     if not session:
         raise HTTPException(status_code=401, detail="Sign in with a service principal first")
     return session
+
+
+def require_execution_session(session: Session = Depends(require_session)) -> Session:
+    return session
+
+
+def require_legacy_session(session: Session = Depends(require_session)) -> Session:
+    if session.paired:
+        raise HTTPException(
+            status_code=409,
+            detail="Global scratch cleanup and copying source admins are disabled for paired sign-ins. "
+            "Use the migration's own cleanup action, and grant destination access in its tenant.",
+        )
+    return session
+
+
+@contextmanager
+def _planning_clients(session: Session) -> Iterator[tuple[FabricClient, FabricClient]]:
+    with FabricClient(session.tokens) as source:
+        if session.paired:
+            with FabricClient(session.destination_tokens) as target:
+                yield source, target
+        else:
+            yield source, source
+
+
+def _tenant_plan_inputs(session: Session, target: FabricClient) -> dict[str, Any]:
+    if not session.paired:
+        return {}
+    return {
+        "target_client": target,
+        "source_tenant_id": session.source_tenant_id,
+        "target_tenant_id": session.target_tenant_id,
+        "source_client_id": session.principal.client_id,
+        "target_client_id": session.destination_tokens.principal.client_id,
+    }
 
 
 def _run_conflict(error: RunConflict) -> HTTPException:
@@ -109,20 +181,39 @@ def _run_conflict(error: RunConflict) -> HTTPException:
 def _start_attempt(
     session: Session, plan: MigrationPlan, *, cleanup: bool, prior: journal.Replay | None = None
 ) -> MigrationRun:
+    if session.paired:
+        plan.copy_permissions = False
+    record = _plan_record(plan)
+    _require_identity(session, record)
+    if session.paired and plan.strategy is not Strategy.REBUILD:
+        raise HTTPException(status_code=409, detail="Paired migration must rebuild the workspace.")
+    if session.paired and (plan.include_data or plan.include_files) and not plan.write_freeze_confirmed:
+        raise HTTPException(
+            status_code=409,
+            detail="Pause source writes and confirm the write freeze before copying data or files "
+            "with separate destination credentials, or turn off both copy options.",
+        )
+    if plan.execution_blocker:
+        raise HTTPException(status_code=409, detail=plan.execution_blocker)
     run = MigrationRun(
         source_workspace_name=plan.source_workspace_name, capacity_name=plan.capacity_name
     )
     registry = REGISTRY
     try:
         prior = registry.admit(
-            run, directory=SETTINGS.journal_dir, plan=_plan_record(plan), cleanup=cleanup, prior=prior
+            run, directory=_session_directory(session), plan=record, cleanup=cleanup, prior=prior
         )
     except RunConflict as error:
         raise _run_conflict(error) from error
+    except journal.TenantBindingError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
     def failed(error: Exception) -> None:
         logger.exception("Migration attempt %s could not run", run.id)
-        journal.Journal(SETTINGS.journal_for(run.id)).finished("failed", str(error))
+        try:
+            journal.Journal(_session_journal(session, run.id)).finished("failed", str(error))
+        except Exception:
+            logger.exception("Could not record failure for migration attempt %s", run.id)
         run.mark_finished(RunStatus.FAILED, str(error))
 
     def work() -> None:
@@ -130,6 +221,8 @@ def _start_attempt(
             kwargs: dict[str, Any] = {"cleanup": cleanup}
             if prior is not None:
                 kwargs["prior"] = prior
+            if session.paired:
+                kwargs["target_principal"] = session.destination_tokens.principal
             run_migration(run, session.principal, plan, **kwargs)
         except Exception as error:
             failed(error)
@@ -148,10 +241,20 @@ def _start_attempt(
 # ---------------------------------------------------------------------- schemas
 
 
-class LoginRequest(BaseModel):
+class PrincipalCredentials(BaseModel):
     tenant_id: str = Field(min_length=1)
     client_id: str = Field(min_length=1)
-    client_secret: str = Field(min_length=1)
+    client_secret: str = Field(min_length=1, repr=False)
+
+    def principal(self) -> ServicePrincipal:
+        return ServicePrincipal(
+            tenant_id=self.tenant_id.strip(), client_id=self.client_id.strip(),
+            client_secret=self.client_secret,
+        )
+
+
+class LoginRequest(PrincipalCredentials):
+    destination: PrincipalCredentials | None = None
 
 
 class RestoreAccessRequest(BaseModel):
@@ -172,6 +275,63 @@ class StartRunRequest(BaseModel):
     include_files: bool = True
     copy_permissions: bool = True
     cleanup_when_done: bool = True
+    write_freeze_confirmed: bool = False
+    connection_mappings: dict[str, str] = Field(default_factory=dict, max_length=1000)
+    reference_mappings: list[dict[str, str]] = Field(default_factory=list, max_length=1000)
+
+    @field_validator("connection_mappings")
+    @classmethod
+    def connection_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for source, target in value.items():
+            try:
+                source, target = str(UUID(source.strip())), str(UUID(target.strip()))
+            except ValueError as error:
+                raise ValueError(
+                    "Connection mappings require source and destination connection GUIDs."
+                ) from error
+            if source in result and result[source] != target:
+                raise ValueError("Each source connection must have only one destination mapping.")
+            result[source] = target
+        return result
+
+    @field_validator("reference_mappings")
+    @classmethod
+    def item_ids(cls, value: list[dict[str, str]]) -> list[dict[str, str]]:
+        fields = {"source_workspace_id", "source_item_id", "target_workspace_id", "target_item_id"}
+        result = []
+        for entry in value:
+            if set(entry) != fields:
+                raise ValueError(
+                    "External mappings require exactly source and destination workspace and item IDs."
+                )
+            try:
+                result.append({key: str(UUID(entry[key].strip())) for key in fields})
+            except ValueError as error:
+                raise ValueError("External mappings require workspace and item GUIDs.") from error
+        return result
+
+    def plan_options(self) -> dict[str, Any]:
+        return self.model_dump(exclude={"cleanup_when_done"})
+
+
+class ResumeRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connection_mappings: dict[str, str] | None = Field(default=None, max_length=1000)
+    reference_mappings: list[dict[str, str]] | None = Field(default=None, max_length=1000)
+
+    @field_validator("connection_mappings")
+    @classmethod
+    def connection_ids(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        return StartRunRequest.connection_ids(value) if value is not None else None
+
+    @field_validator("reference_mappings")
+    @classmethod
+    def item_ids(cls, value: list[dict[str, str]] | None) -> list[dict[str, str]] | None:
+        return StartRunRequest.item_ids(value) if value is not None else None
+
+    def apply(self, plan: MigrationPlan) -> MigrationPlan:
+        return replace(plan, **self.model_dump(exclude_none=True))
 
 
 # ------------------------------------------------------------------------- app
@@ -193,19 +353,35 @@ def create_app() -> FastAPI:
 
     @app.post("/api/login")
     async def login(body: LoginRequest) -> dict[str, Any]:
-        principal = ServicePrincipal(
-            tenant_id=body.tenant_id.strip(),
-            client_id=body.client_id.strip(),
-            client_secret=body.client_secret,
-        )
+        principal = body.principal()
         tokens = TokenProvider(principal)
         try:
             await asyncio.to_thread(tokens.verify)
         except AuthError as error:
-            raise HTTPException(status_code=401, detail=str(error)) from error
+            detail = f"Source sign-in failed: {error}" if body.destination else str(error)
+            raise HTTPException(status_code=401, detail=detail) from error
 
-        session = SESSIONS.create(principal, tokens)
-        return {"sessionId": session.id, "principal": principal.redacted()}
+        target_tokens = None
+        if body.destination is not None:
+            target_tokens = TokenProvider(body.destination.principal())
+            try:
+                await asyncio.to_thread(target_tokens.verify)
+            except AuthError as error:
+                raise HTTPException(status_code=401, detail=f"Destination sign-in failed: {error}") from error
+        try:
+            session = await asyncio.to_thread(
+                SESSIONS.create, principal, tokens, target_tokens=target_tokens,
+            )
+        except AuthError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        result: dict[str, Any] = {"sessionId": session.id, "principal": principal.redacted()}
+        if target_tokens is not None:
+            result.update(
+                destinationPrincipal=target_tokens.principal.redacted(),
+                sourceTenantId=session.source_tenant_id, targetTenantId=session.target_tenant_id,
+                paired=True, crossTenant=session.cross_tenant,
+            )
+        return result
 
     @app.post("/api/logout")
     async def logout(session: Session = Depends(require_session)) -> dict[str, bool]:
@@ -217,7 +393,7 @@ def create_app() -> FastAPI:
     @app.get("/api/capacities")
     async def list_capacities(session: Session = Depends(require_session)) -> dict[str, Any]:
         def work() -> list[dict[str, Any]]:
-            with FabricClient(session.tokens) as client:
+            with FabricClient(session.destination_tokens) as client:
                 return [
                     {
                         "id": capacity["id"],
@@ -248,6 +424,26 @@ def create_app() -> FastAPI:
 
         return {"workspaces": await _run_fabric(work)}
 
+    @app.get("/api/connections")
+    async def connections(
+        side: Literal["source", "target"] = "target",
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        def work() -> list[dict[str, Any]]:
+            tokens = session.tokens if side == "source" else session.destination_tokens
+            with FabricClient(tokens) as client:
+                # Return only selector metadata, never connection paths or credentials.
+                # https://learn.microsoft.com/rest/api/fabric/core/connections/list-connections
+                return [
+                    {
+                        "id": str(entry.get("id", ""))[:128],
+                        "displayName": str(entry.get("displayName", ""))[:256],
+                        "connectivityType": str(entry.get("connectivityType", ""))[:64],
+                    }
+                    for entry in client.list_all("connections")[:1000] if entry.get("id")
+                ]
+        return {"side": side, "connections": await _run_fabric(work)}
+
     @app.get("/api/preview")
     async def preview(
         capacity_id: str,
@@ -257,20 +453,25 @@ def create_app() -> FastAPI:
         """Summarise what the migration would create before the operator commits."""
 
         def work() -> dict[str, Any]:
-            with FabricClient(session.tokens) as client:
+            with _planning_clients(session) as (client, target):
                 plan = build_plan(
                     client,
                     capacity_id=capacity_id,
                     source_workspace_id=source_workspace_id,
+                    copy_permissions=not session.paired,
+                    **_tenant_plan_inputs(session, target),
                 )
-                assessment = assess_workspace(list_items(client, source_workspace_id))
+                assessment = assess_workspace(
+                    list_items(client, source_workspace_id), force_rebuild=plan.strategy is Strategy.REBUILD,
+                    require_stopped=session.paired,
+                )
 
                 result: dict[str, Any] = {
                     "targetWorkspaceName": plan.target_workspace_name,
                     "capacityRegion": plan.capacity_region,
                     "capacityName": plan.capacity_name,
                     "sourceWorkspaceName": plan.source_workspace_name,
-                    "strategy": assessment.strategy.value,
+                    "strategy": plan.strategy.value,
                     "unsupported": [item.as_dict() for item in assessment.unsupported],
                     "unsupportedItemTypes": assessment.unsupported_types,
                     "unsupportedSummary": assessment.grouped_messages(),
@@ -278,8 +479,19 @@ def create_app() -> FastAPI:
                     "largeSemanticModels": [],
                     "blockers": [],
                 }
+                if session.paired:
+                    result.update(
+                        paired=True, crossTenant=session.cross_tenant, sourceTenantId=plan.source_tenant_id,
+                        targetTenantId=plan.target_tenant_id, copyPermissions=plan.copy_permissions,
+                        sourceClientId=plan.source_client_id, targetClientId=plan.target_client_id,
+                        assessmentNotice=(
+                            "Counts describe rebuild candidates, not qualified cross-tenant support. "
+                            "Re-check destination mappings below. "
+                            "Validate copied data and items before cutover."
+                        ),
+                    )
 
-                if assessment.strategy is Strategy.REASSIGN:
+                if plan.strategy is Strategy.REASSIGN:
                     result["counts"] = []
                     result["migratedTotal"] = 0
                     result.update(_semantic_model_preview(session, source_workspace_id, plan))
@@ -308,7 +520,10 @@ def create_app() -> FastAPI:
 
         def work() -> dict[str, Any]:
             with FabricClient(session.tokens) as client:
-                assessment = assess_workspace(list_items(client, source_workspace_id))
+                assessment = assess_workspace(
+                    list_items(client, source_workspace_id), force_rebuild=session.paired,
+                    require_stopped=session.paired,
+                )
                 if assessment.strategy is Strategy.REASSIGN:
                     # Nothing is rebuilt, so no reference has to be rewritten.
                     return {"dependencies": [], "connectionAccess": None}
@@ -326,6 +541,27 @@ def create_app() -> FastAPI:
                     "connectionAccess": report["connectionAccess"],
                 }
 
+        result = await _run_fabric(work)
+        if session.paired:
+            result.update(
+                paired=True, sourceTenantId=session.source_tenant_id,
+                targetTenantId=session.target_tenant_id, connectionAccessScope="source",
+                blockers=[],
+                assessmentNotice=(
+                    "This is source-side dependency inventory only. Source connection access "
+                    "does not establish destination connection access or migration readiness."
+                ),
+            )
+        return result
+
+    @app.post("/api/preview/dependencies")
+    async def preview_destination_dependencies(
+        body: StartRunRequest, session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        def work() -> dict[str, Any]:
+            with _planning_clients(session) as (client, target):
+                plan = build_plan(client, **body.plan_options(), **_tenant_plan_inputs(session, target))
+                return _paired_dependency_report(session, client, target, plan)
         return await _run_fabric(work)
 
     # ------------------------------------------------------------------- runs
@@ -333,19 +569,12 @@ def create_app() -> FastAPI:
     @app.post("/api/runs")
     async def start_run(
         body: StartRunRequest,
-        session: Session = Depends(require_session),
+        session: Session = Depends(require_execution_session),
     ) -> dict[str, Any]:
         def prepare() -> MigrationPlan:
-            with FabricClient(session.tokens) as client:
+            with _planning_clients(session) as (client, target):
                 return build_plan(
-                    client,
-                    capacity_id=body.capacity_id,
-                    source_workspace_id=body.source_workspace_id,
-                    target_workspace_name=body.target_workspace_name,
-                    include_files=body.include_files,
-                    include_data=body.include_data,
-                    copy_permissions=body.copy_permissions,
-                    strategy=body.strategy,
+                    client, **body.plan_options(), **_tenant_plan_inputs(session, target),
                 )
 
         plan = await _run_fabric(prepare)
@@ -356,7 +585,7 @@ def create_app() -> FastAPI:
         return {"runId": run.id, "plan": _plan_dict(plan)}
 
     @app.get("/api/scratch-workspaces")
-    async def list_scratch(session: Session = Depends(require_session)) -> dict[str, Any]:
+    async def list_scratch(session: Session = Depends(require_legacy_session)) -> dict[str, Any]:
         """Scratch workspaces left behind by runs this process no longer knows about."""
 
         def work() -> list[dict[str, Any]]:
@@ -369,7 +598,7 @@ def create_app() -> FastAPI:
         return {"workspaces": await _run_fabric(work)}
 
     @app.post("/api/scratch-workspaces/cleanup")
-    async def cleanup_scratch(session: Session = Depends(require_session)) -> dict[str, Any]:
+    async def cleanup_scratch(session: Session = Depends(require_legacy_session)) -> dict[str, Any]:
         def work() -> tuple[int, list[str]]:
             with REGISTRY.cleanup_claim(
                 directory=SETTINGS.journal_dir
@@ -385,7 +614,7 @@ def create_app() -> FastAPI:
     @app.post("/api/workspaces/restore-access")
     async def restore_access(
         body: RestoreAccessRequest,
-        session: Session = Depends(require_session),
+        session: Session = Depends(require_legacy_session),
     ) -> dict[str, Any]:
         """Grant a workspace's admins access to another workspace.
 
@@ -406,21 +635,21 @@ def create_app() -> FastAPI:
         return await _run_fabric(work)
 
     @app.get("/api/runs/{run_id}")
-    async def get_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:
-        return _require_run(run_id).snapshot()
+    async def get_run(run_id: str, session: Session = Depends(require_execution_session)) -> dict[str, Any]:
+        return _require_run(run_id, session).snapshot()
 
     @app.get("/api/runs/{run_id}/readiness")
     async def get_readiness(
-        run_id: str, download: bool = False, _: Session = Depends(require_session),
+        run_id: str, download: bool = False, session: Session = Depends(require_execution_session),
     ) -> JSONResponse:
-        report = await asyncio.to_thread(_readiness, run_id)
+        report = await asyncio.to_thread(_readiness, run_id, session)
         headers = {"Cache-Control": "no-store"}
         if download:
             headers["Content-Disposition"] = f'attachment; filename="cutover-{run_id}.json"'
         return JSONResponse(report, headers=headers)
 
     @app.get("/api/resumable")
-    async def resumable(_: Session = Depends(require_session)) -> dict[str, Any]:
+    async def resumable(session: Session = Depends(require_execution_session)) -> dict[str, Any]:
         """Runs that stopped without finishing, from their journals on disk.
 
         Read from disk rather than from the run registry on purpose: the runs worth offering
@@ -428,51 +657,72 @@ def create_app() -> FastAPI:
         """
 
         def work() -> list[dict[str, Any]]:
-            return [_resumable_dict(replay) for replay in REGISTRY.resumable(SETTINGS.journal_dir)]
+            return [
+                _resumable_dict(replay) for replay in REGISTRY.resumable(
+                    _session_directory(session), **_session_identity(session),
+                )
+                if _replay_matches(session, replay)
+            ]
 
         return {"runs": await asyncio.to_thread(work)}
 
+    @app.get("/api/runs/{run_id}/resume-plan")
+    async def resume_plan(
+        run_id: str,
+        session: Session = Depends(require_execution_session),
+    ) -> dict[str, Any]:
+        replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
+        return {
+            "runId": run_id, "plan": _plan_dict(plan), "cleanupWhenDone": replay.cleanup,
+            "targetWorkspaceId": replay.target_workspace_id,
+            "items": [
+                {"sourceId": source_id, "targetId": item.get("target", ""),
+                 "name": item.get("name", ""), "type": item.get("type", "")}
+                for source_id, item in replay.items.items()
+            ],
+        }
+
+    @app.post("/api/runs/{run_id}/resume-preview")
+    async def resume_preview(
+        run_id: str, body: ResumeRunRequest,
+        session: Session = Depends(require_execution_session),
+    ) -> dict[str, Any]:
+        def work() -> dict[str, Any]:
+            replay, plan = _resume_plan(session, run_id)
+            with _planning_clients(session) as (source, target):
+                return _paired_dependency_report(session, source, target, body.apply(plan), prior=replay)
+        return await _run_fabric(work)
+
     @app.post("/api/runs/{run_id}/resume")
     async def resume(
-        run_id: str,
-        session: Session = Depends(require_session),
+        run_id: str, body: ResumeRunRequest | None = None,
+        session: Session = Depends(require_execution_session),
     ) -> dict[str, Any]:
-        """Pick up an interrupted run, in a new run that starts from the old one's journal."""
-        path = SETTINGS.journal_for(run_id)
-        # Existence of the file, not of a plan inside it: a journal that exists but says
-        # nothing useful is a different problem from one that was never written, and the
-        # operator should be told which.
-        if not await asyncio.to_thread(path.is_file):
-            raise HTTPException(status_code=404, detail="No journal for that run")
-        replay = await asyncio.to_thread(journal.read, path)
-        # A finished run may be picked up too. That is how the items it left behind are
-        # retried: the target workspace and everything already in it are adopted, so only
-        # what did not make it the first time is attempted. Its scratch workspace was deleted
-        # on the way out, and the workspace phase notices and builds another.
-        try:
-            plan = plan_from_journal(replay)
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
+        """Adopt the previous target, changing only explicitly supplied operator mappings."""
+        replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
+        if body is not None:
+            plan = body.apply(plan)
         run = _start_attempt(session, plan, cleanup=replay.cleanup, prior=replay)
         return {"runId": run.id, "plan": _plan_dict(plan), "resumedFrom": run_id}
 
     @app.post("/api/runs/{run_id}/cancel")
-    async def cancel_run(run_id: str, _: Session = Depends(require_session)) -> dict[str, Any]:
-        run = _require_run(run_id)
+    async def cancel_run(
+        run_id: str, session: Session = Depends(require_execution_session),
+    ) -> dict[str, Any]:
+        run = _require_run(run_id, session)
         run.cancel()
         return {"ok": True, "status": run.status.value}
 
     @app.post("/api/runs/{run_id}/cleanup")
     async def cleanup(
         run_id: str,
-        session: Session = Depends(require_session),
+        session: Session = Depends(require_execution_session),
     ) -> dict[str, Any]:
-        run = _require_run(run_id)
+        run = _require_run(run_id, session)
         def work() -> list[str]:
             with REGISTRY.cleanup_claim(
-                run, directory=SETTINGS.journal_dir
-            ), FabricClient(session.tokens) as client:
+                run, directory=_session_directory(session), **_session_identity(session),
+            ), FabricClient(session.destination_tokens) as client:
                 return cleanup_run(run, client)
 
         try:
@@ -484,15 +734,16 @@ def create_app() -> FastAPI:
     @app.get("/api/runs/{run_id}/events")
     async def run_events(run_id: str, request: Request, session_id: str | None = None):
         """Server-sent events feed. EventSource cannot set headers, so the id comes as a query."""
-        if not SESSIONS.get(session_id):
+        session = SESSIONS.get(session_id)
+        if not session:
             raise HTTPException(status_code=401, detail="Sign in with a service principal first")
-        run = _require_run(run_id)
+        run = _require_run(run_id, session)
 
         async def stream():
             subscriber = run.subscribe()
             try:
                 while True:
-                    if await request.is_disconnected():
+                    if SESSIONS.get(session.id) is not session or await request.is_disconnected():
                         return
                     try:
                         event = await asyncio.to_thread(subscriber.get, True, 15)
@@ -525,13 +776,71 @@ def create_app() -> FastAPI:
 # ------------------------------------------------------------------- utilities
 
 
-def _readiness(run_id: str) -> dict[str, Any]:
+def _session_identity(session: Session) -> dict[str, str]:
+    if not session.paired:
+        return {}
+    return {
+        "source_tenant_id": session.source_tenant_id,
+        "target_tenant_id": session.target_tenant_id,
+        "source_client_id": session.principal.client_id,
+        "target_client_id": session.destination_tokens.principal.client_id,
+    }
+
+
+def _session_directory(session: Session) -> Path:
+    return SETTINGS.journal_dir_for(
+        source_tenant_id=session.source_tenant_id, target_tenant_id=session.target_tenant_id,
+    )
+
+
+def _session_journal(session: Session, run_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid run ID")
+    return _session_directory(session) / f"{run_id}.jsonl"
+
+
+def _require_identity(session: Session, plan: dict[str, Any]) -> None:
+    try:
+        journal.validate_tenant_binding(plan, **_session_identity(session))
+    except journal.TenantBindingError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _require_replay(session: Session, replay: journal.Replay) -> None:
+    try:
+        journal.validate_replay_binding(replay, **_session_identity(session))
+    except journal.TenantBindingError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _replay_matches(session: Session, replay: journal.Replay) -> bool:
+    try:
+        _require_replay(session, replay)
+    except HTTPException:
+        return False
+    return True
+
+
+def _resume_plan(session: Session, run_id: str) -> tuple[journal.Replay, MigrationPlan]:
+    path = _session_journal(session, run_id)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No journal for that run")
+    replay = journal.read(path)
+    _require_replay(session, replay)
+    try:
+        return replay, plan_from_journal(replay)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _readiness(run_id: str, session: Session) -> dict[str, Any]:
     # Validate even for in-memory runs: the id is also used in the download filename.
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
         raise HTTPException(status_code=400, detail="Invalid run ID")
-    path = SETTINGS.journal_for(run_id)
+    path = _session_journal(session, run_id)
     run = REGISTRY.get(run_id)
     if run is not None:
+        _require_identity(session, run.plan)
         return readiness_report(
             run.lifecycle.snapshot(), run_id=run_id, lineage_id=run.lineage_id,
             run_status=run.status.value, inventory_complete=run.inventory_complete,
@@ -540,6 +849,7 @@ def _readiness(run_id: str) -> dict[str, Any]:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No run or saved journal for that run")
     replay = journal.read(path)
+    _require_replay(session, replay)
     outcomes = dict(replay.outcomes)
     for source, item in replay.items.items():
         outcomes.setdefault(source, ItemOutcome(
@@ -565,15 +875,24 @@ def _readiness_attempts(replay: journal.Replay | None) -> list[dict[str, Any]]:
 
 def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
     return {
+        "capacityId": plan.capacity_id,
         "capacityName": plan.capacity_name,
         "capacityRegion": plan.capacity_region,
         "sourceWorkspaceName": plan.source_workspace_name,
+        "sourceWorkspaceId": plan.source_workspace_id,
         "targetWorkspaceName": plan.target_workspace_name,
         "strategy": plan.strategy.value,
         "capacityWarning": plan.capacity_warning,
         "includeData": plan.include_data,
         "includeFiles": plan.include_files,
         "copyPermissions": plan.copy_permissions,
+        "sourceTenantId": plan.source_tenant_id,
+        "targetTenantId": plan.target_tenant_id,
+        "sourceClientId": plan.source_client_id,
+        "targetClientId": plan.target_client_id,
+        "writeFreezeConfirmed": plan.write_freeze_confirmed,
+        "connectionMappings": plan.connection_mappings,
+        "referenceMappings": plan.reference_mappings,
     }
 
 
@@ -600,6 +919,10 @@ def _resumable_dict(replay: journal.Replay) -> dict[str, Any]:
         "itemsCreated": len(replay.items) or len(replay.id_map),
         "lastPhase": replay.phases_started[-1] if replay.phases_started else "",
         "warnings": len(replay.warnings),
+        "sourceTenantId": plan.get("source_tenant_id", ""),
+        "targetTenantId": plan.get("target_tenant_id", ""),
+        "sourceClientId": plan.get("source_client_id", ""),
+        "targetClientId": plan.get("target_client_id", ""),
     }
 
 
@@ -614,6 +937,134 @@ def _object_id(session: Session) -> str:
     except AuthError as error:
         logger.info("Could not read the service principal object id: %s", error)
         return ""
+
+
+def _paired_dependency_report(
+    session: Session, source: FabricClient, target: FabricClient, plan: MigrationPlan,
+    *, prior: journal.Replay | None = None,
+) -> dict[str, Any]:
+    assessment = assess_workspace(
+        list_items(source, plan.source_workspace_id), force_rebuild=plan.strategy is Strategy.REBUILD,
+        require_stopped=session.paired,
+    )
+    if not session.paired:
+        return _dependency_report(
+            source, source_workspace_id=plan.source_workspace_id, migrated=assessment.migrated,
+            client_id=session.principal.client_id, object_id=_object_id(session),
+            tenant_id=session.principal.tenant_id,
+        )
+    if plan.strategy is Strategy.REASSIGN:
+        return {"dependencies": [], "connectionAccess": None, "blockers": [], "paired": True}
+    messages: list[str] = []
+    aliases, _ = migration_refs.resolve(
+        source, target, plan.reference_mappings, migrating_workspace_id=plan.source_workspace_id,
+    )
+    if prior is not None:
+        aliases = {**prior.id_map, **aliases}
+        if prior.target_workspace_id:
+            aliases[plan.source_workspace_id] = prior.target_workspace_id
+    rewrite = definitions.build_rewriter(aliases)
+    bound: dict[str, list[str]] = {}
+    for item in assessment.migrated if plan.strategy is Strategy.REBUILD else []:
+        name = item.get("displayName") or item["id"]
+        try:
+            if session.paired and item.get("type") == "SemanticModel":
+                # Default TMDL cannot prove the absence of source principal assignments.
+                definition = get_item_definition(source, plan.source_workspace_id, item["id"], fmt="TMSL")
+            else:
+                definition = get_item_definition(source, plan.source_workspace_id, item["id"])
+        except FabricError as error:
+            messages.append(
+                f"Source connection references for '{name}' could not be checked: {error}. "
+                "Restore source definition access and re-check."
+            )
+            continue
+        parts = definition.get("parts") or []
+        if session.paired:
+            try:
+                if item.get("type") == "SemanticModel":
+                    parts, omissions = analytics.without_model_memberships(parts)
+                    messages.extend(f"'{name}' definition preview: {warning}" for warning in omissions)
+                messages.extend(
+                    f"'{name}': {warning}"
+                    for warning in analytics.validate_cross_tenant_identities(
+                        parts, item_type=item.get("type") or "",
+                    )
+                )
+            except analytics.IdentityBindingError as error:
+                messages.append(f"'{name}' will not be created with its source identity bindings: {error}")
+                continue
+        for connection_id in connections.referenced_connection_ids(parts):
+            bound.setdefault(connection_id.casefold(), []).append(name)
+
+    for source_id in sorted(set(bound) | set(plan.connection_mappings)):
+        target_id = plan.connection_mappings.get(source_id)
+        if not target_id and prior is not None:
+            target_id = prior.id_map.get(source_id)
+        consumers = ", ".join(bound.get(source_id) or [source_id])
+        if not target_id:
+            if session.cross_tenant:
+                messages.append(
+                    f"{consumers}: map source connection {source_id} to a destination connection. "
+                    "Items with unresolved source connections will not be created."
+                )
+                continue
+            target_id = source_id
+        try:
+            original = source.get(f"connections/{source_id}")
+            replacement = target.get(f"connections/{target_id}")
+        except FabricError as error:
+            messages.append(
+                f"{consumers}: connection mapping {source_id} → {target_id} could not be checked: {error}. "
+                "Grant the appropriate app access to its connection and re-check; "
+                "affected items may be skipped."
+            )
+            continue
+        old_path = (original.get("connectionDetails") or {}).get("path") or ""
+        new_path = rewrite(old_path) if rewrite else old_path
+        reused = not session.cross_tenant and target_id.casefold() == source_id.casefold()
+        if plan.source_workspace_id.casefold() in new_path.casefold() or (
+            not reused and not connections.matches_replacement(replacement, original, new_path)
+        ):
+            messages.append(
+                f"{consumers}: destination connection {target_id} does not match the mapped source. "
+                "Create a replacement against the destination store and update this mapping; "
+                "dependent items will be skipped until the replacement can be verified."
+            )
+
+    graph = relations.build_graph(source, plan.source_workspace_id, assessment.migrated)
+    mapped_external = {
+        (entry["source_workspace_id"].casefold(), entry["source_item_id"].casefold())
+        for entry in plan.reference_mappings
+    }
+    if not graph.available:
+        messages.append(
+            "Source item relationships could not be checked. Verify external item mappings "
+            "and inspect skipped-item details after migration before cutover."
+        )
+    for item_id, dependencies in graph.dependencies.items():
+        for dependency in dependencies:
+            workspace_id = graph.workspace_of(dependency)
+            if (
+                session.cross_tenant and workspace_id
+                and workspace_id.casefold() != plan.source_workspace_id.casefold()
+                and (workspace_id.casefold(), dependency.casefold()) not in mapped_external
+            ):
+                messages.append(
+                    f"'{graph.name_of(item_id)}' needs external item '{graph.name_of(dependency)}'. "
+                    f"Map source workspace {workspace_id}, item {dependency} to a destination item. "
+                    "Consumers with unresolved source references will not be created."
+                )
+    return {
+        "dependencies": messages, "connectionAccess": None, "blockers": [],
+        "connectionAccessScope": "destination", "paired": True,
+        "sourceTenantId": session.source_tenant_id, "targetTenantId": session.target_tenant_id,
+        "assessmentNotice": (
+            "Destination mapping metadata was checked, not data-copy or cutover readiness. "
+            "Resolve the prerequisites listed above; items with unresolved source references are skipped. "
+            "Validate the destination and the exported readiness report before cutover."
+        ),
+    }
 
 
 def _dependency_report(
@@ -715,10 +1166,12 @@ def _semantic_model_preview(
     }
 
 
-def _require_run(run_id: str) -> MigrationRun:
+def _require_run(run_id: str, session: Session) -> MigrationRun:
+    _session_journal(session, run_id)
     run = REGISTRY.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Unknown migration run")
+    _require_identity(session, run.plan)
     return run
 
 
@@ -729,8 +1182,12 @@ async def _run_fabric(work):
     except FabricApiError as error:
         status = error.status_code if error.status_code in (401, 403, 404, 409, 429) else 502
         raise HTTPException(status_code=status, detail=error.body[:500] or str(error)) from error
+    except FabricError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
     except AuthError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 app = create_app()

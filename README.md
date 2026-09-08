@@ -1,6 +1,6 @@
 # Fab Shuffle
 
-Region transfer tool for Microsoft Fabric workspaces.
+Region and tenant transfer tool for Microsoft Fabric workspaces.
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
 
@@ -23,9 +23,118 @@ v2 is a Python application driven almost entirely by the
 small web UI that walks you through the move. (v1 was a PowerShell script around the `fab`
 CLI; it still lives on the `main` branch's history.)
 
+### Cross-tenant migrations
+
+Select **Another tenant** on the sign-in screen and enter separate source and destination
+service principals. The wizard lists source workspaces with the source identity and
+destination capacities with the destination identity. Neither principal needs access to the
+other tenant. This creates a new destination workspace; it never reassigns or deletes the source.
+The existing single-principal same-tenant workflow is unchanged.
+
+Prepare access in each tenant before starting. Both principals need the Fabric API tenant
+settings and the item/data-plane permissions for their side of the migration. The destination
+principal also needs permission to create workspaces and contributor/admin access to the
+destination Fabric capacity, as documented by
+[Create Workspace](https://learn.microsoft.com/rest/api/fabric/core/workspaces/create-workspace).
+Azure capacity Reader alone is not proof of those Fabric permissions.
+
+**Access assignments are not copied.** This includes workspace admins, connection sharing,
+SQL principals/grants/memberships, and semantic-model role memberships. Model role/filter
+definitions are retained. Destination administrators must arrange human access and any
+workspace identities or gateway infrastructure themselves. Sensitivity labels and tenant
+policies require destination configuration; encrypted report/model labels can prevent export.
+
+**Stop source writes before copying data or files.** The review screen requires confirmation.
+The freeze must cover scheduled jobs, ingestion, maintenance and expiration processes, and
+must remain in place through reconciliation and any retries. If the source changes, start a
+fresh migration rather than treating old checkpoints as a new snapshot. Metadata-only
+migrations can omit data and files without this confirmation.
+
+On the review screen, map source connection IDs to connections configured in the destination.
+For dependencies outside the migrating workspace, provide both source and destination
+workspace/item IDs. The tool checks destinations with destination credentials; a source
+connection being visible does not make it usable in the destination. It does not export or
+reuse source connection secrets.
+
+Some connections cannot be prepared until the new data stores exist. Their consumers are
+left uncreated, with the required destination coordinates reported. Use **Retry** to edit
+the saved mappings, recheck them, and resume into the same destination. Changed mappings
+invalidate affected bindings so existing consumers are refreshed instead of retaining old IDs.
+
+Paired data transfers use independently authenticated clients, not native cross-tenant
+Copy Jobs:
+
+| Data | Paired transfer |
+| --- | --- |
+| Lakehouse Files | Bounded OneLake reads/writes, excluding shortcut paths; any unmanaged Delta table discovered under Files/ is also path-safety inspected |
+| Lakehouse Tables | Quiesced Delta files/logs/checkpoints with path-safety inspection; SQL catalog visibility checked after endpoint refresh |
+| Warehouse / SQL database | Destination-aware schema deployment with security-object exclusions, then bounded SQL row streaming |
+| KQL | Source query streaming and destination ingestion; target update policies are stopped before copying |
+| Cosmos DB | Separate source/destination SDK clients and bounded document transfer |
+
+`FAB_SHUFFLE_MAX_STAGING_BYTES` defaults to **1073741824** (1 GiB). Streaming buffers are
+bounded and transfers do not silently switch to cloud staging. Schema-tool staging usage is
+monitored and excessive usage terminates the tool with an error; a filesystem-enforced hard
+disk limit requires an operator-configured volume quota.
+Complex Delta features, schema-tool limitations, or service/network restrictions are reported
+with their required corrective action. PyArrow inspects Delta checkpoint references wherever
+a `_delta_log` is found, whether under a Tables/ root (managed tables only) or an unmanaged
+Delta table written directly under Files/; table files are not rewritten to conceal an
+external or escaping storage dependency. Ordinary, non-Delta content under Files/ is not
+Delta-inspected, since it has no checkpoint references to validate.
+
+Definitions are recreated only after known references have destination mappings. Mirrors,
+Activator rules and Databricks catalog sync retain their stopped-arrival behavior.
+**Eventstreams are manual in paired migrations:** an inactive-create contract could not be
+confirmed for every node, so the tool does not create a potentially active second stream.
+Recreate those with ingestion deactivated, then reconnect their dependent items. Airflow
+configuration and DAG files are copied without the tool invoking jobs; inspect DAG pause
+settings and runtime dependencies before enabling the destination scheduler. Import-mode
+semantic models need destination credentials and refresh; definition creation does not copy
+their cached data.
+
+Recovery is bound to the ordered tenant and application pair. Paired journals live separately
+under `local/journal-paired-v1`, so older single-client builds cannot accidentally resume them.
+Sign back in with the same applications to resume, inspect a run, cancel it, or clean up its
+owned temporary resources. Global scratch sweeps and source-admin restoration are unavailable
+in paired mode.
+
+The cutover report remains advisory: transferred content, unmeasured runtime behavior,
+manual activation and omitted access configuration are distinct. Keep the source until an
+operator has checked destination queries, data and application access. No live two-tenant
+service qualification is implied by the automated test suite.
+
+For API clients, `POST /api/login` accepts the existing source credentials and an optional
+`destination` object:
+
+```json
+{
+  "tenant_id": "<source-directory-tenant-id>",
+  "client_id": "<source-application-id>",
+  "client_secret": "<source-secret>",
+  "destination": {
+    "tenant_id": "<destination-directory-tenant-id>",
+    "client_id": "<destination-application-id>",
+    "client_secret": "<destination-secret>"
+  }
+}
+```
+
+Use the returned `sessionId` in `X-Fab-Shuffle-Session`. `POST /api/preview/dependencies`
+accepts the same options and mappings as `POST /api/runs`, including
+`write_freeze_confirmed`, `connection_mappings`, and `reference_mappings`. Reference entries
+contain `source_workspace_id`, `source_item_id`, `target_workspace_id`, and `target_item_id`.
+Resume accepts updated mappings, not a different tenant pair or destination workspace.
+The interactive API schema is at `/api/docs`.
+
+Supplying two principals in the same tenant also uses the paired rebuild/freeze workflow.
+Omit `destination` for the original reassignment behavior. Multi-workspace batches, optional
+cloud staging and incremental/low-downtime cutover remain later roadmap phases.
+
 ### Two ways to move a workspace
 
-Fab Shuffle inspects the workspace and picks the cheaper of two strategies.
+For single-principal same-tenant moves, Fab Shuffle inspects the workspace and picks the
+cheaper of two strategies. Paired migrations always rebuild.
 
 **Reassign** — if the workspace holds only Power BI content (reports, paginated reports,
 semantic models, dashboards), there is nothing to rebuild. The cross-region restriction on
@@ -53,7 +162,7 @@ copies everything it supports.
 | Eventhouse | ✅ | n/a | |
 | KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
 | Mirrored database | ✅ | n/a | Mirroring must be started by hand afterwards |
-| Eventstream | ✅ | n/a | Sources, destinations, and operators rebound |
+| Eventstream | ✅ | n/a | Same-tenant single-principal rebuilds; manual inactive creation for paired migrations |
 | KQL queryset | ✅ | n/a | Rebound to the migrated eventhouse |
 | KQL dashboard | ✅ | n/a | Rebound to the migrated eventhouse |
 | Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |

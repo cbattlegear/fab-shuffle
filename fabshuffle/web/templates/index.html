@@ -12,7 +12,7 @@
       <span class="logo" aria-hidden="true">⇄</span>
       <div>
         <h1>Fab Shuffle</h1>
-        <p>Move a Microsoft Fabric workspace to another region</p>
+        <p>Move a Microsoft Fabric workspace to another region or tenant</p>
       </div>
     </div>
     <button id="sign-out" class="link-button" hidden>Sign out</button>
@@ -35,10 +35,16 @@
     <section class="panel" data-stage="login">
       <h2>Sign in with a service principal</h2>
       <p class="hint">
-        Credentials stay in this container's memory and are never written to disk. The service
-        principal needs Reader on the target capacity and Admin on the source workspace.
+        Credentials stay in this container's memory and are never written to disk.
+        Use a source principal with workspace access and a destination principal with access to the target capacity.
       </p>
       <form id="login-form" class="form">
+        <fieldset class="options login-mode">
+          <legend>Destination</legend>
+          <label><input type="checkbox" id="another-tenant" /> Another tenant</label>
+        </fieldset>
+        <fieldset class="credentials">
+        <legend id="source-credentials-label">Service principal</legend>
         <label>Tenant ID
           <input name="tenant_id" autocomplete="off" spellcheck="false" required
                  placeholder="00000000-1111-2222-3333-444444444444" />
@@ -50,6 +56,19 @@
         <label>Client secret
           <input name="client_secret" type="password" autocomplete="off" required />
         </label>
+        </fieldset>
+        <fieldset class="credentials" id="destination-credentials" disabled hidden>
+          <legend>Destination service principal</legend>
+          <label>Destination tenant ID
+            <input name="destination_tenant_id" autocomplete="off" spellcheck="false" required />
+          </label>
+          <label>Destination client ID
+            <input name="destination_client_id" autocomplete="off" spellcheck="false" required />
+          </label>
+          <label>Destination client secret
+            <input name="destination_client_secret" type="password" autocomplete="off" required />
+          </label>
+        </fieldset>
         <button type="submit" class="primary">Sign in</button>
       </form>
     </section>
@@ -58,6 +77,8 @@
     <section class="panel" data-stage="capacity" hidden>
       <h2>Pick the target capacity</h2>
       <p class="hint">The new workspace is created on this capacity, which determines the target region.</p>
+      <p id="destination-context" class="hint identity-context" hidden></p>
+      <p id="resumable-status" class="hint" role="status" hidden></p>
       <div id="resumable" class="warnings" hidden>
         <h3>Unfinished migrations</h3>
         <p class="hint">
@@ -74,7 +95,7 @@
         <button class="secondary" id="delete-leftovers">Delete them</button>
       </div>
 
-      <details class="tool">
+      <details class="tool" id="restore-access-tool">
         <summary>Locked out of a workspace Fab Shuffle created?</summary>
         <p class="hint">
           A run that failed before its permissions step leaves a workspace only the service
@@ -101,6 +122,7 @@
     <section class="panel" data-stage="workspace" hidden>
       <h2>Pick the source workspace</h2>
       <p class="hint">Everything Fab Shuffle supports is recreated in a brand new workspace. The source is left untouched.</p>
+      <p id="source-context" class="hint identity-context" hidden></p>
       <input id="workspace-filter" class="filter" type="search" placeholder="Filter workspaces" />
       <div id="workspace-list" class="choice-list" role="radiogroup" aria-label="Workspaces"></div>
       <div class="actions">
@@ -111,9 +133,17 @@
 
     <!-- 4. Review -->
     <section class="panel" data-stage="review" hidden>
-      <h2>Review the move</h2>
+      <h2 id="review-title">Review the move</h2>
       <div id="strategy-callout" class="callout"></div>
       <div id="review-summary" class="summary"></div>
+      <details id="resume-artifacts" class="resume-artifacts" hidden>
+        <summary>Destination item IDs for replacement connections</summary>
+        <p class="hint">Use these recorded destination workspace and item IDs when creating replacement
+          connections. Share the connections with the destination app, update the mappings below,
+          and re-check before resuming. Existing migrated items and copy checkpoints are retained.</p>
+        <p id="resume-target-id" class="hint identity-context"></p>
+        <ul id="resume-item-ids" tabindex="0" aria-label="Recorded destination item IDs"></ul>
+      </details>
 
       <div id="blockers" class="warnings danger" hidden>
         <h3>Blockers</h3>
@@ -175,8 +205,35 @@
         <label><input type="checkbox" id="opt-permissions" checked /> Copy workspace permissions</label>
         <label><input type="checkbox" id="opt-cleanup" checked /> Delete temporary artifacts when finished</label>
       </fieldset>
+      <section id="destination-mappings" class="mapping-controls" aria-labelledby="mapping-title" hidden>
+        <h3 id="mapping-title">Destination references</h3>
+        <p class="hint">Create destination connections first, then map source IDs to their replacements.
+          Connection credentials and source permissions are not copied. Leave out an item rather than
+          leave it pointing back to the source tenant.</p>
+        <h4>Connection mappings</h4>
+        <p id="connection-options-status" class="hint" role="status"></p>
+        <datalist id="source-connection-options"></datalist>
+        <datalist id="target-connection-options"></datalist>
+        <div id="connection-mapping-rows"></div>
+        <button id="add-connection-mapping" type="button" class="secondary">Add connection mapping</button>
+        <h4>External item mappings</h4>
+        <p class="hint">For references to items outside the workspace being moved, supply the source
+          workspace and item IDs and the existing destination workspace and item IDs.</p>
+        <div id="reference-mapping-rows"></div>
+        <button id="add-reference-mapping" type="button" class="secondary">Add external item mapping</button>
+        <p id="mapping-status" class="hint" role="status">Re-check after editing mappings.</p>
+        <button id="recheck-mappings" type="button" class="secondary">Re-check destination mappings</button>
+      </section>
+      <fieldset id="write-freeze" class="options write-freeze" hidden>
+        <legend>Source write freeze</legend>
+        <label><input type="checkbox" id="opt-write-freeze" /> I have paused source writes and will keep them paused until copying finishes.</label>
+        <p class="hint">Required when separate destination credentials are used to copy table data or files,
+          even within one tenant. Otherwise turn off both copy options.
+          This confirmation does not establish cutover readiness.</p>
+      </fieldset>
       <div class="actions">
-        <button class="secondary" data-back="workspace">Back</button>
+        <button class="secondary" id="review-back" data-back="workspace">Back</button>
+        <button class="secondary" id="resume-back" type="button" hidden>Back without resuming</button>
         <button class="primary" id="start-run">Start migration</button>
       </div>
     </section>

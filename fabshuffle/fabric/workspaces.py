@@ -308,6 +308,8 @@ def clone_folder_tree(
     client: FabricClient,
     source_workspace_id: str,
     target_workspace_id: str,
+    *,
+    target_client: FabricClient | None = None,
 ) -> dict[str, str]:
     """Recreate the source workspace folder hierarchy, returning old id -> new id.
 
@@ -315,14 +317,17 @@ def clone_folder_tree(
     second time, so a resumed run reuses the tree the earlier attempt built instead of failing
     on the name. Folders are matched on name within a parent, which is what Fabric enforces
     uniqueness on.
+
+    ``client`` reads the source; ``target_client`` reads and writes the destination.
     """
+    destination = client if target_client is None else target_client
     source_folders = list_folders(client, source_workspace_id)
     if not source_folders:
         return {}
 
     existing = {
         (folder.get("parentFolderId") or "", folder.get("displayName") or ""): folder["id"]
-        for folder in list_folders(client, target_workspace_id)
+        for folder in list_folders(destination, target_workspace_id)
     }
 
     by_parent: dict[str | None, list[dict[str, Any]]] = {}
@@ -339,7 +344,7 @@ def clone_folder_tree(
                 mapping[folder["id"]] = found
             else:
                 created = create_folder(
-                    client, target_workspace_id, folder["displayName"], new_parent
+                    destination, target_workspace_id, folder["displayName"], new_parent
                 )
                 mapping[folder["id"]] = created["id"]
             create_level(folder["id"])
