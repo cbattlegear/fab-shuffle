@@ -27,6 +27,7 @@ from test_rebuild_ordering import (
     TARGET_ENDPOINT,
     TARGET_WS,
     FakeFabric,
+    StubPowerBi,
     make_plan,
 )
 
@@ -115,6 +116,7 @@ def fabric(monkeypatch):
     monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda *a: [])
     monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
     monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", StubPowerBi())
     return fake
 
 

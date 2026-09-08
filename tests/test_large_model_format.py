@@ -6,6 +6,11 @@ its default small (``Abf``) format, so the large format is silently lost unless 
 back. Verified live: a source model reporting ``targetStorageMode=PremiumFiles`` produced a
 target reporting ``Abf`` with no warning. The reassign path already converts large models
 down and up around the move; the rebuild path never touched storage format at all.
+
+The source is read with the source's own tokens and the target is written with the target's,
+never one client for both - the same split every cross-tenant-aware phase in this file uses -
+and the restore is confirmed with ``PowerBiClient.convert`` (PATCH then poll), the same call
+the reassign path relies on, rather than trusting an unpolled PATCH response.
 """
 
 from __future__ import annotations
@@ -15,28 +20,38 @@ import pytest
 from fabshuffle import orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import analytics, powerbi
-from fabshuffle.run import MigrationRun, StepStatus
+from fabshuffle.run import CancelledError, MigrationRun, StepStatus
 
 PRINCIPAL = ServicePrincipal("tenant", "client", "secret")
+SOURCE_TOKENS = object()
+DESTINATION_TOKENS = object()
 
 
 class FakePowerBi:
-    """Stands in for PowerBiClient, recording every storage-format change in order."""
+    """Stands in for PowerBiClient, recording which tokens read the source and wrote the
+    target, and every storage-format change, in order."""
 
     def __init__(
         self,
         source_models: list[powerbi.SemanticModel],
         *,
+        target_models: dict[str, powerbi.SemanticModel] | None = None,
         fail_on_target: str | None = None,
         fail_list: bool = False,
+        fail_get_target: str | None = None,
     ) -> None:
         self.source_models = source_models
+        # Keyed by target model id: what the target workspace already reports, if anything.
+        self.target_models = target_models or {}
         self.fail_on_target = fail_on_target
         self.fail_list = fail_list
+        self.fail_get_target = fail_get_target
         self.storage_calls: list[tuple[str, str, str]] = []
         self.listed: list[str] = []
+        self.tokens_used: list[object] = []
 
-    def __call__(self, _tokens) -> FakePowerBi:
+    def __call__(self, tokens: object) -> FakePowerBi:
+        self.tokens_used.append(tokens)
         return self
 
     def __enter__(self) -> FakePowerBi:
@@ -51,10 +66,18 @@ class FakePowerBi:
             raise powerbi.PowerBiError(f"GET /groups/{workspace_id}/datasets failed with HTTP 403")
         return self.source_models
 
+    def get_semantic_model(self, workspace_id: str, model_id: str) -> powerbi.SemanticModel | None:
+        if model_id == self.fail_get_target:
+            raise powerbi.PowerBiError(f"GET /groups/{workspace_id}/datasets/{model_id} failed with HTTP 403")
+        return self.target_models.get(model_id)
+
     def set_storage_mode(self, workspace_id: str, model_id: str, storage_mode: str) -> None:
         if model_id == self.fail_on_target:
             raise powerbi.PowerBiError(f"HTTP 400: cannot enable large storage on {model_id}")
         self.storage_calls.append((workspace_id, model_id, storage_mode))
+
+    def convert(self, workspace_id, model, storage_mode, *, on_progress=None) -> None:
+        self.set_storage_mode(workspace_id, model.id, storage_mode)
 
 
 def large(name: str, model_id: str) -> powerbi.SemanticModel:
@@ -70,6 +93,7 @@ def make_ctx(
     region: str = "centralus",
     id_map: dict[str, str] | None = None,
     target_ws: str = "ws-target",
+    cross_tenant: bool = False,
 ) -> orchestrator._Context:
     plan = orchestrator.MigrationPlan(
         capacity_id="cap",
@@ -81,12 +105,14 @@ def make_ctx(
     )
     ctx = orchestrator._Context(
         client=object(),
-        tokens=object(),
+        tokens=SOURCE_TOKENS,
         principal=PRINCIPAL,
         plan=plan,
         run=MigrationRun(source_workspace_name="src", capacity_name="F64"),
         scratch_dir=None,
     )
+    if cross_tenant:
+        ctx.target_tokens = DESTINATION_TOKENS
     ctx.target_workspace_id = target_ws
     if id_map:
         ctx.id_map.update(id_map)
@@ -107,6 +133,20 @@ def test_a_large_source_model_sets_the_target_back_to_premium_files(monkeypatch)
     assert warnings == []
     # The source is read, and the target model is the one set to large.
     assert fake.listed == ["ws-source"]
+    assert fake.storage_calls == [("ws-target", "sm-tgt", powerbi.LARGE)]
+
+
+def test_the_source_is_read_and_the_target_is_written_with_separate_tokens(monkeypatch):
+    """Cross-tenant safety: reading the source must never reuse the destination's tokens
+    (or vice versa) just because a single PowerBiClient could technically do both."""
+    fake = FakePowerBi([large("sm_sales", "sm-src")])
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
+
+    ctx = make_ctx(id_map={"sm-src": "sm-tgt"}, cross_tenant=True)
+    warnings = orchestrator._restore_large_semantic_models(ctx, "analytics")
+
+    assert warnings == []
+    assert fake.tokens_used == [SOURCE_TOKENS, DESTINATION_TOKENS]
     assert fake.storage_calls == [("ws-target", "sm-tgt", powerbi.LARGE)]
 
 
@@ -147,6 +187,21 @@ def test_a_large_model_that_did_not_migrate_is_skipped(monkeypatch):
     assert fake.storage_calls == []
 
 
+def test_a_target_already_on_the_large_format_is_left_alone(monkeypatch):
+    """Idempotent on resume: a target an earlier attempt already restored is not re-converted."""
+    fake = FakePowerBi(
+        [large("sm_sales", "sm-src")],
+        target_models={"sm-tgt": large("sm_sales", "sm-tgt")},
+    )
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
+
+    ctx = make_ctx(id_map={"sm-src": "sm-tgt"})
+    warnings = orchestrator._restore_large_semantic_models(ctx, "analytics")
+
+    assert warnings == []
+    assert fake.storage_calls == []
+
+
 def test_an_unsupported_target_region_warns_and_makes_no_call(monkeypatch):
     fake = FakePowerBi([large("sm_sales", "sm-src")])
     monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
@@ -178,6 +233,21 @@ def test_a_failure_setting_the_mode_warns_but_does_not_raise(monkeypatch):
     assert "HTTP 400: cannot enable large storage on sm-tgt" in warnings[0]
 
 
+def test_a_failure_confirming_the_targets_current_format_warns_but_does_not_raise(monkeypatch):
+    """A failed read of the target's own current format is a target-side failure too, and
+    gets the same actionable warning rather than an unhandled exception."""
+    fake = FakePowerBi([large("sm_sales", "sm-src")], fail_get_target="sm-tgt")
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
+
+    ctx = make_ctx(id_map={"sm-src": "sm-tgt"})
+    warnings = orchestrator._restore_large_semantic_models(ctx, "analytics")
+
+    assert fake.storage_calls == []
+    assert len(warnings) == 1
+    assert "'sm_sales'" in warnings[0]
+    assert "HTTP 403" in warnings[0]
+
+
 def test_a_failure_on_one_model_still_sets_the_others(monkeypatch):
     fake = FakePowerBi([large("Bad", "bad-src"), large("Good", "good-src")], fail_on_target="bad-tgt")
     monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
@@ -201,6 +271,21 @@ def test_failing_to_read_the_source_formats_warns_instead_of_raising(monkeypatch
     assert len(warnings) == 1
     assert "Check each model's storage format by hand" in warnings[0]
     assert "HTTP 403" in warnings[0]
+
+
+def test_cancellation_stops_before_any_target_write(monkeypatch):
+    fake = FakePowerBi([large("sm_sales", "sm-src")])
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", fake)
+
+    ctx = make_ctx(id_map={"sm-src": "sm-tgt"})
+    ctx.run.cancel()
+
+    with pytest.raises(CancelledError):
+        orchestrator._restore_large_semantic_models(ctx, "analytics")
+
+    # The source was still read (nothing destructive happens on that side), but the target
+    # was never touched once the cancellation was noticed.
+    assert fake.storage_calls == []
 
 
 # ------------------------------------------------- wired into the rebuild phase
