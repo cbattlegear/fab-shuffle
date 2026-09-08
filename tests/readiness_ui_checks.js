@@ -125,7 +125,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, resetReadiness, observeReadiness, renderReadinessItems,
-      renderReadinessStatus, watchRun };`, context);
+      renderReadinessStatus, watchRun, renderRun, scheduleReadiness };`, context);
   const ui = context.ui;
   const get = (id) => document.querySelector(`#${id}`);
   const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
@@ -151,10 +151,11 @@ function fixture() {
     });
     await flush();
   }
-  function begin(id = "one") {
+  function begin(id = "one", status = "succeeded") {
     ui.state.sessionId = "private-session";
     ui.state.runId = id;
     ui.resetReadiness(id);
+    if (status) ui.observeReadiness({ status, readinessRevision: 0 });
   }
   function change(id, value, type = "input") {
     const element = get(id);
@@ -182,24 +183,91 @@ function report(runId = "one", items = [item(0)], overrides = {}) {
   const counts = { ready: 0, needs_attention: 0, unknown: 0 };
   items.forEach((entry) => { counts[entry.state] = (counts[entry.state] || 0) + 1; });
   return {
-    schemaVersion: 1, runId, lineageId: "lineage", runStatus: "running",
+    schemaVersion: 1, runId, lineageId: "lineage", runStatus: "succeeded",
     state: "needs_attention", counts, limits: ["Recorded evidence only; verify the target."],
     items, ...overrides,
   };
 }
 
 const scenarios = {
+  async hidden_until_halted(f) {
+    f.begin("one", null);
+    assert.equal(f.get("cutover-readiness").hidden, true);
+    assert.equal(f.get("readiness-jump").parentElement.hidden, true);
+    assert.equal(f.get("readiness-export").disabled, true);
+    await f.tick(1000);
+    for (const status of ["pending", "running"]) {
+      f.ui.observeReadiness({ status, readinessRevision: 1, cancelled: true });
+      f.ui.scheduleReadiness(true);
+      await f.tick(1000);
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.get("cutover-readiness").hidden, true);
+    }
+    for (const status of ["succeeded", "failed", "cancelled", "interrupted"]) {
+      const index = f.requests.length;
+      f.begin(status, null);
+      f.ui.observeReadiness({ status, readinessRevision: 1 });
+      assert.equal(f.get("cutover-readiness").hidden, false);
+      assert.equal(f.get("readiness-jump").parentElement.hidden, false);
+      await f.tick(0);
+      assert.equal(f.requests.length, index + 1);
+      await f.reply(index, report(status, [item(0)], { runStatus: status }));
+      assert.equal(f.get("readiness-export").disabled, false);
+    }
+  },
+  async active_again(f) {
+    f.begin();
+    await f.tick(0);
+    f.ui.observeReadiness({ status: "running", readinessRevision: 1 });
+    assert.equal(f.requests[0].options.signal.aborted, true);
+    await f.reply(0, report());
+    await f.tick(1000);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.ui.state.readiness.report, null);
+    assert.equal(f.get("cutover-readiness").hidden, true);
+    f.ui.observeReadiness({ status: "failed", readinessRevision: 2 });
+    await f.tick(0);
+    await f.reply(1, report("one", [item(0)], { runStatus: "failed" }));
+    assert.equal(f.get("readiness-items").children.length, 1);
+    f.ui.observeReadiness({ status: "running", readinessRevision: 3 });
+    assert.equal(f.get("readiness-items").children.length, 0);
+    assert.equal(f.get("readiness-jump").parentElement.hidden, true);
+    await f.get("readiness-export").click();
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.ui.state.runId, "one");
+    assert.equal(f.ui.state.sessionId, "private-session");
+  },
+  async target_is_not_spinner(f) {
+    f.begin("one", null);
+    const name = '<img src=x onerror="alert(1)"> workspace';
+    for (const status of ["running", "pending", "succeeded", "failed", "cancelled"]) {
+      f.ui.renderRun({
+        id: "one", status, steps: [], summary: {},
+        targetWorkspace: { displayName: name }, readinessRevision: 1,
+      });
+      const banner = f.get("run-banner");
+      const target = banner.querySelector(".run-target");
+      assert.equal(target.textContent, ` — target workspace: ${name}`);
+      assert.equal(target.className.split(" ").includes("spin"), false);
+      assert.equal(target.querySelector("img"), null);
+      const spinner = banner.querySelector(".spin");
+      if (status === "running") {
+        assert.equal(spinner.textContent, "◐");
+        assert.equal(spinner.attributes["aria-hidden"], "true");
+      } else assert.equal(spinner, null);
+    }
+    f.ui.renderRun({ id: "one", status: "running", steps: [], summary: {}, readinessRevision: 2 });
+    assert.equal(f.get("run-banner").querySelector(".spin").textContent, "◐");
+    assert.equal(f.get("run-banner").querySelector(".run-target").textContent, "");
+  },
   async throttle(f) {
     f.begin();
     assert.equal(f.get("readiness-loading").hidden, false);
-    f.ui.observeReadiness({ status: "running", readinessRevision: 1 });
-    await f.tick(499);
-    assert.equal(f.requests.length, 0);
-    await f.tick(1);
+    await f.tick(0);
     assert.equal(f.requests.length, 1);
     assert.equal(f.requests[0].options.headers["X-Fab-Shuffle-Session"], "private-session");
-    f.ui.observeReadiness({ status: "running", readinessRevision: 2 });
-    f.ui.observeReadiness({ status: "running", readinessRevision: 3 });
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 2 });
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 3 });
     await f.reply(0, report("one", [item(0, { name: "stale" })]));
     assert.equal(f.ui.state.readiness.report, null);
     await f.tick(499);
@@ -208,31 +276,32 @@ const scenarios = {
     await f.reply(1, report());
     assert.equal(f.get("readiness-items").children.length, 1);
     assert.equal(f.get("readiness-loading").hidden, true);
-    f.ui.observeReadiness({ status: "running", readinessRevision: 3 });
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 3 });
     await f.tick(2000);
     assert.equal(f.requests.length, 2);
   },
   async terminal(f) {
-    f.begin();
+    f.begin("one", null);
     f.ui.observeReadiness({ status: "running", readinessRevision: 7 });
     await f.tick(500);
     f.ui.observeReadiness({ status: "succeeded", readinessRevision: 7 });
-    assert.equal(f.requests.length, 1);
-    await f.reply(0, report());
-    assert.equal(f.ui.state.readiness.report, null);
+    assert.equal(f.requests.length, 0);
     await f.tick(0);
-    assert.equal(f.requests.length, 2);
-    await f.reply(1, report("one", [item(0)], { state: "unknown", runStatus: "succeeded" }));
+    assert.equal(f.requests.length, 1);
+    await f.reply(0, report("one", [item(0)], { state: "unknown", runStatus: "succeeded" }));
     assert.equal(f.get("readiness-overall").textContent, "Unknown");
     f.ui.observeReadiness({ status: "succeeded", readinessRevision: 7 });
     await f.tick(1000);
-    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests.length, 1);
   },
   async run_races(f) {
-    f.begin();
+    f.begin("one", null);
     f.ui.watchRun("one");
     const oldStream = f.streams[0];
-    await f.tick(500);
+    oldStream.onmessage({ data: JSON.stringify({
+      id: "one", status: "succeeded", steps: [], summary: {}, readinessRevision: 1,
+    }) });
+    await f.tick(0);
     oldStream.onerror();
     assert.equal(f.requests[1].url, "/api/runs/one");
     f.ui.watchRun("two");
@@ -244,6 +313,11 @@ const scenarios = {
     assert.equal(f.ui.state.readiness.runStatus, null);
     assert.equal(f.ui.state.readiness.report, null);
     await f.tick(500);
+    assert.equal(f.requests.length, 2);
+    f.streams[1].onmessage({ data: JSON.stringify({
+      id: "two", status: "succeeded", steps: [], summary: {}, readinessRevision: 1,
+    }) });
+    await f.tick(0);
     await f.reply(2, report("two"));
     assert.equal(f.ui.state.readiness.report.runId, "two");
     await f.get("start-over").click();
@@ -314,7 +388,7 @@ const scenarios = {
     assert.equal(f.get("readiness-empty").hidden, false);
     assert.match(f.get("readiness-empty").textContent, /No item evidence/);
     assert.equal(f.get("readiness-error").hidden, true);
-    f.ui.observeReadiness({ status: "running", readinessRevision: 2 });
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 2 });
     await f.tick(500);
     await f.reply(2, report("wrong-run"));
     assert.match(f.get("readiness-error").textContent, /unsupported format/);

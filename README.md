@@ -247,6 +247,8 @@ count limits.
 The progress/results screen separates **migration completion** from **cutover readiness**.
 A successful run can still leave data uncopied, dependencies unresolved, or activation work
 for the operator. Readiness never changes the run's success, cancellation or failure status.
+The report and its export controls appear only after the migration finishes, fails, is cancelled,
+or is interrupted. They remain hidden while a run is pending or running.
 
 | State | Meaning |
 | --- | --- |

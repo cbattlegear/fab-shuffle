@@ -1054,10 +1054,10 @@ function renderRun(run) {
   observeReadiness(run);
   const banner = $("#run-banner");
   banner.className = `run-banner ${run.status}`;
-  const spinner = run.status === "running" ? '<span class="spin">◐</span> ' : "";
-  banner.innerHTML = `${spinner}<strong></strong><span></span>`;
+  const spinner = run.status === "running" ? '<span class="spin" aria-hidden="true">◐</span> ' : "";
+  banner.innerHTML = `${spinner}<strong></strong><span class="run-target"></span>`;
   banner.querySelector("strong").textContent = RUN_MESSAGES[run.status] || run.status;
-  banner.querySelector("span").textContent = run.targetWorkspace
+  banner.querySelector(".run-target").textContent = run.targetWorkspace
     ? ` — target workspace: ${run.targetWorkspace.displayName}`
     : "";
 
@@ -1116,6 +1116,10 @@ function readinessState(value) {
   return Object.hasOwn(READINESS_LABELS, value) ? value : "unknown";
 }
 
+function readinessAvailable(status) {
+  return ["succeeded", "failed", "cancelled", "interrupted"].includes(status);
+}
+
 function resetReadiness(runId = null) {
   const previous = state.readiness;
   if (previous) {
@@ -1138,17 +1142,26 @@ function resetReadiness(runId = null) {
   $("#readiness-results").textContent = "";
   $("#readiness-empty").hidden = true;
   renderReadinessStatus();
-  if (state.readiness) scheduleReadiness();
 }
 
 function observeReadiness(run) {
   const current = state.readiness;
   if (!current || current.runId !== state.runId) return;
-  const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
+  const terminal = readinessAvailable(run.status);
   const finishedNow = terminal && current.runStatus !== run.status;
   const changed = current.runStatus === null || current.revision !== run.readinessRevision;
   current.runStatus = run.status;
   current.revision = run.readinessRevision;
+  if (!terminal) {
+    if (current.report || current.controller || current.downloadController || current.pending ||
+        current.timer !== null || current.error || current.downloadError) {
+      resetReadiness(current.runId);
+      state.readiness.runStatus = run.status;
+      state.readiness.revision = run.readinessRevision;
+    }
+    renderReadinessStatus();
+    return;
+  }
   if (changed || finishedNow) {
     current.version += 1;
     scheduleReadiness(finishedNow);
@@ -1157,7 +1170,7 @@ function observeReadiness(run) {
 
 function scheduleReadiness(immediate = false) {
   const current = state.readiness;
-  if (!current) return;
+  if (!current || !readinessAvailable(current.runStatus)) return;
   current.pending = true;
   current.urgent ||= immediate;
   if (immediate) {
@@ -1174,7 +1187,8 @@ function scheduleReadiness(immediate = false) {
 }
 
 async function fetchReadiness(current) {
-  if (state.readiness !== current || state.runId !== current.runId) return;
+  if (state.readiness !== current || state.runId !== current.runId ||
+      !readinessAvailable(current.runStatus)) return;
   current.timer = null;
   current.pending = false;
   current.urgent = false;
@@ -1212,9 +1226,13 @@ async function fetchReadiness(current) {
 
 function renderReadinessStatus() {
   const current = state.readiness;
-  $("#cutover-readiness").hidden = !current;
-  $(".readiness-jump").hidden = !current;
-  if (!current) return;
+  const visible = current && readinessAvailable(current.runStatus);
+  $("#cutover-readiness").hidden = !visible;
+  $(".readiness-jump").hidden = !visible;
+  if (!visible) {
+    $("#readiness-export").disabled = true;
+    return;
+  }
   const report = current.report;
   const loading = Boolean(current.controller || current.pending);
   const reportedState = current.error ? "unknown" : readinessState(report?.state);
@@ -1232,9 +1250,7 @@ function renderReadinessStatus() {
       : "Readiness could not be established. Retry loading the report.")
     : loading
       ? (report ? "Updating readiness… Showing the last loaded snapshot." : "Loading readiness report…")
-      : ["pending", "running"].includes(current.runStatus)
-        ? "The migration is still running. Readiness will update as evidence is recorded."
-        : "Readiness report loaded.";
+      : "Readiness report loaded.";
   $("#readiness-error").textContent = current.error;
   $("#readiness-error").hidden = !current.error;
   $("#readiness-retry").hidden = !current.error;
@@ -1391,7 +1407,7 @@ $("#readiness-retry").addEventListener("click", () => scheduleReadiness(true));
 
 $("#readiness-export").addEventListener("click", async () => {
   const current = state.readiness;
-  if (!current?.report || current.downloadController) return;
+  if (!current?.report || !readinessAvailable(current.runStatus) || current.downloadController) return;
   current.downloadController = new AbortController();
   current.downloadError = "";
   renderReadinessStatus();
