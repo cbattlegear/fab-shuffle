@@ -8,7 +8,13 @@ rewrite their exported definitions through that map. A phase can therefore only 
 items created by an *earlier* phase:
 
 0. ``assessment`` and ``dependencies`` run before anything is created, so a workspace that
-   cannot migrate cleanly can be abandoned before it is half built.
+   cannot migrate cleanly can be abandoned before it is half built. ``dependencies`` also
+   detects which tenant connections are actually referenced by the items and shortcuts being
+   migrated - an explicit ``connection_mappings`` entry, an item definition that binds one
+   directly, or a shortcut - so later phases can recognise them (see
+   ``_load_source_references``). It is detection only: nothing is created, adopted by name,
+   or deleted, and a supplied mapping is not yet checked, because the data stores its path
+   might reference do not exist yet.
 1. ``workspaces``   create the target and scratch workspaces, the folder tree, and the custom
    Spark pools plus workspace Spark settings. Pools go here because an environment pins one
    by id, so it must exist and be in the id map before the engineering phase.
@@ -19,32 +25,42 @@ items created by an *earlier* phase:
 4. ``warehouses``   schema before data, so Copy Job activities have tables to land in.
 5. ``sqldatabases`` Fabric SQL databases, schema through the item definition and rows through
    a Copy Job. A data store like the rest, and read by GraphQL APIs, pipelines and Copy Jobs.
-6. ``mirrored``     mirrored databases, which are data stores with their own SQL analytics
-   endpoint, so they belong with the others and before anything that reads them.
-7. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
+6. ``connections``  only runs when the operator supplied ``connection_mappings``; with none
+   supplied there is no phase and no rebuild noise about connections it never touched. Each
+   supplied mapping is validated and rewritten through the id map now that every phase that
+   can add to it has run (see ``_validate_connection_mappings``), so a connection whose source
+   path names a lakehouse or warehouse endpoint is not misdiagnosed as broken before that
+   endpoint existed. Nothing is created, adopted by name, or deleted here either: a connection
+   id is tenant scoped, so it resolves unchanged from the migrated workspace, and the API
+   never returns an existing connection's credentials, so a faithful copy is never possible
+   anyway.
+7. ``mirrored``     mirrored databases, which are data stores with their own SQL analytics
+   endpoint and can themselves bind a connection directly, so they belong with the others and
+   after connection mappings are validated, and before anything that reads them.
+8. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
    them. This covers both lakehouse shortcuts and KQL database table shortcuts. The SQL
    analytics endpoint is refreshed only now, so it picks up both the copied tables and the
    new shortcuts, and only then is its schema copied.
-7. ``connections``  recreate connections that point into the source workspace, aimed at the
-   items just created. Their new ids go into the id map, so everything after this binds to
-   them. A connection's target cannot be changed in place, so this is a replacement.
-   Earlier consumers (mirrors and shortcuts) refuse unresolved source-bound connections;
-   retry them after the replacement exists rather than creating a source-bound copy.
-8. ``realtime``     eventstreams, KQL querysets, and KQL dashboards. They read the
+9. ``realtime``     eventstreams, KQL querysets, and KQL dashboards. They read the
    eventhouses and data stores above, and an eventstream sources from connections.
-9. ``engineering``  environments, then notebooks, then dataflows, then Spark job definitions,
-   GraphQL APIs, graph models and query sets, maps, variable libraries, and mounted data
-   factories. A notebook attaches to an environment and reads a lakehouse; a semantic model
-   can read a dataflow; a query set names its graph model. All of them come before analytics.
-10. ``analytics``   semantic models, then reports. Models bind to lakehouse and warehouse
+10. ``engineering``  environments, then notebooks, then dataflows, then Spark job definitions,
+    GraphQL APIs, graph models and query sets, maps, variable libraries, and mounted data
+    factories. A notebook attaches to an environment and reads a lakehouse; a semantic model
+    can read a dataflow; a query set names its graph model. All of them come before analytics.
+11. ``analytics``   semantic models, then reports. Models bind to lakehouse and warehouse
     SQL endpoints, so they need the data store phases finished; reports bind to models, so
     they run after.
-11. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
+12. ``orchestration`` data pipelines and Copy Jobs, which read, refresh, and invoke anything
     above.
-12. ``reflexes``    Activator items, last of the content phases. One watches an eventstream or
+13. ``reflexes``    Activator items, last of the content phases. One watches an eventstream or
     KQL database and acts by running pipelines and notebooks, so both sides must exist first.
-13. ``permissions`` remaining role assignments. Admins were granted back in step 1.
-14. ``cleanup``     drop the scratch workspace and local staging.
+14. ``permissions`` remaining role assignments. Admins were granted back in step 1.
+15. ``cleanup``     drop the scratch workspace and local staging.
+
+A dependent item that still binds an unresolved source-bound connection - none supplied, or a
+supplied mapping that failed validation - is refused, with a warning naming the connection and
+the item, rather than silently created against a connection that will not work once the source
+workspace is gone.
 """
 
 from __future__ import annotations
@@ -126,7 +142,6 @@ class DependencyReport:
     graph: relations.DependencyGraph
     available: bool = True
     issues: list[relations.DependencyIssue] = field(default_factory=list)
-    prerequisites: list[connections.ConnectionPrerequisite] = field(default_factory=list)
     access: list[ConnectionAccess] = field(default_factory=list)
 
     def messages(self) -> list[str]:
@@ -136,25 +151,7 @@ class DependencyReport:
         review screen, and listing it twice made the same nine lines appear under two
         headings.
         """
-        warnings = [issue.message() for issue in self.issues]
-        if self.prerequisites:
-            warnings.append(inward_connection_summary(self.prerequisites))
-        return warnings
-
-
-def inward_connection_summary(prerequisites: list[connections.ConnectionPrerequisite]) -> str:
-    """One line for connections that point at items in the workspace being migrated.
-
-    Their target cannot be changed and a replacement needs credentials Fabric never returns,
-    so this is work for whoever owns them. Naming each one individually said the same
-    sentence several times over, so it is a count and a list of names.
-    """
-    named = sorted({p.connection_name or p.connection_id for p in prerequisites})
-    return (
-        f"{len(prerequisites)} connection(s) point at items in this workspace and will need to "
-        "be replaced before their consumers can migrate, because Fabric does not allow a "
-        f"connection's target to be changed: {', '.join(named)}."
-    )
+        return [issue.message() for issue in self.issues]
 
 
 @dataclass
@@ -1240,47 +1237,11 @@ def dependency_warnings(
         migrated_ids={item["id"] for item in migrated if item.get("id")},
         source_workspace_id=source_workspace_id,
     )
-    prerequisites = connection_prerequisites(
-        client,
-        source_workspace_id=source_workspace_id,
-        migrated=migrated,
-        client_id=client_id,
-    )
     return DependencyReport(
         graph=graph,
         issues=issues,
-        prerequisites=prerequisites,
         access=scan_connection_access(client, source_workspace_id=source_workspace_id),
     )
-
-
-def connection_prerequisites(
-    client: FabricClient,
-    *,
-    source_workspace_id: str,
-    migrated: list[dict[str, Any]],
-    client_id: str,
-) -> list[connections.Prerequisite]:
-    """Find connections that point at items in the workspace being migrated.
-
-    Fabric does not let a connection's target change, so these cannot be repointed at the
-    migrated items. Surfacing them before anything is created means the operator learns what
-    they will have to rebuild by hand while it is still cheap to stop.
-    """
-    endpoints: list[str] = []
-    for lakehouse in data_stores.list_lakehouses(client, source_workspace_id):
-        endpoint = data_stores.lakehouse_sql_endpoint(lakehouse)
-        endpoints.extend(filter(None, [endpoint.get("connectionString"), endpoint.get("id")]))
-    for warehouse in data_stores.list_warehouses(client, source_workspace_id):
-        endpoints.append(data_stores.warehouse_connection_string(warehouse))
-    for eventhouse in eventhouses.list_eventhouses(client, source_workspace_id):
-        properties = eventhouse.get("properties") or {}
-        endpoints.extend(
-            filter(None, [properties.get("queryServiceUri"), properties.get("ingestionServiceUri")])
-        )
-
-    identifiers = connections.source_identifiers(source_workspace_id, migrated, endpoints)
-    return connections.scan_prerequisites(client, identifiers=identifiers, client_id=client_id)
 
 
 def _check_dependencies(ctx: _Context) -> None:
@@ -1326,8 +1287,6 @@ def _check_dependencies(ctx: _Context) -> None:
 
     if report.issues:
         ctx.run.summary["dependencyIssues"] = [issue.as_dict() for issue in report.issues]
-    if report.prerequisites:
-        ctx.run.summary["connectionPrerequisites"] = [p.as_dict() for p in report.prerequisites]
     if report.access:
         ctx.run.summary["connectionAccess"] = [entry.as_dict() for entry in report.access]
 
@@ -1429,81 +1388,71 @@ def _load_source_references(ctx: _Context) -> None:
         for connection in connections.list_connections(ctx.client)
         if connection.get("id")
     }
-    referenced_connections: set[str] = set(ctx.plan.connection_mappings)
-    if ctx.plan.cross_tenant:
-        for item in ctx.assessment.migrated if ctx.assessment else ():
-            try:
-                definition = items_module.get_item_definition(ctx.client, source_id, item["id"])
-            except FabricError as error:
-                ctx.warnings.append(
-                    f"Connection inventory for '{item.get('displayName') or item['id']}' could "
-                    f"not be exported: {error}. Restore source definition access before retrying."
-                )
-                continue
-            referenced_connections.update(connections.referenced_connection_ids(
-                definition.get("parts") or [],
-            ))
+    # A connection only matters here if something actually being migrated points at it: an
+    # explicit operator mapping, an item whose definition binds one directly, or a shortcut
+    # (connections do not always appear in an item's own definition parts). Fab Shuffle never
+    # scans every tenant connection looking for a reason to act on one - only the connections
+    # its selected items and shortcuts actually reference.
+    referenced_connections: set[str] = {key.casefold() for key in ctx.plan.connection_mappings}
+    for item in ctx.assessment.migrated if ctx.assessment else ():
+        if item.get("type") not in CONNECTION_BINDING_TYPES or not item.get("id"):
+            continue
+        try:
+            definition = items_module.try_get_item_definition(ctx.client, source_id, item["id"])
+        except FabricError as error:
+            ctx.warnings.append(
+                f"Connection bindings for '{item.get('displayName') or item['id']}' could "
+                f"not be read: {error}. Restore source definition access before retrying."
+            )
+            continue
+        if definition is None:
+            continue
+        referenced_connections.update(
+            value.casefold()
+            for value in connections.referenced_connection_ids(definition.get("parts") or [])
+        )
+    for item in ctx.assessment.migrated if ctx.assessment else ():
+        item_id = item.get("id")
+        item_type = item.get("type")
+        if not item_id or item_type not in ("Lakehouse", "KQLDatabase"):
+            continue
+        try:
+            found = (
+                shortcuts.list_shortcuts(ctx.client, source_id, item_id) if item_type == "Lakehouse"
+                else shortcuts.list_table_shortcuts(ctx.client, source_id, item_id)
+            )
+        except FabricApiError as error:
+            ctx.warnings.append(
+                f"Shortcuts for '{item.get('displayName') or item_id}' could not be listed: "
+                f"{error}. Restore source shortcut access before retrying."
+            )
+            continue
+        referenced_connections.update(
+            value.casefold() for value in shortcuts.referenced_connection_ids(found)
+        )
     for connection_id in ctx.plan.connection_mappings:
         if connection_id not in source_connections:
             source_connections[connection_id] = ctx.client.get(f"connections/{connection_id}")
     for connection in source_connections.values():
+        connection_id = str(connection.get("id") or "")
+        if not connection_id or connection_id.casefold() not in referenced_connections:
+            continue
         path = (connection.get("connectionDetails") or {}).get("path") or ""
-        if not connection.get("id") or (not ctx.plan.cross_tenant and not any(
+        if not ctx.plan.cross_tenant and not any(
             key.casefold() in path.casefold() for key in identifiers if key
-        )):
+        ):
+            # Referenced, but not pointing back into this workspace: a standard external
+            # connection that is reused unchanged, with nothing here for the operator to do.
             continue
-        if ctx.plan.cross_tenant and str(connection["id"]).casefold() not in {
-            value.casefold() for value in referenced_connections
-        }:
-            continue
-        source_connection_id = str(connection["id"]).casefold()
+        source_connection_id = connection_id.casefold()
         ctx.source_items[source_connection_id] = {
             **connection, "id": source_connection_id, "type": "Connection",
         }
-        supplied_target = ctx.plan.connection_mappings.get(source_connection_id)
-        if supplied_target:
-            if source_connection_id in ctx.id_map and ctx.id_map[source_connection_id] != supplied_target:
-                ctx.invalidate_mapping(source_connection_id)
-            ctx.map_alias(source_connection_id, supplied_target, source_connection_id)
-        # A journaled ID is not proof that a tenant-scoped connection still exists, is
-        # readable, or targets the expected path. Validate before early consumers use it.
-        mapped_key = next(
-            (key for key in ctx.id_map if key.casefold() == source_connection_id.casefold()), None
-        )
-        if mapped_key is None:
-            continue
-        target_id = ctx.id_map[mapped_key]
-        rewrite = definitions.build_rewriter(ctx.id_map)
-        new_path = rewrite(path) if rewrite else path
-        needed = analytics.dangling_references(
-            [definitions.part("connection.txt", path)], ctx.id_map, ctx.source_items,
-            ignore=(source_connection_id,),
-        )
-        try:
-            target = ctx.destination_client.get(f"connections/{target_id}")
-        except FabricError as error:
-            ctx.invalidate_mapping(mapped_key)
-            ctx.unverified_connections.add(source_connection_id)
-            ctx.warnings.append(
-                f"Connection '{connections.display_name(connection)}' replacement {target_id} "
-                f"could not be verified: {error}. Grant access or restore it, then retry."
-            )
-            continue
-        if (
-            needed
-            or (not ctx.plan.cross_tenant and connections.same_path(path, new_path))
-            or not connections.matches_replacement(target, connection, new_path)
-        ):
-            ctx.invalidate_mapping(mapped_key)
-            ctx.warnings.append(
-                f"Connection '{connections.display_name(connection)}' replacement {target_id} no longer "
-                "matches its migrated target. Restore the replacement against the migrated "
-                "store, then retry; dependent items will not be created with the old binding."
-            )
-            continue
-        if mapped_key != source_connection_id:
-            del ctx.id_map[mapped_key]
-            ctx.id_map[source_connection_id] = target_id
+        # Only detection happens here: this runs in the "dependencies" phase, before any
+        # data store exists, so a supplied ``connection_mappings`` entry cannot yet be
+        # rewritten against the id map (its lakehouse or warehouse endpoint has not been
+        # created). Applying and validating the mapping is ``_validate_connection_mappings``,
+        # which runs later, once every phase that can add to the id map has finished.
 
 
 def _create_workspaces(ctx: _Context) -> None:
@@ -3082,6 +3031,100 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
     return migrated, warnings
 
 
+# -------------------------------------------------------------------- phase 5b
+
+
+def _validate_connection_mappings(ctx: _Context) -> None:
+    """Validate operator-supplied connection replacements now that data stores exist.
+
+    Only runs when the operator supplied ``connection_mappings``: with none supplied there is
+    nothing to validate, and no phase is shown at all - a rebuild with no explicit mappings
+    gets no connection step and no rebuild noise about connections it never touched.
+
+    ``_load_source_references`` (the ``dependencies`` phase) only detects which connections
+    are actually referenced; it runs before any data store exists, so a mapping whose source
+    path names a lakehouse or warehouse SQL endpoint cannot yet be rewritten through the id
+    map. Checking it there would misdiagnose a mapping that is fine but simply hasn't had its
+    target created yet. This phase runs the same rewrite-and-verify check once every phase
+    that can add to the id map (workspaces through sqldatabases) has finished, so the id map is
+    as complete as it will be before anything that could bind the connection - starting with
+    mirrored databases, which can bind one directly - is created.
+
+    Nothing is created, adopted by name, or deleted here, in any mode: a connection id is
+    tenant scoped, so it resolves unchanged from the migrated workspace, and the API never
+    returns an existing connection's credentials, so a faithful copy is never possible anyway.
+    A mapping that does not hold up is refused and its id map entry withdrawn, so a dependent
+    item is refused too rather than built against a stale binding.
+    """
+    step = "connections"
+    ctx.run.start_step(step, "Validating supplied connection mappings")
+    ctx.run.raise_if_cancelled()
+    if not ctx.plan.connection_mappings:
+        ctx.run.finish_step(step, StepStatus.SKIPPED, "No connection mappings supplied")
+        return
+
+    warnings: list[str] = []
+    for raw_source_id, supplied_target in ctx.plan.connection_mappings.items():
+        source_connection_id = raw_source_id.casefold()
+        connection = ctx.source_items.get(source_connection_id)
+        if not connection or connection.get("type") != "Connection":
+            # Not a connection any migrated item or shortcut actually references: nothing to
+            # validate or bind.
+            continue
+        path = (connection.get("connectionDetails") or {}).get("path") or ""
+        if source_connection_id in ctx.id_map and ctx.id_map[source_connection_id] != supplied_target:
+            ctx.invalidate_mapping(source_connection_id)
+        ctx.map_alias(source_connection_id, supplied_target, source_connection_id)
+        # A journaled ID is not proof that a tenant-scoped connection still exists, is
+        # readable, or targets the expected path. Validate before any consumer uses it.
+        mapped_key = next(
+            (key for key in ctx.id_map if key.casefold() == source_connection_id), None
+        )
+        if mapped_key is None:
+            continue
+        target_id = ctx.id_map[mapped_key]
+        rewrite = definitions.build_rewriter(ctx.id_map)
+        new_path = rewrite(path) if rewrite else path
+        needed = analytics.dangling_references(
+            [definitions.part("connection.txt", path)], ctx.id_map, ctx.source_items,
+            ignore=(source_connection_id,),
+        )
+        try:
+            target = ctx.destination_client.get(f"connections/{target_id}")
+        except FabricError as error:
+            ctx.invalidate_mapping(mapped_key)
+            ctx.unverified_connections.add(source_connection_id)
+            warnings.append(
+                f"Connection '{connections.display_name(connection)}' replacement {target_id} "
+                f"could not be verified: {error}. Grant access or restore it, then retry."
+            )
+            continue
+        if (
+            needed
+            or (not ctx.plan.cross_tenant and connections.same_path(path, new_path))
+            or not connections.matches_replacement(target, connection, new_path)
+        ):
+            ctx.invalidate_mapping(mapped_key)
+            warnings.append(
+                f"Connection '{connections.display_name(connection)}' replacement {target_id} no longer "
+                "matches its migrated target. Restore the replacement against the migrated "
+                "store, then retry; dependent items will not be created with the old binding."
+            )
+            continue
+        if mapped_key != source_connection_id:
+            del ctx.id_map[mapped_key]
+            ctx.id_map[source_connection_id] = target_id
+
+    ctx.warnings.extend(warnings)
+    if warnings:
+        ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Some connection mappings need attention", warnings)
+    else:
+        ctx.run.finish_step(
+            step, StepStatus.SUCCEEDED,
+            f"Validated {len(ctx.plan.connection_mappings)} connection mapping(s)",
+        )
+
+
 # --------------------------------------------------------------------- phase 6
 
 
@@ -3502,164 +3545,6 @@ def _transfer_endpoint_schemas(
         on_progress=lambda message: ctx.run.update_step(step, f"Transferring endpoint schema: {message}"),
         noun="schema transfer",
     )
-
-
-# --------------------------------------------------------------------- phase 7
-
-
-def _migrate_connections(ctx: _Context) -> None:
-    step = "connections"
-    ctx.run.start_step(step, "Replacing connections that target the source workspace")
-    ctx.run.raise_if_cancelled()
-    sources = [item for item in ctx.source_items.values() if item.get("type") == "Connection"]
-    if not sources:
-        ctx.run.finish_step(step, StepStatus.SKIPPED, "No known source-bound connections")
-        return
-
-    warnings: list[str] = []
-    try:
-        known = ctx.destination_client.list_all("connections")
-    except FabricError as error:
-        warnings.append(
-            f"Connection replacements could not be inspected: {error}. "
-            "Grant the service principal access to connections, then retry."
-        )
-        ctx.warnings.extend(warnings)
-        ctx.run.finish_step(step, StepStatus.SUCCEEDED, "Connections require attention", warnings)
-        return
-
-    metadata: dict[str, dict[str, Any]] | None = None
-    replaced = 0
-    for source in sources:
-        ctx.run.raise_if_cancelled()
-        source_id = source["id"]
-        if source_id in ctx.unverified_connections:
-            warnings.append(
-                f"Connection '{connections.display_name(source)}' has an unreadable prior "
-                "replacement. Restore this service principal's access to it, then retry; no "
-                "duplicate was created."
-            )
-            continue
-        path = (source.get("connectionDetails") or {}).get("path") or ""
-        name = connections.replacement_name(source, ctx.target_workspace_id)
-        needed = analytics.dangling_references(
-            [definitions.part("connection.txt", path)], ctx.id_map, ctx.source_items,
-            ignore=(source_id,),
-        )
-        rewrite = definitions.build_rewriter(ctx.id_map)
-        new_path = rewrite(path) if rewrite else path
-        if needed or (not ctx.plan.cross_tenant and connections.same_path(path, new_path)):
-            warnings.append(
-                f"Connection '{connections.display_name(source)}' was not replaced: its target "
-                f"still needs {', '.join(needed) or 'a complete source-to-target mapping'}. "
-                "Migrate that store and its endpoint, then retry."
-            )
-            continue
-
-        connectivity = source.get("connectivityType") or ""
-        connection_type_label = (source.get("connectionDetails") or {}).get("type")
-        if connectivity == "PersonalCloud":
-            # A personal cloud connection cannot be shared and Fabric has no API or portal
-            # flow to create one explicitly (it only arises implicitly from a data source's
-            # default mapping), so the fix is a new shareable connection, not a like-for-like
-            # recreation of the personal one.
-            instruction = (
-                "Personal cloud connections cannot be shared or recreated by hand: create a "
-                f"new shareable cloud connection named '{name}' with type "
-                f"'{connection_type_label}' and target '{new_path}' in Manage connections and "
-                "gateways, grant this service principal User access to it, then retry. "
-                "Dependent items are left uncreated until that replacement is available."
-            )
-        else:
-            instruction = (
-                f"Create connection '{name}' with type '{connection_type_label}', connectivity "
-                f"'{connectivity}' and target '{new_path}' "
-                "in Manage connections and gateways, enter its credentials, grant this service "
-                "principal User access, then retry. Dependent items are left uncreated until "
-                "that replacement is available."
-            )
-        supplied_target = ctx.plan.connection_mappings.get(source_id)
-        if supplied_target and source_id not in ctx.id_map:
-            ctx.map_alias(source_id, supplied_target, source_id)
-        mapped_key = next((key for key in ctx.id_map if key.casefold() == source_id.casefold()), None)
-        if mapped_key:
-            target_id = ctx.id_map[mapped_key]
-            try:
-                candidate = ctx.destination_client.get(f"connections/{target_id}")
-            except FabricError as error:
-                ctx.invalidate_mapping(mapped_key)
-                warnings.append(f"Replacement {target_id} could not be verified: {error}. {instruction}")
-                continue
-            if connections.matches_replacement(candidate, source, new_path):
-                replaced += 1
-                continue
-            ctx.invalidate_mapping(mapped_key)
-            warnings.append(f"Replacement {target_id} has the wrong target. {instruction}")
-            continue
-
-        if ctx.plan.cross_tenant:
-            warnings.append(
-                f"Connection '{connections.display_name(source)}' ({source_id}) needs an "
-                f"explicit destination connection mapping. {instruction}"
-            )
-            continue
-
-        candidates = [
-            candidate for candidate in known
-            if candidate.get("displayName") == name
-            and connections.matches_replacement(candidate, source, new_path)
-        ]
-        if len(candidates) > 1:
-            warnings.append(
-                f"More than one connection is named '{name}'; keep one replacement. {instruction}"
-            )
-            continue
-        if candidates:
-            ctx.id_map[source_id] = candidates[0]["id"]
-            replaced += 1
-            continue
-
-        connection_type = (source.get("connectionDetails") or {}).get("type") or ""
-        if metadata is None:
-            try:
-                metadata = connections.supported_types(ctx.destination_client)
-            except FabricError as error:
-                warnings.append(f"Connection creation metadata could not be read: {error}. {instruction}")
-                continue
-        supported = metadata.get(connection_type)
-        reason = connections.can_recreate(source, supported)
-        payload = None if reason else connections.build_creation_payload(
-            source, new_path, supported, display_name=name
-        )
-        if not payload:
-            warnings.append(
-                f"Connection '{connections.display_name(source)}' "
-                f"{reason or 'has a path whose creation parameters cannot be reconstructed safely'}. "
-                + instruction
-            )
-            continue
-        ctx.run.update_step(step, f"Replacing connection '{connections.display_name(source)}'")
-        try:
-            created = connections.create_connection(ctx.destination_client, payload)
-            if not connections.matches_replacement(created, source, new_path):
-                raise FabricError("the created connection did not return the expected ID, type and target")
-        except FabricError as error:
-            warnings.append(
-                f"Connection '{connections.display_name(source)}' was not replaced: {error}. {instruction}"
-            )
-            continue
-        ctx.id_map[source_id] = created["id"]
-        known.append(created)
-        replaced += 1
-        if not ctx.plan.paired:
-            _, sharing_warnings = connections.copy_role_assignments(
-                ctx.destination_client, source_connection_id=source_id, target_connection_id=created["id"],
-                client_id=ctx.destination_principal.client_id,
-            )
-            warnings.extend(sharing_warnings)
-
-    ctx.warnings.extend(warnings)
-    ctx.run.finish_step(step, StepStatus.SUCCEEDED, f"Resolved {replaced} connection(s)", warnings)
 
 
 def _migrate_realtime(ctx: _Context) -> None:
@@ -4449,9 +4334,9 @@ _REBUILD_PHASES: tuple[tuple[str, Callable[[_Context], None]], ...] = (
     ("lakehouses", _migrate_lakehouses),
     ("warehouses", _migrate_warehouses),
     ("sqldatabases", _migrate_sql_databases),
+    ("connections", _validate_connection_mappings),
     ("mirrored", _migrate_mirrored_databases),
     ("shortcuts", _migrate_shortcuts_and_endpoints),
-    ("connections", _migrate_connections),
     ("realtime", _migrate_realtime),
     ("engineering", _migrate_engineering),
     ("analytics", _migrate_reports_and_models),
@@ -4466,7 +4351,6 @@ __all__ = [
     "MigrationPlan",
     "build_plan",
     "cleanup_run",
-    "connection_prerequisites",
     "default_target_name",
     "dependency_warnings",
     "run_migration",

@@ -1,7 +1,10 @@
 """Connection references inside item definitions.
 
-External connections stay tenant scoped. Connections targeting the source workspace need
-a proven replacement before consumers can migrate; existing secrets are never exported.
+Connections are tenant scoped, so the same connection id resolves from the migrated
+workspace; the API never returns an existing connection's credentials, so a faithful copy is
+never possible. Fab Shuffle never creates, adopts by name, or deletes a connection on the
+operator's behalf: it only rewrites an explicit ``connection_mappings`` entry the operator
+supplied, and reports the connections that still need one.
 """
 
 from __future__ import annotations
@@ -52,45 +55,6 @@ class ConnectionIssue:
             "connectionId": self.connection_id,
             "connectionName": self.connection_name,
             "reason": self.reason,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ConnectionPrerequisite:
-    """A connection that points into the workspace being migrated.
-
-    Its target cannot be repointed: no Update Connection request accepts
-    ``connectionDetails``, so the path is fixed for the life of the connection. It has to be
-    replaced by a new connection aimed at the migrated item, and doing that needs the
-    credentials, which the API never returns.
-    """
-
-    connection_id: str
-    connection_name: str
-    path: str
-    matched: str
-    credential_type: str
-    connectivity_type: str
-    manageable: bool
-
-    def message(self) -> str:
-        return (
-            f"Connection '{self.connection_name}' points at '{self.matched}' in the source "
-            f"workspace (path '{self.path}'). Fabric does not allow a connection's target to "
-            f"be changed, so create a replacement {self.credential_type} connection against "
-            "the migrated item and repoint the items that use it."
-        )
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "connectionId": self.connection_id,
-            "connectionName": self.connection_name,
-            "path": self.path,
-            "matched": self.matched,
-            "credentialType": self.credential_type,
-            "connectivityType": self.connectivity_type,
-            "manageable": self.manageable,
-            "message": self.message(),
         }
 
 
@@ -314,226 +278,6 @@ def copy_role_assignments(
     return copied, warnings
 
 
-def source_identifiers(
-    workspace_id: str,
-    items: Iterable[Mapping[str, Any]],
-    endpoints: Iterable[str] = (),
-) -> dict[str, str]:
-    """Strings that, if they appear in a connection path, mean it points into this workspace.
-
-    Maps the identifier to a human readable name for it.
-    """
-    identifiers: dict[str, str] = {workspace_id: "this workspace"}
-    for item in items:
-        item_id = item.get("id")
-        if item_id:
-            identifiers[item_id] = f"{item.get('type') or 'item'} '{item.get('displayName')}'"
-    for endpoint in endpoints:
-        if endpoint:
-            identifiers[endpoint] = endpoint
-    return identifiers
-
-
-def scan_prerequisites(
-    client: FabricClient,
-    *,
-    identifiers: Mapping[str, str],
-    client_id: str,
-    known: Iterable[Mapping[str, Any]] | None = None,
-) -> list[ConnectionPrerequisite]:
-    """Find connections that point into the workspace being migrated.
-
-    These are the ones a migration cannot fix by itself, so they are surfaced before anything
-    is created, together with what has to change.
-    """
-    candidates = list(known) if known is not None else list_connections(client)
-    found: list[ConnectionPrerequisite] = []
-
-    for connection in candidates:
-        details = connection.get("connectionDetails") or {}
-        path = details.get("path") or ""
-        if not path:
-            continue
-
-        lowered = path.casefold()
-        matched = next(
-            (label for key, label in identifiers.items() if key and key.casefold() in lowered),
-            None,
-        )
-        if matched is None:
-            continue
-
-        connection_id = connection.get("id") or ""
-        credentials = connection.get("credentialDetails") or {}
-        found.append(
-            ConnectionPrerequisite(
-                connection_id=connection_id,
-                connection_name=connection.get("displayName") or connection_id,
-                path=path,
-                matched=matched,
-                credential_type=credentials.get("credentialType") or "unknown",
-                connectivity_type=connection.get("connectivityType") or "",
-                manageable=is_owned_by(list_role_assignments(client, connection_id), client_id),
-            )
-        )
-
-    return found
-
-
-# Credential types Fab Shuffle can set on a new connection without being handed a secret.
-# Everything else (Basic, Key, ServicePrincipal, OAuth2, ...) needs input from the operator,
-# because the API never returns an existing connection's credentials.
-NO_SECRET_CREDENTIALS = frozenset({"WorkspaceIdentity", "Anonymous"})
-
-# Only cloud connections can be recreated unattended. Gateway-bound ones need a gateway id
-# and stay tied to their gateway's region anyway.
-RECREATABLE_CONNECTIVITY = frozenset({"ShareableCloud"})
-
-
-@dataclass(frozen=True, slots=True)
-class Replacement:
-    """A connection that was recreated against the migrated items."""
-
-    old_id: str
-    new_id: str
-    name: str
-    old_path: str
-    new_path: str
-
-
-def supported_types(client: FabricClient) -> dict[str, dict[str, Any]]:
-    types = client.list_all("connections/supportedConnectionTypes")
-    return {entry["type"]: entry for entry in types if entry.get("type")}
-
-
-def _creation_method(metadata: Mapping[str, Any], connection_type: str) -> dict[str, Any] | None:
-    """Pick the creation method to rebuild a connection with.
-
-    Prefer the one named after the type, which is the recommended method; fall back to the
-    only method when there is exactly one. Anything ambiguous is refused rather than guessed.
-    """
-    methods = metadata.get("creationMethods") or []
-    for method in methods:
-        if method.get("name") == connection_type:
-            return dict(method)
-    return dict(methods[0]) if len(methods) == 1 else None
-
-
-def build_parameters(path: str, method: Mapping[str, Any]) -> list[dict[str, str]] | None:
-    """Turn a rendered connection path back into typed creation parameters.
-
-    ``path`` is the creation method's parameter values joined with ``;`` in declaration
-    order, so ``contoso.database.windows.net;sales`` maps onto ``server`` then ``database``.
-    Returns ``None`` when the two cannot be lined up, rather than sending a malformed payload.
-    """
-    declared = method.get("parameters") or []
-    values = path.split(";")
-    if not declared or len(values) > len(declared):
-        return None
-
-    parameters: list[dict[str, str]] = []
-    for index, parameter in enumerate(declared):
-        name = parameter.get("name")
-        if not name:
-            return None
-        value = values[index] if index < len(values) else ""
-        if not value:
-            if parameter.get("required"):
-                return None
-            continue
-        parameters.append({"name": name, "dataType": parameter.get("dataType") or "Text", "value": value})
-
-    return parameters or None
-
-
-def can_recreate(
-    connection: Mapping[str, Any],
-    metadata: Mapping[str, Any] | None,
-) -> str | None:
-    """Why a connection cannot be recreated unattended, or ``None`` when it can be."""
-    credential_type = (connection.get("credentialDetails") or {}).get("credentialType") or ""
-    connectivity = connection.get("connectivityType") or ""
-
-    if connectivity not in RECREATABLE_CONNECTIVITY:
-        if connectivity in GATEWAY_TYPES:
-            return (
-                f"is a {connectivity} connection, which has to be recreated by hand "
-                "against its gateway"
-            )
-        if connectivity == "PersonalCloud":
-            # A personal cloud connection has no gateway and, per Fabric's connectivity
-            # types, "cannot be shared with others" - there is nothing to recreate it
-            # against. Only a new shareable cloud connection can stand in for it.
-            return (
-                "is a personal cloud connection, which cannot be shared or recreated by "
-                "hand; a new shareable cloud connection has to be created in its place"
-            )
-        return (
-            f"is a {connectivity or 'unknown'} connection, which cannot be recreated "
-            "unattended"
-        )
-    if credential_type not in NO_SECRET_CREDENTIALS:
-        return (
-            f"uses {credential_type or 'unknown'} credentials, which Fabric never returns, so "
-            "a replacement has to be created with the credentials supplied by hand"
-        )
-    if metadata is None:
-        return "has a connection type this tenant does not report as supported"
-    if credential_type not in (metadata.get("supportedCredentialTypes") or []):
-        return f"cannot use {credential_type} credentials for its connection type"
-    return None
-
-
-def build_creation_payload(
-    connection: Mapping[str, Any],
-    new_path: str,
-    metadata: Mapping[str, Any],
-    *,
-    display_name: str,
-) -> dict[str, Any] | None:
-    connection_type = (connection.get("connectionDetails") or {}).get("type") or ""
-    method = _creation_method(metadata, connection_type)
-    if not method:
-        return None
-
-    # Learn's Get/Create Connection examples document SQL's server;database path.
-    # Other connectors' rendered paths are opaque: declaration order is not proof of an
-    # inverse encoding. Require a manual replacement rather than inventing parameters.
-    # https://learn.microsoft.com/rest/api/fabric/core/connections/get-connection
-    if connection_type != "SQL" or method.get("name") != "SQL":
-        return None
-    declared = method.get("parameters") or []
-    if [parameter.get("name") for parameter in declared] != ["server", "database"]:
-        return None
-    if any(parameter.get("dataType") != "Text" for parameter in declared):
-        return None
-    parameters = build_parameters(new_path, method)
-    if not parameters:
-        return None
-
-    credentials = connection.get("credentialDetails") or {}
-    payload = {
-        "connectivityType": connection.get("connectivityType"),
-        "displayName": display_name,
-        "privacyLevel": connection.get("privacyLevel") or "Organizational",
-        "connectionDetails": {
-            "type": connection_type,
-            "creationMethod": method["name"],
-            "parameters": parameters,
-        },
-        "credentialDetails": {
-            "singleSignOnType": credentials.get("singleSignOnType") or "None",
-            "connectionEncryption": credentials.get("connectionEncryption") or "NotEncrypted",
-            "skipTestConnection": bool(credentials.get("skipTestConnection", False)),
-            "credentials": {"credentialType": credentials.get("credentialType")},
-        },
-    }
-    for key in ("allowConnectionUsageInGateway", "allowUsageInUserControlledCode"):
-        if key in connection:
-            payload[key] = connection[key]
-    return payload
-
-
 def display_name(connection: Mapping[str, Any]) -> str:
     """A connection's name for messages, falling back to its id when unnamed.
 
@@ -543,11 +287,6 @@ def display_name(connection: Mapping[str, Any]) -> str:
     the id at least identifies which connection needs attention.
     """
     return str(connection.get("displayName") or connection.get("id") or "")
-
-
-def replacement_name(connection: Mapping[str, Any], target_workspace_id: str) -> str:
-    """Stable name lets a retry adopt an operator-created or unjournaled replacement."""
-    return f"{connection.get('displayName') or connection['id']} (Fab Shuffle {target_workspace_id})"
 
 
 def same_path(left: str, right: str) -> bool:
@@ -572,35 +311,15 @@ def matches_replacement(
     )
 
 
-def create_connection(client: FabricClient, payload: Mapping[str, Any]) -> dict[str, Any]:
-    return client.post("connections", json=dict(payload))
-
-
-def delete_connection(client: FabricClient, connection_id: str) -> None:
-    client.delete(f"connections/{connection_id}")
-
-
 __all__ = [
     "GATEWAY_TYPES",
-    "NO_SECRET_CREDENTIALS",
-    "RECREATABLE_CONNECTIVITY",
     "REGIONAL_GATEWAY_TYPES",
     "ConnectionIssue",
-    "ConnectionPrerequisite",
-    "Replacement",
-    "build_creation_payload",
-    "build_parameters",
-    "can_recreate",
     "check",
     "connections_by_id",
-    "create_connection",
-    "delete_connection",
     "display_name",
     "is_owned_by",
     "list_connections",
     "list_role_assignments",
     "referenced_connection_ids",
-    "scan_prerequisites",
-    "source_identifiers",
-    "supported_types",
 ]

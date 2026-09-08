@@ -162,7 +162,6 @@ def test_the_access_list_reaches_the_dependency_report(monkeypatch) -> None:
     monkeypatch.setattr(
         relations, "build_graph", lambda *a, **k: relations.DependencyGraph(dependencies={})
     )
-    monkeypatch.setattr(orchestrator, "connection_prerequisites", lambda *a, **k: [])
     monkeypatch.setattr(
         orchestrator,
         "scan_connection_access",

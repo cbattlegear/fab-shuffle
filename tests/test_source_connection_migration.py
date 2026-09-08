@@ -1,9 +1,20 @@
-"""A full rebuild must replace internal connections before importing their consumers."""
+"""A rebuild never creates or adopts a connection; it only uses what the operator maps.
+
+Automatic same-tenant connection recreation was deliberately removed (see ``test_connections.py``
+and the "Connections" section of the README for the policy). A connection whose path points back
+into the workspace being migrated is never created, adopted by name, or adopted by a coincidental
+path match. If the operator supplies an explicit ``connection_mappings`` entry naming an existing,
+verified destination connection, that mapping is honoured; otherwise the connection is left
+unresolved and anything that depends on it - a Data pipeline, an Eventstream, a mirrored database
+- is refused through the same generic dangling-reference guard used for every other cross-item
+dependency, not a bespoke connection-phase warning.
+"""
+
+from __future__ import annotations
 
 from dataclasses import replace
 
 import pytest
-from test_connection_replacement import SQL_METADATA, connection
 from test_rebuild_ordering import (
     LAKEHOUSE,
     MODEL,
@@ -21,9 +32,9 @@ from test_rebuild_ordering import (
 
 from fabshuffle import journal, orchestrator
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric import connections
 from fabshuffle.fabric.client import FabricApiError
 from fabshuffle.fabric.definitions import decode_json_part, part
+from fabshuffle.fabric.support import assess_workspace
 from fabshuffle.run import MigrationRun, RunStatus
 
 CONNECTION = "aaaabbbb-1111-2222-3333-444455556666"
@@ -33,6 +44,24 @@ CONSUMERS = [
     {"id": "pipeline-source", "type": "DataPipeline", "displayName": "Daily pipeline"},
     {"id": "stream-source", "type": "Eventstream", "displayName": "Live events"},
 ]
+
+
+def connection(**overrides):
+    base = {
+        "id": "conn-old",
+        "displayName": "Bronze SQL",
+        "connectivityType": "ShareableCloud",
+        "privacyLevel": "Organizational",
+        "connectionDetails": {"type": "SQL", "path": "old.datawarehouse.fabric.microsoft.com;bronze"},
+        "credentialDetails": {
+            "credentialType": "WorkspaceIdentity",
+            "singleSignOnType": "None",
+            "connectionEncryption": "Encrypted",
+            "skipTestConnection": False,
+        },
+    }
+    base.update(overrides)
+    return base
 
 
 class Fabric(FakeFabric):
@@ -46,8 +75,6 @@ class Fabric(FakeFabric):
             self.source_connection,
             connection(id=EXTERNAL, connectionDetails={"type": "SQL", "path": "external.example.com;other"}),
         ]
-        self.connection_creates = []
-        self.connection_error = None
         self.unreadable = set()
         self.early_items = []
         self.definitions[MODEL] = [part("model.bim", MODEL_BIM)]
@@ -61,15 +88,11 @@ class Fabric(FakeFabric):
     def list_all(self, path, params=None, value_key="value"):
         if path == "connections":
             return self.tenant_connections
-        if path == "connections/supportedConnectionTypes":
-            return [SQL_METADATA]
         if path == f"workspaces/{SOURCE_WS}/mirroredDatabases":
             return self.early_items
         items = super().list_all(path, params, value_key)
         if path == f"workspaces/{SOURCE_WS}/items":
             return [*items, *CONSUMERS, *self.early_items]
-        if path == f"workspaces/{TARGET_WS}/items":
-            return [item for item in items if item["type"] != "Connection"]
         return items
 
     def get(self, path, params=None):
@@ -81,23 +104,6 @@ class Fabric(FakeFabric):
                         return candidate
             raise FabricApiError("GET", path, 403, '{"errorCode":"Denied","message":"share replacement"}')
         return super().get(path, params)
-
-    def post(self, path, json=None, params=None, wait=True):
-        if path == "connections":
-            self.connection_creates.append(json)
-            if self.connection_error:
-                raise self.connection_error
-            candidate = {
-                **json, "id": REPLACEMENT,
-                "connectionDetails": {
-                    "type": json["connectionDetails"]["type"],
-                    "path": ";".join(p["value"] for p in json["connectionDetails"]["parameters"]),
-                },
-            }
-            self.tenant_connections.append(candidate)
-            self.created.append(("Connection", json["displayName"], REPLACEMENT))
-            return candidate
-        return super().post(path, json, params, wait)
 
 
 @pytest.fixture
@@ -112,113 +118,153 @@ def fabric(monkeypatch):
     return fake
 
 
-def rebuild(fabric, prior=None):
+def rebuild(fabric, prior=None, **plan_overrides):
     run = MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64")
-    plan = replace(make_plan(), include_data=False, include_files=False)
+    plan = replace(make_plan(), include_data=False, include_files=False, **plan_overrides)
     orchestrator.run_migration(run, PRINCIPAL, plan, cleanup=False, prior=prior)
     assert run.status == RunStatus.SUCCEEDED, run.error
     return run
 
 
-def test_connection_is_created_and_journaled_before_pipeline_and_eventstream(fabric):
-    run = rebuild(fabric)
-    order = [kind for kind, _, _ in fabric.created]
-    assert order.index("Lakehouse") < order.index("Connection") < order.index("Eventstream")
-    assert order.index("Connection") < order.index("DataPipeline")
-    for kind, _, target_id in fabric.created:
-        if kind in {"DataPipeline", "Eventstream"}:
-            payload = decode_json_part(fabric.definitions[target_id][0]["payload"])
-            assert payload["connectionId"] == REPLACEMENT
-            assert payload["externalReferences"]["connection"] == EXTERNAL
-    assert len(fabric.connection_creates) == 1
-    assert fabric.connection_creates[0]["connectionDetails"]["parameters"] == [
-        {"name": "server", "dataType": "Text", "value": TARGET_ENDPOINT},
-        {"name": "database", "dataType": "Text", "value": "lh-new"},
-    ]
-    assert journal.read(SETTINGS.journal_for(run.id)).id_map[CONNECTION] == REPLACEMENT
+# --------------------------------------------------------- no mapping, no creation, no adoption
 
 
-@pytest.mark.parametrize("reason", ["secrets", "create-fails", "unmapped-store"])
-def test_unresolved_source_connection_prevents_dependent_creates(fabric, reason):
-    if reason == "secrets":
-        fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
-    elif reason == "create-fails":
-        fabric.connection_error = FabricApiError(
-            "POST", "connections", 400, '{"errorCode":"InvalidCredentials","message":"grant identity"}',
-        )
-    else:
-        fabric.source_connection["connectionDetails"]["path"] = f"{SOURCE_ENDPOINT};{MODEL}"
+def test_a_source_bound_connection_is_never_created_or_adopted_without_a_mapping(fabric):
     run = rebuild(fabric)
+
+    assert not any(kind == "Connection" for kind, _, _ in fabric.created)
+    # Nothing to bind the connection to, so the consumers that need it are refused rather
+    # than created against a stale or absent reference.
     assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
     warnings = run.summary["warnings"]
-    assert any("Bronze SQL" in warning for warning in warnings)
-    if reason == "create-fails":
-        assert any("InvalidCredentials" in warning and "grant identity" in warning for warning in warnings)
-    elif reason == "secrets":
-        assert not fabric.connection_creates
-        assert any("enter its credentials" in warning and TARGET_ENDPOINT in warning for warning in warnings)
+    assert any("Daily pipeline" in warning and "Bronze SQL" in warning for warning in warnings)
+    assert any("Live events" in warning and "Bronze SQL" in warning for warning in warnings)
+    assert CONNECTION not in journal.read(SETTINGS.journal_for(run.id)).id_map
 
 
-def test_retry_adopts_an_operator_created_replacement_without_copying_secrets(fabric):
-    fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
-    first = rebuild(fabric)
-    candidate = connection(
-        id=REPLACEMENT, displayName=connections.replacement_name(fabric.source_connection, TARGET_WS),
-        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
-        credentialDetails={"credentialType": "Basic"},
-    )
-    fabric.tenant_connections.append(candidate)
-    second = rebuild(fabric, journal.read(SETTINGS.journal_for(first.id)))
-    assert not fabric.connection_creates
-    assert any(kind == "DataPipeline" for kind, _, _ in fabric.created)
-    assert journal.read(SETTINGS.journal_for(second.id)).id_map[CONNECTION] == REPLACEMENT
-
-
-def test_retry_verifies_and_reuses_a_prior_replacement(fabric):
-    first = rebuild(fabric)
-    rebuild(fabric, journal.read(SETTINGS.journal_for(first.id)))
-    assert len(fabric.connection_creates) == 1
-
-
-def test_an_inaccessible_prior_replacement_is_not_duplicated_or_used_for_new_consumers(fabric):
-    first = rebuild(fabric)
-    prior = journal.read(SETTINGS.journal_for(first.id))
-    # A prior consumer that was never created must not reuse an unverifiable connection.
-    for item in CONSUMERS:
-        prior.id_map.pop(item["id"], None)
-    fabric.created = [entry for entry in fabric.created if entry[0] not in {"DataPipeline", "Eventstream"}]
-    fabric.unreadable.add(REPLACEMENT)
-    second = rebuild(fabric, prior)
-    assert len(fabric.connection_creates) == 1
-    assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
-    assert any(
-        "Denied" in warning and "share replacement" in warning
-        for warning in second.summary["warnings"]
-    )
-
-
-def test_name_alone_never_adopts_a_source_bound_connection(fabric):
-    fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
+def test_a_plausible_destination_connection_is_never_adopted_without_an_explicit_mapping(fabric):
+    """A destination connection that happens to share the migrated target's path must not be
+    treated as a replacement just because it looks like one; only a supplied mapping does."""
     fabric.tenant_connections.append(connection(
-        id=REPLACEMENT, displayName=connections.replacement_name(fabric.source_connection, TARGET_WS),
-        connectionDetails={"type": "SQL", "path": f"{SOURCE_ENDPOINT};{LAKEHOUSE}"},
+        id=REPLACEMENT, displayName="Bronze SQL",
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
     ))
     rebuild(fabric)
     assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
 
 
-def test_early_mirror_consumer_refuses_a_connection_not_yet_replaced(fabric):
+def test_a_connection_referenced_but_not_pointing_into_the_workspace_is_left_alone(fabric):
+    """``EXTERNAL`` is bound by both consumers but its path never names this workspace, so it
+    is a standard external connection: reused unchanged, nothing for the operator to resolve."""
+    fabric.tenant_connections.append(connection(
+        id=REPLACEMENT, displayName="Bronze SQL (dest)",
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
+    ))
+    run = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT})
+    assert EXTERNAL not in journal.read(SETTINGS.journal_for(run.id)).id_map
+    assert not any("external.example.com" in warning for warning in run.summary["warnings"])
+
+
+# ------------------------------------------------------------------- explicit mapping honoured
+
+
+def test_an_explicit_connection_mapping_is_validated_and_used_to_bind_consumers(fabric):
+    fabric.tenant_connections.append(connection(
+        id=REPLACEMENT, displayName="Bronze SQL (dest)",
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
+    ))
+    run = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT})
+
+    assert not any(kind == "Connection" for kind, _, _ in fabric.created)
+    for kind, _, target_id in fabric.created:
+        if kind in {"DataPipeline", "Eventstream"}:
+            payload = decode_json_part(fabric.definitions[target_id][0]["payload"])
+            assert payload["connectionId"] == REPLACEMENT
+            assert payload["externalReferences"]["connection"] == EXTERNAL
+    assert {kind for kind, _, _ in fabric.created} >= {"DataPipeline", "Eventstream"}
+    assert journal.read(SETTINGS.journal_for(run.id)).id_map[CONNECTION] == REPLACEMENT
+
+
+def test_resume_preserves_a_previously_validated_mapping(fabric):
+    fabric.tenant_connections.append(connection(
+        id=REPLACEMENT, displayName="Bronze SQL (dest)",
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
+    ))
+    first = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT})
+    prior = journal.read(SETTINGS.journal_for(first.id))
+    second = rebuild(fabric, prior=prior, connection_mappings={CONNECTION: REPLACEMENT})
+
+    assert not any(kind == "Connection" for kind, _, _ in fabric.created)
+    assert journal.read(SETTINGS.journal_for(second.id)).id_map[CONNECTION] == REPLACEMENT
+
+
+def test_removed_connection_mapping_invalidates_the_prior_binding_on_retry(fabric):
+    """Removing a mapping between attempts tombstones it hard enough to refuse a resume that
+    would otherwise leave an already-created consumer bound to a connection nobody vouches
+    for any more, rather than silently reconciling it as if nothing had changed."""
+    fabric.tenant_connections.append(connection(
+        id=REPLACEMENT, displayName="Bronze SQL (dest)",
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
+    ))
+    first = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT})
+    assert journal.read(SETTINGS.journal_for(first.id)).id_map[CONNECTION] == REPLACEMENT
+
+    prior = journal.read(SETTINGS.journal_for(first.id))
+    second = MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64")
+    plan = replace(make_plan(), include_data=False, include_files=False)
+    orchestrator.run_migration(second, PRINCIPAL, plan, cleanup=False, prior=prior)
+
+    # The Eventstream this mapping used to bind was already created last time; with the
+    # mapping gone it cannot be silently rebound, so the resume itself is refused rather
+    # than quietly finishing with the stale binding intact.
+    assert second.status == RunStatus.FAILED
+    assert "Live events" in second.error and "Bronze SQL" in second.error
+    assert CONNECTION not in journal.read(SETTINGS.journal_for(second.id)).id_map
+
+
+@pytest.mark.parametrize("mismatch", ["type", "connectivityType"])
+def test_a_mapping_to_a_connection_that_no_longer_matches_the_migrated_target_is_refused(fabric, mismatch):
+    replacement = connection(
+        id=REPLACEMENT, displayName="Bronze SQL (dest)",
+        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
+    )
+    if mismatch == "type":
+        replacement["connectionDetails"]["type"] = "Web"
+    else:
+        replacement["connectivityType"] = "PersonalCloud"
+    fabric.tenant_connections.append(replacement)
+
+    run = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT})
+    assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
+    assert CONNECTION not in journal.read(SETTINGS.journal_for(run.id)).id_map
+    assert any("no longer matches its migrated target" in warning for warning in run.summary["warnings"])
+
+
+def test_a_mapping_to_an_unreadable_destination_connection_is_refused(fabric):
+    fabric.unreadable.add(REPLACEMENT)
+    run = rebuild(fabric, connection_mappings={CONNECTION: REPLACEMENT})
+
+    assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
+    assert CONNECTION not in journal.read(SETTINGS.journal_for(run.id)).id_map
+    assert any(
+        "Denied" in warning and "share replacement" in warning for warning in run.summary["warnings"]
+    )
+
+
+# ------------------------------------------------------------------------- early mirror consumer
+
+
+def test_early_mirror_consumer_refuses_an_unmapped_connection(fabric):
     mirror = {"id": "mirror", "displayName": "Internal mirror", "type": "MirroredDatabase"}
     fabric.early_items = [mirror]
     fabric.definitions["mirror"] = [part("mirroring.json", {"connection": CONNECTION})]
+
     run = rebuild(fabric)
     assert not any(kind == "MirroredDatabase" for kind, _, _ in fabric.created)
     assert any(
-        "Internal mirror" in warning and "Bronze SQL" in warning
-        for warning in run.summary["warnings"]
+        "Internal mirror" in warning and "Bronze SQL" in warning for warning in run.summary["warnings"]
     )
     assert "mirror" not in journal.read(SETTINGS.journal_for(run.id)).id_map
-    assert len(fabric.connection_creates) == 1
 
 
 def test_connection_detection_does_not_require_the_relations_api(fabric, monkeypatch):
@@ -227,64 +273,81 @@ def test_connection_detection_does_not_require_the_relations_api(fabric, monkeyp
     monkeypatch.setattr(
         relations, "build_graph", lambda *a, **k: relations.DependencyGraph(available=False),
     )
-    fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
     rebuild(fabric)
     assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
 
 
-@pytest.mark.parametrize("mismatch", ["type", "connectivityType"])
-def test_manual_adoption_requires_connector_and_connectivity_identity(fabric, mismatch):
-    fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
-    replacement = connection(
-        id=REPLACEMENT, displayName=connections.replacement_name(fabric.source_connection, TARGET_WS),
-        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};lh-new"},
+# ---------------------------------------------------------------- shortcuts bind connections too
+
+
+def test_a_connection_referenced_only_by_a_shortcut_is_still_detected():
+    """A shortcut's target carries its own ``connectionId``, separate from an item's own
+    definition parts, so it must be picked up even when nothing else in the workspace names
+    the connection directly."""
+    lakehouse = {"id": LAKEHOUSE, "displayName": "bronze", "type": "Lakehouse"}
+    source_connection = connection(
+        id=CONNECTION, connectionDetails={"type": "SQL", "path": f"{SOURCE_ENDPOINT};{LAKEHOUSE}"},
     )
-    if mismatch == "type":
-        replacement["connectionDetails"]["type"] = "Web"
-    else:
-        replacement["connectivityType"] = "PersonalCloud"
-    fabric.tenant_connections.append(replacement)
-    rebuild(fabric)
-    assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
 
+    class Client:
+        def list_all(self, path, params=None, value_key="value"):
+            if path == "connections":
+                return [source_connection]
+            if path == f"workspaces/{SOURCE_WS}/lakehouses":
+                return []
+            if path == f"workspaces/{SOURCE_WS}/items/{LAKEHOUSE}/shortcuts":
+                return [{
+                    "name": "ext", "path": "Files/ext",
+                    "target": {"adlsGen2": {"connectionId": CONNECTION}},
+                }]
+            raise AssertionError(f"unexpected list {path}")
 
-@pytest.mark.parametrize("catalog_mapped", [False, True])
-def test_generated_sql_catalog_mapping_allows_verified_manual_connection_adoption(fabric, catalog_mapped):
-    source_catalog = "Orders-aaaabbbb-2222-3333-4444-555566667777"
-    target_catalog = "Orders-bbbbcccc-2222-3333-4444-555566667777"
-    fabric.source_connection["connectionDetails"]["path"] = f"{SOURCE_ENDPOINT};{source_catalog}"
-    fabric.source_connection["credentialDetails"] = {"credentialType": "Basic"}
-    fabric.tenant_connections.append(connection(
-        id=REPLACEMENT, displayName=connections.replacement_name(fabric.source_connection, TARGET_WS),
-        connectionDetails={"type": "SQL", "path": f"{TARGET_ENDPOINT};{target_catalog}"},
-        credentialDetails={"credentialType": "Basic"},
-    ))
     ctx = orchestrator._Context(
-        client=fabric, tokens=object(), principal=PRINCIPAL, plan=make_plan(),
-        run=MigrationRun(source_workspace_name="src", capacity_name="F64"), scratch_dir=None,
+        client=Client(), tokens=object(), principal=PRINCIPAL, plan=make_plan(),
+        run=MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64"), scratch_dir=None,
         target_workspace_id=TARGET_WS,
-        source_items={
-            "sql-item": {
-                "id": "sql-item", "type": "SQLDatabase", "displayName": "Orders",
-                "properties": {"serverFqdn": SOURCE_ENDPOINT, "databaseName": source_catalog},
-            },
-            CONNECTION: {**fabric.source_connection, "type": "Connection"},
-        },
-        id_map={
-            SOURCE_WS: TARGET_WS, "sql-item": "sql-new", SOURCE_ENDPOINT: TARGET_ENDPOINT,
-            **({source_catalog: target_catalog} if catalog_mapped else {}),
-        },
+        source_items={LAKEHOUSE: dict(lakehouse)},
+        id_map={SOURCE_WS: TARGET_WS, LAKEHOUSE: "lh-new"},
+        assessment=assess_workspace([lakehouse], force_rebuild=True),
     )
-    orchestrator._migrate_connections(ctx)
-    orchestrator._migrate_realtime(ctx)
-    orchestrator._migrate_orchestration(ctx)
-    assert not fabric.connection_creates
-    if catalog_mapped:
-        assert ctx.id_map[CONNECTION] == REPLACEMENT
-        assert {kind for kind, _, _ in fabric.created} == {"Eventstream", "DataPipeline"}
-        for _, _, target_id in fabric.created:
-            payload = decode_json_part(fabric.definitions[target_id][0]["payload"])
-            assert payload["connectionId"] == REPLACEMENT
-    else:
-        assert CONNECTION not in ctx.id_map and not fabric.created
-        assert any("Orders" in warning for warning in ctx.warnings)
+    orchestrator._load_source_references(ctx)
+
+    # Detected and tracked (available for the operator to map), but still not resolved: a
+    # shortcut reference does not imply a mapping any more than an item definition does.
+    assert ctx.source_items[CONNECTION]["type"] == "Connection"
+    assert CONNECTION not in ctx.id_map
+
+
+def test_a_connection_pointing_at_the_workspace_but_referenced_by_nothing_is_left_alone():
+    """Fab Shuffle never scans every tenant connection for one that merely points at the
+    workspace; only connections its selected items and shortcuts actually reference matter."""
+    lakehouse = {"id": LAKEHOUSE, "displayName": "bronze", "type": "Lakehouse"}
+    unreferenced = "dddddddd-1111-2222-3333-444455556666"
+    stray = connection(
+        id=unreferenced, displayName="Unrelated",
+        connectionDetails={"type": "SQL", "path": f"{SOURCE_ENDPOINT};{LAKEHOUSE}"},
+    )
+
+    class Client:
+        def list_all(self, path, params=None, value_key="value"):
+            if path == "connections":
+                return [stray]
+            if path == f"workspaces/{SOURCE_WS}/lakehouses":
+                return []
+            if path == f"workspaces/{SOURCE_WS}/items/{LAKEHOUSE}/shortcuts":
+                return []
+            raise AssertionError(f"unexpected list {path}")
+
+    ctx = orchestrator._Context(
+        client=Client(), tokens=object(), principal=PRINCIPAL, plan=make_plan(),
+        run=MigrationRun(source_workspace_name="bronze-ws", capacity_name="F64"), scratch_dir=None,
+        target_workspace_id=TARGET_WS,
+        source_items={LAKEHOUSE: dict(lakehouse)},
+        id_map={SOURCE_WS: TARGET_WS, LAKEHOUSE: "lh-new"},
+        assessment=assess_workspace([lakehouse], force_rebuild=True),
+    )
+    orchestrator._load_source_references(ctx)
+
+    assert unreferenced not in ctx.source_items
+    assert unreferenced not in ctx.id_map
+    assert not ctx.warnings

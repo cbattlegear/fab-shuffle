@@ -170,8 +170,8 @@ copies everything it supports.
 | Notebook | ✅ | n/a | Default lakehouse and environment attachment rebound |
 | Environment | ✅ | n/a | Libraries and Spark settings; needs publishing afterwards |
 | Dataflow Gen2 (CI/CD) | ✅ | n/a | Rebound to migrated items |
-| Data pipeline | ✅ | n/a | Rebound to migrated items and replacement connections |
-| Copy Job | ✅ | n/a | Rebound to migrated items and replacement connections |
+| Data pipeline | ✅ | n/a | Rebound to migrated items; a connection still pointing at the source needs an explicit destination mapping |
+| Copy Job | ✅ | n/a | Rebound to migrated items; a connection still pointing at the source needs an explicit destination mapping |
 | OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
 | Workspace folders | ✅ | n/a | Hierarchy recreated, and items placed back into it |
 | Custom Spark pools | ✅ | n/a | Recreated, and environments repointed at them |
@@ -286,7 +286,10 @@ map, and later phases rewrite their exported definitions through it, so a phase 
 reference items created by an earlier one:
 
 0. **Assessment and dependency check** — both run before anything is created, so a workspace
-   that cannot migrate cleanly can be abandoned rather than left half built.
+   that cannot migrate cleanly can be abandoned rather than left half built. The dependency
+   check also detects which tenant connections the migrated items and shortcuts actually
+   reference; it does not validate a supplied `connection_mappings` entry yet, because the
+   data store its path might name does not exist yet.
 1. **Workspaces** — target and scratch workspaces, the folder tree, and the custom Spark
    pools plus workspace Spark settings. Pools come first because an environment pins one by
    id, so it has to exist before the engineering phase runs.
@@ -295,70 +298,80 @@ reference items created by an earlier one:
 3. **Lakehouses** — before warehouses, because warehouse views can reference lakehouse
    tables through the SQL analytics endpoint.
 4. **Warehouses** — schema before data, so Copy Job activities have tables to land in.
-5. **Mirrored databases** — data stores with their own SQL analytics endpoint, so they go
-   with the others and before anything that reads them.
-6. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
+5. **Fabric SQL databases** — schema through the item definition, rows through a Copy Job;
+   a data store like the rest, read by GraphQL APIs, pipelines and Copy Jobs.
+6. **Connection mappings** — only runs when the operator supplied `connection_mappings`; with
+   none supplied, there is no step and no rebuild noise about connections nothing referenced.
+   Each supplied mapping is validated now that every phase above it that can add to the id map
+   has run, so a connection whose path names a lakehouse or warehouse endpoint is not
+   misdiagnosed as broken before that endpoint existed.
+7. **Mirrored databases** — data stores with their own SQL analytics endpoint that can also
+   bind a connection directly, so they go with the others, after connection mappings are
+   validated, and before anything that reads them.
+8. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
    This covers lakehouse shortcuts and KQL database table shortcuts. The SQL analytics
    endpoint is refreshed only now, so it sees both the copied tables and the new shortcuts,
    and only then is its schema copied.
-7. **Connections** — recreate connections that point into the source workspace, aimed at the
-   items just created, and put their new ids in the id map so everything after this binds to
-   them.
-8. **Eventstreams, KQL querysets, and KQL dashboards** — all three read the eventhouses and
+9. **Eventstreams, KQL querysets, and KQL dashboards** — all three read the eventhouses and
    data stores above, and an eventstream sources from connections.
-9. **Environments, notebooks, then dataflows, then the rest** — a notebook attaches to an
-   environment and reads a lakehouse, and a semantic model can read a dataflow, so those come
-   first. Spark job definitions, GraphQL APIs, graph models and query sets, maps, variable
-   libraries and mounted data factories follow, since each reads something built earlier.
-10. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
-    endpoint and GUID of the lakehouse or warehouse it reads, so it needs step 6 finished; a
-    report embeds its model's GUID, so it runs after the models. Models are ordered among
-    themselves using the relations graph, so a composite model follows what it reads.
-11. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
+10. **Environments, notebooks, then dataflows, then the rest** — a notebook attaches to an
+    environment and reads a lakehouse, and a semantic model can read a dataflow, so those come
+    first. Spark job definitions, GraphQL APIs, graph models and query sets, maps, variable
+    libraries and mounted data factories follow, since each reads something built earlier.
+11. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
+    endpoint and GUID of the lakehouse or warehouse it reads, so it needs the data store phases
+    finished; a report embeds its model's GUID, so it runs after the models. Models are ordered
+    among themselves using the relations graph, so a composite model follows what it reads.
+12. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
     refreshing models, and invoking each other, so they are ordered among themselves by the
     relations graph.
-12. **Activators** — last of the content phases. An Activator watches an eventstream or KQL
+13. **Activators** — last of the content phases. An Activator watches an eventstream or KQL
     database and acts by running pipelines and notebooks, so everything on both sides has to
     exist first.
-13. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+14. **Permissions** — the source workspace's admins are granted as soon as the workspace is
     created, so a failed run never leaves a workspace nobody can open. The remaining roles
     are replayed here, last, so nothing is visible half built.
-14. **Cleanup** — drop the scratch workspace and local staging.
+15. **Cleanup** — drop the scratch workspace and local staging.
 
 ### Connections
 
-A connection's **target cannot be changed**: none of the six `Update Connection` request
-variants accepts `connectionDetails`, so the path is fixed for the life of the connection.
-Connections are also tenant scoped, so one that points at something *outside* the workspace
-keeps working from the new region untouched.
+Fab Shuffle never creates, adopts by name, or deletes a connection on the operator's behalf,
+in any mode. A connection id is tenant scoped, so it resolves unchanged into the new
+workspace or tenant without needing to be recreated, and the API never returns an existing
+connection's credentials, so a faithful copy would not be possible even if Fabric allowed it.
+(An earlier version of this tool tried to recreate source-bound connections automatically;
+that was removed because it could only ever cover a narrow, verified-credential-free subset
+of connectors, guessed at "the same" connection by name, and left every other connector
+either silently unreplaced or wrongly adopted.)
 
-That leaves connections pointing *into* the workspace being migrated. They are found before
-anything is created, by scanning every connection path for the source workspace, its item
-GUIDs, or their SQL and Kusto endpoints. Each hit also reports whether the service principal
-holds **Owner** on it, which is the only one of the three connection roles (`User`,
-`UserWithReshare`, `Owner`) that permits management.
+An operator who has already created — or wants to point at — a replacement connection
+supplies its destination connection ID by source connection ID in the plan's
+`connection_mappings`. That supplied mapping is validated in its own phase, after every data
+store phase above it that can add to the id map has run: read back from the destination with
+destination credentials, and checked that it still targets the migrated store now that the
+store exists, then rewritten through the id map so items migrated afterwards bind to it.
+Changed or removed mappings invalidate the previously accepted binding rather than silently
+keeping the old id — see [Cross-tenant migrations](#cross-tenant-migrations) above for the
+same mechanism from the operator's side. With no `connection_mappings` supplied at all, this
+phase does not run: there is nothing to validate, and no rebuild noise about connections
+nothing referenced.
 
-Once the migrated items exist, Fab Shuffle recreates those connections against them and puts
-the new connection id in the id map, so every item migrated afterwards binds to the
-replacement. Automatic creation requires a shareable cloud SQL connection with a verified
-`server;database` path shape, and a credential type that needs no secret (`WorkspaceIdentity`
-or `Anonymous`) and is reported by the tenant. Fabric never returns an existing connection's
-credentials. Other connectors' rendered paths cannot safely be inverted into creation
-parameters without a documented format; they and secret-bearing or gateway connections
-require an operator-created replacement.
+Only connections that a *migrated* item or shortcut actually references are ever looked at: a
+data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported
+definition names one, or a lakehouse/KQL database shortcut whose target does (a shortcut's
+connection lives on the shortcut target, not in the item's own definition). Fab Shuffle does
+not scan every tenant connection that merely happens to point at the source workspace — only
+ones its own selected items and shortcuts depend on.
 
-For a manual replacement, the warning gives the exact name
-`<original name> (Fab Shuffle <target workspace ID>)`, connector type, and target path.
-Create it in **Manage connections and gateways**, enter the credentials and grant the service
-principal User access, then retry. The retry adopts only a matching name, connector,
-connectivity type and migrated path; a name alone is not proof. Previously recorded
-replacements are read back and verified, not blindly reused.
+A dependent item whose referenced connection still points into the source workspace, with no
+supplied `connection_mappings` entry for it, is refused rather than created against a
+connection that stops resolving once the source workspace is gone. The warning names the
+connection and the item and asks for a destination replacement to be created and mapped by
+hand in `connection_mappings`; it does not create one and does not promise that doing so will
+fix the underlying data source.
 
-An item with a known source-bound connection is not created until its replacement exists.
-This includes mirrors and shortcuts that run before the connection phase: retry those after
-the required stores and connections have been created. External connections are unchanged.
-
-Connections that migrated items merely *use* are left alone and checked instead, reporting:
+Connections that migrated items merely *use*, and that already point at something outside the
+workspace being migrated, are left alone and checked instead, reporting:
 
 - connections the service principal **cannot see**, which will make the item fail to run;
 - **personal cloud** connections, which cannot be shared;
@@ -699,6 +712,5 @@ published digest rather than rebuilding a tag.
 
 - Migration of the remaining definition-backed item types (notebooks, pipelines, semantic
   models, eventstreams, and friends)
-- Connection remapping for external shortcuts and pipelines
 - Configurable parallelism for data transfers
 - Multiple workspace support in a single run

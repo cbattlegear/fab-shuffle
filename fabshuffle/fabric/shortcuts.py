@@ -450,6 +450,27 @@ class _ShortcutEvidence:
             )
 
 
+def referenced_connection_ids(source: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Connection ids a shortcut's target names directly.
+
+    A shortcut can bind an external connection (an ADLS Gen2 account, an S3 endpoint, a
+    delegated cross-tenant OneLake target) that never appears anywhere in its item's own
+    definition, since the connection lives on the shortcut target, not in the item's
+    definition parts. Anything that needs to know which connections an item actually depends
+    on - before deciding whether one of them still needs an explicit destination mapping -
+    has to look at its shortcuts separately from ``connections.referenced_connection_ids``.
+    """
+    found: set[str] = set()
+    for shortcut in source:
+        for settings in (shortcut.get("target") or {}).values():
+            if not isinstance(settings, Mapping):
+                continue
+            connection_id = settings.get("connectionId")
+            if isinstance(connection_id, str) and connection_id:
+                found.add(connection_id)
+    return found
+
+
 def _source_connection_ids(
     shortcut: Mapping[str, Any],
     source_items: Mapping[str, Mapping[str, Any]] | None,
@@ -767,6 +788,7 @@ __all__ = [
     "list_shortcuts",
     "list_table_shortcuts",
     "onelake_item_id",
+    "referenced_connection_ids",
     "remap_shortcut_target",
     "table_shortcut_keys",
     "table_shortcut_names",
