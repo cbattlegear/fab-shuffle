@@ -80,10 +80,10 @@
       <p id="destination-context" class="hint identity-context" hidden></p>
       <p id="resumable-status" class="hint" role="status" hidden></p>
       <div id="resumable" class="warnings" hidden>
-        <h3>Unfinished migrations</h3>
+        <h3>Saved migrations needing attention</h3>
         <p class="hint">
-          These stopped partway, most likely because the container was restarted. Picking one
-          up carries on from where it got to instead of building the workspace again.
+          These stopped partway or finished with failed work. Retrying carries on from the
+          saved journal instead of building the workspace again or repeating completed copies.
         </p>
         <ul></ul>
       </div>

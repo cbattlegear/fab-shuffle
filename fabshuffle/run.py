@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fabshuffle import journal
-from fabshuffle.lifecycle import Lifecycle
+from fabshuffle.lifecycle import EvidenceState, Lifecycle
 
 
 class StepStatus(StrEnum):
@@ -383,8 +383,14 @@ class RunRegistry:
                 lineage = replay.lineage_id or replay.run_id
                 target = replay.target_workspace_id
                 keys = self._cleanup_keys(replay.plan, lineage, target, replay.scratch_workspace_id)
+                failed_work = replay.status == RunStatus.SUCCEEDED.value and any(
+                    evidence.state is EvidenceState.FAILED
+                    for outcome in replay.outcomes.values()
+                    for step, evidence in outcome.steps.items()
+                    if step in outcome.required
+                )
                 if (
-                    replay.interrupted
+                    (replay.interrupted or failed_work)
                     and not self._active(lineage, target, replay.plan, replay.scratch_workspace_id)
                     and "*" not in self._cleaning
                     and not self._cleaning.intersection(keys)

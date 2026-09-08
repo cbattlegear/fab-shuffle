@@ -9,6 +9,9 @@ Fabric directly and takes an access token from a file, which is the token we alr
 from __future__ import annotations
 
 import subprocess
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import pyodbc
 import pytest
@@ -68,6 +71,8 @@ def target_connection(monkeypatch):
     reaching for a real SQL endpoint.
     """
     connection = FakeConnection()
+    # These command-construction tests model the supported container runtime, not the host.
+    monkeypatch.setattr(bulkcopy, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(bulkcopy.sqlschema, "connect", lambda *a, **k: connection)
     return connection
 
@@ -115,6 +120,42 @@ def test_the_token_is_written_as_utf16le_with_no_bom():
     # bcp reads UTF-16LE and rejects a byte order mark.
     assert raw == b"a\x00b\x00c\x00"
     assert not raw.startswith(b"\xff\xfe")
+
+
+def test_token_file_uses_secure_temporary_storage_not_application_directory():
+    with bulkcopy.token_file(FakeTokens()) as path:
+        assert path.parent == Path(tempfile.gettempdir())
+
+
+def test_windows_cannot_fall_back_to_integrated_authentication(monkeypatch, tmp_path):
+    monkeypatch.setattr(bulkcopy, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(
+        bulkcopy.sqlschema, "connect", lambda *a, **kw: pytest.fail("No target connection should open"),
+    )
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: pytest.fail("Windows bcp must not be invoked"),
+    )
+    tokens = FakeTokens()
+    staging = tmp_path / "bcp"
+    with pytest.raises(bulkcopy.BulkCopyError, match="Windows integrated/user authentication"):
+        bulkcopy.copy_tables(
+            source_server="source", source_database="db", target_server="target", target_database="db",
+            tables=[TableRef(name="CustomerAddress", schema="SalesLT")],
+            tokens=tokens, scratch_dir=staging,
+        )
+    assert tokens.asked == 0
+    assert not staging.exists()
+
+
+@pytest.mark.parametrize("direction", ["out", "in"])
+def test_direct_windows_bcp_calls_are_also_refused(monkeypatch, tmp_path, direction):
+    monkeypatch.setattr(bulkcopy, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("No integrated-auth fallback"))
+    with pytest.raises(bulkcopy.BulkCopyError, match="Docker image"):
+        bulkcopy._bcp(
+            TableRef(name="Orders"), direction, tmp_path / "data",
+            server="server", database="db", token=tmp_path / "token",
+        )
 
 
 def test_the_token_file_is_owner_only_and_removed_afterwards():
@@ -380,7 +421,8 @@ def test_a_missing_bcp_says_so_rather_than_failing_obscurely(monkeypatch, tmp_pa
         scratch_dir=tmp_path,
     )
 
-    assert "is not installed in this image" in warnings[0]
+    assert "is not installed in this runtime" in warnings[0]
+    assert "Docker image" in warnings[0]
 
 
 def test_the_data_file_is_removed_after_each_table(monkeypatch, tmp_path):

@@ -141,7 +141,7 @@ const scenarios = {
     assert.ok(f.requests.every((r) => r.url !== "/api/scratch-workspaces"));
     const resumable = f.requests.findIndex((r) => r.url === "/api/resumable");
     await f.reply(resumable, { runs: [] });
-    assert.match(f.get("resumable-status").textContent, /No unfinished runs/);
+    assert.match(f.get("resumable-status").textContent, /No saved runs need retrying/);
   },
   async freeze_and_review(f) {
     f.paired();

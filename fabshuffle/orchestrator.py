@@ -1485,7 +1485,7 @@ def _load_source_references(ctx: _Context) -> None:
             ctx.invalidate_mapping(mapped_key)
             ctx.unverified_connections.add(source_connection_id)
             ctx.warnings.append(
-                f"Connection '{connection.get('displayName')}' replacement {target_id} "
+                f"Connection '{connections.display_name(connection)}' replacement {target_id} "
                 f"could not be verified: {error}. Grant access or restore it, then retry."
             )
             continue
@@ -1496,7 +1496,7 @@ def _load_source_references(ctx: _Context) -> None:
         ):
             ctx.invalidate_mapping(mapped_key)
             ctx.warnings.append(
-                f"Connection '{connection.get('displayName')}' replacement {target_id} no longer "
+                f"Connection '{connections.display_name(connection)}' replacement {target_id} no longer "
                 "matches its migrated target. Restore the replacement against the migrated "
                 "store, then retry; dependent items will not be created with the old binding."
             )
@@ -3535,8 +3535,9 @@ def _migrate_connections(ctx: _Context) -> None:
         source_id = source["id"]
         if source_id in ctx.unverified_connections:
             warnings.append(
-                f"Connection '{source.get('displayName')}' has an unreadable prior replacement. "
-                "Restore this service principal's access to it, then retry; no duplicate was created."
+                f"Connection '{connections.display_name(source)}' has an unreadable prior "
+                "replacement. Restore this service principal's access to it, then retry; no "
+                "duplicate was created."
             )
             continue
         path = (source.get("connectionDetails") or {}).get("path") or ""
@@ -3549,20 +3550,34 @@ def _migrate_connections(ctx: _Context) -> None:
         new_path = rewrite(path) if rewrite else path
         if needed or (not ctx.plan.cross_tenant and connections.same_path(path, new_path)):
             warnings.append(
-                f"Connection '{source.get('displayName')}' was not replaced: its target "
+                f"Connection '{connections.display_name(source)}' was not replaced: its target "
                 f"still needs {', '.join(needed) or 'a complete source-to-target mapping'}. "
                 "Migrate that store and its endpoint, then retry."
             )
             continue
 
-        instruction = (
-            f"Create connection '{name}' with type "
-            f"'{(source.get('connectionDetails') or {}).get('type')}', connectivity "
-            f"'{source.get('connectivityType')}' and target '{new_path}' "
-            "in Manage connections and gateways, enter its credentials, grant this service "
-            "principal User access, then retry. Dependent items are left uncreated until "
-            "that replacement is available."
-        )
+        connectivity = source.get("connectivityType") or ""
+        connection_type_label = (source.get("connectionDetails") or {}).get("type")
+        if connectivity == "PersonalCloud":
+            # A personal cloud connection cannot be shared and Fabric has no API or portal
+            # flow to create one explicitly (it only arises implicitly from a data source's
+            # default mapping), so the fix is a new shareable connection, not a like-for-like
+            # recreation of the personal one.
+            instruction = (
+                "Personal cloud connections cannot be shared or recreated by hand: create a "
+                f"new shareable cloud connection named '{name}' with type "
+                f"'{connection_type_label}' and target '{new_path}' in Manage connections and "
+                "gateways, grant this service principal User access to it, then retry. "
+                "Dependent items are left uncreated until that replacement is available."
+            )
+        else:
+            instruction = (
+                f"Create connection '{name}' with type '{connection_type_label}', connectivity "
+                f"'{connectivity}' and target '{new_path}' "
+                "in Manage connections and gateways, enter its credentials, grant this service "
+                "principal User access, then retry. Dependent items are left uncreated until "
+                "that replacement is available."
+            )
         supplied_target = ctx.plan.connection_mappings.get(source_id)
         if supplied_target and source_id not in ctx.id_map:
             ctx.map_alias(source_id, supplied_target, source_id)
@@ -3584,7 +3599,7 @@ def _migrate_connections(ctx: _Context) -> None:
 
         if ctx.plan.cross_tenant:
             warnings.append(
-                f"Connection '{source.get('displayName') or source_id}' ({source_id}) needs an "
+                f"Connection '{connections.display_name(source)}' ({source_id}) needs an "
                 f"explicit destination connection mapping. {instruction}"
             )
             continue
@@ -3618,19 +3633,19 @@ def _migrate_connections(ctx: _Context) -> None:
         )
         if not payload:
             warnings.append(
-                f"Connection '{source.get('displayName')}' "
+                f"Connection '{connections.display_name(source)}' "
                 f"{reason or 'has a path whose creation parameters cannot be reconstructed safely'}. "
                 + instruction
             )
             continue
-        ctx.run.update_step(step, f"Replacing connection '{source.get('displayName')}'")
+        ctx.run.update_step(step, f"Replacing connection '{connections.display_name(source)}'")
         try:
             created = connections.create_connection(ctx.destination_client, payload)
             if not connections.matches_replacement(created, source, new_path):
                 raise FabricError("the created connection did not return the expected ID, type and target")
         except FabricError as error:
             warnings.append(
-                f"Connection '{source.get('displayName')}' was not replaced: {error}. {instruction}"
+                f"Connection '{connections.display_name(source)}' was not replaced: {error}. {instruction}"
             )
             continue
         ctx.id_map[source_id] = created["id"]

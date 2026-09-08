@@ -102,17 +102,25 @@ def _remap_target(target: Mapping[str, Any], id_map: Mapping[str, str]) -> dict[
         if target_type == "oneLake":
             workspace_id = settings.get("workspaceId") or ""
             if identity_key(workspace_id) not in identities:
-                result[target_type] = dict(settings)
-                continue
-            result[target_type] = {
-                **settings,
-                "workspaceId": identities.get(
-                    identity_key(settings.get("workspaceId") or ""), settings.get("workspaceId")
-                ),
-                "itemId": identities.get(
-                    identity_key(settings.get("itemId") or ""), settings.get("itemId")
-                ),
-            }
+                remapped = dict(settings)
+            else:
+                remapped = {
+                    **settings,
+                    "workspaceId": identities.get(
+                        identity_key(settings.get("workspaceId") or ""), settings.get("workspaceId")
+                    ),
+                    "itemId": identities.get(
+                        identity_key(settings.get("itemId") or ""), settings.get("itemId")
+                    ),
+                }
+            # A delegated cross-tenant OneLake shortcut carries its own connectionId (the
+            # producer-tenant connection used for the cross-tenant auth), independent of
+            # whether workspaceId/itemId needed remapping. Leaving it pointed at the source
+            # connection makes the create call a legitimate 400 against the wrong tenant.
+            connection_id = settings.get("connectionId")
+            if isinstance(connection_id, str):
+                remapped["connectionId"] = identities.get(identity_key(connection_id), connection_id)
+            result[target_type] = remapped
         else:
             result[target_type] = dict(settings)
             connection_id = settings.get("connectionId")

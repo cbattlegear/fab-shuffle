@@ -429,6 +429,12 @@ Steps to set up your service principal:
 Fab Shuffle is a container with a web wizard. Run it wherever you like — your own machine is
 the simplest, and Azure Container Apps takes one click.
 
+**Run and test the application through its Docker image, not a host Python preview.** The image
+provides the pinned AzCopy, SqlPackage, UnpackDacPac, bcp and ODBC runtime. Windows bcp does not
+support the access-token-file mode used here; the application refuses that invocation rather
+than attempting Windows integrated authentication. SQL authentication remains service-principal
+access tokens, never the current desktop user's identity.
+
 #### Locally
 
 ```bash
@@ -508,6 +514,8 @@ The same machinery retries a run that *did* finish but left items behind — a c
 was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
 what did not migrate** on the progress screen, and only the missing items are attempted. The
 scratch workspace it deleted on the way out is rebuilt automatically.
+Completed runs with recorded failed steps also appear under **Saved migrations needing
+attention** after a container restart, so a runtime handoff does not lose the retry controls.
 
 Two things follow from this:
 

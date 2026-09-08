@@ -61,7 +61,7 @@ def token_file(tokens: TokenProvider):
     bcp wants UTF-16LE without a byte order mark. The file holds a live credential, so it is
     created with owner-only permissions and deleted in a finally rather than left in scratch.
     """
-    handle, path = tempfile.mkstemp(prefix="fabshuffle-token-", suffix=".tok", dir=Path.cwd())
+    handle, path = tempfile.mkstemp(prefix="fabshuffle-token-", suffix=".tok")
     os.close(handle)
     location = Path(path)
     try:
@@ -122,13 +122,28 @@ def _run(command: list[str], *, what: str) -> str:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except FileNotFoundError as error:
         raise BulkCopyError(
-            f"{what} could not run because '{command[0]}' is not installed in this image. "
-            "Copying SQL database rows needs bcp."
+            f"{what} could not run because '{command[0]}' is not installed in this runtime. "
+            "Run the Fab Shuffle Docker image, which includes the required bcp tool."
         ) from error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1000:]
         raise BulkCopyError(f"{what} failed with exit code {result.returncode}: {detail}")
     return result.stdout or ""
+
+
+def _bcp_token_file_supported() -> bool:
+    return sys.platform in ("linux", "darwin")
+
+
+def _require_bcp_token_file_auth() -> None:
+    # https://learn.microsoft.com/sql/tools/bcp/bcp-authentication
+    # Windows bcp does not support -P <token_file>; never fall through to Windows user auth.
+    if not _bcp_token_file_supported():
+        raise BulkCopyError(
+            "Service-principal access-token-file authentication with bcp requires Linux or macOS. "
+            "Run the Fab Shuffle Docker image; Windows integrated/user authentication is not supported "
+            "and will not be attempted."
+        )
 
 
 def _bcp(
@@ -141,6 +156,7 @@ def _bcp(
     token: Path,
     extra: Iterable[str] = (),
 ) -> str:
+    _require_bcp_token_file_auth()
     command = [
         SETTINGS.bcp_path,
         _qualified(table),
@@ -150,7 +166,7 @@ def _bcp(
         server,
         "-d",
         database,
-        # Entra access token, read from a file. Linux only, which is what we run on.
+        # Entra access token, read from a file. The Docker image runs the supported Linux client.
         "-G",
         "-P",
         str(token),
@@ -211,6 +227,7 @@ def copy_tables(
             on_complete(CopyOutcome("tables", empty=True))
         return []
 
+    _require_bcp_token_file_auth()
     scratch_dir.mkdir(parents=True, exist_ok=True)
     warnings: list[str] = []
     copied_rows = 0

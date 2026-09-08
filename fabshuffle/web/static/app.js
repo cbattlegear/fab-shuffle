@@ -249,7 +249,7 @@ async function loadResumable() {
   const sessionId = state.sessionId;
   const status = $("#resumable-status");
   status.hidden = !state.paired;
-  status.textContent = "Looking for unfinished runs for this tenant and app pair…";
+  status.textContent = "Looking for saved runs needing attention for this tenant and app pair…";
   try {
     const { runs } = await api("/api/resumable");
     if (state.sessionId !== sessionId) return;
@@ -257,7 +257,7 @@ async function loadResumable() {
     container.hidden = !runs.length;
     status.textContent = runs.length
       ? "Only runs bound to this source and destination tenant/app pair are shown."
-      : "No unfinished runs for this tenant/app pair. To recover another pair, sign in with its original apps.";
+      : "No saved runs need retrying for this tenant/app pair. To recover another pair, sign in with its original apps.";
     if (!runs.length) return;
 
     const list = container.querySelector("ul");
@@ -274,6 +274,7 @@ async function loadResumable() {
       const started = run.startedAt ? new Date(run.startedAt).toLocaleString() : "an earlier run";
       const built = run.itemsCreated === 1 ? "1 item" : `${run.itemsCreated} items`;
       detail.textContent = `Started ${started}. Got as far as ${run.lastPhase || "the beginning"}, ${built} built.`;
+      if (run.status === "succeeded") detail.textContent += " Finished with failed work; retry is available.";
       if (run.sourceTenantId) detail.textContent += ` Tenants: ${run.sourceTenantId} → ${run.targetTenantId}.`;
       if (run.sourceTenantId) {
         detail.textContent += " Keep source writes paused while resuming data or file copies.";

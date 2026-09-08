@@ -455,9 +455,22 @@ def can_recreate(
     connectivity = connection.get("connectivityType") or ""
 
     if connectivity not in RECREATABLE_CONNECTIVITY:
+        if connectivity in GATEWAY_TYPES:
+            return (
+                f"is a {connectivity} connection, which has to be recreated by hand "
+                "against its gateway"
+            )
+        if connectivity == "PersonalCloud":
+            # A personal cloud connection has no gateway and, per Fabric's connectivity
+            # types, "cannot be shared with others" - there is nothing to recreate it
+            # against. Only a new shareable cloud connection can stand in for it.
+            return (
+                "is a personal cloud connection, which cannot be shared or recreated by "
+                "hand; a new shareable cloud connection has to be created in its place"
+            )
         return (
-            f"is a {connectivity or 'gateway'} connection, which has to be recreated by hand "
-            "against its gateway"
+            f"is a {connectivity or 'unknown'} connection, which cannot be recreated "
+            "unattended"
         )
     if credential_type not in NO_SECRET_CREDENTIALS:
         return (
@@ -521,6 +534,17 @@ def build_creation_payload(
     return payload
 
 
+def display_name(connection: Mapping[str, Any]) -> str:
+    """A connection's name for messages, falling back to its id when unnamed.
+
+    An operator-created connection can be left unnamed, and Fabric does not always
+    populate ``displayName`` on every connection it returns. Quoting the empty result
+    verbatim reads as ``Connection 'None'`` and gives the operator nothing to act on;
+    the id at least identifies which connection needs attention.
+    """
+    return str(connection.get("displayName") or connection.get("id") or "")
+
+
 def replacement_name(connection: Mapping[str, Any], target_workspace_id: str) -> str:
     """Stable name lets a retry adopt an operator-created or unjournaled replacement."""
     return f"{connection.get('displayName') or connection['id']} (Fab Shuffle {target_workspace_id})"
@@ -571,6 +595,7 @@ __all__ = [
     "connections_by_id",
     "create_connection",
     "delete_connection",
+    "display_name",
     "is_owned_by",
     "list_connections",
     "list_role_assignments",

@@ -115,7 +115,7 @@ def _azcopy(args: list[str], principal: ServicePrincipal) -> None:
     except FileNotFoundError as error:
         raise FileTransferError(
             f"OneLake file transfer needs azcopy, but '{SETTINGS.azcopy_path}' is not installed "
-            "in this image."
+            "in this runtime. Run the Fab Shuffle Docker image, which includes azcopy."
         ) from error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1500:]

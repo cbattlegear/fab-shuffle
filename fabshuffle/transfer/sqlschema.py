@@ -852,7 +852,7 @@ def _run_bounded(
             )
         except FileNotFoundError as error:
             raise SchemaTransferError(
-                f"{what} could not run because '{command[0]}' is not installed in this image. "
+                f"{what} could not run because '{command[0]}' is not installed in this runtime. "
                 "T-SQL schema transfer needs sqlpackage."
             ) from error
         try:
@@ -884,7 +884,7 @@ def _run(command: list[str], *, what: str) -> None:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except FileNotFoundError as error:
         raise SchemaTransferError(
-            f"{what} could not run because '{command[0]}' is not installed in this image. "
+            f"{what} could not run because '{command[0]}' is not installed in this runtime. "
             "T-SQL schema transfer needs sqlpackage and unpackdacpac."
         ) from error
     if result.returncode != 0:
