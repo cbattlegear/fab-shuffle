@@ -769,43 +769,65 @@ Three gaps in the Fabric REST API are covered by external tooling bundled in the
 
 ## Development
 
-Python 3.11+ is supported. Use the checked-in resolution, not `pip install -e ".[dev]"`
-(which resolves the project's compatibility ranges afresh). In a POSIX shell:
+**Use Docker for application execution, tests and lint, on every host OS.** The validation
+target extends the same pinned Debian/Python runtime as the production image, including
+AzCopy, SqlPackage, UnpackDacPac, bcp and ODBC. It adds hash-locked development dependencies
+and digest-pinned Node and PowerShell for the JavaScript UI and generated-script tests.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --require-hashes --only-binary=:all: -r requirements/bootstrap.txt
-python -m uv pip sync --require-hashes --only-binary=:all: requirements/bootstrap.txt requirements/build.txt requirements/dev.txt
-python -m uv pip install --no-build-isolation --no-deps -e .
-python scripts/lock_dependencies.py --check
-python -m pytest -q
-python -m ruff check .
-python -m fabshuffle
+docker build --platform linux/amd64 --target test -t fab-shuffle:test .
+docker run --rm --platform linux/amd64 --network none fab-shuffle:test
 ```
 
-On Windows, activate with `.venv\Scripts\Activate.ps1` instead of `source`, then run the
-same `python` commands. Linux also needs `unixodbc` installed for `pyodbc` imports.
-`uv.lock` is universal, not a Windows freeze: exports retain platform markers, including
-`uvloop` only on supported non-Windows platforms. Third-party wheels are required; a
-platform/Python combination without a locked wheel fails explicitly and needs a reviewed
-dependency refresh rather than an uncontrolled source build.
+Use Docker's **Linux containers** mode on Windows. No host Python, PowerShell, Node,
+virtualenv, nested Docker daemon or daemon-socket mount is needed. The container entrypoint
+checks required tools, installed dependencies, lock exports, runtime/import/HTTP smoke,
+Ruff, then pytest; missing tools fail instead of silently skipping coverage.
+Tests run with no external network, credentials, published ports or persistent recovery
+volume. PowerShell authentication/API calls are mocked, not live tenant operations.
+
+To select related tests, append their paths or pytest selectors to the same command:
+
+```bash
+docker run --rm --platform linux/amd64 --network none fab-shuffle:test tests/test_shortcut_retry.py tests/test_mirror_activation.py
+```
+
+The image contains a snapshot of the checkout: rebuild the `test` target after edits.
+`.github/workflows/tests.yml` uses exactly this build/run path on an Ubuntu Docker host,
+not a native Ubuntu/Windows Python matrix. Its successful result gates the production
+image build/publication; shared BuildKit caches avoid rebuilding unchanged runtime layers.
+The final/default Dockerfile target is `production`, so published images never contain
+the test dependencies or validation entrypoint. Release builds retain AMD64/ARM64 smoke
+coverage; the full suite targets Linux AMD64, the vendor-supported SQL tooling platform.
+
+Use the checked-in resolution, not `pip install -e ".[dev]"`, which would resolve the
+compatibility ranges afresh. `uv.lock` remains universal and retains platform markers;
+that is dependency metadata, not a promise of native Windows application support.
 
 ### Deliberate release upgrades
 
 Review dependency and tool updates at least monthly, and promptly for security fixes. A
 scheduled image rebuild does **not** update the pins. Make updates on a branch:
 
-1. Use the locked development environment above. For a selected dependency run
+For dependency maintenance only, start a shell in the test image with your checkout mounted
+at `/workspace` (replace the placeholder with its absolute host path). This container needs
+network access to fetch the explicitly selected package versions; do not mount recovery
+volumes or provide Fabric credentials.
+
+```text
+docker run --rm -it --mount "type=bind,source=<absolute-checkout-path>,target=/workspace" --workdir /workspace --entrypoint /bin/sh fab-shuffle:test
+```
+
+1. Inside that container, for a selected dependency run
    `python -m uv lock --upgrade-package NAME==VERSION`; use `python -m uv lock --upgrade`
-   only for a deliberate full refresh. Preserve `requires-python` and platform support.
+   only for a deliberate full refresh. Preserve the declared dependency compatibility.
    To update the resolver/installer, edit the exact `lock` group pins and
    `tool.uv.required-version` together, install that exact uv version into this isolated
    environment, and regenerate. To update the build backend, change both
    `build-system.requires` and the `build` group. The lock includes their transitives.
 2. Run `python scripts/lock_dependencies.py` to regenerate all four hashed exports.
-   Re-run the install/sync commands above and
-   `python scripts/lock_dependencies.py --check`. Commit `pyproject.toml`, `uv.lock`, and
+   Exit and rebuild the test target with the updated inputs, then run its validation
+   entrypoint. Commit `pyproject.toml`, `uv.lock`, and
    the exports together. Do not edit generated hashes or replace them with `pip freeze`.
 3. Review `tools.lock.json` and the Dockerfile base digest using the official upstream
    release metadata linked in the manifest's `sources`. Select each exact version's
@@ -818,11 +840,13 @@ scheduled image rebuild does **not** update the pins. Make updates on a branch:
    with `docker buildx imagetools inspect python:VERSION-bookworm`.
    Check the Microsoft Learn per-tool pages
    for supported architectures and runtime changes, not assumptions about roll-forward.
-   The Docker workflow also pins action SHAs, cosign, Buildx, BuildKit, and QEMU; review
-   those explicitly rather than letting a setup action download latest.
-4. Run `python -m pytest -q` and `python -m ruff check .` **before** building.
+   The Dockerfile also pins validation-only Node and PowerShell image digests. The workflows
+   pin action SHAs, cosign, Buildx, BuildKit, and QEMU; review those explicitly rather than
+   letting a setup action download latest.
+4. Run the test image's validation entrypoint (including pytest and Ruff) **before**
+   building or publishing the production target.
    Build a unique local tag with
-   `docker build --platform linux/amd64 -t fab-shuffle:release-review-UNIQUE .`;
+   `docker build --platform linux/amd64 --target production -t fab-shuffle:release-review-UNIQUE .`;
    repeat for `linux/arm64` with a different tag on an ARM runner or under emulation.
    Both builds must pass the embedded CLI/import/HTTP smoke checks. Do not push from the
    refresh procedure. The existing `v*.*.*` release workflow still controls publication,

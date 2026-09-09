@@ -101,6 +101,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          target: production
           # The README offers this image on both architectures, and the Dockerfile picks an
           # azcopy tarball to match. A pull request only needs to prove the build still works,
           # so it stays on amd64 rather than paying for emulation.
@@ -108,7 +109,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          cache-from: |
+            type=gha
+            type=gha,scope=validation
           cache-to: type=gha,mode=max
 
       # Sign the resulting Docker image digest except on PRs.

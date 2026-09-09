@@ -199,17 +199,9 @@ def test_the_fallback_listing_also_shows_a_visible_error_not_a_silent_empty_tabl
 
 # --------------------------------------------------------------- real PowerShell, in Docker
 #
-# A generated string that merely *looks* like PowerShell is not proof it runs correctly, and
-# the container this suite otherwise runs in has no PowerShell at all. Both tests below shell
-# out to Docker instead of asking for a host-installed ``pwsh``/``powershell``, so the check
-# works the same way in the sandboxed validation container as anywhere else Docker is
-# available, and is skipped (not faked, and never run against a host ``pwsh``) where it is
-# not. Pinned by digest to the exact image already verified locally, not a floating tag.
-POWERSHELL_IMAGE = (
-    "mcr.microsoft.com/powershell:7.4-ubuntu-22.04"
-    "@sha256:62300a213a9293916333df2b014cd3a8f22fb0b0b65f2bb446aaf436bcf8c868"
-)
-DOCKER = shutil.which("docker")
+# The test target carries PowerShell itself. No host shell, nested Docker engine, daemon
+# socket or live credentials are needed. The container entrypoint refuses missing tools
+# before pytest starts, so CI cannot quietly skip this coverage.
 PWSH = shutil.which("pwsh") if Path("/.dockerenv").is_file() else None
 
 # A connection id the mocked ``Invoke-RestMethod`` below recognises as "found"; anything else
@@ -328,19 +320,11 @@ STUB_AZ_ACCOUNTS_MANIFEST = """@{
 """
 
 
-def _run_pwsh_in_docker(directory: Path, *args: str):
-    if PWSH:
-        return subprocess.run(
-            [PWSH, "-NoProfile", "-NonInteractive", *[
-                arg.replace("/scripts", directory.as_posix()) for arg in args
-            ]],
-            capture_output=True, text=True, timeout=120,
-        )
+def _run_pwsh(directory: Path, *args: str):
     return subprocess.run(
-        [
-            DOCKER, "run", "--rm", "-v", f"{directory}:/scripts:ro",
-            POWERSHELL_IMAGE, "pwsh", "-NoProfile", "-NonInteractive", *args,
-        ],
+        [PWSH, "-NoProfile", "-NonInteractive", *[
+            arg.replace("/scripts", directory.as_posix()) for arg in args
+        ]],
         capture_output=True, text=True, timeout=120,
     )
 
@@ -359,19 +343,18 @@ def _prepare_exec_fixture(directory: Path, script: str, invocation: str) -> None
         '$env:PSModulePath = "/scripts/Modules:$env:PSModulePath"\n'
         f". /scripts/mocks.ps1\n{invocation}\n"
     )
-    if PWSH:
-        runner = runner.replace("/scripts", directory.as_posix())
+    runner = runner.replace("/scripts", directory.as_posix())
     (directory / "run.ps1").write_text(runner, encoding="utf-8")
 
 
-@pytest.mark.skipif(DOCKER is None and PWSH is None, reason="PowerShell execution requires Docker")
+@pytest.mark.skipif(PWSH is None, reason="Use the Dockerfile test target with PowerShell installed")
 def test_the_generated_script_is_valid_powershell():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "lookup.ps1"
         path.write_text(
             connections_lookup_script([CONNECTION_A, CONNECTION_B], tenant_id=TENANT_ID), encoding="utf-8",
         )
-        result = _run_pwsh_in_docker(
+        result = _run_pwsh(
             Path(directory), "-Command",
             "$e=$null; $t=$null; "
             "[System.Management.Automation.Language.Parser]::ParseFile('/scripts/lookup.ps1', "
@@ -382,7 +365,7 @@ def test_the_generated_script_is_valid_powershell():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.skipif(DOCKER is None and PWSH is None, reason="PowerShell execution requires Docker")
+@pytest.mark.skipif(PWSH is None, reason="Use the Dockerfile test target with PowerShell installed")
 def test_running_the_script_returns_only_whitelisted_fields_and_a_visible_get_error():
     """Executes the actual generated script under a real PowerShell, with ``Connect-AzAccount``,
     ``Get-AzAccessToken`` and ``Invoke-RestMethod`` replaced by mocks - never a live call. Proves,
@@ -396,7 +379,7 @@ def test_running_the_script_returns_only_whitelisted_fields_and_a_visible_get_er
             path, connections_lookup_script([GOOD_ID, CONNECTION_A], tenant_id=TENANT_ID),
             ". /scripts/lookup.ps1",
         )
-        result = _run_pwsh_in_docker(path, "-File", "/scripts/run.ps1")
+        result = _run_pwsh(path, "-File", "/scripts/run.ps1")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -417,7 +400,7 @@ def test_running_the_script_returns_only_whitelisted_fields_and_a_visible_get_er
     assert "(unavailable)" in output
 
 
-@pytest.mark.skipif(DOCKER is None and PWSH is None, reason="PowerShell execution requires Docker")
+@pytest.mark.skipif(PWSH is None, reason="Use the Dockerfile test target with PowerShell installed")
 def test_running_the_script_with_no_known_ids_lists_every_visible_connection_paged():
     """A report from before this scan existed has nothing recorded; run rather than read the
     script to prove it falls back to a paged list of every connection, still only ever prints
@@ -429,7 +412,7 @@ def test_running_the_script_with_no_known_ids_lists_every_visible_connection_pag
         _prepare_exec_fixture(
             path, connections_lookup_script([], tenant_id=TENANT_ID), ". /scripts/lookup.ps1",
         )
-        result = _run_pwsh_in_docker(path, "-File", "/scripts/run.ps1")
+        result = _run_pwsh(path, "-File", "/scripts/run.ps1")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -446,7 +429,7 @@ def test_running_the_script_with_no_known_ids_lists_every_visible_connection_pag
     assert "page-two.example.com" not in output
 
 
-@pytest.mark.skipif(DOCKER is None and PWSH is None, reason="PowerShell execution requires Docker")
+@pytest.mark.skipif(PWSH is None, reason="Use the Dockerfile test target with PowerShell installed")
 def test_running_the_script_with_a_supplied_connection_id_looks_it_up():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
@@ -454,7 +437,7 @@ def test_running_the_script_with_a_supplied_connection_id_looks_it_up():
             path, connections_lookup_script([], tenant_id=TENANT_ID),
             f"& /scripts/lookup.ps1 -ConnectionId '{GOOD_ID}'",
         )
-        result = _run_pwsh_in_docker(path, "-File", "/scripts/run.ps1")
+        result = _run_pwsh(path, "-File", "/scripts/run.ps1")
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
@@ -465,7 +448,7 @@ def test_running_the_script_with_a_supplied_connection_id_looks_it_up():
     assert "not-a-guid" not in output
 
 
-@pytest.mark.skipif(DOCKER is None and PWSH is None, reason="PowerShell execution requires Docker")
+@pytest.mark.skipif(PWSH is None, reason="Use the Dockerfile test target with PowerShell installed")
 def test_invalid_operator_ids_fail_before_sign_in_instead_of_listing_every_connection():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
@@ -473,7 +456,7 @@ def test_invalid_operator_ids_fail_before_sign_in_instead_of_listing_every_conne
             path, connections_lookup_script([], tenant_id=TENANT_ID),
             "$ErrorActionPreference = 'Stop'\n& /scripts/lookup.ps1 -ConnectionId 'not-a-guid'",
         )
-        result = _run_pwsh_in_docker(path, "-File", "/scripts/run.ps1")
+        result = _run_pwsh(path, "-File", "/scripts/run.ps1")
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert "not-a-guid" in output
