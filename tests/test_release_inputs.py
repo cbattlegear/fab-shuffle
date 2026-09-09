@@ -16,9 +16,17 @@ import yaml
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 
+from fabshuffle import __version__
 from scripts import install_tools, lock_dependencies, smoke_image
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_release_version_matches_runtime_package_and_lock():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    package = next(item for item in lock["package"] if item["name"] == project["project"]["name"])
+    assert __version__ == project["project"]["version"] == package["version"]
 
 
 def requirements(profile):
