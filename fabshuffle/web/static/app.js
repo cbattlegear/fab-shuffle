@@ -1610,6 +1610,11 @@ function connectionAdvisoryItem(entry) {
     "p", `${entry.connectivityType || "Unknown connectivity"} · ${entry.type || "Unknown type"}`, "hint",
   ));
   if (entry.path) row.appendChild(readinessElement("p", `Path: ${entry.path}`, "hint"));
+  if (entry.matchBasis === "sql_server_database") {
+    row.appendChild(readinessElement(
+      "p", "Matched SQL server and database together. Current consumers have not been checked.", "hint",
+    ));
+  }
   if ((entry.matchedSourceItems || []).length) {
     readinessTextList(row, "Matches source item(s)", entry.matchedSourceItems);
   }
@@ -1618,8 +1623,8 @@ function connectionAdvisoryItem(entry) {
   }
   row.appendChild(readinessElement(
     "p",
-    "Fabric does not let a connection's target be changed through the API. Repoint or recreate "
-      + "this connection by hand against the migrated workspace, then update whatever uses it.",
+    entry.action || "Review current consumers and destination bindings before cutover. "
+      + "A listed connection is not proof that manual recreation is needed.",
     "hint",
   ));
   return row;
@@ -1659,7 +1664,7 @@ function renderConnectionAdvisories() {
     scanState === "complete"
       ? "No tenant-visible connection's path was found to reference the source workspace. "
         + "You can still download a lookup script below to list every connection you can see."
-      : "No connection advisory results are recorded yet. The lookup script below still works "
+      : "No verified connection matches are available in this snapshot. The lookup script below still works "
         + "on its own - it lists every connection you can see."
   );
   // Only a reassign - which never scans, because nothing about a connection's path changes -

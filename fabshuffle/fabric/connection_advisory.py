@@ -9,12 +9,9 @@ of its data-store endpoints? Those are exactly the connections something *outsid
 migration - a pipeline in another workspace, a Power Automate flow, a report nobody remembered -
 might still be reading through once the source workspace is gone.
 
-Detection only ever matches a whole, unique identifier: the source workspace's GUID, an item's
-GUID, a complete OneLake root, or a complete SQL/Kusto endpoint string. It never matches a bare
-catalog or database *name* on its own, because those are short, human-chosen words that a
-different tenant's connection can share by coincidence; matching one would misreport an
-unrelated connection as pointing at this source workspace. A boundary check around every match
-keeps a GUID or endpoint from being "found" inside a longer, unrelated token, too.
+SQL paths require an exact server AND database pair from source data-store metadata. Even a
+GUID-shaped database name is not globally unique across SQL servers. Other paths use literal
+workspace/item identifiers and complete OneLake or non-SQL endpoint references.
 
 Nothing here talks the caller into believing more than it can measure. Fabric connections
 cannot have their target changed through the API, so this never promises to repoint one; it
@@ -46,6 +43,7 @@ SCAN_INCOMPLETE = "incomplete"
 SCAN_NOT_APPLICABLE = "not_applicable"
 SCAN_UNKNOWN = "unknown"
 SCAN_STALE = "stale"
+MATCHER_VERSION = 2
 
 _SCAN_ACTION = (
     "Review the reported service error and the source principal's connection access in "
@@ -60,8 +58,9 @@ _SCAN_ACTION = (
 #: for an exhaustive one, which it is not.
 LIMITS = [
     "Scope is limited by what this credential could see when the scan ran, and by literal "
-    "metadata matching against the source workspace GUID, an item GUID, a complete OneLake "
-    "root, or a complete SQL/Kusto endpoint string. It does not read what an item's definition "
+    "metadata matching: SQL requires the complete server/database pair; other paths use "
+    "workspace/item GUIDs, complete OneLake roots or non-SQL endpoints. It does not read what "
+    "an item's definition "
     "does with a connection, only whether the connection's own path names something from the "
     "source. A connection that reaches the source workspace some other way is not detected.",
     "Not proven exhaustive. A connection this credential cannot list at all is not in the "
@@ -69,6 +68,9 @@ LIMITS = [
     "A missing, unread, or stale scan (state unknown, incomplete, or stale) is not evidence "
     "that no connection needs review - only that this was not checked, or not checked since "
     "the mapping last changed. Treat it the same as a report with no evidence at all.",
+    "PersonalCloud is not proof of default-semantic-model ownership. Automatic denotes an "
+    "implicit/SSO binding. A matching target does not establish which consumers still use "
+    "the connection, or whether it needs manual recreation.",
 ]
 
 
@@ -126,7 +128,7 @@ def _signature(token: str, owner_item_id: str) -> _Signature:
 def _item_signatures(
     client: FabricClient, *, source_workspace_id: str, source_workspace_name: str,
     check_cancel: Callable[[], None] | None = None,
-) -> tuple[list[_Signature], list[str]]:
+) -> tuple[list[_Signature], dict[connections_module.SqlTarget, set[str]], list[str]]:
     """Every boundary-matchable identifier the source workspace and its items are known by.
 
     Read independently of the migration's own bookkeeping (``ctx.id_map``/``ctx.source_items``)
@@ -136,6 +138,7 @@ def _item_signatures(
     advisory report, not a precondition for anything, so a partial answer is better than none.
     """
     signatures = [_signature(source_workspace_id, "")]
+    sql_targets: dict[connections_module.SqlTarget, set[str]] = {}
     warnings: list[str] = []
     try:
         source_items = list_items(client, source_workspace_id)
@@ -150,18 +153,16 @@ def _item_signatures(
         for root in migration_refs.onelake_aliases(source_workspace_id, source_workspace_name, item):
             signatures.append(_signature(root, item_id))
 
-    for label, lister, endpoint_of in (
+    for label, item_type, lister in (
         (
-            "lakehouses", data_stores.list_lakehouses,
-            lambda i: data_stores.lakehouse_sql_endpoint(i).get("connectionString"),
+            "lakehouses", "Lakehouse", data_stores.list_lakehouses,
         ),
-        ("warehouses", data_stores.list_warehouses, data_stores.warehouse_connection_string),
-        ("SQL databases", sqldatabases.list_sql_databases, sqldatabases.server_fqdn),
+        ("warehouses", "Warehouse", data_stores.list_warehouses),
+        ("SQL databases", "SQLDatabase", sqldatabases.list_sql_databases),
         (
-            "mirrored databases", data_stores.list_mirrored_databases,
-            lambda i: data_stores.mirrored_database_sql_endpoint(i).get("connectionString"),
+            "mirrored databases", "MirroredDatabase", data_stores.list_mirrored_databases,
         ),
-        ("Cosmos DB databases", cosmosdb.list_cosmos_databases, cosmosdb.endpoint_url),
+        ("Cosmos DB databases", "CosmosDBDatabase", cosmosdb.list_cosmos_databases),
     ):
         if check_cancel:
             check_cancel()
@@ -171,9 +172,17 @@ def _item_signatures(
             warnings.append(f"{label} ({_error_detail(error)})")
             continue
         for entry in items:
-            endpoint = endpoint_of(entry)
-            if endpoint:
-                signatures.append(_signature(str(endpoint), str(entry.get("id") or "")))
+            owner = str(entry.get("id") or "")
+            pairs = connections_module.item_sql_targets({**entry, "type": item_type})
+            for pair in pairs:
+                sql_targets.setdefault(pair, set()).add(owner)
+            if item_type != "CosmosDBDatabase" and not pairs:
+                warnings.append(
+                    f"{label} '{safe_text(str(entry.get('displayName') or owner))}' "
+                    "(SQL coordinates not returned)"
+                )
+            if item_type == "CosmosDBDatabase" and (endpoint := cosmosdb.endpoint_url(entry)):
+                signatures.append(_signature(str(endpoint), owner))
 
     if check_cancel:
         check_cancel()
@@ -187,7 +196,7 @@ def _item_signatures(
     except (FabricError, AuthError) as error:
         warnings.append(f"eventhouses ({_error_detail(error)})")
 
-    return signatures, warnings
+    return signatures, sql_targets, warnings
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,8 +210,27 @@ class ConnectionAdvisory:
     path: str = ""
     matched_source_items: tuple[str, ...] = ()
     expected_new_path: str = ""
+    match_basis: str = "literal_reference"
 
     def as_dict(self) -> dict[str, Any]:
+        if self.connectivity_type == "Automatic":
+            action = (
+                "Implicit/SSO connection. Check the consuming semantic model's data source "
+                "and SSO settings against the destination; do not treat this as a shared "
+                "connection that must be recreated."
+            )
+        elif self.connectivity_type == "PersonalCloud":
+            action = (
+                "Personal cloud connection; it may be used by semantic models. Review their "
+                "Gateway and cloud connections settings and destination data sources. This "
+                "does not prove default-model ownership or that manual recreation is needed."
+            )
+        else:
+            action = (
+                "Review current consumers before cutover. If they must move, configure a "
+                "destination connection and update their bindings manually. No connection "
+                "is changed by this report."
+            )
         result = {
             "connectionId": self.connection_id,
             "connectionName": self.connection_name,
@@ -210,6 +238,9 @@ class ConnectionAdvisory:
             "type": self.connection_type,
             "path": self.path,
             "matchedSourceItems": list(self.matched_source_items),
+            "matchBasis": self.match_basis,
+            "usageState": "not_checked",
+            "action": action,
         }
         if self.expected_new_path:
             result["expectedNewPath"] = self.expected_new_path
@@ -232,6 +263,7 @@ class ConnectionAdvisoryScan:
 
     def as_dict(self) -> dict[str, Any]:
         result = {
+            "matcherVersion": MATCHER_VERSION,
             "sourceWorkspaceId": self.source_workspace_id,
             "targetWorkspaceId": self.target_workspace_id,
             "generatedAt": self.generated_at,
@@ -285,11 +317,12 @@ def scan_source_connections(
 
     if check_cancel:
         check_cancel()
-    signatures, signature_warnings = _item_signatures(
+    signatures, sql_targets, signature_warnings = _item_signatures(
         client, source_workspace_id=source_workspace_id, source_workspace_name=source_workspace_name,
         check_cancel=check_cancel,
     )
     rewrite = build_rewriter(dict(id_map or {}))
+    sql_servers = {target.server for target in sql_targets}
 
     advisories: list[ConnectionAdvisory] = []
     for candidate in raw_connections:
@@ -299,28 +332,55 @@ def scan_source_connections(
         if not connection_id:
             continue
         details = candidate.get("connectionDetails") or {}
-        raw_path = redact_path(str(details.get("path") or ""))
-        if not raw_path:
-            continue
-
-        matched_items = sorted({
-            signature.owner_item_id for signature in signatures
-            if signature.owner_item_id and signature.pattern.search(raw_path)
-        })
-        workspace_matched = any(
-            not signature.owner_item_id and signature.pattern.search(raw_path)
-            for signature in signatures
+        original_path = str(details.get("path") or "")
+        raw_path = redact_path(original_path)
+        sql = str(details.get("type") or "").casefold() == "sql"
+        # Also prevent an unrecognised connector carrying a SQL-style path from bypassing
+        # the pair check through the generic GUID matcher.
+        sql = sql or (
+            ";" in original_path and any(
+                domain in original_path.split(";", 1)[0].casefold()
+                for domain in (".datawarehouse.fabric.microsoft.com", ".database.windows.net")
+            )
         )
-        if not matched_items and not workspace_matched:
-            continue
-
-        redacted = redact_path(raw_path)
         expected_new_path = ""
-        if rewrite is not None:
-            candidate_new_path = rewrite(redacted)
+        if sql:
+            target = connections_module.sql_path_target(original_path)
+            if target is None:
+                signature_warnings.append(
+                    f"connection {connection_id} (SQL server/database path could not be verified)"
+                )
+                continue
+            matched_items = sorted(sql_targets.get(target, set()))
+            if not matched_items:
+                if target.server in sql_servers:
+                    signature_warnings.append(
+                        f"connection {connection_id} (SQL server matches, but the database "
+                        "could not be matched to a source item)"
+                    )
+                continue
+            destination = connections_module.mapped_sql_target(target, id_map or {})
+            if destination is not None and destination.server not in sql_servers:
+                expected_new_path = redact_path(f"{destination.server};{destination.database}")
+        else:
+            if not raw_path:
+                continue
+            matched_items = sorted({
+                signature.owner_item_id for signature in signatures
+                if signature.owner_item_id and signature.pattern.search(raw_path)
+            })
+            workspace_matched = any(
+                not signature.owner_item_id and signature.pattern.search(raw_path)
+                for signature in signatures
+            )
+            if not matched_items and not workspace_matched:
+                continue
+
+        if not sql and rewrite is not None:
+            candidate_new_path = rewrite(raw_path)
             # A partial rewrite is not a usable destination. Do not suggest a path that
             # still names any known source resource, even if the workspace ID changed.
-            if candidate_new_path != redacted and not any(
+            if candidate_new_path != raw_path and not any(
                 signature.pattern.search(candidate_new_path) for signature in signatures
             ):
                 expected_new_path = candidate_new_path
@@ -330,9 +390,10 @@ def scan_source_connections(
             connection_name=safe_text(connections_module.display_name(candidate)),
             connectivity_type=safe_text(str(candidate.get("connectivityType") or "")),
             connection_type=safe_text(str(details.get("type") or "")),
-            path=redacted,
+            path=raw_path,
             matched_source_items=tuple(matched_items),
             expected_new_path=expected_new_path,
+            match_basis="sql_server_database" if sql else "literal_reference",
         ))
 
     advisories.sort(key=lambda entry: (entry.connection_name.casefold(), entry.connection_id))
@@ -390,6 +451,24 @@ def section_for_report(
                 "No connection scan has been recorded for this run yet. It runs late in the "
                 "migration, once every item that could be repointed has a destination. Unknown "
                 "is not a clean result - it means this has not been checked at all."
+            ),
+            "limits": list(LIMITS),
+        }
+    if payload.get("matcherVersion") != MATCHER_VERSION:
+        return {
+            "scanState": SCAN_STALE, "connections": [],
+            "sourceWorkspaceId": payload.get("sourceWorkspaceId", ""),
+            "targetWorkspaceId": payload.get("targetWorkspaceId", ""),
+            "generatedAt": payload.get("generatedAt", ""),
+            "message": (
+                "This snapshot used the retired identifier-only matcher. Its connection "
+                "matches and suggested destination paths have been withheld, not revalidated."
+            ),
+            "action": (
+                "Use the lookup script to identify connections, then inspect their server/database "
+                "pairs in Fabric before cutover. A new migration attempt records a new scan; "
+                "there is no need "
+                "to restart a migration just to look up connection names."
             ),
             "limits": list(LIMITS),
         }

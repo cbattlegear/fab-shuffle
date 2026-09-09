@@ -296,6 +296,81 @@ def same_path(left: str, right: str) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SqlTarget:
+    server: str
+    database: str
+
+
+def sql_target(server: str, database: str) -> SqlTarget | None:
+    """Normalize a SQL address without treating a catalog as a global identifier."""
+    host = server.strip().lower().removeprefix("tcp:")
+    match = re.fullmatch(r"([a-z0-9-]+(?:\.[a-z0-9-]+)*\.?)(?:,([0-9]+))?", host)
+    if not match or not database.strip() or any(c in database for c in ";\r\n"):
+        return None
+    hostname, port = match.groups()
+    if port and not 1 <= int(port) <= 65535:
+        return None
+    host = hostname.rstrip(".")
+    if port and int(port) != 1433:
+        host += f",{int(port)}"
+    catalog = database
+    if _GUID.fullmatch(catalog):
+        catalog = catalog.lower()
+    # Database names can be case sensitive; only GUID casing is known to be immaterial.
+    return SqlTarget(host, catalog)
+
+
+def sql_path_target(path: str) -> SqlTarget | None:
+    """Fabric's SQL List Connections path is the server and database separated by ';'.
+
+    Do not guess at missing catalogs, additional fields, or other connection-string formats.
+    Those must remain unverified instead of falling back to matching a GUID anywhere.
+    """
+    parts = path.split(";")
+    return sql_target(*parts) if len(parts) == 2 else None
+
+
+def item_sql_targets(item: Mapping[str, Any]) -> set[SqlTarget]:
+    """Server/catalog pairs explicitly described by data-store metadata.
+
+    Warehouse accepts a name or ID as Initial Catalog; SQLDatabase's databaseName is
+    independent of its display name/ID. A lakehouse's SQL endpoint has its own ID.
+    https://learn.microsoft.com/fabric/data-warehouse/connectivity
+    https://learn.microsoft.com/rest/api/fabric/lakehouse/items/get-lakehouse
+    """
+    properties = item.get("properties") or {}
+    pairs: list[tuple[str, str]] = []
+    endpoint = properties.get("sqlEndpointProperties") or {}
+    if endpoint.get("connectionString"):
+        pairs.extend(
+            (endpoint["connectionString"], str(catalog or ""))
+            for catalog in (endpoint.get("id"), item.get("displayName"))
+        )
+    if item.get("type") in ("Warehouse", "SQLEndpoint"):
+        server = properties.get("connectionString") or properties.get("connectionInfo") or ""
+        pairs.extend((server, str(catalog or "")) for catalog in (item.get("id"), item.get("displayName")))
+    if item.get("type") == "SQLDatabase":
+        pairs.append((properties.get("serverFqdn") or "", properties.get("databaseName") or ""))
+    return {target for server, database in pairs if (target := sql_target(server, database)) is not None}
+
+
+def mapped_sql_target(source: SqlTarget, mappings: Mapping[str, str]) -> SqlTarget | None:
+    """Require exact, unambiguous mappings for BOTH parts before suggesting a new SQL path."""
+    servers = {
+        value for key, value in mappings.items()
+        if (candidate := sql_target(key, source.database)) is not None
+        and candidate.server == source.server
+    }
+    databases = {value for key, value in mappings.items() if same_path(key, source.database)}
+    if len(servers) != 1 or len(databases) != 1:
+        return None
+    destination = sql_target(servers.pop(), databases.pop())
+    if destination is None or destination.server == source.server:
+        return None
+    return destination
+
+
 def matches_replacement(
     candidate: Mapping[str, Any],
     source: Mapping[str, Any],

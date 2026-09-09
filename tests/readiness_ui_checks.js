@@ -192,7 +192,8 @@ function report(runId = "one", items = [item(0)], overrides = {}) {
 function connectionEntry(overrides = {}) {
   return {
     connectionId: "conn-1", connectionName: "Bronze SQL", connectivityType: "ShareableCloud",
-    type: "SQL", path: "src.example.com;bronze", matchedSourceItems: ["item-1"], ...overrides,
+    type: "SQL", path: "src.example.com;bronze", matchedSourceItems: ["item-1"],
+    matchBasis: "sql_server_database", usageState: "not_checked", ...overrides,
   };
 }
 
@@ -413,7 +414,9 @@ const scenarios = {
     assert.match(rows[0].textContent, /ShareableCloud/);
     assert.match(rows[0].textContent, /src\.example\.com;bronze/);
     assert.match(rows[0].textContent, /item-1/);
-    assert.match(rows[0].textContent, /does not let a connection's target be changed/);
+    assert.match(rows[0].textContent, /Matched SQL server and database together/);
+    assert.match(rows[0].textContent, /Current consumers have not been checked/);
+    assert.match(rows[0].textContent, /not proof that manual recreation is needed/);
     assert.equal(f.get("connection-advisories-empty").hidden, true);
     assert.equal(f.get("connection-lookup-script").hidden, false);
 
@@ -472,6 +475,28 @@ const scenarios = {
     }));
     assert.match(f.get("connection-advisories-status").textContent, /^Unknown/);
     assert.equal(f.get("connection-advisories-scope").hidden, true);
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+  },
+  async connection_advisories_personal_and_retired(f) {
+    f.begin();
+    await f.tick(500);
+    const action = "Personal cloud connection; review semantic model bindings, not automatic recreation.";
+    await f.reply(0, report("one", [], { connectionAdvisories: advisories({
+      connections: [connectionEntry({ connectivityType: "PersonalCloud", action })],
+    }) }));
+    assert.match(f.get("connection-advisories-items").textContent, /review semantic model bindings/);
+    assert.doesNotMatch(f.get("connection-advisories-items").textContent, /Repoint or recreate this connection/);
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 2 });
+    await f.tick(500);
+    await f.reply(1, report("one", [], { connectionAdvisories: advisories({
+      scanState: "stale", connections: [],
+      message: "The retired matcher results have been withheld, not revalidated.",
+      action: "Use the lookup script to inspect server/database pairs.",
+    }) }));
+    assert.equal(f.get("connection-advisories-items").children.length, 0);
+    assert.match(f.get("connection-advisories-status").textContent, /^Stale/);
+    assert.match(f.get("connection-advisories-action").textContent, /server\/database pairs/);
+    assert.match(f.get("connection-advisories-empty").textContent, /No verified connection matches/);
     assert.equal(f.get("connection-lookup-script").hidden, false);
   },
   async connection_advisories_safe_text(f) {

@@ -319,12 +319,12 @@
         <section id="connection-advisories" class="connection-advisories" aria-labelledby="connection-advisories-title" hidden>
           <h4 id="connection-advisories-title">Connections pointing at the source workspace</h4>
           <p class="hint">
-            A tenant-wide scan of every connection this credential can see, for one whose path still
-            names the source workspace, one of its items, or one of its endpoints. Reporting only:
-            Fabric does not let a connection's target be changed through the API, so repoint or
-            recreate one listed here by hand, then update whatever uses it. The original connection
-            is kept listed even where a replacement was mapped, since something outside this
-            migration may still read through it.
+            Read-only matches against source targets visible to this credential. SQL matches require
+            both the server and database, not a database name or GUID alone. Current consumers have
+            not been checked: personal and implicit/SSO connections may belong to semantic models
+            and do not automatically need recreation. Review their destination bindings before
+            cutover. A mapped replacement does not prove that external consumers stopped using
+            the original connection.
           </p>
           <p id="connection-advisories-status" class="hint" role="status" aria-live="polite"></p>
           <p id="connection-advisories-context" class="hint"></p>

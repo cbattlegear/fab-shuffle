@@ -546,6 +546,7 @@ def test_connection_advisories_defaults_to_unknown_not_a_false_green(client, ses
 def test_connection_advisories_from_this_attempt_are_reported_as_is(client, session_id, run):
     run.plan = {"strategy": "rebuild"}
     run.set_connection_advisory({
+        "matcherVersion": 2,
         "scanState": "complete", "sourceWorkspaceId": "src", "targetWorkspaceId": "tgt",
         "attemptId": run.id, "connections": [{"connectionId": "conn-1", "connectionName": "Bronze SQL"}],
         "message": "1 tenant-visible connection(s)...",
@@ -562,6 +563,7 @@ def test_connection_advisories_from_this_attempt_are_reported_as_is(client, sess
 def test_connection_advisories_from_an_earlier_attempt_are_marked_stale(client, session_id, run):
     run.plan = {"strategy": "rebuild"}
     run.set_connection_advisory({
+        "matcherVersion": 2,
         "scanState": "complete", "connections": [{"connectionId": "conn-1"}],
         "attemptId": "an-earlier-attempt", "message": "1 tenant-visible connection(s)...",
     })
@@ -588,6 +590,7 @@ def test_reassign_runs_report_connection_advisories_as_not_applicable(client, se
 def test_saved_journal_reports_its_recorded_connection_advisory(client, session_id):
     book = saved_book()
     book.connection_advisory({
+        "matcherVersion": 2,
         "scanState": "complete", "connections": [{"connectionId": "conn-1"}], "attemptId": "saved",
         "message": "1 tenant-visible connection(s)...",
     })
@@ -613,6 +616,7 @@ def test_connection_advisories_survive_registry_restart(client, session_id, run,
     book = saved_book(run.id)
     run.plan = {"strategy": "rebuild"}
     payload = {
+        "matcherVersion": 2,
         "scanState": "complete", "connections": [{"connectionId": "conn-1"}], "attemptId": run.id,
         "message": "1 tenant-visible connection(s)...",
     }
@@ -627,3 +631,28 @@ def test_connection_advisories_survive_registry_restart(client, session_id, run,
     assert before.status_code == after.status_code == 200
     assert before.json()["connectionAdvisories"] == after.json()["connectionAdvisories"]
     assert after.json()["connectionAdvisories"]["connections"][0]["connectionId"] == "conn-1"
+
+
+def test_retired_matcher_results_are_withheld_in_live_saved_and_downloaded_reports(
+    client, session_id, run, monkeypatch,
+):
+    book = saved_book(run.id)
+    run.plan = {"strategy": "rebuild"}
+    payload = {
+        "scanState": "complete", "attemptId": run.id,
+        "connections": [{"connectionId": "misleading-match", "expectedNewPath": "wrong-server;new-db"}],
+    }
+    book.connection_advisory(payload)
+    book.finished("succeeded")
+    run.set_connection_advisory(payload)
+    run.mark_finished(RunStatus.SUCCEEDED)
+    for registry in (web.REGISTRY, RunRegistry()):
+        monkeypatch.setattr(web, "REGISTRY", registry)
+        for suffix in ("", "?download=true"):
+            response = client.get(f"/api/runs/{run.id}/readiness{suffix}", headers=auth(session_id))
+            assert response.status_code == 200
+            section = response.json()["connectionAdvisories"]
+            assert section["scanState"] == "stale"
+            assert section["connections"] == []
+            assert "wrong-server" not in response.text
+    assert journal.read(book.path).connection_advisory == payload

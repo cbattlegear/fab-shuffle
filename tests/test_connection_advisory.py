@@ -130,7 +130,7 @@ def test_a_connection_naming_a_source_sql_endpoint_is_found():
             "id": LAKEHOUSE, "displayName": "bronze",
             "properties": {"sqlEndpointProperties": {"connectionString": endpoint}},
         }],
-        connections=[connection("conn-1", f"{endpoint};somecatalog", ctype="SQL")],
+        connections=[connection("conn-1", f"{endpoint};bronze", ctype="SQL")],
     )
     scan = ca.scan_source_connections(client, source_workspace_id=SOURCE_WS)
     assert scan.connections[0].matched_source_items == (LAKEHOUSE,)
@@ -354,6 +354,7 @@ def test_a_missing_scan_is_unknown_not_a_false_green():
 
 def test_a_scan_from_the_current_attempt_is_unchanged():
     payload = {
+        "matcherVersion": ca.MATCHER_VERSION,
         "scanState": "complete", "connections": [], "attemptId": "r1", "message": "fine",
     }
     section = ca.section_for_report(payload, run_id="r1", strategy="rebuild")
@@ -363,6 +364,7 @@ def test_a_scan_from_the_current_attempt_is_unchanged():
 
 def test_a_scan_from_an_earlier_attempt_is_marked_stale():
     payload = {
+        "matcherVersion": ca.MATCHER_VERSION,
         "scanState": "complete", "connections": [{"connectionId": "conn-1"}],
         "attemptId": "old-attempt", "message": "1 tenant-visible connection(s)...",
     }
@@ -370,3 +372,140 @@ def test_a_scan_from_an_earlier_attempt_is_marked_stale():
     assert section["scanState"] == ca.SCAN_STALE
     assert "earlier attempt" in section["message"]
     assert section["connections"] == [{"connectionId": "conn-1"}]
+
+
+def test_retired_matcher_snapshot_is_withheld_without_changing_the_journal_payload():
+    payload = {
+        "scanState": "complete", "attemptId": "r1",
+        "connections": [{"connectionId": "c", "expectedNewPath": "other-server;wrong-database"}],
+    }
+    section = ca.section_for_report(payload, run_id="r1", strategy="rebuild")
+    assert section["scanState"] == ca.SCAN_STALE
+    assert section["connections"] == []
+    assert "retired identifier-only matcher" in section["message"]
+    assert "not revalidated" in section["message"]
+    assert "lookup script" in section["action"]
+    assert payload["connections"][0]["expectedNewPath"] == "other-server;wrong-database"
+
+
+def sql_source_fixture(connections):
+    return FakeClient(
+        items=[{"id": LAKEHOUSE, "type": "Lakehouse", "displayName": "bronze"},
+               {"id": WAREHOUSE, "type": "SQLEndpoint", "displayName": "bronze"}],
+        lakehouses=[{
+            "id": LAKEHOUSE, "displayName": "bronze",
+            "properties": {"sqlEndpointProperties": {
+                "id": WAREHOUSE, "connectionString": "source.datawarehouse.fabric.microsoft.com",
+            }},
+        }],
+        connections=connections,
+    )
+
+
+def test_database_guid_repeated_on_five_other_servers_does_not_target_this_workspace():
+    """Reproduces the live report: SQL endpoint GUIDs matched on other workspaces' hosts."""
+    rows = [
+        connection(f"conn-{i}-{catalog}", f"other-{i}.datawarehouse.fabric.microsoft.com;{catalog}",
+                   ctype="SQL", connectivity="PersonalCloud", name=None)
+        for i in range(5) for catalog in (WAREHOUSE, LAKEHOUSE)
+    ]
+    scan = ca.scan_source_connections(sql_source_fixture(rows), source_workspace_id=SOURCE_WS)
+    assert scan.scan_state == "complete"
+    assert scan.connections == ()
+
+
+@pytest.mark.parametrize("connectivity", ["PersonalCloud", "ShareableCloud", "Automatic"])
+@pytest.mark.parametrize("catalog", ["bronze", WAREHOUSE, WAREHOUSE.upper()])
+def test_confirmed_sql_pairs_remain_visible_regardless_of_connection_kind(connectivity, catalog):
+    row = connection("c", f"source.datawarehouse.fabric.microsoft.com;{catalog}",
+                     ctype="SQL", connectivity=connectivity)
+    scan = ca.scan_source_connections(sql_source_fixture([row]), source_workspace_id=SOURCE_WS)
+    [found] = scan.connections
+    assert found.matched_source_items == (LAKEHOUSE,)
+    payload = found.as_dict()
+    assert payload["matchBasis"] == "sql_server_database"
+    assert payload["usageState"] == "not_checked"
+    if connectivity == "PersonalCloud":
+        assert "does not prove default-model ownership" in payload["action"]
+    if connectivity == "Automatic":
+        assert "Implicit/SSO" in payload["action"]
+
+
+@pytest.mark.parametrize("catalog", ["other", LAKEHOUSE, SOURCE_WS, "bronze-more", "Bronze"])
+def test_sql_server_alone_and_non_catalog_item_ids_are_not_enough(catalog):
+    row = connection("c", f"source.datawarehouse.fabric.microsoft.com;{catalog}", ctype="SQL")
+    scan = ca.scan_source_connections(sql_source_fixture([row]), source_workspace_id=SOURCE_WS)
+    assert scan.connections == ()
+
+
+@pytest.mark.parametrize("path", ["", "source.datawarehouse.fabric.microsoft.com",
+                                "source.datawarehouse.fabric.microsoft.com;",
+                                "source.datawarehouse.fabric.microsoft.com;bronze;extra"])
+def test_unparseable_sql_paths_are_incomplete_not_generic_guid_matches(path):
+    row = connection("c", path, ctype="SQL")
+    scan = ca.scan_source_connections(sql_source_fixture([row]), source_workspace_id=SOURCE_WS)
+    assert scan.scan_state == "incomplete"
+    assert scan.connections == ()
+    assert "connection c" in scan.message
+
+
+def test_unknown_sql_style_connector_cannot_bypass_pair_matching():
+    row = connection("c", f"other.datawarehouse.fabric.microsoft.com;{WAREHOUSE}", ctype="NewSqlType")
+    scan = ca.scan_source_connections(sql_source_fixture([row]), source_workspace_id=SOURCE_WS)
+    assert not scan.connections
+
+
+def test_sql_destination_suggestion_requires_exact_mappings_for_both_coordinates():
+    row = connection("c", f"source.datawarehouse.fabric.microsoft.com;{WAREHOUSE}", ctype="SQL")
+    for mappings in (
+        {WAREHOUSE: TARGET_LAKEHOUSE},
+        {"source.datawarehouse.fabric.microsoft.com": "target.datawarehouse.fabric.microsoft.com"},
+    ):
+        scan = ca.scan_source_connections(
+            sql_source_fixture([row]), source_workspace_id=SOURCE_WS, id_map=mappings,
+        )
+        assert scan.connections[0].expected_new_path == ""
+    scan = ca.scan_source_connections(
+        sql_source_fixture([row]), source_workspace_id=SOURCE_WS,
+        id_map={WAREHOUSE: TARGET_LAKEHOUSE,
+                "source.datawarehouse.fabric.microsoft.com": "target.datawarehouse.fabric.microsoft.com"},
+    )
+    assert scan.connections[0].expected_new_path == \
+        f"target.datawarehouse.fabric.microsoft.com;{TARGET_LAKEHOUSE}"
+
+
+def test_sql_database_uses_service_database_name_not_display_name_or_item_id():
+    rows = [connection(f"c-{i}", f"server.database.windows.net;{db}", ctype="SQL")
+            for i, db in enumerate(["actual-catalog", "Display", LAKEHOUSE])]
+    client = FakeClient(sql_databases=[{
+        "id": LAKEHOUSE, "displayName": "Display",
+        "properties": {"serverFqdn": "tcp:SERVER.database.windows.net,1433",
+                       "databaseName": "actual-catalog"},
+    }], connections=rows)
+    scan = ca.scan_source_connections(client, source_workspace_id=SOURCE_WS)
+    assert [c.connection_id for c in scan.connections] == ["c-0"]
+
+
+def test_matching_server_with_unknown_catalog_is_unverified_not_a_clean_scan():
+    row = connection("c", "source.datawarehouse.fabric.microsoft.com;master", ctype="SQL")
+    scan = ca.scan_source_connections(sql_source_fixture([row]), source_workspace_id=SOURCE_WS)
+    assert scan.scan_state == "incomplete"
+    assert not scan.connections
+    assert "SQL server matches, but the database" in scan.message
+
+
+def test_sql_destination_cannot_be_another_source_store_server():
+    row = connection("c", f"source.datawarehouse.fabric.microsoft.com;{WAREHOUSE}", ctype="SQL")
+    client = sql_source_fixture([row])
+    client.sql_databases = [{
+        "id": "other-source-store", "properties": {
+            "serverFqdn": "other-source.database.windows.net", "databaseName": "Original",
+        },
+    }]
+    scan = ca.scan_source_connections(
+        client, source_workspace_id=SOURCE_WS, id_map={
+            "source.datawarehouse.fabric.microsoft.com": "other-source.database.windows.net",
+            WAREHOUSE: TARGET_LAKEHOUSE,
+        },
+    )
+    assert scan.connections[0].expected_new_path == ""

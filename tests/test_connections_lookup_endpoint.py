@@ -58,6 +58,7 @@ def auth(session_id):
 def with_advisory(run, connection_ids, *, strategy="rebuild"):
     run.plan = {"strategy": strategy}
     run.set_connection_advisory({
+        "matcherVersion": 2,
         "scanState": "complete", "attemptId": run.id,
         "connections": [{"connectionId": cid} for cid in connection_ids],
         "message": f"{len(connection_ids)} tenant-visible connection(s)...",
@@ -137,6 +138,7 @@ def test_a_saved_run_serves_its_recorded_scan_too(client, session_id):
     book = journal.Journal(SETTINGS.journal_for("saved"))
     book.run_created({"source_workspace_id": "source-workspace", "strategy": "rebuild"}, cleanup=True)
     book.connection_advisory({
+        "matcherVersion": 2,
         "scanState": "complete", "attemptId": "saved",
         "connections": [{"connectionId": CONNECTION_A}], "message": "1 tenant-visible connection(s)...",
     })
@@ -146,3 +148,16 @@ def test_a_saved_run_serves_its_recorded_scan_too(client, session_id):
 
     assert response.status_code == 200
     assert f"'{CONNECTION_A}'" in response.text
+
+
+def test_script_does_not_present_retired_matcher_ids_as_confirmed_targets(client, session_id, run):
+    run.plan = {"strategy": "rebuild"}
+    run.set_connection_advisory({
+        "scanState": "complete", "attemptId": run.id,
+        "connections": [{"connectionId": CONNECTION_A}],
+    })
+    run.mark_finished(RunStatus.SUCCEEDED)
+    response = client.get(f"/api/runs/{run.id}/connections/script", headers=auth(session_id))
+    assert response.status_code == 200
+    assert CONNECTION_A not in response.text
+    assert "listing every" in response.text

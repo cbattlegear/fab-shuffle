@@ -393,10 +393,20 @@ workspace being migrated, are left alone and checked instead, reporting:
 
 After a rebuild, **Connections pointing at the source workspace** appears in the cutover
 report. It lists connection names where returned, IDs, redacted paths, matching source item
-IDs and the destination workspace. A suggested destination path appears only when recorded
-mappings remove every recognised source reference from that path. Review the connections
-and their consumers, then manually configure replacements or repoint them as appropriate
-before retiring the source. A source connection stays listed even if the migration used an
+IDs and the destination workspace. **SQL matches require both server and database** from
+source data-store metadata. A matching database name or GUID on a different server is not a
+source connection. Hostname casing, `tcp:` and the default port are normalized; database-name
+case is preserved, except for GUID casing. Missing or unrecognised SQL path formats are
+unverified, not matches. SQL destination suggestions require exact mappings for both
+coordinates; changing only the catalog while retaining the old server is never suggested.
+Other path suggestions must remove every recognised source reference.
+
+Review current consumers before deciding whether to change anything. **PersonalCloud does
+not prove default-semantic-model ownership**, and an **Automatic** connection is an implicit/
+SSO binding, not a shared connection that necessarily needs recreation. Check the consuming
+model's data-source and Gateway and cloud connections settings. The report does not infer
+ownership or usage from a connection's name, SQL target or lack of a display name.
+A source connection stays listed even if the migration used an
 explicit replacement: consumers outside this migration may still use the original.
 
 This is a point-in-time, read-only inventory, not live cutover validation. The scan matches
@@ -407,6 +417,10 @@ not clean results. A run stopped before the scan keeps unknown or stale evidence
 than making additional calls after cancellation. The snapshot survives restart and is
 included as `connectionAdvisories` in the downloadable readiness JSON. Reassignment does
 not need this scan because it retains the original workspace identity.
+Snapshots from the retired identifier-only matcher are marked **Stale** and their matches
+and path suggestions withheld, including in JSON downloads; their journals remain unchanged.
+Use the user lookup script for manual inspection without rerunning the migration. A future
+migration attempt records a new versioned scan.
 
 Under **Look up connection names**, choose **View script**, then **Copy** or **Download
 .ps1**. Run it yourself in **PowerShell 7+ with the Az.Accounts module**, signing into the
