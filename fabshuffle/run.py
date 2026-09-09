@@ -390,13 +390,100 @@ class RunRegistry:
                     if step in outcome.required
                 )
                 if (
-                    (replay.interrupted or failed_work)
+                    not replay.ignored and replay.restart_state != "complete"
+                    and (replay.interrupted or replay.status == RunStatus.CANCELLED.value
+                         or failed_work or replay.restart_state == "pending")
                     and not self._active(lineage, target, replay.plan, replay.scratch_workspace_id)
                     and "*" not in self._cleaning
                     and not self._cleaning.intersection(keys)
                 ):
                     latest.append(replay)
             return latest
+
+    @contextlib.contextmanager
+    def saved_action_claim(
+        self, run_id: str, *, directory: Path, destructive: bool = False,
+        **expected_identity: str,
+    ) -> Iterator[journal.Replay]:
+        """Lock a saved attempt and its workspaces against resume, cleanup and other actions."""
+        with self._lock:
+            replay = journal.read(directory / f"{run_id}.jsonl")
+            if not replay.plan:
+                raise RunConflict(run_id, "The saved migration journal cannot be read.")
+            journal.validate_replay_binding(replay, **expected_identity)
+            if replay.damaged_lines:
+                raise RunConflict(
+                    run_id, "Repair the damaged journal before changing saved migration state.",
+                )
+            latest = journal.latest_runs(directory)
+            if run_id not in {entry.run_id for entry in latest}:
+                raise RunConflict(
+                    run_id, "This attempt was superseded. Select the latest saved migration.",
+                )
+            lineage = replay.lineage_id or run_id
+            target, scratch = replay.target_workspace_id, replay.scratch_workspace_id
+            active = self._active(lineage, target, replay.plan, scratch)
+            if active:
+                raise RunConflict(
+                    active.id, "Wait for the related migration to stop before using this action.",
+                )
+            keys = self._cleanup_keys(replay.plan, lineage, target, scratch)
+            if "*" in self._cleaning or self._cleaning.intersection(keys):
+                raise RunConflict(
+                    run_id, "Another saved-migration action or cleanup is already in progress.",
+                )
+            if destructive:
+                for entry in journal.list_runs(directory):
+                    if entry.ownership_error:
+                        raise journal.TenantBindingError(entry.ownership_error)
+                    related = self._related_saved(replay, entry)
+                    own_ancestor = (
+                        entry.run_id in replay.ancestors
+                        and journal.binding_scope(entry.plan) == journal.binding_scope(replay.plan)
+                    )
+                    if related and entry.run_id != run_id and not own_ancestor:
+                        raise RunConflict(
+                            entry.run_id, "Another saved migration also owns these workspaces. "
+                            "Reconcile that migration before deleting anything.",
+                        )
+                    if related and not own_ancestor and entry.copy_jobs:
+                        raise RunConflict(
+                            entry.run_id, "Copy Jobs may still be running. Resume and reconcile their "
+                            "recorded status before deleting the destination.",
+                        )
+                for attempt in self._runs.values():
+                    own_ancestor = (
+                        attempt.id in replay.ancestors
+                        and journal.binding_scope(attempt.plan) == journal.binding_scope(replay.plan)
+                    )
+                    if (
+                        not own_ancestor and self._related(attempt, lineage, target, replay.plan, scratch)
+                        and attempt.summary.get("unresolvedCopyJobs")
+                    ):
+                        raise RunConflict(
+                            attempt.id, "Reconcile unresolved Copy Jobs before full restart.",
+                        )
+            self._cleaning.update(keys)
+        try:
+            yield replay
+        finally:
+            with self._lock:
+                self._cleaning.difference_update(keys)
+
+    @staticmethod
+    def _related_saved(left: journal.Replay, right: journal.Replay) -> bool:
+        left_workspaces = {
+            journal.target_scope(left.plan, value)
+            for value in (left.target_workspace_id, left.scratch_workspace_id) if value
+        }
+        right_workspaces = {
+            journal.target_scope(right.plan, value)
+            for value in (right.target_workspace_id, right.scratch_workspace_id) if value
+        }
+        return (
+            left.lineage_id == right.lineage_id
+            and journal.binding_scope(left.plan) == journal.binding_scope(right.plan)
+        ) or bool(left_workspaces.intersection(right_workspaces))
 
     @contextlib.contextmanager
     def cleanup_claim(

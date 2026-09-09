@@ -360,12 +360,37 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .warnings button { margin-top: 0.75rem; }
 #leftovers { margin-top: 0; margin-bottom: 1.25rem; }
 
-/* Each unfinished run is a small record with its own action, not a bullet point. */
+/* Each unfinished run is a small record with its own actions, not a bullet point. */
 #resumable { margin-top: 0; margin-bottom: 1.25rem; }
 #resumable ul { list-style: none; padding-left: 0; }
-#resumable li { padding: 0.6rem 0; border-top: 1px solid var(--border); }
+#resumable li { padding: 0.6rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
 #resumable li:first-child { border-top: none; padding-top: 0; }
-#resumable li button { margin-top: 0.4rem; }
+#resumable .saved-run-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.6rem; }
+#resumable li button { margin-top: 0; min-height: 2.75rem; }
+#resumable .saved-run-name { color: var(--text); font-weight: 500; }
+#resumable .saved-run-error { color: var(--danger); margin-top: 0.5rem; }
+.saved-run-actions .destructive { border-color: var(--danger); color: var(--danger); }
+.saved-run-actions .destructive:hover:not(:disabled) { border-color: var(--text); color: var(--text); }
+
+.saved-run-confirmation {
+  width: min(34rem, calc(100% - 2rem));
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  padding: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.4);
+  overflow-wrap: anywhere;
+}
+.saved-run-confirmation::backdrop { background: rgba(0, 0, 0, 0.7); }
+.saved-run-confirmation h2 { margin: 0 0 1rem; font-size: 1.1rem; }
+.saved-run-confirmation p { margin: 0 0 0.85rem; font-size: 0.9rem; }
+.saved-run-confirmation .saved-run-name { font-weight: 600; }
+.saved-run-confirmation button { min-height: 2.75rem; }
+.saved-run-confirmation .destructive { background: var(--danger); color: #10131a; }
+.saved-run-confirmation .destructive:hover:not(:disabled) { background: #f1848a; }
 
 .warnings.danger { border-color: rgba(229, 100, 107, 0.5); background: rgba(229, 100, 107, 0.1); }
 .warnings.danger h3 { color: var(--danger); }

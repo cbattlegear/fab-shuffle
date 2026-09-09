@@ -97,6 +97,24 @@ def dependencies(client, session_id):
     return response.json()["dependencies"]
 
 
+def test_full_restart_preview_rebuilds_powerbi_content_instead_of_reassigning_source(
+    client, session_id, monkeypatch,
+):
+    install(monkeypatch, [{"id": "model", "displayName": "Model", "type": "SemanticModel"}])
+    observed = []
+    monkeypatch.setattr(
+        web, "_dependency_report",
+        lambda *a, **kw: observed.append(kw["migrated"]) or {"dependencies": [], "connectionAccess": None},
+    )
+    params = {"capacity_id": "cap-1", "source_workspace_id": "ws-1", "strategy": "rebuild"}
+    response = client.get("/api/preview", params=params, headers=auth(session_id))
+    assert response.status_code == 200
+    assert response.json()["strategy"] == "rebuild"
+    assert response.json()["migratedTotal"] == 1
+    assert client.get("/api/preview/dependencies", params=params, headers=auth(session_id)).status_code == 200
+    assert observed[0][0]["id"] == "model"
+
+
 def test_preview_recommends_reassignment_for_power_bi_only(client, session_id, monkeypatch):
     install(
         monkeypatch,

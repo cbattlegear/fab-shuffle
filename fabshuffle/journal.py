@@ -54,6 +54,7 @@ FOLLOWER = "follower"
 OUTCOME = "outcome"
 INVENTORY = "inventory"
 REFERENCE_BLOCK = "reference_block"
+RECOVERY_ACTION = "recovery_action"
 
 #: How many run journals to keep. They are small, but the directory sits on a volume that
 #: outlives the container and nothing else ever removes them.
@@ -62,7 +63,10 @@ PAIRED_JOURNAL_VERSION = 1
 TENANT_BINDING_FIELDS = (
     "source_tenant_id", "target_tenant_id", "source_client_id", "target_client_id",
 )
-_OWNED_RECORDS = {WORKSPACE, ITEM, MAPPING, DATA, INVALIDATED, REFRESH, COPY_JOB, FOLLOWER, REFERENCE_BLOCK}
+_OWNED_RECORDS = {
+    WORKSPACE, ITEM, MAPPING, DATA, INVALIDATED, REFRESH, COPY_JOB, FOLLOWER,
+    REFERENCE_BLOCK, RECOVERY_ACTION,
+}
 
 
 class TenantBindingError(ValueError):
@@ -129,6 +133,11 @@ def validate_replay_binding(replay: Replay, **expected: str) -> bool:
 
 
 def validate_resume_plan(plan: Mapping[str, Any], prior: Replay) -> None:
+    if prior.ignored or prior.restart_state:
+        raise TenantBindingError(
+            "This saved migration was ignored or marked for a full restart and cannot be resumed. "
+            "Finish its full restart or start a fresh migration instead."
+        )
     binding = tenant_binding(plan)
     validate_replay_binding(prior, **binding)
     if binding:
@@ -351,6 +360,11 @@ class Journal:
     def inventory(self) -> None:
         self._write(INVENTORY)
 
+    def recovery_action(self, action: str, *, workspace_id: str = "") -> None:
+        if action not in ("ignore", "restart_started", "workspace_deleted", "restart_completed"):
+            raise ValueError("Unknown saved-migration action.")
+        self._write(RECOVERY_ACTION, action=action, workspace_id=workspace_id, strict=True)
+
 
 #: A journal that records nothing, for a preview or a test that has nothing to resume.
 DISCARD = Journal(None)
@@ -413,6 +427,9 @@ class Replay:
     tenant_binding: dict[str, str] = field(default_factory=dict)
     binding_version: int = 0
     ownership_error: str = ""
+    ignored: bool = False
+    restart_state: str = ""
+    deleted_workspaces: set[str] = field(default_factory=set)
     workspace_owners: dict[str, dict[str, str]] = field(default_factory=dict)
     cleanup: bool = True
     target_workspace_id: str = ""
@@ -622,6 +639,32 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
                 "tenant_id": replay.tenant_binding["target_tenant_id"],
                 "client_id": replay.tenant_binding["target_client_id"],
             }
+    elif kind == RECOVERY_ACTION:
+        action = record.get("action")
+        if action == "ignore":
+            replay.ignored = True
+        elif action == "restart_started" and replay.restart_state != "complete":
+            replay.restart_state = "pending"
+            replay.inventory_complete = False
+            for outcome in replay.outcomes.values():
+                outcome.invalidate(
+                    replay.run_id, target_lost=True,
+                    reason="Full restart was requested; destination contents may have been deleted.",
+                )
+        elif action == "workspace_deleted" and replay.restart_state == "pending":
+            workspace_id = record.get("workspace_id")
+            if workspace_id and workspace_id in (replay.target_workspace_id, replay.scratch_workspace_id):
+                replay.deleted_workspaces.add(workspace_id)
+            else:
+                replay.ownership_error = "Full restart records a workspace not owned by this migration."
+        elif action == "restart_completed" and replay.restart_state in ("pending", "complete"):
+            expected = {value for value in (replay.target_workspace_id, replay.scratch_workspace_id) if value}
+            if expected.issubset(replay.deleted_workspaces):
+                replay.restart_state = "complete"
+            else:
+                replay.ownership_error = "Full restart completed without recording every workspace deletion."
+        else:
+            replay.ownership_error = "The saved migration has invalid full-restart state."
     elif kind == ITEM:
         source = str(record.get("source") or "")
         target = str(record.get("target") or "")
@@ -823,7 +866,10 @@ def prune(directory: Path, keep: int = KEEP_JOURNALS) -> int:
     files = sorted(directory.glob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
     protected = {
         replay.run_id for replay in latest_runs(directory)
-        if replay.interrupted or replay.copy_jobs or replay.ownership_error
+        if (
+            replay.interrupted or replay.copy_jobs or replay.ownership_error
+            or replay.ignored or replay.restart_state
+        )
     }
     removed = 0
     for path in files[keep:]:

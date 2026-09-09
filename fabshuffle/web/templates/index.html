@@ -75,15 +75,17 @@
 
     <!-- 2. Capacity -->
     <section class="panel" data-stage="capacity" hidden>
-      <h2>Pick the target capacity</h2>
+      <h2 id="capacity-title" tabindex="-1">Pick the target capacity</h2>
       <p class="hint">The new workspace is created on this capacity, which determines the target region.</p>
       <p id="destination-context" class="hint identity-context" hidden></p>
       <p id="resumable-status" class="hint" role="status" hidden></p>
       <div id="resumable" class="warnings" hidden>
-        <h3>Saved migrations needing attention</h3>
+        <h3 id="resumable-title" tabindex="-1">Saved migrations needing attention</h3>
         <p class="hint">
           These stopped partway or finished with failed work. Retrying carries on from the
           saved journal instead of building the workspace again or repeating completed copies.
+          Ignore hides a saved migration without deleting data. Full restart deletes its recorded
+          destination before you choose a capacity for a fresh migration.
         </p>
         <ul></ul>
       </div>
@@ -117,6 +119,21 @@
         <button class="primary" id="capacity-next" disabled>Continue</button>
       </div>
     </section>
+
+    <dialog id="saved-run-confirmation" class="saved-run-confirmation"
+            aria-labelledby="saved-run-confirm-title"
+            aria-describedby="saved-run-confirm-name saved-run-confirm-target saved-run-confirm-description saved-run-confirm-warning">
+      <h2 id="saved-run-confirm-title"></h2>
+      <p id="saved-run-confirm-name" class="saved-run-name"></p>
+      <p id="saved-run-confirm-target" class="hint identity-context"></p>
+      <p id="saved-run-confirm-description"></p>
+      <p id="saved-run-confirm-warning"></p>
+      <p id="saved-run-confirm-progress" class="hint" role="status" hidden></p>
+      <div class="actions">
+        <button id="saved-run-confirm-cancel" class="secondary" type="button" autofocus>Cancel</button>
+        <button id="saved-run-confirm-submit" class="primary" type="button"></button>
+      </div>
+    </dialog>
 
     <!-- 3. Workspace -->
     <section class="panel" data-stage="workspace" hidden>

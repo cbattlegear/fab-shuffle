@@ -19,9 +19,9 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from fabshuffle import __version__, journal
+from fabshuffle import __version__, journal, recovery
 from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import analytics, connections, definitions, migration_refs, relations, workspaces
@@ -264,6 +264,15 @@ class RestoreAccessRequest(BaseModel):
     target_workspace_id: str = Field(min_length=1)
 
 
+class ConfirmSavedAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmed: StrictBool
+
+
+class ConfirmFullRestart(ConfirmSavedAction):
+    target_workspace_id: str
+
+
 class StartRunRequest(BaseModel):
     capacity_id: str = Field(min_length=1)
     source_workspace_id: str = Field(min_length=1)
@@ -448,6 +457,7 @@ def create_app() -> FastAPI:
     async def preview(
         capacity_id: str,
         source_workspace_id: str,
+        strategy: Literal["rebuild"] | None = None,
         session: Session = Depends(require_session),
     ) -> dict[str, Any]:
         """Summarise what the migration would create before the operator commits."""
@@ -459,6 +469,7 @@ def create_app() -> FastAPI:
                     capacity_id=capacity_id,
                     source_workspace_id=source_workspace_id,
                     copy_permissions=not session.paired,
+                    **({"strategy": Strategy.REBUILD} if strategy else {}),
                     **_tenant_plan_inputs(session, target),
                 )
                 assessment = assess_workspace(
@@ -509,6 +520,7 @@ def create_app() -> FastAPI:
     @app.get("/api/preview/dependencies")
     async def preview_dependencies(
         source_workspace_id: str,
+        strategy: Literal["rebuild"] | None = None,
         session: Session = Depends(require_session),
     ) -> dict[str, Any]:
         """The dependency check, split out because it is much slower than the rest of the preview.
@@ -521,7 +533,7 @@ def create_app() -> FastAPI:
         def work() -> dict[str, Any]:
             with FabricClient(session.tokens) as client:
                 assessment = assess_workspace(
-                    list_items(client, source_workspace_id), force_rebuild=session.paired,
+                    list_items(client, source_workspace_id), force_rebuild=session.paired or bool(strategy),
                     require_stopped=session.paired,
                 )
                 if assessment.strategy is Strategy.REASSIGN:
@@ -682,6 +694,57 @@ def create_app() -> FastAPI:
             ],
         }
 
+    @app.post("/api/runs/{run_id}/ignore")
+    async def ignore_saved_run(
+        run_id: str, body: ConfirmSavedAction,
+        session: Session = Depends(require_execution_session),
+    ) -> dict[str, Any]:
+        if not body.confirmed:
+            raise HTTPException(status_code=400, detail="Confirm Ignore before hiding this saved migration.")
+
+        def work() -> dict[str, Any]:
+            path = _session_journal(session, run_id)
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail="No journal for that run")
+            with REGISTRY.saved_action_claim(
+                run_id, directory=path.parent, **_session_identity(session),
+            ) as replay:
+                if not replay.ignored:
+                    journal.Journal(path).recovery_action("ignore")
+                return {"ignored": True, "runId": run_id}
+
+        return await _run_saved_action(work)
+
+    @app.post("/api/runs/{run_id}/restart")
+    async def restart_saved_run(
+        run_id: str, body: ConfirmFullRestart,
+        session: Session = Depends(require_execution_session),
+    ) -> dict[str, Any]:
+        if not body.confirmed:
+            raise HTTPException(status_code=400, detail="Confirm destination deletion before a full restart.")
+
+        def work() -> dict[str, Any]:
+            path = _session_journal(session, run_id)
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail="No journal for that run")
+            with REGISTRY.saved_action_claim(
+                run_id, directory=path.parent, destructive=True, **_session_identity(session),
+            ) as replay:
+                # Confirmation, mode and source protection precede all remote work.
+                if body.target_workspace_id != replay.target_workspace_id:
+                    raise ValueError(
+                        "The destination changed. Reload the list before confirming full restart.",
+                    )
+                if reason := recovery.restart_blocker(replay):
+                    raise ValueError(reason)
+                with _planning_clients(session) as (source, target):
+                    return recovery.full_restart(
+                        replay, journal.Journal(path), source_client=source, target_client=target,
+                        confirmed_target_id=body.target_workspace_id, identity=_session_identity(session),
+                    )
+
+        return await _run_saved_action(work)
+
     @app.post("/api/runs/{run_id}/resume-preview")
     async def resume_preview(
         run_id: str, body: ResumeRunRequest,
@@ -827,6 +890,11 @@ def _resume_plan(session: Session, run_id: str) -> tuple[journal.Replay, Migrati
         raise HTTPException(status_code=404, detail="No journal for that run")
     replay = journal.read(path)
     _require_replay(session, replay)
+    if replay.ignored or replay.restart_state:
+        raise HTTPException(
+            status_code=409,
+            detail="This migration was ignored or marked for full restart. It cannot be resumed.",
+        )
     try:
         return replay, plan_from_journal(replay)
     except ValueError as error:
@@ -839,6 +907,15 @@ def _readiness(run_id: str, session: Session) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Invalid run ID")
     path = _session_journal(session, run_id)
     run = REGISTRY.get(run_id)
+    if path.is_file():
+        saved = journal.read(path)
+        if saved.restart_state:
+            _require_replay(session, saved)
+            raise HTTPException(
+                status_code=409,
+                detail="This migration's destination is being removed or was removed by Full restart. "
+                "Its old cutover report no longer describes a usable destination.",
+            )
     if run is not None:
         _require_identity(session, run.plan)
         return readiness_report(
@@ -915,6 +992,9 @@ def _resumable_dict(replay: journal.Replay) -> dict[str, Any]:
         "capacityName": plan.get("capacity_name") or "",
         "capacityRegion": plan.get("capacity_region") or "",
         "targetWorkspaceId": replay.target_workspace_id,
+        "recoveryAction": "restart_pending" if replay.restart_state == "pending" else "",
+        "canRestart": not recovery.restart_blocker(replay),
+        "restartBlockedReason": recovery.restart_blocker(replay),
         # What it managed before it stopped, which is what the operator is deciding about.
         "itemsCreated": len(replay.items) or len(replay.id_map),
         "lastPhase": replay.phases_started[-1] if replay.phases_started else "",
@@ -1175,6 +1255,18 @@ def _require_run(run_id: str, session: Session) -> MigrationRun:
     return run
 
 
+async def _run_saved_action(work):
+    try:
+        return await _run_fabric(work)
+    except OSError as error:
+        logger.exception("Could not persist the saved-migration action")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save the migration action: {error}. "
+            "Restore journal storage, reload the saved migrations and retry the action.",
+        ) from error
+
+
 async def _run_fabric(work):
     """Run a blocking Fabric call off the event loop, mapping API errors to HTTP errors."""
     try:
@@ -1186,6 +1278,8 @@ async def _run_fabric(work):
         raise HTTPException(status_code=502, detail=str(error)) from error
     except AuthError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 

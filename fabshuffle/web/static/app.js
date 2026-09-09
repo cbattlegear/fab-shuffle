@@ -19,6 +19,7 @@ const state = {
   mappingsChecked: false,
   resumeRunId: null,
   resumeReturnStage: "capacity",
+  forceRebuild: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -141,6 +142,7 @@ $("#login-form").addEventListener("submit", async (event) => {
   busy(button, true, "Signing in…");
   try {
     const result = await api("/api/login", { method: "POST", body: data });
+    invalidateSavedRunActions();
     state.sessionId = result.sessionId;
     state.identity = result;
     state.paired = !!result.paired;
@@ -149,6 +151,7 @@ $("#login-form").addEventListener("submit", async (event) => {
     state.assessmentPending = false;
     state.mappingsChecked = false;
     state.resumeRunId = null;
+    state.forceRebuild = false;
     state.capacity = null;
     state.workspace = null;
     state.workspaces = [];
@@ -174,6 +177,7 @@ $("#login-form").addEventListener("submit", async (event) => {
 });
 
 $("#sign-out").addEventListener("click", async () => {
+  invalidateSavedRunActions();
   try {
     await api("/api/logout", { method: "POST" });
   } catch (_) {
@@ -186,7 +190,7 @@ $("#sign-out").addEventListener("click", async () => {
   Object.assign(state, {
     sessionId: null, capacity: null, workspace: null, workspaces: [],
     preview: null, runId: null, events: null, identity: null, paired: false, crossTenant: false,
-    resumeRunId: null,
+    resumeRunId: null, forceRebuild: false,
   });
   $("#sign-out").hidden = true;
   goTo("login");
@@ -207,10 +211,15 @@ function renderIdentity() {
 
 // ------------------------------------------------------------------ capacity
 
+let capacityLoadVersion = 0;
+
 async function loadCapacities() {
+  const sessionId = state.sessionId;
+  const version = ++capacityLoadVersion;
   const container = $("#capacity-list");
   container.innerHTML = '<p class="hint">Loading capacities…</p>';
   const { capacities } = await api("/api/capacities");
+  if (sessionId !== state.sessionId || version !== capacityLoadVersion) return;
   renderChoices(
     container,
     capacities.map((capacity) => ({
@@ -232,40 +241,47 @@ async function loadCapacities() {
 
 $("#capacity-next").addEventListener("click", async () => {
   const button = $("#capacity-next");
+  if (button.disabled) return;
+  const sessionId = state.sessionId;
+  const version = state.assessmentVersion;
   busy(button, true, "Loading…");
   try {
     await loadWorkspaces();
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
     goTo("workspace");
   } catch (error) {
-    showError(error.message);
+    if (sessionId === state.sessionId && version === state.assessmentVersion) showError(error.message);
   } finally {
-    busy(button, false);
+    if (sessionId === state.sessionId && version === state.assessmentVersion) busy(button, false);
   }
 });
 
-// Run state lives in memory, so a restarted container loses track of a scratch workspace
-// that was never cleaned up. Surface any leftovers right after sign-in.
+let savedRunsVersion = 0;
+let savedRunConfirmation = null;
+const savedRunErrors = new Map();
+
 async function loadResumable() {
   const sessionId = state.sessionId;
+  const version = ++savedRunsVersion;
   const status = $("#resumable-status");
   status.hidden = !state.paired;
   status.textContent = "Looking for saved runs needing attention for this tenant and app pair…";
   try {
     const { runs } = await api("/api/resumable");
-    if (state.sessionId !== sessionId) return;
+    if (state.sessionId !== sessionId || version !== savedRunsVersion) return;
     const container = $("#resumable");
     container.hidden = !runs.length;
     status.textContent = runs.length
       ? "Only runs bound to this source and destination tenant/app pair are shown."
       : "No saved runs need retrying for this tenant/app pair. To recover another pair, sign in with its original apps.";
-    if (!runs.length) return;
-
     const list = container.querySelector("ul");
     list.innerHTML = "";
     runs.forEach((run) => {
       const item = document.createElement("li");
+      item.dataset.runId = run.runId;
 
       const what = document.createElement("div");
+      what.className = "saved-run-name";
       what.textContent = `${run.sourceWorkspaceName} → ${run.targetWorkspaceName}`;
       item.appendChild(what);
 
@@ -281,45 +297,255 @@ async function loadResumable() {
       }
       item.appendChild(detail);
 
+      const pending = run.recoveryAction === "restart_pending";
+      if (pending || run.canRestart === false) {
+        const reason = document.createElement("p");
+        reason.className = "hint";
+        reason.textContent = pending
+          ? "Full restart is unfinished. Resume is unavailable; finish the full restart before starting a fresh migration."
+          : "";
+        if (run.canRestart === false) reason.textContent += ` ${run.restartBlockedReason || "Full restart is unavailable. Refresh the saved migrations to check again."}`;
+        item.appendChild(reason);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "saved-run-actions";
       const button = document.createElement("button");
+      button.type = "button";
       button.className = "secondary";
-      button.textContent = state.paired ? "Review mappings and resume" : "Pick it up";
-      button.addEventListener("click", () => state.paired
-        ? prepareResume(run.runId, button, "capacity") : resumeRun(run.runId, button));
-      item.appendChild(button);
+      button.textContent = state.paired ? "Review mappings and resume" : "Resume";
+      button.disabled = pending;
+      button.addEventListener("click", async () => {
+        if (button.disabled || sessionId !== state.sessionId || savedRunConfirmation) return;
+        const restore = lockSavedRunRow(item);
+        try {
+          if (state.paired) await prepareResume(run.runId, button, "capacity");
+          else await resumeRun(run.runId, button);
+        } finally {
+          if (sessionId === state.sessionId) restore();
+        }
+      });
+      actions.appendChild(button);
+      for (const kind of ["ignore", "restart"]) {
+        const action = document.createElement("button");
+        action.type = "button";
+        action.className = kind === "restart" ? "secondary destructive" : "secondary";
+        action.textContent = kind === "ignore" ? "Ignore" : pending ? "Finish full restart" : "Full restart";
+        action.disabled = kind === "restart" && run.canRestart === false;
+        action.addEventListener("click", () => {
+          if (!action.disabled && sessionId === state.sessionId) confirmSavedRunAction(run, kind, item, action);
+        });
+        actions.appendChild(action);
+      }
+      item.appendChild(actions);
+      if (savedRunErrors.has(run.runId)) {
+        const error = document.createElement("p");
+        error.className = "hint saved-run-error";
+        error.textContent = savedRunErrors.get(run.runId);
+        item.appendChild(error);
+      }
 
       list.appendChild(item);
     });
+    return true;
   } catch (error) {
-    if (state.sessionId !== sessionId) return;
+    if (state.sessionId !== sessionId || version !== savedRunsVersion) return;
     status.hidden = false;
     status.textContent = `Could not load unfinished migrations: ${error.message}. Sign in again to retry.`;
+    return false;
   }
+}
+
+function lockSavedRunRow(row) {
+  const buttons = Array.from(row.querySelectorAll("button")).map((button) => [button, button.disabled]);
+  buttons.forEach(([button]) => { button.disabled = true; });
+  return () => buttons.forEach(([button, disabled]) => { button.disabled = disabled; });
+}
+
+function closeSavedRunConfirmation(restoreFocus = false) {
+  const confirmation = savedRunConfirmation;
+  savedRunConfirmation = null;
+  const dialog = $("#saved-run-confirmation");
+  if (dialog.open) dialog.close();
+  if (restoreFocus && confirmation?.sessionId === state.sessionId) confirmation.opener.focus();
+}
+
+function invalidateSavedRunActions() {
+  savedRunsVersion++;
+  savedRunErrors.clear();
+  closeSavedRunConfirmation();
+}
+
+function confirmSavedRunAction(run, kind, row, opener) {
+  if (savedRunConfirmation) return;
+  savedRunConfirmation = { run, kind, row, opener, sessionId: state.sessionId, busy: false };
+  const restarting = kind === "restart";
+  $("#saved-run-confirm-title").textContent = restarting ? "Full restart of this migration?" : "Ignore this saved migration?";
+  $("#saved-run-confirm-name").textContent = `${run.sourceWorkspaceName} → ${run.targetWorkspaceName}`;
+  $("#saved-run-confirm-target").textContent = run.targetWorkspaceId
+    ? `Destination workspace ID: ${run.targetWorkspaceId}`
+    : "No destination workspace was recorded for this migration.";
+  $("#saved-run-confirm-description").textContent = restarting
+    ? (run.targetWorkspaceId
+      ? "The recorded destination workspace and all its contents will be deleted. "
+      : "No destination workspace will be deleted because none was recorded. ") +
+      "The source workspace is left unchanged. Any temporary run workspace is cleaned up if needed."
+    : "Permanently hide this migration from the saved migrations list, including after signing in again.";
+  $("#saved-run-confirm-warning").textContent = restarting
+    ? "Deletion cannot be undone. After cleanup, choose a capacity and review a fresh migration. Nothing starts automatically, and no previous item IDs, mappings or copy checkpoints are reused."
+    : "This does not delete any workspace or data, and does not stop running jobs. The saved journal is kept.";
+  $("#saved-run-confirm-cancel").disabled = false;
+  const submit = $("#saved-run-confirm-submit");
+  submit.disabled = false;
+  submit.className = restarting ? "destructive" : "primary";
+  submit.textContent = restarting
+    ? (run.targetWorkspaceId ? "Delete destination and restart" : "Full restart")
+    : "Ignore migration";
+  $("#saved-run-confirm-progress").hidden = true;
+  $("#saved-run-confirmation").showModal();
+  $("#saved-run-confirm-cancel").focus();
+}
+
+$("#saved-run-confirm-cancel").addEventListener("click", () => {
+  if (!savedRunConfirmation?.busy) closeSavedRunConfirmation(true);
+});
+$("#saved-run-confirmation").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  if (!savedRunConfirmation?.busy) closeSavedRunConfirmation(true);
+});
+
+$("#saved-run-confirm-submit").addEventListener("click", async () => {
+  const confirmation = savedRunConfirmation;
+  if (!confirmation || confirmation.busy || confirmation.sessionId !== state.sessionId) return;
+  const { run, kind, row, sessionId } = confirmation;
+  confirmation.busy = true;
+  savedRunsVersion++;
+  const restore = lockSavedRunRow(row);
+  $("#saved-run-confirm-submit").disabled = true;
+  $("#saved-run-confirm-cancel").disabled = true;
+  const progress = $("#saved-run-confirm-progress");
+  progress.hidden = false;
+  progress.textContent = kind === "restart" ? "Cleaning up the recorded migration… Please wait."
+    : "Hiding this saved migration…";
+  const current = () => savedRunConfirmation === confirmation && state.sessionId === sessionId;
+  try {
+    const body = kind === "restart"
+      ? { confirmed: true, target_workspace_id: run.targetWorkspaceId || "" }
+      : { confirmed: true };
+    const result = await api(`/api/runs/${encodeURIComponent(run.runId)}/${kind}`, { method: "POST", body });
+    if (!current()) return;
+    savedRunErrors.delete(run.runId);
+    row.remove();
+    if (!$("#resumable").querySelector("ul").children.length) $("#resumable").hidden = true;
+    if (kind === "restart") {
+      resetForFullRestart(result.sourceWorkspace);
+      goTo("capacity");
+    }
+    closeSavedRunConfirmation();
+    if (kind === "restart") {
+      $("#capacity-title").focus();
+      // Cleanup has already succeeded; a discovery failure must not offer deletion again.
+      loadCapacities().catch((error) => {
+        if (sessionId === state.sessionId) showError(`Full restart cleanup completed. Could not load capacities: ${error.message}. Sign in again to choose a capacity.`);
+      });
+    }
+    await loadResumable();
+    if (sessionId !== state.sessionId) return;
+    if (kind === "ignore") {
+      ($("#resumable").hidden ? $("#capacity-title") : $("#resumable-title")).focus();
+    }
+  } catch (error) {
+    if (!current()) return;
+    restore();
+    if (kind === "restart") {
+      // Until the server reports otherwise, a failed response could mean partial deletion.
+      run.recoveryAction = "restart_pending";
+      row.querySelector("button").disabled = true;
+      confirmation.opener.textContent = "Finish full restart";
+    }
+    const message = `${error.message} ${kind === "restart"
+      ? "Could not confirm that full restart completed. Resolve the error, then try Full restart again."
+      : "Could not confirm that the migration was hidden. Resolve the error, then try Ignore again."}`;
+    savedRunErrors.set(run.runId, message);
+    closeSavedRunConfirmation();
+    showError(message);
+    confirmation.opener.focus();
+    await loadResumable();
+    if (sessionId === state.sessionId) {
+      const updated = Array.from($("#resumable").querySelector("ul").children)
+        .find((item) => item.dataset.runId === run.runId);
+      const action = updated?.querySelectorAll("button")[kind === "restart" ? 2 : 1];
+      if (action && !action.disabled) action.focus();
+      else ($("#resumable").hidden ? $("#capacity-title") : $("#resumable-title")).focus();
+    }
+  }
+});
+
+function resetForFullRestart(sourceWorkspace) {
+  if (state.events) state.events.close();
+  resetReadiness();
+  stopAssessmentTimer();
+  state.assessmentVersion++;
+  Object.assign(state, {
+    capacity: null, workspace: sourceWorkspace, workspaces: [], preview: null,
+    runId: null, resumeRunId: null, resumeReturnStage: "capacity", events: null,
+    assessmentPending: false, forceRebuild: true,
+  });
+  resetMappings();
+  busy($("#capacity-next"), false);
+  busy($("#workspace-next"), false);
+  $("#capacity-next").disabled = true;
+  $("#workspace-next").disabled = true;
+  $("#workspace-filter").value = "";
+  $("#workspace-list").innerHTML = "";
+  $("#target-name").value = "";
+  $("#target-name").disabled = false;
+  for (const id of ["opt-data", "opt-files", "opt-cleanup", "opt-permissions"]) {
+    $(`#${id}`).checked = id !== "opt-permissions" || !state.paired;
+    $(`#${id}`).disabled = id === "opt-permissions" && state.paired;
+  }
+  $("#resume-artifacts").hidden = true;
+  $("#resume-artifacts").open = false;
+  for (const id of ["resume-target-id", "resume-item-ids", "source-connection-options",
+    "target-connection-options", "review-summary", "run-banner", "step-list"]) {
+    $(`#${id}`).textContent = "";
+  }
+  $("#connection-options-status").textContent = "";
+  $("#mapping-status").textContent = "Re-check after editing mappings.";
+  $("#review-title").textContent = "Review the move";
+  $("#review-back").hidden = false;
+  $("#resume-back").hidden = true;
+  $("#start-run").textContent = "Start migration";
+  $("#start-run").disabled = true;
+  for (const id of ["retry-run", "cleanup-run", "cancel-run", "start-over"]) $(`#${id}`).hidden = true;
 }
 
 async function resumeRun(runId, button, mappings) {
   const sessionId = state.sessionId;
+  const version = state.assessmentVersion;
   busy(button, true, "Starting…");
   try {
     const result = await api(`/api/runs/${runId}/resume`, { method: "POST", body: mappings });
-    if (sessionId !== state.sessionId) return;
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
     state.resumeRunId = null;
     state.runId = result.runId;
     goTo("progress");
     watchRun(result.runId);
   } catch (error) {
-    if (sessionId === state.sessionId) showError(error.message);
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
+    showError(error.message);
     busy(button, false);
-    if (state.resumeRunId) setStartEnabled(!state.preview.blockers.length);
+    if (state.resumeRunId && state.preview) setStartEnabled(!state.preview.blockers.length);
   }
 }
 
 async function prepareResume(runId, button, returnStage = "progress") {
   busy(button, true, "Loading saved mappings…");
   const sessionId = state.sessionId;
+  const version = ++state.assessmentVersion;
   try {
     const saved = await api(`/api/runs/${runId}/resume-plan`);
-    if (sessionId !== state.sessionId) return;
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
     const plan = saved.plan;
     state.resumeRunId = runId;
     state.resumeReturnStage = returnStage;
@@ -367,7 +593,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
   } catch (error) {
     if (sessionId === state.sessionId) showError(error.message);
   } finally {
-    busy(button, false);
+    if (sessionId === state.sessionId) busy(button, false);
   }
 }
 
@@ -448,7 +674,10 @@ $("#restore-access").addEventListener("click", async () => {
 // ----------------------------------------------------------------- workspace
 
 async function loadWorkspaces() {
+  const sessionId = state.sessionId;
+  const version = state.assessmentVersion;
   const { workspaces } = await api("/api/workspaces");
+  if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
   state.workspaces = workspaces;
   renderWorkspaces("");
 }
@@ -468,6 +697,13 @@ function renderWorkspaces(filter) {
     state.workspace = entry.raw;
     $("#workspace-next").disabled = false;
   });
+  const selected = entries.find((entry) => entry.id === state.workspace?.id);
+  state.workspace = selected?.raw || null;
+  $("#workspace-next").disabled = !selected;
+  if (selected) {
+    const choice = Array.from($("#workspace-list").children).find((entry) => entry.dataset.id === selected.id);
+    choice.setAttribute("aria-checked", "true");
+  }
   if (!entries.length && state.paired) {
     $("#workspace-list").textContent = needle ? "No matching source workspaces. Clear the filter to see all workspaces."
       : "No source workspaces are visible. Grant the source app workspace access, then sign in again.";
@@ -482,11 +718,14 @@ $("#workspace-filter").addEventListener("input", (event) => {
 
 $("#workspace-next").addEventListener("click", async () => {
   const button = $("#workspace-next");
+  if (button.disabled) return;
+  const sessionId = state.sessionId;
   busy(button, true, "Inspecting…");
   const params = new URLSearchParams({
     capacity_id: state.capacity.id,
     source_workspace_id: state.workspace.id,
   });
+  if (state.forceRebuild) params.set("strategy", "rebuild");
 
   // Both requests go out together, and the review screen appears straight away. The
   // dependency check walks the relations API and every connection in the tenant, so waiting
@@ -501,10 +740,12 @@ $("#workspace-next").addEventListener("click", async () => {
   try {
     goTo("review");
     renderReviewPending();
-    state.preview = await api(`/api/preview?${params}`);
-    if (version !== state.assessmentVersion) return;
+    const preview = await api(`/api/preview?${params}`);
+    if (version !== state.assessmentVersion || sessionId !== state.sessionId) return;
+    state.preview = preview;
     renderReview();
   } catch (error) {
+    if (version !== state.assessmentVersion || sessionId !== state.sessionId) return;
     goTo("workspace");
     showError(error.message);
     busy(button, false);
@@ -527,6 +768,7 @@ $("#recheck").addEventListener("click", async () => {
     return;
   }
   const params = new URLSearchParams({ source_workspace_id: state.workspace.id });
+  if (state.forceRebuild) params.set("strategy", "rebuild");
 
   showDependenciesPending();
   setStartEnabled(false);
@@ -578,6 +820,7 @@ function setStartEnabled(enabled) {
 // -------------------------------------------------------------------- review
 
 let mappingRowId = 0;
+let connectionOptionsVersion = 0;
 
 function invalidateMappings() {
   state.assessmentVersion++;
@@ -627,6 +870,7 @@ function addMappingRow(kind) {
 }
 
 function resetMappings() {
+  connectionOptionsVersion++;
   $("#connection-mapping-rows").innerHTML = "";
   $("#reference-mapping-rows").innerHTML = "";
   $("#opt-write-freeze").checked = false;
@@ -698,12 +942,13 @@ async function recheckMappings() {
 
 async function loadConnectionOptions() {
   const sessionId = state.sessionId;
+  const version = ++connectionOptionsVersion;
   const status = $("#connection-options-status");
   status.textContent = "Loading source and destination connection IDs…";
   const results = await Promise.all(["source", "target"].map(async (side) => {
     try {
       const result = await api(`/api/connections?side=${side}`);
-      if (sessionId !== state.sessionId) return "";
+      if (sessionId !== state.sessionId || version !== connectionOptionsVersion) return "";
       const options = $(`#${side}-connection-options`);
       options.innerHTML = "";
       result.connections.forEach((entry) => {
@@ -716,7 +961,7 @@ async function loadConnectionOptions() {
         : `${side}: no visible connections; create or share one, then re-check`;
     } catch (error) { return `${side}: ${error.message}. Enter known IDs manually or re-check to retry`; }
   }));
-  if (sessionId === state.sessionId) status.textContent = results.join(". ");
+  if (sessionId === state.sessionId && version === connectionOptionsVersion) status.textContent = results.join(". ");
 }
 
 $("#add-connection-mapping").addEventListener("click", () => addMappingRow("connection").querySelector("input").focus());
@@ -733,9 +978,10 @@ function renderReviewPending() {
   const callout = $("#strategy-callout");
   callout.className = "callout";
   callout.innerHTML = '<strong><span class="spin">◜</span> Inspecting the workspace</strong><p></p>';
-  callout.querySelector("p").textContent =
-    "Reading the items in the source workspace to work out whether it can be reassigned or " +
-    "has to be rebuilt.";
+  callout.querySelector("p").textContent = state.forceRebuild
+    ? "Reading the source items to plan a fresh workspace. Full restart always rebuilds; the source will not be reassigned."
+    : "Reading the items in the source workspace to work out whether it can be reassigned or " +
+      "has to be rebuilt.";
   $("#review-summary").innerHTML = "";
   ["#blockers", "#unsupported", "#dependencies", "#review-warnings", "#connection-access"].forEach(
     (id) => {
@@ -994,12 +1240,6 @@ $("#start-run").addEventListener("click", async () => {
     });
     if (sessionId !== state.sessionId) return;
 
-    $("#resume-back").addEventListener("click", () => {
-      state.resumeRunId = null;
-      state.assessmentVersion++;
-      stopAssessmentTimer();
-      goTo(state.resumeReturnStage);
-    });
     state.runId = result.runId;
     goTo("progress");
     watchRun(result.runId);
@@ -1009,6 +1249,13 @@ $("#start-run").addEventListener("click", async () => {
     busy(button, false);
     if (sessionId === state.sessionId && state.preview) setStartEnabled(!state.preview.blockers.length);
   }
+});
+
+$("#resume-back").addEventListener("click", () => {
+  state.resumeRunId = null;
+  state.assessmentVersion++;
+  stopAssessmentTimer();
+  goTo(state.resumeReturnStage);
 });
 
 // ------------------------------------------------------------------ progress
@@ -1490,6 +1737,7 @@ $("#start-over").addEventListener("click", () => {
   state.runId = null;
   state.events = null;
   state.workspace = null;
+  state.forceRebuild = false;
   $("#workspace-next").disabled = true;
   goTo("capacity");
 });

@@ -535,6 +535,23 @@ scratch workspace it deleted on the way out is rebuilt automatically.
 Completed runs with recorded failed steps also appear under **Saved migrations needing
 attention** after a container restart, so a runtime handoff does not lose the retry controls.
 
+Each saved migration offers two confirmed actions in addition to resuming:
+
+- **Ignore** hides that migration from the list permanently, including after a container
+  restart. It preserves its journal and leaves all workspaces, data and remote jobs alone.
+- **Full restart** deletes the recorded destination workspace and its contents, along with
+  the run's recorded scratch workspace if it still exists, then returns to destination
+  capacity selection. The source is retained. The next migration is a fresh run: no old item
+  mappings, completed-copy checkpoints, destination capacity or write-freeze confirmation
+  are reused.
+
+Neither action is available while a related migration is running. Full restart is refused
+for reassignment runs (their workspace is the source), mismatched destination confirmations,
+or unresolved Copy Jobs. Reconcile those jobs first; Ignore does not stop them.
+If deletion fails midway, the entry remains available to **finish the full restart**, but
+cannot resume the old copy into a partly deleted destination. Only confirmed workspace
+deletions are skipped on the next restart attempt. Service errors are retained in the message.
+
 Two things follow from this:
 
 - **Resuming needs you to sign in again.** Credentials are never written down, so nothing can

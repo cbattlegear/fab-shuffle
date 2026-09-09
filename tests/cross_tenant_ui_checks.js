@@ -9,7 +9,7 @@ function fixture() {
     constructor(tag) {
       this.tagName = tag; this.children = []; this.dataset = {}; this.handlers = {};
       this.className = ""; this._text = ""; this.value = ""; this.hidden = false;
-      this.disabled = false; this.checked = false;
+      this.disabled = false; this.checked = false; this.open = false;
       this.classList = {
         add: (name) => { this.className += ` ${name}`; },
         remove: (name) => { this.className = this.className.split(" ").filter((n) => n !== name).join(" "); },
@@ -44,7 +44,9 @@ function fixture() {
     }
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
     addEventListener(type, handler) { this.handlers[type] = handler; }
-    focus() {}
+    focus() { document.activeElement = this; }
+    showModal() { this.open = true; }
+    close() { this.open = false; }
     scrollIntoView() {}
     remove() { this.parentElement.children = this.parentElement.children.filter((child) => child !== this); }
     click() { return this.handlers.click?.({ target: this, currentTarget: this }); }
@@ -70,6 +72,7 @@ function fixture() {
   const root = path.join(__dirname, "..", "fabshuffle", "web");
   parse(fs.readFileSync(path.join(root, "templates", "index.html"), "utf8"), document);
   document.body = document.querySelector("body");
+  document.activeElement = document.body;
   const context = vm.createContext({
     document, console, URLSearchParams, AbortController,
     setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
@@ -88,7 +91,7 @@ function fixture() {
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, loginBody, updateLoginMode, renderReview, renderIdentity, migrationBody,
       mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume,
-      invalidateMappings };`, context);
+      invalidateMappings, loadResumable, loadConnectionOptions, watchRun, resetReadiness };`, context);
   const flush = async () => { for (let i = 0; i < 18; i++) await Promise.resolve(); };
   async function reply(index, data, status = 200) {
     requests[index].resolve({ ok: status < 400, status, text: async () => JSON.stringify(data) });
@@ -111,11 +114,12 @@ function fixture() {
     ui.renderReview();
     ui.setStartEnabled(true);
   }
-  return { get, ui, requests, streams, reply, flush, paired };
+  return { get, ui, document, requests, streams, reply, flush, paired };
 }
 
 const scenarios = {
   async login(f) {
+    f.ui.state.forceRebuild = true;
     const form = f.get("login-form");
     form.querySelectorAll("input").filter((i) => i.name).forEach((input) => { input.value = input.name; });
     assert.equal(f.ui.loginBody(form).destination, undefined);
@@ -136,6 +140,7 @@ const scenarios = {
     assert.equal(form.querySelectorAll("input").find((i) => i.name === "destination_client_secret").value, "");
     await f.reply(1, { capacities: [] });
     assert.equal(f.ui.state.paired, true);
+    assert.equal(f.ui.state.forceRebuild, false);
     assert.equal(f.get("restore-access-tool").hidden, true);
     assert.match(f.get("destination-context").textContent, /target-tenant/);
     assert.ok(f.requests.every((r) => r.url !== "/api/scratch-workspaces"));
@@ -274,8 +279,12 @@ const scenarios = {
   },
 };
 
-const name = process.argv[2];
-assert.ok(scenarios[name], `Unknown paired UI check: ${name}`);
-scenarios[name](fixture()).then(() => console.log(`Passed ${name}`)).catch((error) => {
-  console.error(error); process.exitCode = 1;
-});
+module.exports = { fixture };
+
+if (require.main === module) {
+  const name = process.argv[2];
+  assert.ok(scenarios[name], `Unknown paired UI check: ${name}`);
+  scenarios[name](fixture()).then(() => console.log(`Passed ${name}`)).catch((error) => {
+    console.error(error); process.exitCode = 1;
+  });
+}
