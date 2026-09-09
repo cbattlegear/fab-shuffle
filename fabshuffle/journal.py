@@ -55,6 +55,7 @@ OUTCOME = "outcome"
 INVENTORY = "inventory"
 REFERENCE_BLOCK = "reference_block"
 RECOVERY_ACTION = "recovery_action"
+CONNECTION_ADVISORY = "connection_advisory"
 
 #: How many run journals to keep. They are small, but the directory sits on a volume that
 #: outlives the container and nothing else ever removes them.
@@ -365,6 +366,18 @@ class Journal:
             raise ValueError("Unknown saved-migration action.")
         self._write(RECOVERY_ACTION, action=action, workspace_id=workspace_id, strict=True)
 
+    def connection_advisory(self, payload: dict[str, Any]) -> None:
+        """A point-in-time advisory scan of tenant connections against the source workspace.
+
+        Purely informational, like ``warning`` and ``outcome``: nothing here is a resource
+        that resume has to reconcile, so a write failure must never take the migration down
+        (the default, non-strict ``_write``), and the record is not tenant-ownership checked
+        the way an owned resource record is. A stale or foreign snapshot is instead caught at
+        read time, by comparing its own recorded run id against the current one (see
+        ``fabshuffle.fabric.connection_advisory.section_for_report``).
+        """
+        self._write(CONNECTION_ADVISORY, payload=payload)
+
 
 #: A journal that records nothing, for a preview or a test that has nothing to resume.
 DISCARD = Journal(None)
@@ -455,6 +468,11 @@ class Replay:
     phases_finished: set[str] = field(default_factory=set)
     status: str = ""
     error: str | None = None
+    # The latest connection advisory scan recorded for this run, verbatim as
+    # ``connection_advisory.ConnectionAdvisoryScan.as_dict()`` produced it. Purely advisory:
+    # never checked against tenant ownership the way a resource record is, and staleness is
+    # judged at report time instead, by comparing its own recorded attempt id.
+    connection_advisory: dict[str, Any] | None = None
     # Lines that could not be read. A truncated last line is expected after a crash; anything
     # else is worth knowing about.
     damaged_lines: int = 0
@@ -533,6 +551,8 @@ def _state_records(replay: Replay) -> list[dict[str, Any]]:
     records.extend({"t": OUTCOME, "item": item.record()} for item in replay.outcomes.values())
     if replay.inventory_complete:
         records.append({"t": INVENTORY})
+    if replay.connection_advisory:
+        records.append({"t": CONNECTION_ADVISORY, "payload": replay.connection_advisory})
     if replay.tenant_binding:
         for record in records:
             if record["t"] in _OWNED_RECORDS:
@@ -651,6 +671,10 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
                     replay.run_id, target_lost=True,
                     reason="Full restart was requested; destination contents may have been deleted.",
                 )
+            # The destination this scan was taken against is being torn down; an inherited
+            # snapshot from before the restart would describe a workspace that no longer
+            # exists, not the one about to be rebuilt.
+            replay.connection_advisory = None
         elif action == "workspace_deleted" and replay.restart_state == "pending":
             workspace_id = record.get("workspace_id")
             if workspace_id and workspace_id in (replay.target_workspace_id, replay.scratch_workspace_id):
@@ -766,6 +790,10 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
             replay.outcomes[outcome.sourceId] = outcome
     elif kind == INVENTORY:
         replay.inventory_complete = True
+    elif kind == CONNECTION_ADVISORY:
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            replay.connection_advisory = payload
     # Unknown advisory kinds are ignored. Paired formats live outside legacy journal discovery.
 
 

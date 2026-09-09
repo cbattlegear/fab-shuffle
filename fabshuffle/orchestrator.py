@@ -54,18 +54,33 @@ items created by an *earlier* phase:
     above.
 13. ``reflexes``    Activator items, last of the content phases. One watches an eventstream or
     KQL database and acts by running pipelines and notebooks, so both sides must exist first.
-14. ``permissions`` remaining role assignments. Admins were granted back in step 1.
-15. ``cleanup``     drop the scratch workspace and local staging.
+14. ``connectionadvisory`` a tenant-wide, read-only scan of every connection this credential
+    can see, looking for a path that still names the source workspace, one of its items, or
+    one of its data-store endpoints (see ``fabshuffle.fabric.connection_advisory``). Placed
+    here because it wants the id map as complete as it will get, to preview what a matched
+    connection's path would become if repointed by hand, but still before the workspace-level
+    ``permissions``/``cleanup`` steps that do not touch it either way. It is advisory only: it
+    never creates, adopts, deletes, or grants anything, and never gates item migration or
+    changes ``id_map``. A failure before this phase leaves the scan unknown (or a previous
+    attempt's snapshot stale); cancellation never starts another network scan.
+15. ``permissions`` remaining role assignments. Admins were granted back in step 1.
+16. ``cleanup``     drop the scratch workspace and local staging.
 
 A dependent item that still binds an unresolved source-bound connection - none supplied, or a
 supplied mapping that failed validation - is refused, with a warning naming the connection and
 the item, rather than silently created against a connection that will not work once the source
 workspace is gone.
+
+A ``REASSIGN`` strategy moves the existing workspace onto the new capacity in place, so none of
+the phases above run, and neither does the connection advisory scan: the workspace's id and
+every connection's path are unchanged by reassignment, so there is nothing to repoint and
+nothing worth scanning for.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
@@ -82,6 +97,7 @@ from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
     airflow,
     analytics,
+    connection_advisory,
     connections,
     copyjobs,
     cosmosdb,
@@ -463,6 +479,11 @@ class _Context:
                     "last_phase": self.prior.phases_started[-1] if self.prior.phases_started else "",
                 }]
             ]
+            # Carried forward so a resume that fails again before the phase reruns still
+            # shows the previous attempt's scan, rather than nothing at all. It is still
+            # attributed to the earlier attempt id, so a report reading it back can tell it
+            # has not been refreshed yet.
+            self.run.connection_advisory = self.prior.connection_advisory
         self.id_map = journal_module.RecordingMap(self._record_mapping, self.id_map)
         self.warnings = journal_module.RecordingList(self.journal.warning, self.warnings)
         self.dormant = journal_module.RecordingMap(self.journal.dormant, self.dormant)
@@ -1171,6 +1192,210 @@ foreach ($id in $connectionIds) {{
     }}
 }}
 """
+
+
+_TENANT_LITERAL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def _validated_connection_ids(connection_ids: Iterable[str]) -> list[str]:
+    """Keep only well-formed connection GUIDs, normalised to their canonical form.
+
+    Refuse malformed recorded identifiers rather than turning a broken ID list into the
+    list-everything fallback.
+    """
+    seen: dict[str, str] = {}
+    for raw in connection_ids:
+        try:
+            normalised = str(UUID(str(raw).strip()))
+        except (ValueError, AttributeError, TypeError) as error:
+            raise ValueError("A recorded connection ID is not a GUID; inspect the saved journal.") from error
+        seen[normalised.casefold()] = normalised
+    return sorted(seen.values())
+
+
+def _validated_tenant_literal(tenant_id: str) -> str:
+    """A tenant identifier safe to embed as a script literal: a GUID, or a verified-domain
+    style name (letters, digits, dots and hyphens only). Anything else is refused outright
+    rather than embedded, since a legacy plan can carry a principal's tenant as either shape.
+    """
+    candidate = str(tenant_id or "").strip()
+    try:
+        return str(UUID(candidate))
+    except (ValueError, AttributeError, TypeError):
+        pass
+    if candidate and _TENANT_LITERAL.match(candidate):
+        return candidate
+    raise ValueError(f"'{tenant_id}' is not a safe tenant identifier for a generated script.")
+
+
+def connections_lookup_script(connection_ids: Iterable[str], *, tenant_id: str) -> str:
+    """A PowerShell script an operator runs, signed in as themself, to look up what each
+    connection id the advisory scan found actually is.
+
+    Fab Shuffle's own credential is deliberately not used here. It is frequently the very
+    credential the scan just reported cannot see one of these connections, and even where it
+    can, the API may not return a display name. The user's account may have different access,
+    but names and permissions are not guaranteed. This script only ever reads: no role is
+    granted, nothing is created or changed, no token or secret is ever printed, and looking a
+    connection up here does not itself grant this account, or anyone, access to it.
+
+    ``connection_ids`` can be empty - an older report, from before this scan existed, has
+    nothing recorded to embed. Rather than generate a script that loops over nothing, the
+    script itself lists every connection the signed-in account can see when it is handed none,
+    so the operator still gets something usable. The same ``-ConnectionId`` parameter also
+    lets an operator add ids by hand at run time, against any report.
+    """
+    ids = _validated_connection_ids(connection_ids)
+    tenant = _validated_tenant_literal(tenant_id)
+    listed = "\n".join(f"    '{connection_id}'" for connection_id in ids)
+
+    lines = [
+        "#Requires -Version 7.0",
+        "#Requires -Modules Az.Accounts",
+        "# Looks up the display name, connectivity type and definition type for connection",
+        "# ids a Fab Shuffle cutover readiness scan found. Run this signed in as yourself,",
+        "# not the service principal; it only reads. It does not create, change, or grant",
+        "# anything, and looking a connection up here does not give this account - or anyone",
+        "# else - any access to it.",
+        "",
+        "param(",
+        "    # Extra connection ids to look up alongside whatever this report",
+        "    # recorded. Also what makes this script useful on its own against a report from",
+        "    # before this scan existed, which has nothing recorded to embed.",
+        "    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+        "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]",
+        "    [string[]] $ConnectionId = @()",
+        ")",
+        "",
+        "$ErrorActionPreference = 'Stop'",
+        "",
+        "$fabric = 'https://api.fabric.microsoft.com'",
+        f"$tenantId = '{tenant}'",
+        "$recordedConnectionIds = @(",
+        listed,
+        ")",
+        "$suppliedConnectionIds = @($ConnectionId)",
+        "$connectionIds = @($recordedConnectionIds + $suppliedConnectionIds | Select-Object -Unique)",
+        "",
+        "function Get-FabricSecureToken {",
+        "    # Az 14 / Az.Accounts 5 return a SecureString already, which -Authentication",
+        "    # Bearer wants directly; older versions return a plain string, wrapped here",
+        "    # rather than ever being printed, logged, or passed around unprotected.",
+        "    if ((Get-Command Get-AzAccessToken).Parameters.ContainsKey('AsSecureString')) {",
+        "        return (Get-AzAccessToken -ResourceUrl $fabric -TenantId $tenantId -AsSecureString).Token",
+        "    }",
+        "    $value = (Get-AzAccessToken -ResourceUrl $fabric -TenantId $tenantId).Token",
+        "    if ($value -is [string]) {",
+        "        return ConvertTo-SecureString -String $value -AsPlainText -Force",
+        "    }",
+        "    return $value",
+        "}",
+        "",
+        "function Connect-ForFabric {",
+        "    # -TenantId keeps conditional access off the \"organizations\" pseudo-tenant,",
+        "    # where it cannot be evaluated. No -ServicePrincipal: this signs in as whoever",
+        "    # runs the script. -SkipContextPopulation skips listing Azure subscriptions,",
+        "    # which a Fabric-only lookup does not need and which an account with none - or",
+        "    # many - would otherwise pay for on every sign-in.",
+        "    Connect-AzAccount -TenantId $tenantId -SkipContextPopulation | Out-Null",
+        "}",
+        "",
+        "$context = Get-AzContext",
+        "if (-not $context -or $context.Account.Type -ne 'User' -or "
+        "$context.Tenant.Id -ne $tenantId) { Connect-ForFabric }",
+        "if ((Get-AzContext).Account.Type -ne 'User') {",
+        "    throw 'Sign in with a user account, not a service principal or managed identity.'",
+        "}",
+        "",
+        "try {",
+        "    $secureToken = Get-FabricSecureToken",
+        "} catch {",
+        "    # An existing sign-in from somewhere else looks fine to Get-AzContext and is",
+        "    # still refused for Fabric, so the only way to find out is to ask.",
+        "    Write-Host 'Signing in again, scoped to Fabric.' -ForegroundColor Yellow",
+        "    Connect-ForFabric",
+        "    $secureToken = Get-FabricSecureToken",
+        "}",
+        "",
+        "function Get-FabricServiceError($ErrorRecord) {",
+        "    # The service's own code and message say far more than a bare HTTP status; a",
+        "    # failed lookup is reported with these, never left as a blank name.",
+        "    $parsed = $null",
+        "    if ($ErrorRecord.ErrorDetails.Message) {",
+        "        try { $parsed = $ErrorRecord.ErrorDetails.Message | ConvertFrom-Json } catch {}",
+        "    }",
+        "    $code = if ($parsed.errorCode) { $parsed.errorCode } else { '' }",
+        "    $message = if ($parsed.message) { $parsed.message } else { $ErrorRecord.Exception.Message }",
+        "    return \"$code $message\".Trim()",
+        "}",
+        "",
+        "if ($connectionIds.Count -gt 0) {",
+        "    $results = foreach ($id in $connectionIds) {",
+        "        try {",
+        "            $connection = Invoke-RestMethod -Method Get -Authentication Bearer "
+        "-Token $secureToken -Uri \"$fabric/v1/connections/$id\"",
+        "            [PSCustomObject]@{",
+        "                Id               = $id",
+        "                Name             = if ($connection.displayName) { $connection.displayName } "
+        "else { '(not returned)' }",
+        "                ConnectivityType = if ($connection.connectivityType) "
+        "{ $connection.connectivityType } else { '(not returned)' }",
+        "                Type             = if ($connection.connectionDetails.type) "
+        "{ $connection.connectionDetails.type } else { '(not returned)' }",
+        "            }",
+        "        } catch {",
+        "            # One connection this account cannot read should not stop the rest.",
+        "            Write-Warning \"Connection $id : $(Get-FabricServiceError $_)\"",
+        "            [PSCustomObject]@{ Id = $id; Name = '(unavailable)'; "
+        "ConnectivityType = '(unavailable)'; Type = '(unavailable)' }",
+        "        }",
+        "    }",
+        "} else {",
+        "    # Nothing was recorded or supplied - most likely a report from before this scan",
+        "    # existed. Listing every connection this account can see is still more useful",
+        "    # than an empty result.",
+        "    Write-Host 'No connection ids were recorded or supplied; listing every ' `",
+        "        'connection this account can see instead.' -ForegroundColor Yellow",
+        "    $results = @()",
+        "    $continuationToken = $null",
+        "    do {",
+        "        # Always the fixed Fabric host, with only the (URL-encoded) continuation",
+        "        # token appended - never a server-returned continuationUri. Following an",
+        "        # absolute URI the response supplies would hand this account's bearer",
+        "        # token to wherever that URI points, which does not have to stay on",
+        "        # $fabric.",
+        "        $uri = if ($continuationToken) {",
+        "            \"$fabric/v1/connections?continuationToken=\" `",
+        "                + [System.Uri]::EscapeDataString($continuationToken)",
+        "        } else {",
+        "            \"$fabric/v1/connections\"",
+        "        }",
+        "        try {",
+        "            $page = Invoke-RestMethod -Method Get -Authentication Bearer "
+        "-Token $secureToken -Uri $uri",
+        "        } catch {",
+        "            Write-Warning \"Listing connections : $(Get-FabricServiceError $_)\"",
+        "            break",
+        "        }",
+        "        foreach ($connection in $page.value) {",
+        "            $results += [PSCustomObject]@{",
+        "                Id               = $connection.id",
+        "                Name             = if ($connection.displayName) { $connection.displayName } "
+        "else { '(not returned)' }",
+        "                ConnectivityType = if ($connection.connectivityType) "
+        "{ $connection.connectivityType } else { '(not returned)' }",
+        "                Type             = if ($connection.connectionDetails.type) "
+        "{ $connection.connectionDetails.type } else { '(not returned)' }",
+        "            }",
+        "        }",
+        "        $continuationToken = $page.continuationToken",
+        "    } while ($continuationToken)",
+        "}",
+        "",
+        "$results | Format-Table -AutoSize",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def scan_connection_access(
@@ -4292,6 +4517,46 @@ def _check_connections(
     return [issue.message() for issue in issues]
 
 
+# -------------------------------------------------------------------- phase 14
+
+
+def _scan_connection_advisories(ctx: _Context) -> None:
+    """Advisory scan: which tenant-visible connections still point at the source workspace.
+
+    Runs once ``id_map`` is as complete as it will get - after every phase that can add to it,
+    and before the workspace-level ``permissions``/``cleanup`` steps that do not touch it
+    either way - so a matched connection's preview of its repointed path is as accurate as
+    this run can make it. See ``fabshuffle.fabric.connection_advisory`` for what "matched"
+    means and why a bare catalog name is never enough on its own.
+
+    Reporting only. Nothing here is created, adopted by name, deleted, or granted, and the
+    result never blocks or gates anything already migrated - it cannot, because it runs after
+    every phase that migrates something. A read failure narrows what the scan could check; it
+    never fails the step, because an incomplete answer is still worth having.
+
+    Honour cancellation between reads. An interrupted scan leaves missing or stale evidence,
+    not a fresh network scan started from the cancellation handler.
+    """
+    step = "connectionadvisory"
+    ctx.run.start_step(step, "Scanning tenant connections for source workspace references")
+    scan = connection_advisory.scan_source_connections(
+        ctx.client,
+        source_workspace_id=ctx.plan.source_workspace_id,
+        source_workspace_name=ctx.plan.source_workspace_name,
+        target_workspace_id=ctx.target_workspace_id,
+        attempt_id=ctx.run.id,
+        id_map=dict(ctx.id_map),
+        check_cancel=ctx.run.raise_if_cancelled,
+    )
+    payload = scan.as_dict()
+    ctx.journal.connection_advisory(payload)
+    ctx.run.set_connection_advisory(payload)
+    ctx.run.finish_step(
+        step, StepStatus.SUCCEEDED, scan.message,
+        [scan.message, scan.action] if scan.action else [],
+    )
+
+
 # --------------------------------------------------------------------- phase 8
 
 
@@ -4473,6 +4738,7 @@ _REBUILD_PHASES: tuple[tuple[str, Callable[[_Context], None]], ...] = (
     ("analytics", _migrate_reports_and_models),
     ("orchestration", _migrate_orchestration),
     ("reflexes", _migrate_reflexes),
+    ("connectionadvisory", _scan_connection_advisories),
     ("permissions", _copy_permissions),
 )
 

@@ -94,11 +94,20 @@ class MigrationRun:
         self.readiness_revision = 0
         self.inventory_complete = False
         self.readiness_attempts: list[dict[str, Any]] = []
+        # The latest tenant-wide connection advisory scan (see
+        # ``fabshuffle.fabric.connection_advisory``), or ``None`` before the phase that
+        # produces it has run this attempt. Advisory only: it never changes ``status``.
+        self.connection_advisory: dict[str, Any] | None = None
         self.lifecycle = Lifecycle(attempt_id=self.id, changed=self.readiness_changed)
 
     def readiness_changed(self) -> None:
         # The next normal progress event carries only a revision, not the item list.
         with self._lock:
+            self.readiness_revision += 1
+
+    def set_connection_advisory(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self.connection_advisory = payload
             self.readiness_revision += 1
 
     # ------------------------------------------------------------------- steps

@@ -245,6 +245,7 @@ def test_phases_run_in_dependency_order(fabric):
         "analytics",
         "orchestration",
         "reflexes",
+        "connectionadvisory",
         "permissions",
     ]
 

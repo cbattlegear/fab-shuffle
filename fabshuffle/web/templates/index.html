@@ -315,6 +315,43 @@
           <span id="readiness-page"></span>
           <button type="button" class="secondary" id="readiness-next">Next</button>
         </nav>
+
+        <section id="connection-advisories" class="connection-advisories" aria-labelledby="connection-advisories-title" hidden>
+          <h4 id="connection-advisories-title">Connections pointing at the source workspace</h4>
+          <p class="hint">
+            A tenant-wide scan of every connection this credential can see, for one whose path still
+            names the source workspace, one of its items, or one of its endpoints. Reporting only:
+            Fabric does not let a connection's target be changed through the API, so repoint or
+            recreate one listed here by hand, then update whatever uses it. The original connection
+            is kept listed even where a replacement was mapped, since something outside this
+            migration may still read through it.
+          </p>
+          <p id="connection-advisories-status" class="hint" role="status" aria-live="polite"></p>
+          <p id="connection-advisories-context" class="hint"></p>
+          <p id="connection-advisories-action" class="hint" hidden></p>
+          <details id="connection-advisories-scope" class="readiness-scope" hidden>
+            <summary>What this scan does and does not check</summary>
+            <ul id="connection-advisories-limits"></ul>
+          </details>
+          <ul id="connection-advisories-items" class="connection-advisories-items"></ul>
+          <p id="connection-advisories-empty" class="hint" hidden></p>
+          <details id="connection-lookup-script" hidden>
+            <summary>Look up connection names</summary>
+            <p class="hint">
+              Runs signed in as you, not the service principal, and only reads: it grants, creates
+              or changes nothing, and looking a name up here does not give you or the service
+              principal any access to that connection. Works even without a recorded scan - it then
+              lists every connection you can see instead of looking up specific ids.
+            </p>
+            <button type="button" class="secondary" id="connection-lookup-fetch">View script</button>
+            <p id="connection-lookup-error" class="readiness-error" role="alert" hidden></p>
+            <div class="script" id="connection-lookup-pre" hidden>
+              <button class="copy" type="button" id="connection-lookup-copy">Copy</button>
+              <a id="connection-lookup-download" download>Download .ps1</a>
+              <pre><code></code></pre>
+            </div>
+          </details>
+        </section>
       </section>
     </section>
   </main>

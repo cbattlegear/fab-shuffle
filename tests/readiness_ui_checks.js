@@ -189,12 +189,30 @@ function report(runId = "one", items = [item(0)], overrides = {}) {
   };
 }
 
+function connectionEntry(overrides = {}) {
+  return {
+    connectionId: "conn-1", connectionName: "Bronze SQL", connectivityType: "ShareableCloud",
+    type: "SQL", path: "src.example.com;bronze", matchedSourceItems: ["item-1"], ...overrides,
+  };
+}
+
+function advisories(overrides = {}) {
+  return {
+    scanState: "complete", sourceWorkspaceId: "src-ws", targetWorkspaceId: "tgt-ws",
+    generatedAt: "2024-01-01T00:00:00Z", connections: [connectionEntry()],
+    message: "1 tenant-visible connection(s) still reference the source workspace.",
+    limits: ["Scope is limited by literal metadata matching; not proven exhaustive."],
+    ...overrides,
+  };
+}
+
 const scenarios = {
   async hidden_until_halted(f) {
     f.begin("one", null);
     assert.equal(f.get("cutover-readiness").hidden, true);
     assert.equal(f.get("readiness-jump").parentElement.hidden, true);
     assert.equal(f.get("readiness-export").disabled, true);
+    assert.equal(f.get("connection-advisories").hidden, true);
     await f.tick(1000);
     for (const status of ["pending", "running"]) {
       f.ui.observeReadiness({ status, readinessRevision: 1, cancelled: true });
@@ -202,6 +220,7 @@ const scenarios = {
       await f.tick(1000);
       assert.equal(f.requests.length, 0);
       assert.equal(f.get("cutover-readiness").hidden, true);
+      assert.equal(f.get("connection-advisories").hidden, true);
     }
     for (const status of ["succeeded", "failed", "cancelled", "interrupted"]) {
       const index = f.requests.length;
@@ -213,6 +232,9 @@ const scenarios = {
       assert.equal(f.requests.length, index + 1);
       await f.reply(index, report(status, [item(0)], { runStatus: status }));
       assert.equal(f.get("readiness-export").disabled, false);
+      // No connectionAdvisories field on this report: shown, but as Unknown, not a false green.
+      assert.equal(f.get("connection-advisories").hidden, false);
+      assert.equal(f.get("connection-advisories-status").textContent.trim(), "Unknown");
     }
   },
   async active_again(f) {
@@ -373,6 +395,145 @@ const scenarios = {
     f.ui.renderReadinessItems();
     assert.match(f.get("readiness-items").textContent, /Unknown/);
     assert.match(f.get("readiness-items").textContent, /Verify this item/);
+  },
+  async connection_advisories_render(f) {
+    f.begin();
+    await f.tick(500);
+    await f.reply(0, report("one", [item(0)], { connectionAdvisories: advisories() }));
+    assert.equal(f.get("connection-advisories").hidden, false);
+    assert.equal(f.get("connection-advisories-status").textContent.trim(),
+      "Reviewed 1 tenant-visible connection(s) still reference the source workspace.");
+    assert.equal(f.get("connection-advisories-scope").hidden, false);
+    assert.equal(f.get("connection-advisories-limits").children.length, 1);
+    assert.match(f.get("connection-advisories-limits").textContent, /not proven exhaustive/);
+    const rows = f.get("connection-advisories-items").children;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].querySelector("h5").textContent, "Bronze SQL");
+    assert.match(rows[0].textContent, /ID: conn-1/);
+    assert.match(rows[0].textContent, /ShareableCloud/);
+    assert.match(rows[0].textContent, /src\.example\.com;bronze/);
+    assert.match(rows[0].textContent, /item-1/);
+    assert.match(rows[0].textContent, /does not let a connection's target be changed/);
+    assert.equal(f.get("connection-advisories-empty").hidden, true);
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 2 });
+    await f.tick(500);
+    await f.reply(1, report("one", [item(0)], {
+      connectionAdvisories: advisories({ connections: [], message: "No tenant-visible connection's path was found to reference the source workspace." }),
+    }));
+    assert.equal(f.get("connection-advisories-items").children.length, 0);
+    assert.equal(f.get("connection-advisories-empty").hidden, false);
+    assert.match(f.get("connection-advisories-empty").textContent, /No tenant-visible connection/);
+    // Zero matches is not the same as nothing to look up: the script still falls back to
+    // listing every visible connection, so it stays available.
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+  },
+  async connection_advisories_states(f) {
+    f.begin();
+    await f.tick(500);
+    await f.reply(0, report("one", [item(0)], {
+      connectionAdvisories: advisories({ scanState: "not_applicable", connections: [], message: "Reassignment moves the existing workspace." }),
+    }));
+    assert.equal(f.get("connection-advisories-status").textContent.trim(),
+      "Not applicable Reassignment moves the existing workspace.");
+    assert.equal(f.get("connection-advisories-empty").hidden, true);
+    // A reassign never scans, and there is genuinely nothing to look up by hand either.
+    assert.equal(f.get("connection-lookup-script").hidden, true);
+
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 2 });
+    await f.tick(500);
+    await f.reply(1, report("one", [item(0)], {
+      connectionAdvisories: advisories({
+        scanState: "stale", message: "This scan is from an earlier attempt and has not been refreshed by this one.",
+      }),
+    }));
+    assert.match(f.get("connection-advisories-status").textContent, /^Stale/);
+    assert.match(f.get("connection-advisories-status").textContent, /earlier attempt/);
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 3 });
+    await f.tick(500);
+    await f.reply(2, report("one", [item(0)], {
+      connectionAdvisories: advisories({
+        scanState: "incomplete", connections: [],
+        message: "The tenant's connections could not be listed.",
+      }),
+    }));
+    assert.match(f.get("connection-advisories-status").textContent, /^Incomplete/);
+    assert.equal(f.get("connection-advisories-empty").hidden, false);
+    assert.match(f.get("connection-advisories-empty").textContent, /lists every connection/);
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+
+    f.ui.observeReadiness({ status: "succeeded", readinessRevision: 4 });
+    await f.tick(500);
+    await f.reply(3, report("one", [item(0)], {
+      connectionAdvisories: advisories({ scanState: "unknown", connections: [], message: "", limits: [] }),
+    }));
+    assert.match(f.get("connection-advisories-status").textContent, /^Unknown/);
+    assert.equal(f.get("connection-advisories-scope").hidden, true);
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+  },
+  async connection_advisories_safe_text(f) {
+    const hostile = '<img src=x onerror="alert(1)">';
+    f.begin();
+    await f.tick(500);
+    await f.reply(0, report("one", [item(0)], {
+      connectionAdvisories: advisories({
+        connections: [connectionEntry({
+          connectionId: hostile, connectionName: hostile, path: hostile, matchedSourceItems: [hostile],
+        })],
+      }),
+    }));
+    const row = f.get("connection-advisories-items").children[0];
+    assert.equal(row.querySelector("h5").textContent, hostile);
+    assert.equal(row.querySelector("img"), null);
+    assert.match(row.textContent, new RegExp(`ID: ${hostile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  },
+  async connection_lookup_script_flow(f) {
+    f.begin();
+    await f.tick(500);
+    await f.reply(0, report("one", [item(0)], { connectionAdvisories: advisories() }));
+    assert.equal(f.get("connection-lookup-script").hidden, false);
+
+    const fetching = f.get("connection-lookup-fetch").click();
+    assert.equal(f.requests[1].url, "/api/runs/one/connections/script");
+    await f.reply(1, { text: async () => "#Requires -Version 7.0\nWrite-Host 'hi'" });
+    await fetching;
+    assert.equal(f.get("connection-lookup-pre").hidden, false);
+    assert.match(f.get("connection-lookup-pre").querySelector("code").textContent, /Requires -Version 7/);
+    assert.equal(f.get("connection-lookup-download").href, "blob:readiness");
+    assert.match(f.get("connection-lookup-download").download, /connection-lookup-one\.ps1/);
+    assert.equal(f.get("connection-lookup-fetch").disabled, false);
+
+    const failing = f.get("connection-lookup-fetch").click();
+    assert.equal(f.get("connection-lookup-fetch").disabled, true);
+    await f.reply(2, { detail: "No connection advisory results are recorded for this run to look up." }, 404);
+    await failing;
+    assert.match(f.get("connection-lookup-error").textContent, /No connection advisory results/);
+    assert.equal(f.get("connection-lookup-error").hidden, false);
+    assert.equal(f.get("connection-lookup-fetch").disabled, false);
+    f.ui.resetReadiness("two");
+    assert.deepEqual(f.revoked, ["blob:readiness"]);
+  },
+  async connection_lookup_races(f) {
+    f.begin();
+    await f.tick(500);
+    await f.reply(0, report("one", [item(0)], { connectionAdvisories: advisories() }));
+    const fetching = f.get("connection-lookup-fetch").click();
+    let resolveText;
+    await f.reply(1, { text: () => new Promise((resolve) => { resolveText = resolve; }) });
+    f.begin("two", "running");
+    assert.equal(f.requests[1].options.signal.aborted, true);
+    resolveText("# Stale script from the previous run");
+    await fetching;
+    assert.equal(f.get("connection-lookup-pre").hidden, true);
+    assert.equal(f.get("connection-lookup-pre").querySelector("code").textContent, "");
+    assert.equal(f.get("connection-lookup-download").href, "");
+    assert.equal(f.get("connection-advisories").hidden, true);
+    const count = f.requests.length;
+    await f.get("connection-lookup-fetch").click();
+    assert.equal(f.requests.length, count);
   },
   async errors_and_empty(f) {
     f.begin();

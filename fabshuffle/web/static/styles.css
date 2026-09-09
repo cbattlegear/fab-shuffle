@@ -313,6 +313,55 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   .readiness-identifiers dd { margin-bottom: 0.45rem; }
 }
 
+/* The connection advisory scan section on the cutover readiness report. */
+.connection-advisories { margin-top: 1.75rem; padding-top: 1.25rem; border-top: 1px solid var(--border); }
+.connection-advisories h4 { margin: 0 0 0.5rem; font-size: 0.95rem; }
+.connection-advisories .hint { max-width: 75ch; }
+#connection-advisories-status { display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; margin: 0.5rem 0 1rem; }
+.connection-advisories-items { list-style: none; margin: 0; padding: 0; }
+.connection-advisory-item { padding: 0.85rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.connection-advisory-item h5 { margin: 0 0 0.2rem; font-size: 0.9rem; font-weight: 600; }
+.connection-advisory-item .hint { margin: 0.2rem 0; font-size: 0.82rem; }
+#connection-lookup-script { margin-top: 1rem; }
+#connection-lookup-script summary { cursor: pointer; font-size: 0.85rem; color: var(--text); padding: 0.15rem 0; }
+#connection-lookup-script summary:hover { color: var(--accent); }
+#connection-lookup-script .hint { margin: 0.4rem 0 0.6rem; }
+#connection-lookup-script .script { position: relative; margin-top: 0.6rem; }
+#connection-lookup-script pre {
+  margin: 0;
+  max-height: 20rem;
+  overflow: auto;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+}
+#connection-lookup-script code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre;
+  background: none;
+  padding: 0;
+  color: var(--text-dim);
+}
+#connection-lookup-script .copy {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  z-index: 1;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+}
+#connection-lookup-download {
+  position: absolute;
+  top: 0.4rem;
+  right: 4rem;
+  z-index: 1;
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+
 .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
 
 /* Direct children only: the nested warning list must not inherit the two-column grid,

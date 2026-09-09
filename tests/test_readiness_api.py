@@ -525,3 +525,105 @@ def test_sse_transmits_the_readiness_revision_without_full_item_lists(client, se
         assert not {"items", "outcomes", "lifecycle", "readiness"} & snapshot.keys()
         assert "private-source-marker" not in json.dumps(snapshot)
         assert "Private item-name marker" not in json.dumps(snapshot)
+
+
+# ------------------------------------------------------- connection advisories section
+
+
+def test_connection_advisories_defaults_to_unknown_not_a_false_green(client, session_id, run):
+    run.plan = {"strategy": "rebuild"}
+    run.mark_finished(RunStatus.SUCCEEDED)
+
+    response = client.get(f"/api/runs/{run.id}/readiness", headers=auth(session_id))
+    assert response.status_code == 200
+    advisories = response.json()["connectionAdvisories"]
+    assert advisories["scanState"] == "unknown"
+    assert advisories["connections"] == []
+    # It must never contribute to the item-evidence counts or overall state.
+    assert response.json()["state"] in ("ready", "unknown", "needs_attention")
+
+
+def test_connection_advisories_from_this_attempt_are_reported_as_is(client, session_id, run):
+    run.plan = {"strategy": "rebuild"}
+    run.set_connection_advisory({
+        "scanState": "complete", "sourceWorkspaceId": "src", "targetWorkspaceId": "tgt",
+        "attemptId": run.id, "connections": [{"connectionId": "conn-1", "connectionName": "Bronze SQL"}],
+        "message": "1 tenant-visible connection(s)...",
+    })
+    run.mark_finished(RunStatus.SUCCEEDED)
+
+    response = client.get(f"/api/runs/{run.id}/readiness", headers=auth(session_id))
+    advisories = response.json()["connectionAdvisories"]
+    assert advisories["scanState"] == "complete"
+    assert advisories["connections"][0]["connectionId"] == "conn-1"
+    assert "attemptId" not in advisories
+
+
+def test_connection_advisories_from_an_earlier_attempt_are_marked_stale(client, session_id, run):
+    run.plan = {"strategy": "rebuild"}
+    run.set_connection_advisory({
+        "scanState": "complete", "connections": [{"connectionId": "conn-1"}],
+        "attemptId": "an-earlier-attempt", "message": "1 tenant-visible connection(s)...",
+    })
+    run.mark_finished(RunStatus.SUCCEEDED)
+
+    response = client.get(f"/api/runs/{run.id}/readiness", headers=auth(session_id))
+    advisories = response.json()["connectionAdvisories"]
+    assert advisories["scanState"] == "stale"
+    assert "earlier attempt" in advisories["message"]
+    assert advisories["connections"] == [{"connectionId": "conn-1"}]
+
+
+def test_reassign_runs_report_connection_advisories_as_not_applicable(client, session_id, run):
+    """A reassign never scans, and never should: nothing changes ids or paths."""
+    run.plan = {"strategy": "reassign"}
+    run.mark_finished(RunStatus.SUCCEEDED)
+
+    response = client.get(f"/api/runs/{run.id}/readiness", headers=auth(session_id))
+    advisories = response.json()["connectionAdvisories"]
+    assert advisories["scanState"] == "not_applicable"
+    assert advisories["connections"] == []
+
+
+def test_saved_journal_reports_its_recorded_connection_advisory(client, session_id):
+    book = saved_book()
+    book.connection_advisory({
+        "scanState": "complete", "connections": [{"connectionId": "conn-1"}], "attemptId": "saved",
+        "message": "1 tenant-visible connection(s)...",
+    })
+    book.finished("succeeded")
+
+    response = client.get("/api/runs/saved/readiness", headers=auth(session_id))
+    assert response.status_code == 200
+    advisories = response.json()["connectionAdvisories"]
+    assert advisories["scanState"] == "complete"
+    assert advisories["connections"][0]["connectionId"] == "conn-1"
+
+
+def test_saved_journal_without_a_recorded_scan_is_unknown(client, session_id):
+    book = saved_book()
+    book.finished("succeeded")
+
+    response = client.get("/api/runs/saved/readiness", headers=auth(session_id))
+    advisories = response.json()["connectionAdvisories"]
+    assert advisories["scanState"] == "unknown"
+
+
+def test_connection_advisories_survive_registry_restart(client, session_id, run, monkeypatch):
+    book = saved_book(run.id)
+    run.plan = {"strategy": "rebuild"}
+    payload = {
+        "scanState": "complete", "connections": [{"connectionId": "conn-1"}], "attemptId": run.id,
+        "message": "1 tenant-visible connection(s)...",
+    }
+    book.connection_advisory(payload)
+    run.set_connection_advisory(payload)
+    run.mark_finished(RunStatus.SUCCEEDED)
+    before = client.get(f"/api/runs/{run.id}/readiness", headers=auth(session_id))
+
+    monkeypatch.setattr(web, "REGISTRY", RunRegistry())
+    after = client.get(f"/api/runs/{run.id}/readiness", headers=auth(session_id))
+
+    assert before.status_code == after.status_code == 200
+    assert before.json()["connectionAdvisories"] == after.json()["connectionAdvisories"]
+    assert after.json()["connectionAdvisories"]["connections"][0]["connectionId"] == "conn-1"

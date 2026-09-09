@@ -333,17 +333,21 @@ reference items created by an earlier one:
 13. **Activators** — last of the content phases. An Activator watches an eventstream or KQL
     database and acts by running pipelines and notebooks, so everything on both sides has to
     exist first.
-14. **Permissions** — the source workspace's admins are granted as soon as the workspace is
+14. **Connection advisories** — read-only inventory of visible connections whose paths still
+    target the source workspace. The cutover report shows manual review actions; this phase
+    does not recreate connections or modify item mappings.
+15. **Permissions** — the source workspace's admins are granted as soon as the workspace is
     created, so a failed run never leaves a workspace nobody can open. The remaining roles
     are replayed here, last, so nothing is visible half built.
-15. **Cleanup** — drop the scratch workspace and local staging.
+16. **Cleanup** — drop the scratch workspace and local staging.
 
 ### Connections
 
 Fab Shuffle never creates, adopts by name, or deletes a connection on the operator's behalf,
-in any mode. A connection id is tenant scoped, so it resolves unchanged into the new
-workspace or tenant without needing to be recreated, and the API never returns an existing
-connection's credentials, so a faithful copy would not be possible even if Fabric allowed it.
+in any mode. A connection id is tenant scoped: it can be reused within that tenant when its
+target and access are still appropriate, but it does not resolve in another tenant.
+The API never returns an existing connection's credentials, so a faithful copy would not
+be possible even if Fabric allowed it.
 (An earlier version of this tool tried to recreate source-bound connections automatically;
 that was removed because it could only ever cover a narrow, verified-credential-free subset
 of connectors, guessed at "the same" connection by name, and left every other connector
@@ -361,12 +365,14 @@ same mechanism from the operator's side. With no `connection_mappings` supplied 
 phase does not run: there is nothing to validate, and no rebuild noise about connections
 nothing referenced.
 
-Only connections that a *migrated* item or shortcut actually references are ever looked at: a
+Migration dependency checks apply only to connections that a *migrated* item or shortcut
+actually references: a
 data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported
 definition names one, or a lakehouse/KQL database shortcut whose target does (a shortcut's
-connection lives on the shortcut target, not in the item's own definition). Fab Shuffle does
-not scan every tenant connection that merely happens to point at the source workspace — only
-ones its own selected items and shortcuts depend on.
+connection lives on the shortcut target, not in the item's own definition). Separately,
+cutover advisories report visible connections pointing into the source workspace, including
+ones no migrated item uses. That read-only inventory does not recreate connections or block
+the creation of unrelated items.
 
 A dependent item whose referenced connection still points into the source workspace, with no
 supplied `connection_mappings` entry for it, is refused rather than created against a
@@ -382,6 +388,37 @@ workspace being migrated, are left alone and checked instead, reporting:
 - **personal cloud** connections, which cannot be shared;
 - connections routed through a **gateway**. A virtual network gateway in particular stays in
   its original region, so it may no longer be the right path to the data.
+
+#### Connection cutover advisories
+
+After a rebuild, **Connections pointing at the source workspace** appears in the cutover
+report. It lists connection names where returned, IDs, redacted paths, matching source item
+IDs and the destination workspace. A suggested destination path appears only when recorded
+mappings remove every recognised source reference from that path. Review the connections
+and their consumers, then manually configure replacements or repoint them as appropriate
+before retiring the source. A source connection stays listed even if the migration used an
+explicit replacement: consumers outside this migration may still use the original.
+
+This is a point-in-time, read-only inventory, not live cutover validation. The scan matches
+known literal identifiers and endpoints in metadata returned to the source principal. It
+cannot discover connections that principal cannot list, dynamic references or all external
+consumers. Service errors remain visible; missing, incomplete and older-attempt scans are
+not clean results. A run stopped before the scan keeps unknown or stale evidence rather
+than making additional calls after cancellation. The snapshot survives restart and is
+included as `connectionAdvisories` in the downloadable readiness JSON. Reassignment does
+not need this scan because it retains the original workspace identity.
+
+Under **Look up connection names**, choose **View script**, then **Copy** or **Download
+.ps1**. Run it yourself in **PowerShell 7+ with the Az.Accounts module**, signing into the
+source tenant with your **user account**, not the migration service principal. It reads
+recorded connection IDs; `-ConnectionId` can add IDs. With no recorded or supplied IDs, it
+lists all connections your account can see, including additional pages. Only IDs, names
+and connection types are printed, along with service errors for failed lookups. No access
+is granted, no connection is changed, and names the API does not return remain unavailable.
+[List Connections](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/list-connections)
+and [Get Connection](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/get-connection)
+require connection access and, for user authentication, a delegated `Connection.Read.All`
+or `Connection.ReadWrite.All` scope. A name lookup does not fix missing access.
 
 ### Airflow files
 
@@ -471,8 +508,10 @@ with the container.
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
 
 Deploys [`deploy/azuredeploy.json`](deploy/azuredeploy.json): a Container App running the
-same public image, its environment, and a Log Analytics workspace for the container's logs.
-The template's output `url` is the wizard.
+same public image, its environment, a Log Analytics workspace for the container's logs,
+and a storage account with a classic Azure Files SMB share mounted at `/app/local`.
+The template's output `url` is the wizard. Staging files and recovery journals use the share;
+session credentials and active workers remain in memory.
 
 Worth knowing before you use it:
 
@@ -483,13 +522,36 @@ Worth knowing before you use it:
 - **It runs as exactly one replica, deliberately.** Sessions and run progress are held in the
   process, so a second replica would not know about your sign-in or your migration. Do not
   raise `maxReplicas`.
-- **Delete it when you are done.** It bills while it runs, and it exists for one job.
+- **Clean up after the migration.** Compute, logs, and storage incur charges. Retain the share
+  while you need recovery journals or staged files; deleting the storage account or resource
+  group deletes those too.
 - The region you deploy into has nothing to do with the region you are migrating *to*. That
   comes from the capacity you pick in the wizard.
 
-Container Apps gives a few GiB of ephemeral disk, which is the ceiling on lakehouse file
-transfer there. If you are moving more files than that, run it locally with a volume instead:
-nothing else about the migration differs.
+The `shareQuotaGiB` parameter defaults to **100 GiB** and accepts **1 through 102400 GiB**
+(100 TiB). This is persistent Azure Files storage, **not Azure Blob storage and not unlimited
+disk**. File-size, IOPS and throughput limits still apply, and storage operations, capacity
+and data transfer have costs. Size the share for concurrent staging, retained interrupted
+runs and journals; monitor free space and usage. See
+[Azure Files scale targets](https://learn.microsoft.com/en-us/azure/storage/files/storage-files-scale-targets).
+The existing `FAB_SHUFFLE_MAX_STAGING_BYTES` safety limit still defaults to 1 GiB per bounded
+transfer; increasing the share quota does not change it or introduce a Blob transfer backend.
+
+The template mounts the share through the Container Apps environment's `AzureFile` storage
+configuration, using an account key obtained by ARM `listKeys`. The key is not an application
+environment variable or a template output. The deployment identity needs permission to
+create the storage resources and list the account keys. Restrict management access to the
+account and environment, and update the environment storage configuration when rotating the
+key. This simple template uses an authenticated public storage endpoint; the wizard's IP
+restriction does not firewall storage. A private deployment needs compatible VNet, DNS,
+storage firewall and SMB connectivity (TCP 445), not just a deny rule on the account.
+See [Container Apps storage mounts](https://learn.microsoft.com/en-us/azure/container-apps/storage-mounts).
+
+Replacing a revision does not erase the share, but **wait for active migrations to finish
+before deploying an update**: an in-memory worker can still be interrupted. After a restart,
+sign in again to resume from the retained journals. Do not point a second Fab Shuffle
+instance at the same share. Existing deployments without a mount need their old journals
+copied to the share before switching; adding the mount does not copy the old ephemeral data.
 
 #### The wizard
 

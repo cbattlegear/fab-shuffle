@@ -1374,12 +1374,15 @@ function resetReadiness(runId = null) {
     clearTimeout(previous.timer);
     previous.controller?.abort();
     previous.downloadController?.abort();
+    previous.scriptController?.abort();
+    if (previous.scriptUrl) URL.revokeObjectURL(previous.scriptUrl);
   }
   state.readiness = runId ? {
     runId, report: null, revision: undefined, runStatus: null, version: 0,
     pending: false, urgent: false, timer: null, controller: null,
     lastFetch: Date.now(), error: "", downloadError: "", downloadController: null,
     page: 1, filter: "all", search: "",
+    scriptController: null, scriptError: "", scriptUrl: null,
   } : null;
   $("#readiness-filter").value = "all";
   $("#readiness-search").value = "";
@@ -1389,6 +1392,7 @@ function resetReadiness(runId = null) {
   $("#readiness-pagination").hidden = true;
   $("#readiness-results").textContent = "";
   $("#readiness-empty").hidden = true;
+  resetConnectionLookupScript();
   renderReadinessStatus();
 }
 
@@ -1459,6 +1463,7 @@ async function fetchReadiness(current) {
     (report.limits || []).forEach((limit) => {
       $("#readiness-limits").appendChild(readinessElement("li", limit));
     });
+    renderConnectionAdvisories();
   } catch (error) {
     if (state.readiness === current && version === current.version && error.name !== "AbortError") {
       current.error = error.message;
@@ -1479,6 +1484,7 @@ function renderReadinessStatus() {
   $(".readiness-jump").hidden = !visible;
   if (!visible) {
     $("#readiness-export").disabled = true;
+    $("#connection-advisories").hidden = true;
     return;
   }
   const report = current.report;
@@ -1584,6 +1590,164 @@ function readinessItem(item, key, open) {
   row.appendChild(details);
   return row;
 }
+
+const CONNECTION_ADVISORY_LABELS = {
+  complete: "Reviewed", incomplete: "Incomplete", not_applicable: "Not applicable",
+  unknown: "Unknown", stale: "Stale",
+};
+
+function connectionAdvisoryTone(scanState, count) {
+  if (scanState === "complete") return count ? "needs_attention" : "ready";
+  if (scanState === "not_applicable") return "ready";
+  return "unknown";
+}
+
+function connectionAdvisoryItem(entry) {
+  const row = readinessElement("li", null, "connection-advisory-item");
+  row.appendChild(readinessElement("h5", entry.connectionName || entry.connectionId));
+  row.appendChild(readinessElement("p", `ID: ${entry.connectionId}`, "hint"));
+  row.appendChild(readinessElement(
+    "p", `${entry.connectivityType || "Unknown connectivity"} · ${entry.type || "Unknown type"}`, "hint",
+  ));
+  if (entry.path) row.appendChild(readinessElement("p", `Path: ${entry.path}`, "hint"));
+  if ((entry.matchedSourceItems || []).length) {
+    readinessTextList(row, "Matches source item(s)", entry.matchedSourceItems);
+  }
+  if (entry.expectedNewPath) {
+    row.appendChild(readinessElement("p", `If repointed: ${entry.expectedNewPath}`, "hint"));
+  }
+  row.appendChild(readinessElement(
+    "p",
+    "Fabric does not let a connection's target be changed through the API. Repoint or recreate "
+      + "this connection by hand against the migrated workspace, then update whatever uses it.",
+    "hint",
+  ));
+  return row;
+}
+
+function renderConnectionAdvisories() {
+  const current = state.readiness;
+  const section = $("#connection-advisories");
+  if (!current || !readinessAvailable(current.runStatus)) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const advisories = current.report?.connectionAdvisories;
+  const scanState = advisories?.scanState || "unknown";
+  const connections = advisories?.connections || [];
+  const notApplicable = scanState === "not_applicable";
+  const status = $("#connection-advisories-status");
+  status.replaceChildren(
+    readinessElement("span", CONNECTION_ADVISORY_LABELS[scanState] || "Unknown",
+      `readiness-state ${connectionAdvisoryTone(scanState, connections.length)}`),
+    readinessElement("span", advisories?.message ? ` ${advisories.message}` : ""),
+  );
+  $("#connection-advisories-action").textContent = advisories?.action || "";
+  $("#connection-advisories-action").hidden = !advisories?.action;
+  const context = [];
+  if (advisories?.generatedAt) context.push(`Snapshot: ${advisories.generatedAt}`);
+  if (advisories?.targetWorkspaceId) context.push(`Destination workspace: ${advisories.targetWorkspaceId}`);
+  $("#connection-advisories-context").textContent = context.join(" · ");
+  const limits = $("#connection-advisories-limits");
+  limits.replaceChildren();
+  (advisories?.limits || []).forEach((limit) => limits.appendChild(readinessElement("li", limit)));
+  $("#connection-advisories-scope").hidden = !(advisories?.limits || []).length;
+  $("#connection-advisories-items").replaceChildren(...connections.map(connectionAdvisoryItem));
+  $("#connection-advisories-empty").hidden = Boolean(connections.length) || notApplicable;
+  $("#connection-advisories-empty").textContent = connections.length ? "" : notApplicable ? "" : (
+    scanState === "complete"
+      ? "No tenant-visible connection's path was found to reference the source workspace. "
+        + "You can still download a lookup script below to list every connection you can see."
+      : "No connection advisory results are recorded yet. The lookup script below still works "
+        + "on its own - it lists every connection you can see."
+  );
+  // Only a reassign - which never scans, because nothing about a connection's path changes -
+  // has genuinely nothing to look up. Everything else still gets a usable script, even with
+  // zero recorded ids: it falls back to listing every connection the operator can see.
+  $("#connection-lookup-script").hidden = notApplicable;
+  if (notApplicable) resetConnectionLookupScript();
+}
+
+function resetConnectionLookupScript() {
+  const current = state.readiness;
+  current?.scriptController?.abort();
+  if (current?.scriptUrl) URL.revokeObjectURL(current.scriptUrl);
+  if (current) {
+    current.scriptUrl = null;
+    current.scriptController = null;
+    current.scriptError = "";
+  }
+  $("#connection-lookup-script").open = false;
+  $("#connection-lookup-pre").hidden = true;
+  $("#connection-lookup-pre").querySelector("code").textContent = "";
+  $("#connection-lookup-download").href = "";
+  $("#connection-lookup-error").hidden = true;
+  $("#connection-lookup-error").textContent = "";
+  $("#connection-lookup-fetch").disabled = false;
+  $("#connection-lookup-fetch").textContent = "View script";
+}
+
+$("#connection-lookup-fetch").addEventListener("click", async () => {
+  const current = state.readiness;
+  if (!current || !readinessAvailable(current.runStatus) || current.scriptController) return;
+  const version = current.version;
+  const button = $("#connection-lookup-fetch");
+  current.scriptController = new AbortController();
+  current.scriptError = "";
+  button.disabled = true;
+  button.textContent = "Loading…";
+  $("#connection-lookup-error").hidden = true;
+  try {
+    const blob = await api(`/api/runs/${encodeURIComponent(current.runId)}/connections/script`, {
+      download: true, signal: current.scriptController.signal,
+    });
+    if (state.readiness !== current || version !== current.version) return;
+    const text = await blob.text();
+    if (state.readiness !== current || version !== current.version ||
+        !readinessAvailable(current.runStatus)) return;
+    $("#connection-lookup-pre").querySelector("code").textContent = text;
+    $("#connection-lookup-pre").hidden = false;
+    if (current.scriptUrl) URL.revokeObjectURL(current.scriptUrl);
+    current.scriptUrl = URL.createObjectURL(blob);
+    const link = $("#connection-lookup-download");
+    link.href = current.scriptUrl;
+    link.download = `connection-lookup-${current.runId.replace(/[^a-zA-Z0-9_-]/g, "_")}.ps1`;
+  } catch (error) {
+    if (state.readiness === current && error.name !== "AbortError") {
+      current.scriptError = error.message;
+      $("#connection-lookup-error").textContent = error.message;
+      $("#connection-lookup-error").hidden = false;
+    }
+  } finally {
+    if (state.readiness === current) {
+      current.scriptController = null;
+      button.disabled = false;
+      button.textContent = "View script";
+    }
+  }
+});
+
+$("#connection-lookup-copy").addEventListener("click", async () => {
+  const button = $("#connection-lookup-copy");
+  const code = $("#connection-lookup-pre").querySelector("code");
+  if (!code.textContent) return;
+  try {
+    await navigator.clipboard.writeText(code.textContent);
+    button.textContent = "Copied";
+  } catch {
+    // Clipboard access needs a secure context, which a plain http:// host is not.
+    button.textContent = "Press Ctrl+C";
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  setTimeout(() => {
+    button.textContent = "Copy";
+  }, 2000);
+});
 
 function renderReadinessItems() {
   const current = state.readiness;

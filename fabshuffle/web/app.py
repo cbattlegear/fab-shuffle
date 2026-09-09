@@ -17,14 +17,22 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from fabshuffle import __version__, journal, recovery
 from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric import analytics, connections, definitions, migration_refs, relations, workspaces
+from fabshuffle.fabric import (
+    analytics,
+    connection_advisory,
+    connections,
+    definitions,
+    migration_refs,
+    relations,
+    workspaces,
+)
 from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.fabric.items import get_item_definition, list_items
 from fabshuffle.fabric.powerbi import PowerBiClient, PowerBiError
@@ -39,6 +47,7 @@ from fabshuffle.orchestrator import (
     _plan_record,
     build_plan,
     cleanup_run,
+    connections_lookup_script,
     default_target_name,
     dependency_warnings,
     grant_script,
@@ -660,6 +669,23 @@ def create_app() -> FastAPI:
             headers["Content-Disposition"] = f'attachment; filename="cutover-{run_id}.json"'
         return JSONResponse(report, headers=headers)
 
+    @app.get("/api/runs/{run_id}/connections/script")
+    async def get_connections_lookup_script(
+        run_id: str, session: Session = Depends(require_execution_session),
+    ) -> PlainTextResponse:
+        """A PowerShell script, for download, that looks up the connections the advisory
+        scan found - by id, signed in as the operator rather than the service principal.
+
+        Same authorization as the readiness report it is generated from: a run this session
+        cannot see refuses here too, before any script is produced.
+        """
+        script = await asyncio.to_thread(_connections_lookup_script, run_id, session)
+        headers = {
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'attachment; filename="connection-lookup-{run_id}.ps1"',
+        }
+        return PlainTextResponse(script, headers=headers)
+
     @app.get("/api/resumable")
     async def resumable(session: Session = Depends(require_execution_session)) -> dict[str, Any]:
         """Runs that stopped without finishing, from their journals on disk.
@@ -918,11 +944,15 @@ def _readiness(run_id: str, session: Session) -> dict[str, Any]:
             )
     if run is not None:
         _require_identity(session, run.plan)
-        return readiness_report(
+        report = readiness_report(
             run.lifecycle.snapshot(), run_id=run_id, lineage_id=run.lineage_id,
             run_status=run.status.value, inventory_complete=run.inventory_complete,
             attempts=run.readiness_attempts,
         )
+        report["connectionAdvisories"] = connection_advisory.section_for_report(
+            run.connection_advisory, run_id=run_id, strategy=str(run.plan.get("strategy") or ""),
+        )
+        return report
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No run or saved journal for that run")
     replay = journal.read(path)
@@ -934,12 +964,16 @@ def _readiness(run_id: str, session: Session) -> dict[str, Any]:
             str(replay.plan.get("source_workspace_id") or ""), replay.target_workspace_id,
             item["target"], required=list(contract_for(item["type"]).required),
         ))
-    return readiness_report(
+    report = readiness_report(
         outcomes, run_id=run_id, lineage_id=replay.lineage_id,
         run_status=replay.status or "interrupted",
         inventory_complete=replay.inventory_complete and not replay.damaged_lines,
         attempts=_readiness_attempts(replay),
     )
+    report["connectionAdvisories"] = connection_advisory.section_for_report(
+        replay.connection_advisory, run_id=run_id, strategy=str(replay.plan.get("strategy") or ""),
+    )
+    return report
 
 
 def _readiness_attempts(replay: journal.Replay | None) -> list[dict[str, Any]]:
@@ -948,6 +982,53 @@ def _readiness_attempts(replay: journal.Replay | None) -> list[dict[str, Any]]:
         {key: attempt.get(key, "") for key in ("run_id", "status", "last_phase")}
         for attempt in replay.attempts
     ] if replay else []
+
+
+def _plan_record_for_run(run_id: str, session: Session) -> dict[str, Any]:
+    """The stored plan for a run, live or saved, with the same authorization as its report."""
+    run = REGISTRY.get(run_id)
+    if run is not None:
+        _require_identity(session, run.plan)
+        return run.plan
+    path = _session_journal(session, run_id)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No run or saved journal for that run")
+    replay = journal.read(path)
+    _require_replay(session, replay)
+    return replay.plan
+
+
+def _connections_lookup_script(run_id: str, session: Session) -> str:
+    """The PowerShell lookup script for a run's recorded connection advisory scan.
+
+    The tenant it signs into is always the *source* workspace's tenant - where these
+    connections live - not necessarily this session's own: a paired, cross-tenant plan
+    records its source tenant explicitly, and only a same-tenant plan falls back to the
+    signed-in principal's own tenant.
+
+    Not refused merely because no connection was recorded: a report from before this scan
+    existed, or one whose scan has not run yet, has nothing to embed either way, and the
+    script itself falls back to listing every connection the operator can see when it is
+    handed none. Only ``not_applicable`` (a reassign, which never scans because nothing about
+    a connection's path changes) has genuinely nothing to look up.
+    """
+    report = _readiness(run_id, session)
+    advisories = report.get("connectionAdvisories") or {}
+    if advisories.get("scanState") == "not_applicable":
+        raise HTTPException(
+            status_code=404,
+            detail="This run's strategy does not repoint connections, so there is nothing to look up.",
+        )
+    connection_ids = [
+        str(entry["connectionId"]) for entry in advisories.get("connections") or []
+        if entry.get("connectionId")
+    ]
+    plan_record = _plan_record_for_run(run_id, session)
+    tenant_id = str(plan_record.get("source_tenant_id") or session.principal.tenant_id or "")
+    try:
+        return connections_lookup_script(connection_ids, tenant_id=tenant_id)
+    except ValueError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
 
 def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
