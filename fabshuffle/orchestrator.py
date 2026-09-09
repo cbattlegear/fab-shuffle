@@ -36,7 +36,8 @@ items created by an *earlier* phase:
    anyway.
 7. ``mirrored``     mirrored databases, which are data stores with their own SQL analytics
    endpoint and can themselves bind a connection directly, so they belong with the others and
-   after connection mappings are validated, and before anything that reads them.
+   after connection mappings are validated, and before anything that reads them. Created
+   stopped; an explicit operator opt-in starts them here and observes Running before shortcuts.
 8. ``shortcuts``    after *every* data item exists, since a shortcut can point at any of
    them. This covers both lakehouse shortcuts and KQL database table shortcuts. The SQL
    analytics endpoint is refreshed only now, so it picks up both the copied tables and the
@@ -105,6 +106,7 @@ from fabshuffle.fabric import (
     definitions,
     eventhouses,
     migration_refs,
+    mirroring,
     powerbi,
     relations,
     shortcuts,
@@ -200,10 +202,13 @@ class MigrationPlan:
     source_client_id: str = ""
     target_client_id: str = ""
     write_freeze_confirmed: bool = False
+    start_database_mirrors: bool = False
     connection_mappings: dict[str, str] = field(default_factory=dict)
     reference_mappings: list[dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if type(self.start_database_mirrors) is not bool:
+            raise ValueError("Starting database mirrors requires an explicit boolean option.")
         if bool(self.source_tenant_id) != bool(self.target_tenant_id):
             raise ValueError("A tenant-qualified plan requires both source and target tenant IDs.")
         if self.source_tenant_id:
@@ -236,6 +241,8 @@ class MigrationPlan:
 
     @property
     def execution_blocker(self) -> str | None:
+        if self.start_database_mirrors and self.strategy is not Strategy.REBUILD:
+            return "Starting destination database mirrors is only available for rebuild migrations."
         if self.paired and (not self.source_client_id or not self.target_client_id):
             return "Sign in to both tenants again; this plan is missing its application identities."
         if self.paired and self.strategy is not Strategy.REBUILD:
@@ -3386,9 +3393,8 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
     the other data stores: a semantic model can read it, and its endpoint has to be in the id
     map before the analytics phase.
 
-    Mirroring is deliberately not started. Creating the item does not start replication, and
-    starting it would add a second live mirror against the same source database while the
-    original is presumably still running. That is the operator's call.
+    Mirrors are created stopped. Only the explicit start_database_mirrors option authorizes
+    the subsequent start action, before shortcuts are reconciled.
     """
     step = "mirrored"
     ctx.run.start_step(step, "Migrating mirrored databases")
@@ -3409,15 +3415,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
 
     if not databases:
         migrated: list[analytics.MigratedItem] = []
-        running: dict[str, str | None] = {}
     else:
-        # Record what was running before the move, so the warning can say whether replication
-        # actually needs restarting in the new region.
-        running = {
-            db["id"]: data_stores.mirroring_status(ctx.client, source_id, db["id"])
-            for db in databases
-        }
-
         migrated, item_warnings = _migrate_definition_items(
             ctx,
             source_workspace_id=source_id,
@@ -3447,19 +3445,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
         target_endpoint = data_stores.mirrored_database_sql_endpoint(target)
         _map_sql_endpoint(ctx, source_endpoint, target_endpoint, owner=result.source_id)
 
-        was = running.get(result.source_id)
-        state = f"was {was} in the source workspace" if was else "could not be read"
-        warnings.append(
-            f"Mirrored database '{result.name}' was created but its mirroring is not started "
-            f"(replication {state}). Start it from the new workspace once you are ready for a "
-            "second mirror to read the source database."
-        )
-        # Nothing has replicated into it yet, so anything reading its tables has nothing to
-        # read. A shortcut into it fails, and the reason is three steps back from the failure.
-        ctx.dormant[result.source_id] = (
-            "arrives with its mirroring not started, so no data has replicated into it yet. "
-            "Start mirroring in the new workspace."
-        )
+        _configure_database_mirror(ctx, source, result, warnings)
 
     if catalogs:
         results, item_warnings = _migrate_definition_items(
@@ -3488,6 +3474,73 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
     ctx.run.finish_step(
         step, StepStatus.SUCCEEDED, f"Migrated {len(migrated) + len(snowflake)} item(s)", warnings
     )
+
+
+def _configure_database_mirror(
+    ctx: _Context, source: Mapping[str, Any], result: analytics.MigratedItem,
+    warnings: list[str],
+) -> None:
+    evidence = ctx.resolve_item(source, result.target_id, analytics.MIRRORED_DATABASE)
+    ctx.run.raise_if_cancelled()
+    # An empty recorded value also clears dormant explanations inherited from older attempts.
+    ctx.dormant[result.source_id] = ""
+    evidence.step(
+        "activation", EvidenceState.UNKNOWN, "Checking destination mirroring state.",
+        action="Inspect destination mirroring status before retrying a start.",
+    )
+    try:
+        if (
+            not ctx.target_workspace_id
+            or ctx.target_workspace_id.casefold() == ctx.plan.source_workspace_id.casefold()
+        ):
+            raise FabricError("Refusing mirror activation against a missing or source workspace.")
+        if ctx.plan.start_database_mirrors:
+            mirroring.ensure_running(
+                ctx.destination_client, ctx.target_workspace_id, result.target_id,
+                check_cancel=ctx.run.raise_if_cancelled,
+                on_progress=lambda message: ctx.run.update_step("mirrored", f"{result.name}: {message}"),
+            )
+            state = "Running"
+        else:
+            state = mirroring.status(ctx.destination_client, ctx.target_workspace_id, result.target_id)
+    except (FabricError, AuthError, TimeoutError) as error:
+        message = f"Mirrored database '{result.name}' activation could not be confirmed: {error}"
+        action = (
+            "Check destination mirroring and resolve the service error before retrying. "
+            "A submitted start may still be running; the source mirror was not changed."
+        )
+        evidence.step("activation", EvidenceState.FAILED, message, action=action, error=error)
+        warnings.append(f"{message}. {action}")
+        return
+    if state == "Running":
+        evidence.step(
+            "activation", EvidenceState.SUCCEEDED,
+            "Destination reports Running; no start was repeated for an already-running mirror.",
+        )
+        evidence.step(
+            "replication", EvidenceState.UNKNOWN,
+            "Running does not prove initial replication or table readiness.",
+            action="Check replicated tables and initial synchronization in the destination before cutover.",
+        )
+        warnings.append(
+            f"Mirrored database '{result.name}' reports Running. Check initial synchronization "
+            "and table availability before cutover; shortcuts can still need a retry while tables arrive."
+        )
+    else:
+        evidence.step(
+            "activation", EvidenceState.SKIPPED,
+            f"Automatic start was not selected. Destination reports {state}.",
+            action="Start mirroring in the destination when ready, or select "
+            "Start destination database mirrors on retry. This can create a second active replica.",
+        )
+        ctx.dormant[result.source_id] = (
+            f"reports mirroring status {state} in the destination; replicated table availability "
+            "has not been verified. Check mirroring and the target table in the new workspace."
+        )
+        warnings.append(
+            f"Mirrored database '{result.name}' reports {state}; no start was requested. "
+            "Start it in the destination when ready, or select the mirror-start option on retry."
+        )
 
 
 def _migrate_snowflake_databases(
@@ -3588,7 +3641,7 @@ def _migrate_snowflake_databases(
 
 def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     step = "shortcuts"
-    ctx.run.start_step(step, "Recreating shortcuts and syncing SQL endpoints")
+    ctx.run.start_step(step, "Reconciling shortcuts and syncing SQL endpoints")
     ctx.run.raise_if_cancelled()
 
     source_lakehouses = data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id)
@@ -3597,7 +3650,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
         return
 
     warnings: list[str] = []
-    shortcuts_created = 0
+    shortcuts_completed = 0
     endpoints: list[tuple[str, str, str]] = []
 
     # Names for the items in the source workspace, so a shortcut pointing at something that
@@ -3616,8 +3669,8 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
         if not table_shortcuts:
             continue
 
-        ctx.run.update_step(step, f"Recreating table shortcuts for KQL database '{database_name}'")
-        created, shortcut_warnings = shortcuts.copy_table_shortcuts(
+        ctx.run.update_step(step, f"Reconciling table shortcuts for KQL database '{database_name}'")
+        completed, shortcut_warnings = shortcuts.copy_table_shortcuts(
             ctx.client,
             ctx.plan.source_workspace_id,
             source_db_id,
@@ -3631,7 +3684,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
             **ctx.target_kwargs,
             **({"cross_tenant": True} if ctx.plan.cross_tenant else {}),
         )
-        shortcuts_created += created
+        shortcuts_completed += completed
         warnings.extend(f"KQL database '{database_name}': {w}" for w in shortcut_warnings)
 
     for lakehouse in source_lakehouses:
@@ -3641,8 +3694,8 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
         if not target_id:
             continue
 
-        ctx.run.update_step(step, f"Recreating shortcuts for '{name}'")
-        created, shortcut_warnings = shortcuts.copy_shortcuts(
+        ctx.run.update_step(step, f"Reconciling shortcuts for '{name}'")
+        completed, shortcut_warnings = shortcuts.copy_shortcuts(
             ctx.client,
             ctx.plan.source_workspace_id,
             lakehouse["id"],
@@ -3655,7 +3708,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
             **ctx.target_kwargs,
             **({"cross_tenant": True} if ctx.plan.cross_tenant else {}),
         )
-        shortcuts_created += created
+        shortcuts_completed += completed
         warnings.extend(f"Lakehouse '{name}': {w}" for w in shortcut_warnings)
 
         # The endpoint must re-read OneLake after tables and shortcuts land, otherwise the
@@ -3736,7 +3789,7 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
-        step, StepStatus.SUCCEEDED, f"Created {shortcuts_created} shortcut(s)", warnings
+        step, StepStatus.SUCCEEDED, f"Created or reused {shortcuts_completed} shortcut(s)", warnings
     )
 
 
@@ -4654,6 +4707,7 @@ def build_plan(
     source_client_id: str = "",
     target_client_id: str = "",
     write_freeze_confirmed: bool = False,
+    start_database_mirrors: bool = False,
     connection_mappings: Mapping[str, str] | None = None,
     reference_mappings: list[dict[str, str]] | None = None,
 ) -> MigrationPlan:
@@ -4714,6 +4768,7 @@ def build_plan(
         source_client_id=source_client_id,
         target_client_id=target_client_id,
         write_freeze_confirmed=write_freeze_confirmed,
+        start_database_mirrors=start_database_mirrors,
         connection_mappings=dict(connection_mappings or {}),
         reference_mappings=list(reference_mappings or []),
     )

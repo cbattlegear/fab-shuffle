@@ -161,7 +161,7 @@ copies everything it supports.
 | Warehouse | ✅ | ✅ | Collation preserved |
 | Eventhouse | ✅ | n/a | |
 | KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
-| Mirrored database | ✅ | n/a | Mirroring must be started by hand afterwards |
+| Mirrored database | ✅ | n/a | Created stopped; optional explicit start after creation |
 | Eventstream | ✅ | n/a | Same-tenant single-principal rebuilds; manual inactive creation for paired migrations |
 | KQL queryset | ✅ | n/a | Rebound to the migrated eventhouse |
 | KQL dashboard | ✅ | n/a | Rebound to the migrated eventhouse |
@@ -222,8 +222,25 @@ upgrade it with the upgrade wizard or Save As and migrate again.
 leaving it running would mean two copies acting on the same source at once. Mirrored databases
 arrive with mirroring stopped, a mirrored Azure Databricks catalog with `autoSync` disabled,
 and an Activator with every rule's `shouldRun` set to false — otherwise every alert fires
-twice and every pipeline it triggers runs twice, once from each region. Each one reports what
-its original setting was so you can restore it at cutover.
+twice and every pipeline it triggers runs twice, once from each region.
+
+**Start destination database mirrors** is an off-by-default option on the review screen,
+including when retrying a saved migration. Selecting it authorizes a separate start action
+after each `MirroredDatabase` is created, before shortcuts are reconciled. This can run a
+second replica against the same upstream database, adding load and cost. The original mirror
+is never stopped or changed. Activator rules and Databricks catalog sync are not enabled.
+Confirm this option again on each retry; a previously recorded choice does not silently
+authorize another attempt.
+
+The start uses destination credentials and waits for Fabric to report **Running**. Already
+running mirrors are not started twice. An accepted start is not proof of replicated data:
+check initial synchronization and table availability before cutover. A shortcut into a newly
+started mirror can still need retrying while its table arrives. Cancellation stops the
+migration worker, **not replication already started**. With the option off, mirroring remains
+operator-controlled, and retry reads the destination state rather than claiming a manually
+started mirror is still stopped. See
+[Start Mirroring](https://learn.microsoft.com/en-us/rest/api/fabric/mirroreddatabase/mirroring/start-mirroring)
+and [Get Mirroring Status](https://learn.microsoft.com/en-us/rest/api/fabric/mirroreddatabase/mirroring/get-mirroring-status).
 
 **A graph model's index is not copied.** The mappings and graph type come across, and the delta
 tables they read migrate with their lakehouse, but the index itself is built from the data.
@@ -264,8 +281,10 @@ or is interrupted. They remain hidden while a run is pending or running.
 Filter or search the per-item report to see source/target identities, created/adopted/refreshed
 dispositions, step evidence and operator actions. Data and file options skipped at admission
 remain visible. An explicitly empty table/file inventory is different from an unmeasured copy.
-Environment publishing, mirroring startup, Activator rule enablement, catalog auto-sync and
-graph refresh remain operator tasks, not side effects of generating a report.
+Environment publishing, Activator rule enablement, catalog auto-sync and graph refresh remain
+operator tasks. Mirroring startup requires the explicit review-screen opt-in or a manual
+start; generating a report never starts it. Running-state evidence does not prove replication
+has caught up.
 
 **Ready is not permission to delete the source.** This report does not perform row-count/hash
 reconciliation, live execution or activation checks, permission parity, external dependency
@@ -593,6 +612,13 @@ adopted; data that had finished moving is left alone. Anything the journal claim
 no longer there is built again, because the journal records what an attempt *did*, not what is
 there now.
 
+Shortcuts are reconciled against destination inventory before creating anything. An exact
+parent path and name plus the remapped target must match (including connection IDs; KQL also
+compares query acceleration). A matching shortcut is reused without another create request;
+the same name in another folder is a different shortcut. A mismatched shortcut, table or
+folder is not overwritten or deleted. A 409 is only treated as recovered when a follow-up
+read proves the existing shortcut is identical; otherwise the service error remains visible.
+
 Completion checkpoints belong to the target item that received the data. If that item was
 deleted, the replacement receives a fresh copy; existing consumers are rebound to its new
 identifiers before recovery can succeed. Checkpoints and diagnostics carry across every
@@ -610,6 +636,10 @@ what did not migrate** on the progress screen, and only the missing items are at
 scratch workspace it deleted on the way out is rebuilt automatically.
 Completed runs with recorded failed steps also appear under **Saved migrations needing
 attention** after a container restart, so a runtime handoff does not lose the retry controls.
+Resume and Retry open a review screen for that attempt's mirror-start choice. Existing
+capacity, copied-data options and target workspaces are retained. The API option is
+`start_database_mirrors: true` on `POST /api/runs` or `POST /api/runs/{id}/resume`;
+omitting it on resume leaves automatic starts off even if a prior attempt opted in.
 
 Each saved migration offers two confirmed actions in addition to resuming:
 

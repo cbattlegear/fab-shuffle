@@ -267,6 +267,7 @@ const scenarios = {
     f.ui.recheckMappings();
     assert.deepEqual(JSON.parse(f.requests[4].options.body), {
       connection_mappings: { "source-connection": "new-destination-connection" }, reference_mappings: [],
+      start_database_mirrors: false,
     });
     await f.reply(4, { dependencies: [], blockers: [], connectionAccess: null });
     f.get("target-name").value = "must-not-change";
@@ -276,6 +277,51 @@ const scenarios = {
     await f.reply(5, { runId: "resumed-with-mappings" });
     assert.equal(f.ui.state.runId, "resumed-with-mappings");
     assert.match(f.streams[0].url, /resumed-with-mappings\/events/);
+  },
+  async mirror_start_option(f) {
+    f.paired();
+    assert.equal(f.get("opt-start-mirrors").checked, false);
+    assert.equal(f.ui.migrationBody().start_database_mirrors, false);
+    assert.equal(f.get("opt-start-mirrors")["aria-describedby"], "mirror-start-warning");
+    assert.match(f.get("mirror-start-warning").textContent, /second mirror/);
+    assert.match(f.get("mirror-start-warning").textContent, /does not stop the original/);
+    assert.match(f.get("mirror-start-warning").textContent, /Cancellation will not stop/);
+    f.get("opt-start-mirrors").checked = true;
+    assert.equal(f.ui.migrationBody().start_database_mirrors, true);
+    f.ui.state.preview.strategy = "reassign";
+    f.ui.renderReview();
+    assert.equal(f.get("rebuild-options").hidden, true);
+    assert.equal(f.ui.migrationBody().start_database_mirrors, false);
+  },
+  async same_tenant_mirror_retry(f) {
+    f.paired();
+    f.ui.state.paired = false;
+    f.ui.state.crossTenant = false;
+    f.ui.state.runId = "previous";
+    f.get("opt-start-mirrors").checked = true;
+    f.get("retry-run").click();
+    assert.equal(f.requests[0].url, "/api/runs/previous/resume-plan");
+    await f.reply(0, {
+      plan: {
+        ...f.ui.state.preview, capacityId: "capacity", sourceWorkspaceId: "workspace",
+        includeData: false, includeFiles: false, startDatabaseMirrors: true,
+        connectionMappings: { "existing-source": "existing-destination" }, referenceMappings: [],
+      }, cleanupWhenDone: true, targetWorkspaceId: "created-workspace", items: [],
+    });
+    assert.equal(f.get("opt-start-mirrors").checked, false, "Retry requires fresh activation consent");
+    assert.equal(f.get("opt-start-mirrors").disabled, false);
+    assert.equal(f.get("opt-data").disabled, true);
+    assert.equal(f.get("destination-mappings").hidden, true);
+    await f.reply(1, { connections: [] });
+    await f.reply(2, { connections: [] });
+    assert.deepEqual(JSON.parse(f.requests[3].options.body), { start_database_mirrors: false });
+    await f.reply(3, { blockers: [], dependencies: [], connectionAccess: null });
+    f.get("opt-start-mirrors").checked = true;
+    f.get("start-run").click();
+    assert.equal(f.requests[4].url, "/api/runs/previous/resume");
+    assert.deepEqual(JSON.parse(f.requests[4].options.body), { start_database_mirrors: true });
+    await f.reply(4, { runId: "retry" });
+    assert.equal(f.ui.state.runId, "retry");
   },
 };
 

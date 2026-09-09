@@ -2,23 +2,49 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
+from urllib.parse import quote
 
 from fabshuffle.fabric import analytics
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import identity_key, part
 from fabshuffle.lifecycle import EvidenceState, ItemLifecycle
 
+_IDENTITY_TARGET_FIELDS = frozenset({"connectionId", "itemId", "workspaceId"})
+logger = logging.getLogger(__name__)
+
+
+def _shortcut_collection_path(workspace_id: str, item_id: str) -> str:
+    return f"workspaces/{workspace_id}/items/{item_id}/shortcuts"
+
 
 def list_shortcuts(client: FabricClient, workspace_id: str, item_id: str) -> list[dict[str, Any]]:
     try:
-        return client.list_all(f"workspaces/{workspace_id}/items/{item_id}/shortcuts")
+        return _list_shortcuts_strict(client, workspace_id, item_id)
     except FabricApiError as error:
         if error.status_code == 404:
             return []
         raise
+
+
+def _list_shortcuts_strict(client: FabricClient, workspace_id: str, item_id: str) -> list[dict[str, Any]]:
+    return client.list_all(_shortcut_collection_path(workspace_id, item_id))
+
+
+def _get_shortcut_strict(
+    client: FabricClient,
+    workspace_id: str,
+    item_id: str,
+    parent_path: str,
+    name: str,
+) -> dict[str, Any]:
+    encoded_path = quote(parent_path.strip("/"), safe="/")
+    encoded_name = quote(name, safe="")
+    suffix = f"{encoded_path}/{encoded_name}" if encoded_path else encoded_name
+    return client.get(f"{_shortcut_collection_path(workspace_id, item_id)}/{suffix}")
 
 
 def table_shortcut_keys(shortcuts: Iterable[Mapping[str, Any]]) -> set[tuple[str | None, str]]:
@@ -69,7 +95,7 @@ def create_shortcut(
         "target": shortcut["target"],
     }
     return client.post(
-        f"workspaces/{workspace_id}/items/{item_id}/shortcuts",
+        _shortcut_collection_path(workspace_id, item_id),
         json=body,
         params={"shortcutConflictPolicy": conflict_policy},
     )
@@ -134,6 +160,149 @@ def _remap_target(target: Mapping[str, Any], id_map: Mapping[str, str]) -> dict[
 def _target_kind(target: Mapping[str, Any]) -> str:
     """The single target key a shortcut carries, such as ``oneLake`` or ``adlsGen2``."""
     return next((key for key in target if key != "type"), "")
+
+
+def _shortcut_location(shortcut: Mapping[str, Any], *, table: bool = False) -> str:
+    name = "" if shortcut.get("name") is None else str(shortcut.get("name"))
+    if table:
+        return name
+    path = "" if shortcut.get("path") is None else str(shortcut.get("path"))
+    return f"{path}/{name}" if path else name
+
+
+def _shortcut_key(shortcut: Mapping[str, Any], *, table: bool = False) -> tuple[str, str]:
+    name = "" if shortcut.get("name") is None else str(shortcut.get("name"))
+    if table:
+        return ("", name)
+    path = "" if shortcut.get("path") is None else str(shortcut.get("path"))
+    return (path, name)
+
+
+def _normalise_target_value(key: str, value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            nested_key: _normalise_target_value(str(nested_key), nested)
+            for nested_key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalise_target_value("", entry) for entry in value]
+    if isinstance(value, str) and key in _IDENTITY_TARGET_FIELDS:
+        return identity_key(value)
+    return value
+
+
+def _normalise_shortcut_target(target: Mapping[str, Any]) -> dict[str, Any]:
+    # The REST Get/List responses include target.type as a discriminator, while Create
+    # examples omit it from the payload. Do not ignore any other metadata when comparing.
+    return {
+        key: _normalise_target_value(str(key), value)
+        for key, value in target.items()
+        if key != "type"
+    }
+
+
+def _same_shortcut_definition(
+    existing: Mapping[str, Any],
+    desired: Mapping[str, Any],
+    *,
+    table: bool = False,
+) -> bool:
+    if _shortcut_key(existing, table=table) != _shortcut_key(desired, table=table):
+        return False
+    if _normalise_shortcut_target(existing.get("target") or {}) != _normalise_shortcut_target(
+        desired.get("target") or {}
+    ):
+        return False
+    if table:
+        return bool(existing.get("enableQueryAcceleration", False)) == bool(
+            desired.get("enableQueryAcceleration", False)
+        )
+    return True
+
+
+def _destination_match(
+    inventory: Iterable[Mapping[str, Any]],
+    desired: Mapping[str, Any],
+    *,
+    table: bool = False,
+) -> tuple[str, Mapping[str, Any] | None]:
+    """Classify the destination shortcut occupying the desired identity, if any."""
+    desired_key = _shortcut_key(desired, table=table)
+    first_same_identity: Mapping[str, Any] | None = None
+    for existing in inventory:
+        if _shortcut_key(existing, table=table) != desired_key:
+            continue
+        if _same_shortcut_definition(existing, desired, table=table):
+            return "match", existing
+        if first_same_identity is None:
+            first_same_identity = existing
+    return ("mismatch", first_same_identity) if first_same_identity is not None else ("missing", None)
+
+
+def _existing_mismatch_message(
+    shortcut: Mapping[str, Any],
+    existing: Mapping[str, Any],
+    *,
+    label: str,
+    table: bool = False,
+) -> str:
+    location = _shortcut_location(shortcut, table=table)
+    detail = "it points at a different target"
+    if table and _normalise_shortcut_target(existing.get("target") or {}) == _normalise_shortcut_target(
+        shortcut.get("target") or {}
+    ):
+        detail = "its query acceleration setting differs"
+    return (
+        f"{label} '{shortcut.get('name')}' was not created: the destination already has a "
+        f"shortcut at '{location}', but {detail}. Resolve that destination shortcut or choose "
+        "a clean destination path, then retry."
+    )
+
+
+def _record_cached_destination(
+    inventory: list[Mapping[str, Any]] | None,
+    observed: Mapping[str, Any],
+) -> None:
+    if inventory is not None:
+        inventory.append(observed)
+
+
+def _adopt_lakehouse_shortcut_after_conflict(
+    client: FabricClient,
+    workspace_id: str,
+    item_id: str,
+    desired: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    try:
+        existing = _get_shortcut_strict(
+            client,
+            workspace_id,
+            item_id,
+            "" if desired.get("path") is None else str(desired.get("path")),
+            "" if desired.get("name") is None else str(desired.get("name")),
+        )
+    except FabricApiError as error:
+        logger.info("Existing shortcut could not be verified after a create conflict: %s", error)
+        return None
+    return existing if _same_shortcut_definition(existing, desired) else None
+
+
+def _adopt_table_shortcut_after_conflict(
+    client: FabricClient,
+    workspace_id: str,
+    database_id: str,
+    desired: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    try:
+        state, existing = _destination_match(
+            _list_table_shortcuts_strict(client, workspace_id, database_id),
+            desired,
+            table=True,
+        )
+    except FabricApiError as error:
+        logger.info("Existing KQL shortcut could not be verified after a create conflict: %s", error)
+        return None
+    return existing if state == "match" else None
 
 
 def _unmigrated_connection(
@@ -274,6 +443,7 @@ def describe_failure(
     *,
     label: str = "Shortcut",
     said: str = "",
+    location: str = "",
 ) -> str:
     """Explain why a shortcut could not be created.
 
@@ -289,8 +459,8 @@ def describe_failure(
 
     if status_code == 409:
         reason = (
-            "something of that name is already there. Delete it if you are re-running into a "
-            "workspace that was already partly migrated"
+            "something at that destination path/name is already there. Resolve the collision "
+            "or choose a clean target, then retry"
         )
     elif status_code == 404 and internal:
         reason = (
@@ -299,15 +469,11 @@ def describe_failure(
         )
     elif status_code == 404:
         reason = "the path it points at was not found. Check the target still exists"
-    elif status_code == 403 and internal:
+    elif status_code in (401, 403):
         reason = (
-            "this service principal cannot reach the item it points at. Grant it access to "
-            "that workspace"
-        )
-    elif status_code == 403:
-        reason = (
-            "its connection denied access. The connection is tenant wide, so check the "
-            "service principal is allowed to use it and its credentials are still valid"
+            said
+            if said
+            else "the service denied access. Check the caller, target item, and connection permissions"
         )
     elif said:
         # Nothing useful can be inferred from the status alone, but the service said why.
@@ -315,7 +481,10 @@ def describe_failure(
     else:
         reason = "the request was rejected. Recreate it by hand"
 
-    message = f"{label} '{name}' could not be created (HTTP {status_code}): {reason}."
+    subject = f"{label} '{name}'"
+    if location and location != name:
+        subject = f"{subject} at '{location}'"
+    message = f"{subject} could not be created (HTTP {status_code}): {reason}."
     # A recognised status still benefits from the detail, in case our reading of it is wrong.
     if said and said not in reason:
         message = f"{message} The service said: {said}."
@@ -336,6 +505,7 @@ class _ShortcutEvidence:
         self.previous_failures: set[str] = set()
         self.total = 0
         self.created = 0
+        self.reused = 0
 
     @contextmanager
     def operation(self) -> Iterator[_ShortcutEvidence]:
@@ -434,17 +604,28 @@ class _ShortcutEvidence:
                 key, EvidenceState.SUCCEEDED,
                 "This previous shortcut failure was not observed in the completed retry.",
             )
-        if self.created == self.total:
+        completed = self.created + self.reused
+        if completed == self.total:
             reason = (
-                f"Created all {self.total} enumerated shortcuts."
-                if self.total else "Shortcut inventory was empty; no shortcuts were enumerated."
+                "Shortcut inventory was empty; no shortcuts were enumerated."
+                if not self.total
+                else f"Created all {self.total} enumerated shortcuts."
+                if not self.reused
+                else f"Reused all {self.total} enumerated shortcuts already present in the destination."
+                if not self.created
+                else f"Created {self.created} and reused {self.reused} of {self.total} enumerated shortcuts."
             )
             self.lifecycle.step("shortcuts", EvidenceState.SUCCEEDED, reason)
         else:
             names = ", ".join(f"'{name}'" for name in self.failures.values())
+            reason = (
+                f"Created {self.created} of {self.total} enumerated shortcuts."
+                if not self.reused
+                else f"Completed {completed} of {self.total} enumerated shortcuts."
+            )
             self.lifecycle.step(
                 "shortcuts", EvidenceState.FAILED,
-                f"Created {self.created} of {self.total} enumerated shortcuts.",
+                reason,
                 action=f"Resolve the reported failures, then recreate these shortcuts: {names}.",
                 error=self.last_error,
             )
@@ -519,7 +700,9 @@ def copy_shortcuts(
     cross_tenant: bool = False,
     strict_references: bool | None = None,
 ) -> tuple[int, list[str]]:
-    """Recreate every shortcut from a source item onto its migrated counterpart.
+    """Create missing shortcuts and reuse proven identical destination shortcuts.
+
+    The count is completed shortcuts (created plus reused), not new create requests.
 
     ``dormant`` maps a source item id to why its copy has no data yet, for the items that are
     migrated switched off. Used only to explain a failure, never to predict one.
@@ -530,7 +713,15 @@ def copy_shortcuts(
     destination = client if target_client is None else target_client
     strict = cross_tenant or bool(strict_references)
     created = 0
+    reused = 0
     warnings: list[str] = []
+    target_inventory: list[Mapping[str, Any]] | None = None
+
+    def destination_shortcuts() -> list[Mapping[str, Any]]:
+        nonlocal target_inventory
+        if target_inventory is None:
+            target_inventory = _list_shortcuts_strict(destination, target_workspace_id, target_item_id)
+        return target_inventory
 
     with _ShortcutEvidence(lifecycle).operation() as evidence:
         source = list_shortcuts(client, source_workspace_id, source_item_id)
@@ -576,8 +767,6 @@ def copy_shortcuts(
                         destination, [part("shortcut.json", remapped)],
                         source_workspace_id=source_workspace_id,
                     )
-                create_shortcut(destination, target_workspace_id, target_item_id, remapped)
-                created += 1
             except FabricApiError as error:
                 source_id = onelake_item_id(shortcut)
                 reason = {identity_key(k): v for k, v in (dormant or {}).items()}.get(
@@ -598,6 +787,64 @@ def copy_shortcuts(
                         remapped["target"],
                         error.status_code,
                         said=failure_detail(error),
+                        location=_shortcut_location(remapped),
+                    )
+                )
+                warnings.append(message)
+                evidence.failed(
+                    shortcut, message,
+                    f"{message} Resolve the reported error, then recreate this shortcut.", error,
+                )
+                continue
+
+            state, existing = _destination_match(destination_shortcuts(), remapped)
+            if state == "match":
+                reused += 1
+                continue
+            if state == "mismatch":
+                message = _existing_mismatch_message(
+                    remapped, existing or {}, label="Shortcut",
+                )
+                warnings.append(message)
+                evidence.failed(
+                    shortcut,
+                    message,
+                    "Resolve the conflicting destination shortcut, then retry this shortcut.",
+                )
+                continue
+            try:
+                response = create_shortcut(destination, target_workspace_id, target_item_id, remapped)
+                created += 1
+                _record_cached_destination(target_inventory, response or remapped)
+            except FabricApiError as error:
+                if error.status_code == 409:
+                    existing = _adopt_lakehouse_shortcut_after_conflict(
+                        destination, target_workspace_id, target_item_id, remapped,
+                    )
+                    if existing is not None:
+                        reused += 1
+                        _record_cached_destination(target_inventory, existing)
+                        continue
+                source_id = onelake_item_id(shortcut)
+                reason = {identity_key(k): v for k, v in (dormant or {}).items()}.get(
+                    identity_key(source_id)
+                )
+                message = (
+                    describe_dormant(
+                        name,
+                        source_id,
+                        reason,
+                        error.status_code,
+                        source_items,
+                        said=failure_detail(error),
+                    )
+                    if reason
+                    else describe_failure(
+                        name,
+                        remapped["target"],
+                        error.status_code,
+                        said=failure_detail(error),
+                        location=_shortcut_location(remapped),
                     )
                 )
                 warnings.append(message)
@@ -606,7 +853,8 @@ def copy_shortcuts(
                     f"{message} Resolve the reported error, then recreate this shortcut.", error,
                 )
         evidence.created = created
-    return created, warnings
+        evidence.reused = reused
+    return created + reused, warnings
 
 
 # ------------------------------------------------------- KQL table shortcuts
@@ -616,17 +864,29 @@ def copy_shortcuts(
 # flag instead.
 
 
+def _table_shortcut_collection_path(workspace_id: str, database_id: str) -> str:
+    return f"workspaces/{workspace_id}/kqlDatabases/{database_id}/shortcuts"
+
+
 def list_table_shortcuts(
     client: FabricClient,
     workspace_id: str,
     database_id: str,
 ) -> list[dict[str, Any]]:
     try:
-        return client.list_all(f"workspaces/{workspace_id}/kqlDatabases/{database_id}/shortcuts")
+        return _list_table_shortcuts_strict(client, workspace_id, database_id)
     except FabricApiError as error:
         if error.status_code in (400, 404):
             return []
         raise
+
+
+def _list_table_shortcuts_strict(
+    client: FabricClient,
+    workspace_id: str,
+    database_id: str,
+) -> list[dict[str, Any]]:
+    return client.list_all(_table_shortcut_collection_path(workspace_id, database_id))
 
 
 def table_shortcut_names(
@@ -653,7 +913,7 @@ def create_table_shortcut(
     shortcut: Mapping[str, Any],
 ) -> dict[str, Any]:
     return client.post(
-        f"workspaces/{workspace_id}/kqlDatabases/{database_id}/shortcuts",
+        _table_shortcut_collection_path(workspace_id, database_id),
         json={
             "name": shortcut["name"],
             "enableQueryAcceleration": bool(shortcut.get("enableQueryAcceleration", False)),
@@ -678,11 +938,21 @@ def copy_table_shortcuts(
     cross_tenant: bool = False,
     strict_references: bool | None = None,
 ) -> tuple[int, list[str]]:
-    """Recreate a KQL database's table shortcuts against the migrated items."""
+    """Reconcile KQL shortcuts; return the number created or proven identical and reused."""
     destination = client if target_client is None else target_client
     strict = cross_tenant or bool(strict_references)
     created = 0
+    reused = 0
     warnings: list[str] = []
+    target_inventory: list[Mapping[str, Any]] | None = None
+
+    def destination_shortcuts() -> list[Mapping[str, Any]]:
+        nonlocal target_inventory
+        if target_inventory is None:
+            target_inventory = _list_table_shortcuts_strict(
+                destination, target_workspace_id, target_database_id,
+            )
+        return target_inventory
 
     with _ShortcutEvidence(lifecycle).operation() as evidence:
         source = (
@@ -725,6 +995,11 @@ def copy_table_shortcuts(
                     f"Set a recognised target for shortcut '{name}', then recreate it.",
                 )
                 continue
+            desired = {
+                "name": shortcut["name"],
+                "enableQueryAcceleration": bool(shortcut.get("enableQueryAcceleration", False)),
+                "target": target,
+            }
             try:
                 if strict:
                     analytics.validate_cross_tenant_identities([part("shortcut.json", {"target": target})])
@@ -732,17 +1007,6 @@ def copy_table_shortcuts(
                         destination, [part("shortcut.json", {"target": target})],
                         source_workspace_id=source_workspace_id,
                     )
-                create_table_shortcut(
-                    destination,
-                    target_workspace_id,
-                    target_database_id,
-                    {
-                        "name": shortcut["name"],
-                        "enableQueryAcceleration": shortcut.get("enableQueryAcceleration", False),
-                        "target": target,
-                    },
-                )
-                created += 1
             except FabricApiError as error:
                 source_id = onelake_item_id(shortcut)
                 reason = {identity_key(k): v for k, v in (dormant or {}).items()}.get(
@@ -765,6 +1029,68 @@ def copy_table_shortcuts(
                         error.status_code,
                         label="KQL table shortcut",
                         said=failure_detail(error),
+                        location=_shortcut_location(desired, table=True),
+                    )
+                )
+                warnings.append(message)
+                evidence.failed(
+                    shortcut, message,
+                    f"{message} Resolve the reported error, then recreate this shortcut.", error,
+                )
+                continue
+
+            state, existing = _destination_match(destination_shortcuts(), desired, table=True)
+            if state == "match":
+                reused += 1
+                continue
+            if state == "mismatch":
+                message = _existing_mismatch_message(
+                    desired, existing or {}, label="KQL table shortcut", table=True,
+                )
+                warnings.append(message)
+                evidence.failed(
+                    shortcut,
+                    message,
+                    "Resolve the conflicting destination shortcut, then retry this shortcut.",
+                )
+                continue
+            try:
+                response = create_table_shortcut(
+                    destination, target_workspace_id, target_database_id, desired,
+                )
+                created += 1
+                _record_cached_destination(target_inventory, response or desired)
+            except FabricApiError as error:
+                if error.status_code == 409:
+                    existing = _adopt_table_shortcut_after_conflict(
+                        destination, target_workspace_id, target_database_id, desired,
+                    )
+                    if existing is not None:
+                        reused += 1
+                        _record_cached_destination(target_inventory, existing)
+                        continue
+                source_id = onelake_item_id(shortcut)
+                reason = {identity_key(k): v for k, v in (dormant or {}).items()}.get(
+                    identity_key(source_id)
+                )
+                message = (
+                    describe_dormant(
+                        name,
+                        source_id,
+                        reason,
+                        error.status_code,
+                        source_items,
+                        label="KQL table shortcut",
+                        said=failure_detail(error),
+                    )
+                    if reason
+                    else describe_failure(
+                        name,
+                        target,
+                        error.status_code,
+                        label="KQL table shortcut",
+                        said=failure_detail(error),
+                        location=_shortcut_location(desired, table=True),
                     )
                 )
                 warnings.append(message)
@@ -773,7 +1099,8 @@ def copy_table_shortcuts(
                     f"{message} Resolve the reported error, then recreate this shortcut.", error,
                 )
         evidence.created = created
-    return created, warnings
+        evidence.reused = reused
+    return created + reused, warnings
 
 
 __all__ = [

@@ -528,7 +528,7 @@ const scenarios = {
     await load(f);
     assert.equal(buttons(f)[0].textContent, "Resume");
     buttons(f)[0].click();
-    assert.equal(f.requests[1].url, "/api/runs/saved-run/resume");
+    assert.equal(f.requests[1].url, "/api/runs/saved-run/resume-plan");
     assert.ok(buttons(f).every((button) => button.disabled));
     buttons(f)[1].click();
     buttons(f)[2].click();

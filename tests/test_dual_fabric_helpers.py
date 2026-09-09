@@ -274,6 +274,7 @@ def test_shortcuts_read_source_and_create_rebound_targets_with_lifecycle(pair, s
         ]},
     }, {
         ("GET", f"workspaces/{TARGET_WS}"): {"id": TARGET_WS},
+        ("GET", target_path): {"value": []},
         ("POST", target_path): {},
     })
     copy = shortcuts.copy_shortcuts if shortcut_kind == "items" else shortcuts.copy_table_shortcuts
@@ -296,6 +297,10 @@ def test_shortcuts_read_source_and_create_rebound_targets_with_lifecycle(pair, s
     assert internal["target"]["oneLake"]["workspaceId"] == TARGET_WS
     assert internal["target"]["oneLake"]["itemId"] == "target-store"
     assert external["target"]["adlsGen2"]["connectionId"] == "target-connection"
+    assert target_endpoint.paths == [
+        ("GET", f"workspaces/{TARGET_WS}"), ("GET", target_path),
+        ("POST", target_path), ("POST", target_path),
+    ]
     assert lifecycle.owner.get(SOURCE_ID).steps["shortcuts"].state == EvidenceState.SUCCEEDED
 
 
@@ -308,7 +313,7 @@ def test_shortcut_target_failure_preserves_service_evidence(pair, shortcut_kind)
         }}]},
     }, {("POST", target_path): httpx.Response(
         403, json={"errorCode": "TargetConnectionDenied", "message": "Grant access to target connection"},
-    )})
+    ), ("GET", target_path): {"value": []}})
     copy = shortcuts.copy_shortcuts if shortcut_kind == "items" else shortcuts.copy_table_shortcuts
     lifecycle = Lifecycle(attempt_id="attempt", source_workspace=SOURCE_WS).item(
         SOURCE_ID, "Store", "Lakehouse",
@@ -332,6 +337,7 @@ def test_preloaded_kql_shortcuts_never_read_with_target_client(pair):
     target_path = f"workspaces/{TARGET_WS}/kqlDatabases/{TARGET_ID}/shortcuts"
     source, target, source_endpoint, target_endpoint = pair({}, {
         ("GET", f"workspaces/{TARGET_WS}"): {"id": TARGET_WS},
+        ("GET", target_path): {"value": []},
         ("POST", target_path): {},
     })
 
@@ -343,7 +349,9 @@ def test_preloaded_kql_shortcuts_never_read_with_target_client(pair):
         }}],
     ) == (1, [])
     assert not source_endpoint.calls
-    assert target_endpoint.paths == [("GET", f"workspaces/{TARGET_WS}"), ("POST", target_path)]
+    assert target_endpoint.paths == [
+        ("GET", f"workspaces/{TARGET_WS}"), ("GET", target_path), ("POST", target_path),
+    ]
 
 
 @pytest.mark.parametrize("preloaded", [False, True])
@@ -695,13 +703,13 @@ def test_separate_clients_in_same_tenant_can_reuse_external_shortcut_connections
         ("GET", source_path): {"value": [{"path": "Files", "name": "Shared", "target": {
             "adlsGen2": {"connectionId": SOURCE_CONNECTION, "location": "https://storage"},
         }}]},
-    }, {("POST", target_path): {}})
+    }, {("GET", target_path): {"value": []}, ("POST", target_path): {}})
     copy = shortcuts.copy_shortcuts if shortcut_kind == "items" else shortcuts.copy_table_shortcuts
 
     assert copy(source, SOURCE_WS, SOURCE_ID, TARGET_WS, TARGET_ID, {}, target_client=target) == (1, [])
 
     assert source_endpoint.paths == [("GET", source_path)]
-    assert target_endpoint.paths == [("POST", target_path)]
+    assert target_endpoint.paths == [("GET", target_path), ("POST", target_path)]
     assert target_endpoint.bodies[0]["target"]["adlsGen2"]["connectionId"] == SOURCE_CONNECTION
 
 

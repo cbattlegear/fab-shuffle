@@ -294,6 +294,7 @@ class StartRunRequest(BaseModel):
     copy_permissions: bool = True
     cleanup_when_done: bool = True
     write_freeze_confirmed: bool = False
+    start_database_mirrors: StrictBool = False
     connection_mappings: dict[str, str] = Field(default_factory=dict, max_length=1000)
     reference_mappings: list[dict[str, str]] = Field(default_factory=list, max_length=1000)
 
@@ -335,6 +336,7 @@ class StartRunRequest(BaseModel):
 
 class ResumeRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    start_database_mirrors: StrictBool = False
     connection_mappings: dict[str, str] | None = Field(default=None, max_length=1000)
     reference_mappings: list[dict[str, str]] | None = Field(default=None, max_length=1000)
 
@@ -787,7 +789,7 @@ def create_app() -> FastAPI:
         run_id: str, body: ResumeRunRequest | None = None,
         session: Session = Depends(require_execution_session),
     ) -> dict[str, Any]:
-        """Adopt the previous target, changing only explicitly supplied operator mappings."""
+        """Adopt the previous target with explicit mappings and this attempt's activation opt-in."""
         replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
         if body is not None:
             plan = body.apply(plan)
@@ -922,7 +924,7 @@ def _resume_plan(session: Session, run_id: str) -> tuple[journal.Replay, Migrati
             detail="This migration was ignored or marked for full restart. It cannot be resumed.",
         )
     try:
-        return replay, plan_from_journal(replay)
+        return replay, replace(plan_from_journal(replay), start_database_mirrors=False)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -1049,6 +1051,7 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
         "sourceClientId": plan.source_client_id,
         "targetClientId": plan.target_client_id,
         "writeFreezeConfirmed": plan.write_freeze_confirmed,
+        "startDatabaseMirrors": plan.start_database_mirrors,
         "connectionMappings": plan.connection_mappings,
         "referenceMappings": plan.reference_mappings,
     }

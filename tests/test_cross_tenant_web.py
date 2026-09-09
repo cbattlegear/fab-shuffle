@@ -49,6 +49,7 @@ def pair_api(monkeypatch, tmp_path):
             **{key: options[key] for key in (
                 "source_tenant_id", "target_tenant_id", "source_client_id", "target_client_id",
                 "include_data", "include_files", "copy_permissions", "write_freeze_confirmed",
+                "start_database_mirrors",
                 "connection_mappings", "reference_mappings",
             )},
         )
@@ -99,6 +100,32 @@ def test_start_passes_the_bound_pair_and_operator_options_to_execution(pair_api,
     assert not SETTINGS.journal_for(result.json()["runId"]).exists()
     assert SOURCE.client_secret not in path.read_text()
     assert TARGET.client_secret not in path.read_text()
+
+
+@pytest.mark.parametrize("retry_option", [None, {}, {"start_database_mirrors": False},
+                                         {"start_database_mirrors": True}])
+def test_mirror_activation_is_recorded_but_requires_opt_in_again_on_resume(pair_api, retry_option):
+    client, session, prepared, _ = pair_api
+    response = client.post(
+        "/api/runs", headers=headers(session), json=body(start_database_mirrors=True),
+    )
+    assert response.status_code == 200
+    run_id = response.json()["runId"]
+    assert prepared[0][1]["start_database_mirrors"] is True
+    assert response.json()["plan"]["startDatabaseMirrors"] is True
+    book = journal.Journal(web._session_journal(session, run_id))
+    book.workspace("target", "created-target", "Sales-copy")
+    book.finished("failed", "stopped before all items migrated")
+    web.REGISTRY = RunRegistry()
+    saved = client.get(f"/api/runs/{run_id}/resume-plan", headers=headers(session))
+    assert saved.json()["plan"]["startDatabaseMirrors"] is False
+    assert journal.read(book.path).plan["start_database_mirrors"] is True
+    resumed = client.post(f"/api/runs/{run_id}/resume", headers=headers(session), json=retry_option)
+    assert resumed.status_code == 200, resumed.text
+    expected = bool(retry_option and retry_option.get("start_database_mirrors"))
+    assert resumed.json()["plan"]["startDatabaseMirrors"] is expected
+    replay = journal.read(web._session_journal(session, resumed.json()["runId"]))
+    assert replay.plan["start_database_mirrors"] is expected
 
 
 @pytest.mark.parametrize("options", [

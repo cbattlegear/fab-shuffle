@@ -46,23 +46,36 @@ def api_error(code="InvalidPath", message="The shortcut path was not found.", st
 
 
 class Client:
-    def __init__(self, source=(), failures=None, list_error=None):
+    def __init__(self, source=(), failures=None, list_error=None, target=(), target_list_error=None):
         self.source = list(source)
+        self.target = list(target)
         self.failures = failures or {}
         self.list_error = list_error
+        self.target_list_error = target_list_error
         self.listed = []
         self.posted = []
 
     def list_all(self, path):
         self.listed.append(path)
+        if f"workspaces/{TARGET_WS}/" in path:
+            if self.target_list_error:
+                raise self.target_list_error
+            return list(self.target)
         if self.list_error:
             raise self.list_error
-        return self.source
+        return list(self.source)
+
+    def get(self, path):
+        for shortcut in self.target:
+            if path.endswith(f"{shortcut.get('path', '')}/{shortcut.get('name')}"):
+                return shortcut
+        raise api_error("ItemNotFound", "No shortcut found.", status=404)
 
     def post(self, path, json=None, params=None):
         self.posted.append((path, json, params))
         if error := self.failures.get(json["name"]):
             raise error
+        self.target.append(dict(json or {}))
         return {}
 
 
@@ -143,7 +156,7 @@ def test_all_creates_succeed_without_overwriting_definition_evidence(copy_fn, li
     assert item.steps["definition"].state == EvidenceState.FAILED
     assert item.steps["definition"].errorCode == "BadModel"
     assert not any(key.startswith("shortcut:") for key in item.steps)
-    assert len(client.listed) == 1
+    assert len(client.listed) == 2
     assert len(client.posted) == 2
     assert client.posted[0][1]["target"]["oneLake"]["workspaceId"] == TARGET_WS
     assert client.posted[0][1]["target"]["oneLake"]["itemId"] == "warehouse-target"
@@ -455,6 +468,6 @@ def test_kql_uses_supplied_inventory_without_an_extra_service_call():
         shortcuts=(shortcut for shortcut in [onelake()]),
     ) == (1, [])
 
-    assert client.listed == []
+    assert client.listed == [f"workspaces/{TARGET_WS}/kqlDatabases/{TARGET_ITEM}/shortcuts"]
     assert len(client.posted) == 1
     assert outcome(lifecycle).steps["shortcuts"].reason == "Created all 1 enumerated shortcuts."

@@ -221,6 +221,14 @@
         <label><input type="checkbox" id="opt-files" checked /> Copy lakehouse files</label>
         <label><input type="checkbox" id="opt-permissions" checked /> Copy workspace permissions</label>
         <label><input type="checkbox" id="opt-cleanup" checked /> Delete temporary artifacts when finished</label>
+        <label><input type="checkbox" id="opt-start-mirrors" aria-describedby="mirror-start-warning" /> Start destination database mirrors</label>
+        <p id="mirror-start-warning" class="hint">
+          Off by default. Selecting this starts replication after each database mirror is created,
+          before shortcuts are retried. It can run a second mirror against the original database,
+          adding source load and cost. It does not stop the original mirror or wait for every
+          replicated table to arrive. Cancellation will not stop replication already started.
+          This does not enable Activator rules or Databricks catalog sync.
+        </p>
       </fieldset>
       <section id="destination-mappings" class="mapping-controls" aria-labelledby="mapping-title" hidden>
         <h3 id="mapping-title">Destination references</h3>

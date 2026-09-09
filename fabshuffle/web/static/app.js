@@ -159,6 +159,7 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#workspace-next").disabled = true;
     $("#opt-permissions").checked = !state.paired;
     $("#opt-write-freeze").checked = false;
+    $("#opt-start-mirrors").checked = false;
     form.reset();
     updateLoginMode();
     renderIdentity();
@@ -193,6 +194,7 @@ $("#sign-out").addEventListener("click", async () => {
     resumeRunId: null, forceRebuild: false,
   });
   $("#sign-out").hidden = true;
+  $("#opt-start-mirrors").checked = false;
   goTo("login");
 });
 
@@ -319,8 +321,7 @@ async function loadResumable() {
         if (button.disabled || sessionId !== state.sessionId || savedRunConfirmation) return;
         const restore = lockSavedRunRow(item);
         try {
-          if (state.paired) await prepareResume(run.runId, button, "capacity");
-          else await resumeRun(run.runId, button);
+          await prepareResume(run.runId, button, "capacity");
         } finally {
           if (sessionId === state.sessionId) restore();
         }
@@ -504,6 +505,7 @@ function resetForFullRestart(sourceWorkspace) {
     $(`#${id}`).checked = id !== "opt-permissions" || !state.paired;
     $(`#${id}`).disabled = id === "opt-permissions" && state.paired;
   }
+  $("#opt-start-mirrors").checked = false;
   $("#resume-artifacts").hidden = true;
   $("#resume-artifacts").open = false;
   for (const id of ["resume-target-id", "resume-item-ids", "source-connection-options",
@@ -561,6 +563,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
     $("#opt-files").checked = plan.includeFiles;
     $("#opt-permissions").checked = plan.copyPermissions;
     $("#opt-cleanup").checked = saved.cleanupWhenDone;
+    $("#opt-start-mirrors").checked = false;
     for (const [source, target] of Object.entries(plan.connectionMappings || {})) {
       const inputs = addMappingRow("connection").querySelectorAll("input");
       inputs[0].value = source;
@@ -874,6 +877,7 @@ function resetMappings() {
   $("#connection-mapping-rows").innerHTML = "";
   $("#reference-mapping-rows").innerHTML = "";
   $("#opt-write-freeze").checked = false;
+  $("#opt-start-mirrors").checked = false;
   state.mappingsChecked = false;
 }
 
@@ -914,14 +918,22 @@ function migrationBody() {
     copy_permissions: state.paired ? false : $("#opt-permissions").checked,
     cleanup_when_done: $("#opt-cleanup").checked,
     write_freeze_confirmed: $("#opt-write-freeze").checked,
+    start_database_mirrors: !reassign && $("#opt-start-mirrors").checked,
     ...mappingOptions(),
+  };
+}
+
+function resumeOptions() {
+  return {
+    ...(state.paired ? mappingOptions() : {}),
+    start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,
   };
 }
 
 async function recheckMappings() {
   const button = $("#recheck-mappings");
   let body;
-  try { body = state.resumeRunId ? mappingOptions() : migrationBody(); } catch (error) {
+  try { body = state.resumeRunId ? resumeOptions() : migrationBody(); } catch (error) {
     showError(error.message);
     return;
   }
@@ -1119,7 +1131,7 @@ function renderReview() {
   const preview = state.preview;
   const reassign = preview.strategy === "reassign";
   const resuming = !!state.resumeRunId;
-  $("#review-title").textContent = resuming ? "Update mappings and resume" : "Review the move";
+  $("#review-title").textContent = resuming ? "Review options and resume" : "Review the move";
   $("#resume-artifacts").hidden = !resuming;
   $("#resume-artifacts").open = resuming;
   $("#review-back").hidden = resuming;
@@ -1226,7 +1238,7 @@ $("#start-run").addEventListener("click", async () => {
   const button = $("#start-run");
   if (button.disabled) return;
   if (state.resumeRunId) {
-    try { await resumeRun(state.resumeRunId, button, mappingOptions()); }
+    try { await resumeRun(state.resumeRunId, button, resumeOptions()); }
     catch (error) { showError(error.message); }
     return;
   }
@@ -1856,22 +1868,7 @@ $("#readiness-export").addEventListener("click", async () => {
 
 $("#retry-run").addEventListener("click", async () => {
   const button = $("#retry-run");
-  if (state.paired) {
-    await prepareResume(state.runId, button);
-    return;
-  }
-  busy(button, true, "Starting…");
-  try {
-    // The same path as picking up an interrupted run: everything already in the new
-    // workspace is adopted, so only what did not make it is attempted again.
-    const result = await api(`/api/runs/${state.runId}/resume`, { method: "POST" });
-    state.runId = result.runId;
-    watchRun(result.runId);
-  } catch (error) {
-    showError(error.message);
-  } finally {
-    busy(button, false);
-  }
+  await prepareResume(state.runId, button);
 });
 
 $("#cancel-run").addEventListener("click", async () => {
@@ -1908,6 +1905,7 @@ $("#start-over").addEventListener("click", () => {
   state.workspace = null;
   state.forceRebuild = false;
   $("#workspace-next").disabled = true;
+  $("#opt-start-mirrors").checked = false;
   goTo("capacity");
 });
 

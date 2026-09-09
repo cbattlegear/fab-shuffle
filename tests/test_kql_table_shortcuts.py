@@ -49,19 +49,27 @@ S3_SHORTCUT = {
 
 
 class FakeClient:
-    def __init__(self, listed: list[dict] | None = None, *, fail_names: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        listed: list[dict] | None = None,
+        *,
+        fail_names: set[str] | None = None,
+        target: list[dict] | None = None,
+    ) -> None:
         self.listed = listed or []
+        self.target = target or []
         self.fail_names = fail_names or set()
         self.posted: list[tuple[str, dict]] = []
 
     def list_all(self, path, params=None, value_key="value"):
-        return self.listed
+        return list(self.target if path.startswith(f"workspaces/{NEW_WS}/") else self.listed)
 
     def post(self, path, json=None, params=None, wait=True):
         if json["name"] in self.fail_names:
             raise FabricApiError("POST", path, 400, "FailureToReserveTableShortcutName")
         self.posted.append((path, json))
-        return {"name": json["name"]}
+        self.target.append(dict(json or {}))
+        return dict(json or {})
 
 
 def test_shortcut_names_are_collected_for_exclusion():
