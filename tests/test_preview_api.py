@@ -97,6 +97,24 @@ def dependencies(client, session_id):
     return response.json()["dependencies"]
 
 
+def test_full_restart_preview_rebuilds_powerbi_content_instead_of_reassigning_source(
+    client, session_id, monkeypatch,
+):
+    install(monkeypatch, [{"id": "model", "displayName": "Model", "type": "SemanticModel"}])
+    observed = []
+    monkeypatch.setattr(
+        web, "_dependency_report",
+        lambda *a, **kw: observed.append(kw["migrated"]) or {"dependencies": [], "connectionAccess": None},
+    )
+    params = {"capacity_id": "cap-1", "source_workspace_id": "ws-1", "strategy": "rebuild"}
+    response = client.get("/api/preview", params=params, headers=auth(session_id))
+    assert response.status_code == 200
+    assert response.json()["strategy"] == "rebuild"
+    assert response.json()["migratedTotal"] == 1
+    assert client.get("/api/preview/dependencies", params=params, headers=auth(session_id)).status_code == 200
+    assert observed[0][0]["id"] == "model"
+
+
 def test_preview_recommends_reassignment_for_power_bi_only(client, session_id, monkeypatch):
     install(
         monkeypatch,
@@ -176,7 +194,6 @@ def test_dependency_problems_are_reported_before_the_run_starts(client, session_
         workspaces={"ws-other": "Finance"},
     )
     monkeypatch.setattr(relations, "build_graph", lambda *a, **k: graph)
-    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
 
     problems = dependencies(client, session_id)
 
@@ -205,7 +222,6 @@ def test_a_clean_workspace_reports_no_dependency_problems(client, session_id, mo
         "build_graph",
         lambda *a, **k: relations.DependencyGraph(dependencies={"lh": set()}),
     )
-    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
     monkeypatch.setattr("fabshuffle.orchestrator.scan_connection_access", lambda *a, **k: [])
 
     assert dependencies(client, session_id) == []
@@ -234,7 +250,6 @@ def test_connections_needing_a_share_come_back_with_instructions(client, session
     from fabshuffle.orchestrator import ConnectionAccess
 
     clean_graph(monkeypatch)
-    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
     monkeypatch.setattr(
         "fabshuffle.orchestrator.scan_connection_access",
         lambda *a, **k: [ConnectionAccess(connection_id="c-1", used_by=("CopyJob 'j'",))],
@@ -251,38 +266,9 @@ def test_connections_needing_a_share_come_back_with_instructions(client, session
 
 def test_no_access_section_when_nothing_needs_sharing(client, session_id, monkeypatch):
     clean_graph(monkeypatch)
-    monkeypatch.setattr("fabshuffle.orchestrator.connection_prerequisites", lambda *a, **k: [])
     monkeypatch.setattr("fabshuffle.orchestrator.scan_connection_access", lambda *a, **k: [])
 
     assert access(client, session_id) is None
-
-
-def test_inward_connections_are_one_counted_line(client, session_id, monkeypatch):
-    """They are the customer's job to repoint, so they are not listed one by one."""
-    from fabshuffle.fabric.connections import ConnectionPrerequisite
-
-    clean_graph(monkeypatch)
-    monkeypatch.setattr("fabshuffle.orchestrator.scan_connection_access", lambda *a, **k: [])
-    monkeypatch.setattr(
-        "fabshuffle.orchestrator.connection_prerequisites",
-        lambda *a, **k: [
-            ConnectionPrerequisite(
-                connection_id=f"c-{n}",
-                connection_name="",
-                path="p",
-                matched="m",
-                credential_type="unknown",
-                connectivity_type="ShareableCloud",
-                manageable=False,
-            )
-            for n in range(4)
-        ],
-    )
-
-    result = dependencies(client, session_id)
-
-    assert len(result) == 1
-    assert result[0].startswith("4 connection(s) point at items in this workspace")
 
 
 def test_the_preview_does_not_wait_for_the_dependency_check(client, session_id, monkeypatch):

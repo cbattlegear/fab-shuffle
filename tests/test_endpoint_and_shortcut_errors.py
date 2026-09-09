@@ -159,18 +159,30 @@ def test_a_missing_internal_target_blames_the_item_not_the_connection() -> None:
     assert "connection" not in message
 
 
-def test_a_forbidden_internal_target_asks_for_workspace_access() -> None:
+def test_a_forbidden_internal_target_does_not_guess_the_cause() -> None:
     message = shortcuts.describe_failure("adventureworks", ONELAKE, 403)
 
-    assert "service principal" in message
-    assert "Grant it access" in message
+    assert "service denied access" in message
+    assert "service principal" not in message
 
 
-def test_a_forbidden_external_target_does_blame_the_connection() -> None:
-    # The one case where the original message was right.
+def test_a_forbidden_external_target_does_not_guess_the_cause() -> None:
     message = shortcuts.describe_failure("adventureworks", EXTERNAL, 403)
 
-    assert "connection denied access" in message
+    assert "service denied access" in message
+    assert "connection denied access" not in message
+
+
+def test_a_forbidden_status_preserves_what_the_service_said() -> None:
+    message = shortcuts.describe_failure(
+        "adventureworks",
+        EXTERNAL,
+        403,
+        said="Forbidden The connection is not shared with this caller",
+    )
+
+    assert "Forbidden The connection is not shared with this caller" in message
+    assert "service denied access" not in message
 
 
 def test_a_missing_external_target_talks_about_the_path() -> None:
@@ -190,7 +202,7 @@ def test_the_label_distinguishes_kql_table_shortcuts() -> None:
     assert message.startswith("KQL table shortcut 't'")
 
 
-@pytest.mark.parametrize("status", [409, 404, 403, 500])
+@pytest.mark.parametrize("status", [401, 403, 404, 409, 500])
 def test_every_message_names_the_shortcut_and_status(status: int) -> None:
     message = shortcuts.describe_failure("my_shortcut", ONELAKE, status)
 
@@ -203,7 +215,12 @@ class FailingClient:
         self.status = status
 
     def list_all(self, path, params=None, value_key="value"):
+        if path.startswith("workspaces/ws-target/"):
+            return []
         return [{"name": "dbo_movies", "path": "Tables", "target": ONELAKE}]
+
+    def get(self, path, params=None):
+        raise FabricApiError("GET", path, 404, "not found")
 
     def post(self, path, json=None, params=None, wait=True):
         raise FabricApiError("POST", path, self.status, "denied")

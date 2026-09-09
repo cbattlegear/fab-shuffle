@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from fabshuffle.fabric.client import (
     FabricError,
     OperationTimeout,
 )
+from fabshuffle.fabric.connections import referenced_connection_ids
 from fabshuffle.fabric.definitions import (
     GUID_PATTERN,
     build_rewriter,
@@ -35,6 +37,7 @@ from fabshuffle.fabric.definitions import (
     decode_payload,
     find_part,
     is_text_part,
+    part,
     rewrite_parts,
     strip_part,
 )
@@ -76,6 +79,7 @@ PBIR_PART = "definition.pbir"
 PLATFORM_PART = ".platform"
 SPARK_COMPUTE_PART = "Setting/Sparkcompute.yml"
 QUERY_METADATA_PART = "queryMetadata.json"
+SEMANTIC_MODEL_SECURITY_FORMAT = "TMSL"
 
 # The definition format a Dataflow Gen2 (CI/CD) item uses. Anything else is a Gen1 dataflow
 # or a classic Gen2, neither of which the item definition APIs can move.
@@ -314,9 +318,350 @@ class StrandedReference(FabricError):
         super().__init__(f"depends on {', '.join(self.needed)}, which did not migrate")
 
 
+class IdentityBindingError(FabricError):
+    """Source security cannot be imported safely; do not log the rejected definition."""
+
+
 def stranded_items(id_map: Mapping[str, str], source_items: Mapping[str, Any]) -> list[str]:
     """Items of the migrating workspace that have no counterpart in the new one."""
     return [item_id for item_id in source_items if item_id and item_id not in id_map]
+
+
+def with_connection_references(
+    parts: Iterable[Mapping[str, Any]],
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Mapping[str, Any]]:
+    """Include connections named by definitions even when source enumeration hid them."""
+    references: dict[str, Mapping[str, Any]] = {
+        connection_id: {"id": connection_id, "type": "Connection", "displayName": connection_id}
+        for connection_id in referenced_connection_ids(parts)
+    }
+    known = {key.casefold(): value for key, value in (source_items or {}).items()}
+    for key in references:
+        if key.casefold() in known:
+            references[key] = known[key.casefold()]
+    return {**references, **(source_items or {})}
+
+
+def validate_target_workspaces(
+    client: FabricClient,
+    parts: Iterable[Mapping[str, Any]],
+    *,
+    source_workspace_id: str,
+) -> None:
+    """Require destination-side read evidence for every rewritten workspace reference."""
+    workspaces = referenced_workspaces(parts)
+    if source_workspace_id.casefold() in {workspace.casefold() for workspace in workspaces}:
+        raise StrandedReference([f"source workspace '{source_workspace_id}'"])
+    unreachable_workspaces(client, workspaces, strict=True)
+
+
+def validate_cross_tenant_identities(
+    parts: Iterable[Mapping[str, Any]],
+    *,
+    item_type: str = "",
+) -> list[str]:
+    """Refuse known principal assignments without changing roles, filters or credentials.
+
+    Returns actionable warnings for parts whose runtime identity use cannot be inspected.
+    This is not a parser for arbitrary SQL, TMDL, notebooks or packaged executable content.
+    """
+    source = strip_part(parts, PLATFORM_PART)
+    unverified: set[str] = set()
+    model_parts = [candidate for candidate in source if candidate.get("path") == "model.bim"]
+    if item_type == SEMANTIC_MODEL and len(model_parts) != 1:
+        raise IdentityBindingError(
+            "The semantic model has no single inspectable model.bim. Export a TMSL definition, "
+            "omit source principal member assignments from that copy while retaining RLS/filter "
+            "definitions, then retry."
+        )
+
+    def check_model(model: Any, path: str) -> None:
+        if not isinstance(model, Mapping) or not isinstance(model.get("roles", []), list):
+            raise IdentityBindingError(
+                f"'{path}' has an uninspectable model/roles structure. Supply a valid TMSL model.bim "
+                "with source member assignments omitted and RLS/filter definitions retained, then retry."
+            )
+        for role in model.get("roles", []):
+            if not isinstance(role, Mapping) or not isinstance(role.get("members", []), list):
+                raise IdentityBindingError(
+                    f"'{path}' has uninspectable role membership. Supply a valid TMSL role definition "
+                    "without source member assignments; keep its tablePermissions and filters."
+                )
+            if role.get("members"):
+                raise IdentityBindingError(
+                    f"'{path}' role '{role.get('name') or '<unnamed>'}' includes source principal "
+                    "member assignments. Omit members from an exported copy, preserve the role's "
+                    "tablePermissions/filterExpression, and assign destination principals separately."
+                )
+        data_sources = model.get("dataSources", [])
+        if not isinstance(data_sources, list) or any(
+            not isinstance(value, Mapping) for value in data_sources
+        ):
+            raise IdentityBindingError(
+                f"'{path}' has uninspectable model data sources. Export a valid TMSL model and "
+                "configure its destination credentials separately before retrying."
+            )
+        for data_source in data_sources:
+            # Learn: analysis-services/tmsl/datasources-object-tmsl and its protocol schema
+            # distinguish provider account/password from structured credential objects.
+            if data_source.get("account") or data_source.get("password") or data_source.get("credential"):
+                raise IdentityBindingError(
+                    f"'{path}' model data source '{data_source.get('name') or '<unnamed>'}' carries "
+                    "an account or credential object. Omit source credentials from an exported copy "
+                    "and configure the destination connection separately before retrying."
+                )
+            if data_source.get("connectionString"):
+                unverified.add(f"{path} data source '{data_source.get('name') or '<unnamed>'}'")
+
+    # Learn: analysis-services/tmsl/roles-object-tmsl separates members from tablePermissions.
+    # Credential discriminators: rest/api/fabric/core/connections/create-connection.
+    def inspect(node: Any, path: str) -> None:
+        if isinstance(node, list):
+            for child in node:
+                inspect(child, path)
+            return
+        if not isinstance(node, Mapping):
+            return
+        if "model" in node and isinstance(node["model"], Mapping) and "roles" in node["model"]:
+            check_model(node["model"], path)
+        credentials = str(node.get("credentialType") or "").casefold()
+        if credentials in {"serviceprincipal", "workspaceidentity"}:
+            raise IdentityBindingError(
+                f"'{path}' contains an inline {node['credentialType']} credential binding. "
+                "Configure credentials or workspace identity in the destination tenant, bind through "
+                "a mapped destination connection, and remove the source identity binding from the "
+                "exported copy before retrying."
+            )
+        for key, value in node.items():
+            if key.casefold() in {"workspaceidentity", "workspaceidentityid"} and value:
+                raise IdentityBindingError(
+                    f"'{path}' contains a workspace identity binding whose destination authorization "
+                    "cannot be verified. Configure the destination workspace identity and replace "
+                    "the binding in an exported copy before retrying."
+                )
+            if key.casefold() in {"authentication", "credentials", "identity", "principal"} and isinstance(
+                value, Mapping,
+            ):
+                identity_keys = {
+                    "principalid", "serviceprincipalid", "serviceprincipalclientid", "memberid",
+                }
+                bound = any(
+                    field.casefold() in identity_keys and field_value
+                    for field, field_value in value.items()
+                )
+                principal_assignment = (
+                    key.casefold() == "principal" and value.get("id")
+                    and str(value.get("type") or "").casefold() in {"user", "group", "serviceprincipal"}
+                )
+                identity_authentication = str(value.get("type") or "").casefold() in {
+                    "serviceprincipal", "workspaceidentity",
+                }
+                if bound or principal_assignment or identity_authentication:
+                    raise IdentityBindingError(
+                        f"'{path}' contains an explicit principal binding in '{key}'. Remove source "
+                        "principal assignments from an exported copy and configure destination "
+                        "authorization separately before retrying."
+                    )
+            inspect(value, path)
+
+    for candidate in source:
+        path = str(candidate.get("path") or "<unnamed>")
+        suffix = path.rsplit(".", 1)[-1].casefold()
+        if suffix == "kql":
+            text = decode_payload(candidate.get("payload") or "").decode("utf-8")
+            if re.search(
+                r"(?im)^\s*\.(?:add|set|drop)\s+(?:database|table)\s+[^\r\n]+?\s+"
+                r"(?:admins|users|viewers|ingestors|monitors|unrestrictedviewers)\s*\(",
+                text,
+            ):
+                raise IdentityBindingError(
+                    f"'{path}' includes KQL principal role assignments. Omit those commands "
+                    "from an exported schema and configure destination access separately."
+                )
+        if suffix in {"tmdl", "dacpac", "pbix", "abf"}:
+            action = (
+                "Use the security-excluding schema transfer instead."
+                if suffix == "dacpac" else
+                "Supply an inspectable TMSL/model.bim copy with principal memberships omitted "
+                "and RLS/filter definitions retained."
+            )
+            raise IdentityBindingError(
+                f"'{path}' cannot be inspected safely for source principal assignments. {action}"
+            )
+        if suffix in {"json", "bim", "pbism", "pbir", "ipynb"}:
+            try:
+                document = decode_json_part(candidate.get("payload") or "")
+            except (ValueError, UnicodeDecodeError) as error:
+                raise IdentityBindingError(
+                    f"'{path}' is not readable JSON, so its identity bindings cannot be inspected. "
+                    "Supply an inspectable exported copy before retrying."
+                ) from error
+            if path == "model.bim":
+                check_model(document.get("model") if isinstance(document, Mapping) else None, path)
+            inspect(document, path)
+            if suffix != "ipynb":
+                continue
+        if suffix not in {"png", "jpg", "jpeg", "gif", "webp", "ico", "ttf", "woff", "woff2"}:
+            unverified.add(path)
+    if not unverified:
+        return []
+    return [
+        f"Identity bindings inside {', '.join(repr(path) for path in sorted(unverified))} were not verified. "
+        "Inspect these files for source principals or workspace identities and configure destination "
+        "authorization before running this item."
+    ]
+
+
+def _source_item_references(
+    parts: Iterable[Mapping[str, Any]], source_workspace_id: str,
+    *, rewritten_workspaces: Collection[str] = (),
+) -> set[str]:
+    source_workspaces = {
+        source_workspace_id.casefold(), *(value.casefold() for value in rewritten_workspaces),
+    }
+    item_keys = {
+        "itemid", "parenteventhouseitemid", "notebookid", "lakehouseid", "warehouseid",
+        "semanticmodelid", "eventhouseid",
+    }
+    found: set[str] = set()
+
+    def collect(node: Any, in_source: bool) -> None:
+        if isinstance(node, list):
+            for child in node:
+                collect(child, in_source)
+            return
+        if not isinstance(node, Mapping):
+            return
+        workspaces = {
+            value.casefold() for key, value in node.items()
+            if key.casefold() in WORKSPACE_KEYS and isinstance(value, str) and value
+        }
+        if workspaces:
+            in_source = bool(source_workspaces.intersection(workspaces))
+        for key, value in node.items():
+            if in_source and key.casefold() in item_keys and isinstance(value, str) and value:
+                found.add(value)
+            else:
+                collect(value, in_source)
+
+    for candidate in parts:
+        if not is_text_part(candidate.get("path") or ""):
+            continue
+        try:
+            document = decode_json_part(candidate.get("payload") or "")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        collect(document, True)
+        if candidate.get("path") == PBIR_PART and isinstance(document, Mapping):
+            reference = document.get("datasetReference") or {}
+            connection = reference.get("byConnection") if isinstance(reference, Mapping) else None
+            if isinstance(connection, Mapping):
+                model_id = _semantic_model_id(str(connection.get("connectionString") or ""))
+                if model_id:
+                    found.add(model_id)
+    return found
+
+
+def without_model_memberships(
+    parts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Omit TMSL principal assignments without changing role/filter definitions."""
+    result = []
+    warnings = []
+    for candidate in parts:
+        if candidate.get("path") != "model.bim":
+            result.append(candidate)
+            continue
+        try:
+            document = decode_json_part(candidate.get("payload") or "")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise IdentityBindingError("The model.bim membership payload is not readable JSON.") from error
+        model = document.get("model") if isinstance(document, Mapping) else None
+        roles = model.get("roles", []) if isinstance(model, Mapping) else []
+        changed = False
+        for role in roles if isinstance(roles, list) else ():
+            if isinstance(role, dict) and isinstance(role.get("members"), list) and role["members"]:
+                role.pop("members")
+                changed = True
+                warnings.append(
+                    f"Semantic model role '{role.get('name') or '<unnamed>'}' was copied without "
+                    "principal memberships. Its filters are retained; assign destination members separately."
+                )
+        result.append(
+            {**candidate, "payload": part("model.bim", document)["payload"]} if changed else candidate
+        )
+    return result, warnings
+
+
+def validate_cross_tenant_references(
+    parts: Iterable[Mapping[str, Any]],
+    *,
+    source_workspace_id: str,
+    target_workspace_id: str,
+    id_map: Mapping[str, str],
+    target_client: FabricClient,
+    source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    ignore: Collection[str] = (),
+    item_type: str = "",
+    lifecycle: ItemLifecycle | None = None,
+) -> list[str]:
+    """Validate source-form definitions before a manual cross-tenant create or update.
+
+    Pass ``source_items`` to cover all known item identities and endpoint aliases, including
+    references in code rather than JSON. Explicit JSON item references and hidden connection
+    IDs are also checked without an inventory. ``ignore`` is only for an item's own logical
+    identity, never for operational references. This checks a rewritten copy and leaves
+    ``parts`` unchanged; type-specific preparation and the final rewrite remain the caller's.
+    Returns warnings for uninspected runtime identity use; ``lifecycle`` records this as
+    unknown rather than verified when supplied.
+    """
+    source_parts = strip_part(parts, PLATFORM_PART)
+    try:
+        identity_warnings = validate_cross_tenant_identities(source_parts, item_type=item_type)
+    except IdentityBindingError as error:
+        if lifecycle:
+            lifecycle.step(
+                "identity", EvidenceState.FAILED, "Source identity bindings were not safe to import.",
+                action=str(error), error=error,
+            )
+        raise
+    if lifecycle:
+        lifecycle.step(
+            "identity", EvidenceState.UNKNOWN if identity_warnings else EvidenceState.SUCCEEDED,
+            "Runtime identity bindings were not verified." if identity_warnings else
+            "Known structured principal assignments and credential bindings were checked.",
+            action=" ".join(identity_warnings),
+        )
+    references = with_connection_references(source_parts, source_items)
+    known = {key.casefold() for key in references}
+    workspaces = {workspace.casefold() for workspace in referenced_workspaces(source_parts)}
+    rewritten_workspaces = [key for key in id_map if key.casefold() in workspaces]
+    for item_id in _source_item_references(
+        source_parts, source_workspace_id, rewritten_workspaces=rewritten_workspaces,
+    ):
+        if item_id.casefold() not in known:
+            references[item_id] = {"id": item_id, "type": "item", "displayName": item_id}
+    references[source_workspace_id] = {
+        "id": source_workspace_id, "type": "source workspace", "displayName": source_workspace_id,
+    }
+    needed = dangling_references(source_parts, id_map, references, ignore=ignore)
+    if needed:
+        raise StrandedReference(needed)
+
+    workspace_mapping = next(
+        (value for key, value in id_map.items() if key.casefold() == source_workspace_id.casefold()), None,
+    )
+    if workspace_mapping is not None and workspace_mapping.casefold() != target_workspace_id.casefold():
+        raise FabricError(
+            f"Source workspace '{source_workspace_id}' must map to destination workspace "
+            f"'{target_workspace_id}', not '{workspace_mapping}'. Correct the workspace mapping, then retry."
+        )
+    rewritten, _ = rewrite_parts(source_parts, id_map)
+    validate_target_workspaces(
+        target_client, rewritten, source_workspace_id=source_workspace_id,
+    )
+    return identity_warnings
 
 
 def migrate_definition_item(
@@ -332,6 +677,10 @@ def migrate_definition_item(
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
     target_id: str | None = None,
     lifecycle: ItemLifecycle | None = None,
+    target_client: FabricClient | None = None,
+    cross_tenant: bool = False,
+    exclude_identity: bool = False,
+    strict_references: bool | None = None,
 ) -> MigratedItem:
     """Export one item, repoint its references, and recreate it in the target workspace.
 
@@ -341,10 +690,24 @@ def migrate_definition_item(
     ``source_items`` is every item in the workspace being migrated, and is what lets a
     definition depending on something that did not migrate be refused rather than created
     half bound. See :class:`StrandedReference`.
+
+    Exports use ``client``; creates, updates and their operations use ``target_client``,
+    defaulting to ``client`` for migrations within one tenant.
+    ``cross_tenant`` enables strict reference checks. Distinct
+    clients alone do not imply a tenant boundary: two principals may share the same tenant.
     """
+    destination = client if target_client is None else target_client
+    strict = cross_tenant or bool(strict_references)
     name = item["displayName"]
     policy = policy_for(item_type)
-    definition_format: str | None = policy.export_format
+    # Learn: semanticmodel/items/get-semantic-model-definition supports TMSL; default TMDL
+    # cannot be inspected structurally here without risking changes to RLS expressions.
+    export_format = SEMANTIC_MODEL_SECURITY_FORMAT if (
+        (strict or exclude_identity) and item_type == SEMANTIC_MODEL
+    ) else (
+        policy.export_format
+    )
+    definition_format: str | None = export_format
     if lifecycle:
         # Declare known obligations before any successful create/update evidence can persist.
         if policy.activation:
@@ -362,26 +725,33 @@ def migrate_definition_item(
     with lifecycle.operation("export", "Definition exported.") if lifecycle else nullcontext():
         if parts is None:
             definition = get_item_definition(
-                client, source_workspace_id, item["id"], fmt=policy.export_format
+                client, source_workspace_id, item["id"], fmt=export_format
             )
             parts = list(definition.get("parts") or [])
-            definition_format = policy.export_format or definition.get("format")
+            definition_format = export_format or definition.get("format")
 
+    membership_warnings: list[str] = []
+    if (strict or exclude_identity) and item_type == SEMANTIC_MODEL:
+        parts, membership_warnings = without_model_memberships(parts)
+    if exclude_identity and not strict:
+        membership_warnings.extend(validate_cross_tenant_identities(parts, item_type=item_type))
     with lifecycle.operation("rebind", "Known source references rewritten.") if lifecycle else nullcontext():
+        references = with_connection_references(parts, source_items) if strict else source_items or {}
         needed = dangling_references(
-            parts, id_map, source_items or {}, ignore=(item.get("id", ""),)
+            parts, id_map, references, ignore=(item.get("id", ""),)
         )
         if lifecycle:
             lifecycle.references(
-                referenced_item_ids(parts, source_items or {}),
+                referenced_item_ids(parts, references),
                 needed,
             )
         if needed:
             raise StrandedReference(needed)
 
-        warnings: list[str] = []
+        warnings: list[str] = list(membership_warnings)
         if policy.prepare:
-            parts, warnings = policy.prepare(parts, source_workspace_id)
+            parts, preparation_warnings = policy.prepare(parts, source_workspace_id)
+            warnings.extend(preparation_warnings)
 
         if lifecycle and policy.observe:
             policy.observe(lifecycle, parts, source_workspace_id)
@@ -390,17 +760,29 @@ def migrate_definition_item(
         rewritten, changed = rewrite_parts(parts, id_map)
         # Drop the source logical identity rather than asking Fabric to reuse it.
         rewritten = strip_part(rewritten, PLATFORM_PART)
+        if strict:
+            try:
+                identity_warnings = validate_cross_tenant_references(
+                    parts, source_workspace_id=source_workspace_id, target_workspace_id=target_workspace_id,
+                    id_map=id_map, target_client=destination, source_items=source_items,
+                    ignore=(item.get("id", ""),), item_type=item_type, lifecycle=lifecycle,
+                )
+                warnings.extend(identity_warnings)
+            except StrandedReference as error:
+                if lifecycle:
+                    lifecycle.add_references((), error.needed)
+                raise
 
     disposition = Disposition.REFRESHED if target_id else Disposition.CREATED
     with lifecycle.operation("definition", "Definition applied.") if lifecycle else nullcontext():
         if target_id:
             update_item_definition(
-                client, target_workspace_id, target_id, rewritten,
+                destination, target_workspace_id, target_id, rewritten,
                 definition_format=definition_format,
             )
         else:
             created = create_item(
-                client, target_workspace_id, name, item_type,
+                destination, target_workspace_id, name, item_type,
                 description=item.get("description") or None,
                 parts=rewritten, definition_format=definition_format, folder_id=folder_id,
             )
@@ -667,21 +1049,30 @@ def _collect_workspaces(node: Any, found: set[str]) -> None:
 def unreachable_workspaces(
     client: FabricClient,
     workspace_ids: Iterable[str],
+    *,
+    strict: bool = False,
 ) -> list[str]:
     """Which of these workspaces this service principal cannot read.
 
     A workspace that has been deleted, or that we were never given access to, cannot be
     referenced by a new item: Fabric refuses the create and describes it only as
     "UnknownError". Asking directly turns that into something an operator can act on.
+
+    Strict preflight raises the original service/transport error for any failed read rather
+    than treating an inconclusive diagnostic as permission to create the consumer.
     """
     unreachable: list[str] = []
     for workspace_id in sorted(workspace_ids):
         try:
             client.get(f"workspaces/{workspace_id}")
         except FabricApiError as error:
+            if strict:
+                raise
             if error.status_code in (401, 403, 404):
                 unreachable.append(workspace_id)
         except FabricError:
+            if strict:
+                raise
             continue
     return unreachable
 
@@ -700,6 +1091,10 @@ def migrate_items(
     existing_targets: Mapping[str, str] | None = None,
     on_progress: Any = None,
     on_lifecycle: Callable[[Mapping[str, Any], str], ItemLifecycle] | None = None,
+    target_client: FabricClient | None = None,
+    cross_tenant: bool = False,
+    exclude_identity: bool = False,
+    strict_references: bool | None = None,
 ) -> tuple[list[MigratedItem], list[str]]:
     """Migrate a batch of definition-backed items, collecting per-item failures.
 
@@ -708,7 +1103,10 @@ def migrate_items(
 
     ``source_items`` maps every item in the workspace being migrated to its record, and is
     used to say which of them a definition needed but did not get.
+
+    ``target_client`` performs destination writes and destination reference diagnostics.
     """
+    destination = client if target_client is None else target_client
     migrated: list[MigratedItem] = []
     warnings: list[str] = []
 
@@ -731,6 +1129,10 @@ def migrate_items(
                 source_items=source_items,
                 target_id=(existing_targets or {}).get(item.get("id", "")),
                 **({"lifecycle": evidence} if evidence else {}),
+                **({"target_client": target_client} if target_client is not None else {}),
+                **({"cross_tenant": True} if cross_tenant else {}),
+                **({"exclude_identity": True} if exclude_identity else {}),
+                **({"strict_references": strict_references} if strict_references is not None else {}),
             )
         except StrandedReference as error:
             # Refused before anything was created, so there is nothing half bound to clean up.
@@ -742,21 +1144,31 @@ def migrate_items(
                 "Migrate what it needs, then recreate it."
             )
             continue
+        except IdentityBindingError as error:
+            warnings.append(
+                f"{item_type} '{name}' was not migrated: {error}"
+            )
+            continue
         except FabricError as error:
             # Fabric answers some rejections with nothing but "UnknownError". The definition
             # it refused is the only other evidence, so it goes to the log, and its foreign
             # workspace references are checked: a workspace that has been deleted cannot be
             # named by a new item, and that is a fact worth stating rather than a mystery.
-            sent = _rewritten_definition(client, source_workspace_id, item, item_type, id_map)
+            if definition_parts is None:
+                sent = _rewritten_definition(client, source_workspace_id, item, item_type, id_map)
+            else:
+                sent, _ = rewrite_parts(definition_parts, id_map)
+                sent = strip_part(sent, PLATFORM_PART)
             logger.warning(
                 "%s '%s' was rejected: %s\nDefinition sent:\n%s",
                 item_type,
                 name,
                 error,
-                _readable(sent),
+                "<cross-tenant definition withheld to avoid exposing identity/credential payloads>"
+                if cross_tenant or exclude_identity else _readable(sent),
             )
             gone = unreachable_workspaces(
-                client,
+                destination,
                 referenced_workspaces(sent) - {source_workspace_id, target_workspace_id},
             )
             warnings.append(describe_failure(item_type, str(name), error, unreachable=gone))
@@ -782,6 +1194,7 @@ __all__ = [
     "NOTEBOOK",
     "REPORT",
     "SEMANTIC_MODEL",
+    "IdentityBindingError",
     "MigratedItem",
     "classify_dataflow",
     "describe_failure",
@@ -789,4 +1202,8 @@ __all__ = [
     "list_of_type",
     "migrate_definition_item",
     "migrate_items",
+    "validate_cross_tenant_identities",
+    "validate_cross_tenant_references",
+    "validate_target_workspaces",
+    "with_connection_references",
 ]

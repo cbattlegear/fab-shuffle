@@ -102,6 +102,7 @@ def test_ci_keeps_release_semantics_and_gates_builds_on_locked_tests():
     build = next(s for s in steps if s.get("id") == "build-and-push")["with"]
     assert build["push"] == "${{ github.event_name != 'pull_request' }}"
     assert "linux/arm64" in build["platforms"]
+    assert build["target"] == "production"
     assert any("cosign sign --yes" in s.get("run", "") for s in steps)
     for workflow in (release, tests):
         for job in workflow["jobs"].values():
@@ -109,14 +110,40 @@ def test_ci_keeps_release_semantics_and_gates_builds_on_locked_tests():
                 if "uses" in step:
                     assert re.search(r"@[a-f0-9]{40}$", step["uses"])
     commands = "\n".join(s.get("run", "") for s in tests["jobs"]["test"]["steps"])
-    for profile in ("bootstrap", "build", "dev"):
-        assert f"requirements/{profile}.txt" in commands
-    assert "--require-hashes" in commands and "--only-binary=:all:" in commands
-    assert "--no-build-isolation --no-deps" in commands
-    assert "scripts/lock_dependencies.py --check" in commands
-    platforms = tests["jobs"]["test"]["strategy"]["matrix"]["include"]
-    assert any(row["python"].startswith("3.11.") for row in platforms)
-    assert any(row["os"].startswith("windows-") for row in platforms)
+    assert tests["jobs"]["test"]["runs-on"] == "ubuntu-24.04"
+    assert "strategy" not in tests["jobs"]["test"]
+    assert "docker run --rm --platform linux/amd64 --network none fab-shuffle:ci-test" in commands
+    assert "python " not in commands and "pip " not in commands
+    assert "docker.sock" not in commands
+    test_steps = tests["jobs"]["test"]["steps"]
+    assert not any("setup-python" in step.get("uses", "") for step in test_steps)
+    test_build = next(s for s in test_steps if "docker/build-push-action@" in s.get("uses", ""))["with"]
+    assert test_build["target"] == "test"
+    assert test_build["platforms"] == "linux/amd64"
+    assert test_build["load"] is True and test_build["push"] is False
+    assert "scope=validation" in build["cache-from"]
+
+
+def test_test_image_extends_runtime_without_contaminating_default_production_image():
+    docker = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(r"FROM python:[^\n]+ AS runtime", docker)
+    assert re.search(r"FROM node:[^\n]+@sha256:[a-f0-9]{64} AS test-node", docker)
+    assert re.search(
+        r"FROM mcr.microsoft.com/powershell:[^\n]+@sha256:[a-f0-9]{64} AS test-powershell", docker,
+    )
+    validation = docker.split("FROM runtime AS test\n", 1)[1].split("FROM runtime AS production", 1)[0]
+    assert "COPY --from=test-node" in validation and "COPY --from=test-powershell" in validation
+    assert "--require-hashes --only-binary=:all:" in validation
+    assert "-r requirements/dev.txt" in validation
+    for copied in ("tests", "scripts", "deploy", ".github"):
+        assert f"COPY {copied} " in validation
+    assert 'ENTRYPOINT ["python", "scripts/run_container_tests.py"]' in validation
+    assert 'CMD ["tests"]' in validation
+    assert "HEALTHCHECK NONE" in validation
+    assert docker.rstrip().endswith("FROM runtime AS production")
+    ignored = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert not {"tests", "Dockerfile", ".dockerignore"}.intersection(ignored)
+    assert {".git", "local", ".venv"} <= set(ignored)
 
 
 def test_export_check_refuses_stale_files(tmp_path, monkeypatch):

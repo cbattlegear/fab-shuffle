@@ -312,7 +312,16 @@ def _reason_for(item_type: str) -> str:
     return "Fab Shuffle does not migrate this item type yet"
 
 
-def assess_workspace(items: Iterable[Mapping[str, Any]]) -> WorkspaceAssessment:
+STOPPED_EVENTSTREAM_REASON = (
+    "the migration cannot confirm an inactive-create contract for every Eventstream node. "
+    "Recreate it manually with ingestion deactivated, then activate it only at cutover"
+)
+
+
+def assess_workspace(
+    items: Iterable[Mapping[str, Any]], *, force_rebuild: bool = False,
+    require_stopped: bool = False,
+) -> WorkspaceAssessment:
     """Classify a workspace's items and decide which migration strategy applies."""
     migrated: list[dict[str, Any]] = []
     unsupported: list[UnsupportedItem] = []
@@ -328,13 +337,18 @@ def assess_workspace(items: Iterable[Mapping[str, Any]]) -> WorkspaceAssessment:
         # pins the workspace to the rebuild strategy. Unknown future types count as Fabric.
         if item_type not in POWER_BI_TYPES:
             has_fabric_item = True
+        if require_stopped and item_type == "Eventstream":
+            unsupported.append(UnsupportedItem(
+                name=name, type=item_type, reason=STOPPED_EVENTSTREAM_REASON,
+            ))
+            continue
 
         if item_type in REBUILT_TYPES:
             migrated.append(dict(item))
         else:
             unsupported.append(UnsupportedItem(name=name, type=item_type, reason=_reason_for(item_type)))
 
-    if has_fabric_item:
+    if has_fabric_item or force_rebuild:
         return WorkspaceAssessment(Strategy.REBUILD, migrated, unsupported)
 
     # Power BI only: reassignment moves everything, so nothing is left behind.

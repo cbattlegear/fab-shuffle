@@ -11,6 +11,15 @@ const state = {
   runId: null,
   events: null,
   readiness: null,
+  identity: null,
+  paired: false,
+  crossTenant: false,
+  assessmentVersion: 0,
+  assessmentPending: false,
+  mappingsChecked: false,
+  resumeRunId: null,
+  resumeReturnStage: "capacity",
+  forceRebuild: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -33,7 +42,11 @@ async function api(path, { method = "GET", body, signal, download = false } = {}
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(payload.detail || `Request failed with HTTP ${response.status}`);
+    const detail = payload.detail;
+    const message = typeof detail === "string" ? detail
+      : Array.isArray(detail) ? detail.map((entry) => `${(entry.loc || []).join(".")}: ${entry.msg}`).join("; ")
+      : detail?.message;
+    throw new Error(message || `Request failed with HTTP ${response.status}`);
   }
   return payload;
 }
@@ -98,23 +111,64 @@ function renderChoices(container, entries, onSelect) {
 
 // --------------------------------------------------------------------- login
 
+function updateLoginMode() {
+  const paired = $("#another-tenant").checked;
+  $("#destination-credentials").hidden = !paired;
+  $("#destination-credentials").disabled = !paired;
+  $("#source-credentials-label").textContent = paired ? "Source service principal" : "Service principal";
+}
+
+$("#another-tenant").addEventListener("change", updateLoginMode);
+
+function loginBody(form) {
+  const data = Object.fromEntries(new FormData(form).entries());
+  const body = { tenant_id: data.tenant_id, client_id: data.client_id, client_secret: data.client_secret };
+  if ($("#another-tenant").checked) {
+    body.destination = {
+      tenant_id: data.destination_tenant_id,
+      client_id: data.destination_client_id,
+      client_secret: data.destination_client_secret,
+    };
+  }
+  return body;
+}
+
 $("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector("button");
-  const data = Object.fromEntries(new FormData(form).entries());
+  const data = loginBody(form);
 
   busy(button, true, "Signing in…");
   try {
     const result = await api("/api/login", { method: "POST", body: data });
+    invalidateSavedRunActions();
     state.sessionId = result.sessionId;
+    state.identity = result;
+    state.paired = !!result.paired;
+    state.crossTenant = !!result.crossTenant;
+    state.assessmentVersion++;
+    state.assessmentPending = false;
+    state.mappingsChecked = false;
+    state.resumeRunId = null;
+    state.forceRebuild = false;
+    state.capacity = null;
+    state.workspace = null;
+    state.workspaces = [];
+    $("#capacity-next").disabled = true;
+    $("#workspace-next").disabled = true;
+    $("#opt-permissions").checked = !state.paired;
+    $("#opt-write-freeze").checked = false;
+    $("#opt-start-mirrors").checked = false;
     form.reset();
+    updateLoginMode();
+    renderIdentity();
     $("#sign-out").hidden = false;
     await loadCapacities();
-    loadLeftovers();
+    if (!state.paired) loadLeftovers();
     loadResumable();
     // Needed by the restore-access control on this same step.
-    loadWorkspaces().then(fillWorkspaceSelects).catch(() => {});
+    if (!state.paired) loadWorkspaces().then(fillWorkspaceSelects).catch(() => {});
     goTo("capacity");
   } catch (error) {
     showError(error.message);
@@ -124,6 +178,7 @@ $("#login-form").addEventListener("submit", async (event) => {
 });
 
 $("#sign-out").addEventListener("click", async () => {
+  invalidateSavedRunActions();
   try {
     await api("/api/logout", { method: "POST" });
   } catch (_) {
@@ -131,20 +186,42 @@ $("#sign-out").addEventListener("click", async () => {
   }
   if (state.events) state.events.close();
   resetReadiness();
+  stopAssessmentTimer();
+  state.assessmentVersion++;
   Object.assign(state, {
     sessionId: null, capacity: null, workspace: null, workspaces: [],
-    preview: null, runId: null, events: null,
+    preview: null, runId: null, events: null, identity: null, paired: false, crossTenant: false,
+    resumeRunId: null, forceRebuild: false,
   });
   $("#sign-out").hidden = true;
+  $("#opt-start-mirrors").checked = false;
   goTo("login");
 });
 
+function renderIdentity() {
+  const identity = state.identity;
+  $("#restore-access-tool").hidden = state.paired;
+  $("#leftovers").hidden = true;
+  $("#destination-context").hidden = !state.paired;
+  $("#source-context").hidden = !state.paired;
+  if (!state.paired) return;
+  $("#destination-context").textContent =
+    `Destination tenant: ${identity.targetTenantId} · App: ${identity.destinationPrincipal.client_id}`;
+  $("#source-context").textContent =
+    `Source tenant: ${identity.sourceTenantId} · App: ${identity.principal.client_id}`;
+}
+
 // ------------------------------------------------------------------ capacity
 
+let capacityLoadVersion = 0;
+
 async function loadCapacities() {
+  const sessionId = state.sessionId;
+  const version = ++capacityLoadVersion;
   const container = $("#capacity-list");
   container.innerHTML = '<p class="hint">Loading capacities…</p>';
   const { capacities } = await api("/api/capacities");
+  if (sessionId !== state.sessionId || version !== capacityLoadVersion) return;
   renderChoices(
     container,
     capacities.map((capacity) => ({
@@ -158,36 +235,55 @@ async function loadCapacities() {
       $("#capacity-next").disabled = false;
     }
   );
+  if (!capacities.length && state.paired) {
+    container.textContent =
+      "No destination capacities are visible. Grant the destination app access to a capacity, then sign in again.";
+  }
 }
 
 $("#capacity-next").addEventListener("click", async () => {
   const button = $("#capacity-next");
+  if (button.disabled) return;
+  const sessionId = state.sessionId;
+  const version = state.assessmentVersion;
   busy(button, true, "Loading…");
   try {
     await loadWorkspaces();
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
     goTo("workspace");
   } catch (error) {
-    showError(error.message);
+    if (sessionId === state.sessionId && version === state.assessmentVersion) showError(error.message);
   } finally {
-    busy(button, false);
+    if (sessionId === state.sessionId && version === state.assessmentVersion) busy(button, false);
   }
 });
 
-// Run state lives in memory, so a restarted container loses track of a scratch workspace
-// that was never cleaned up. Surface any leftovers right after sign-in.
+let savedRunsVersion = 0;
+let savedRunConfirmation = null;
+const savedRunErrors = new Map();
+
 async function loadResumable() {
+  const sessionId = state.sessionId;
+  const version = ++savedRunsVersion;
+  const status = $("#resumable-status");
+  status.hidden = !state.paired;
+  status.textContent = "Looking for saved runs needing attention for this tenant and app pair…";
   try {
     const { runs } = await api("/api/resumable");
+    if (state.sessionId !== sessionId || version !== savedRunsVersion) return;
     const container = $("#resumable");
     container.hidden = !runs.length;
-    if (!runs.length) return;
-
+    status.textContent = runs.length
+      ? "Only runs bound to this source and destination tenant/app pair are shown."
+      : "No saved runs need retrying for this tenant/app pair. To recover another pair, sign in with its original apps.";
     const list = container.querySelector("ul");
     list.innerHTML = "";
     runs.forEach((run) => {
       const item = document.createElement("li");
+      item.dataset.runId = run.runId;
 
       const what = document.createElement("div");
+      what.className = "saved-run-name";
       what.textContent = `${run.sourceWorkspaceName} → ${run.targetWorkspaceName}`;
       item.appendChild(what);
 
@@ -196,31 +292,311 @@ async function loadResumable() {
       const started = run.startedAt ? new Date(run.startedAt).toLocaleString() : "an earlier run";
       const built = run.itemsCreated === 1 ? "1 item" : `${run.itemsCreated} items`;
       detail.textContent = `Started ${started}. Got as far as ${run.lastPhase || "the beginning"}, ${built} built.`;
+      if (run.status === "succeeded") detail.textContent += " Finished with failed work; retry is available.";
+      if (run.sourceTenantId) detail.textContent += ` Tenants: ${run.sourceTenantId} → ${run.targetTenantId}.`;
+      if (run.sourceTenantId) {
+        detail.textContent += " Keep source writes paused while resuming data or file copies.";
+      }
       item.appendChild(detail);
 
+      const pending = run.recoveryAction === "restart_pending";
+      if (pending || run.canRestart === false) {
+        const reason = document.createElement("p");
+        reason.className = "hint";
+        reason.textContent = pending
+          ? "Full restart is unfinished. Resume is unavailable; finish the full restart before starting a fresh migration."
+          : "";
+        if (run.canRestart === false) reason.textContent += ` ${run.restartBlockedReason || "Full restart is unavailable. Refresh the saved migrations to check again."}`;
+        item.appendChild(reason);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "saved-run-actions";
       const button = document.createElement("button");
+      button.type = "button";
       button.className = "secondary";
-      button.textContent = "Pick it up";
-      button.addEventListener("click", () => resumeRun(run.runId, button));
-      item.appendChild(button);
+      button.textContent = state.paired ? "Review mappings and resume" : "Resume";
+      button.disabled = pending;
+      button.addEventListener("click", async () => {
+        if (button.disabled || sessionId !== state.sessionId || savedRunConfirmation) return;
+        const restore = lockSavedRunRow(item);
+        try {
+          await prepareResume(run.runId, button, "capacity");
+        } finally {
+          if (sessionId === state.sessionId) restore();
+        }
+      });
+      actions.appendChild(button);
+      for (const kind of ["ignore", "restart"]) {
+        const action = document.createElement("button");
+        action.type = "button";
+        action.className = kind === "restart" ? "secondary destructive" : "secondary";
+        action.textContent = kind === "ignore" ? "Ignore" : pending ? "Finish full restart" : "Full restart";
+        action.disabled = kind === "restart" && run.canRestart === false;
+        action.addEventListener("click", () => {
+          if (!action.disabled && sessionId === state.sessionId) confirmSavedRunAction(run, kind, item, action);
+        });
+        actions.appendChild(action);
+      }
+      item.appendChild(actions);
+      if (savedRunErrors.has(run.runId)) {
+        const error = document.createElement("p");
+        error.className = "hint saved-run-error";
+        error.textContent = savedRunErrors.get(run.runId);
+        item.appendChild(error);
+      }
 
       list.appendChild(item);
     });
-  } catch (_) {
-    // Offering an old run back is a convenience; never block sign-in on it.
+    return true;
+  } catch (error) {
+    if (state.sessionId !== sessionId || version !== savedRunsVersion) return;
+    status.hidden = false;
+    status.textContent = `Could not load unfinished migrations: ${error.message}. Sign in again to retry.`;
+    return false;
   }
 }
 
-async function resumeRun(runId, button) {
+function lockSavedRunRow(row) {
+  const buttons = Array.from(row.querySelectorAll("button")).map((button) => [button, button.disabled]);
+  buttons.forEach(([button]) => { button.disabled = true; });
+  return () => buttons.forEach(([button, disabled]) => { button.disabled = disabled; });
+}
+
+function closeSavedRunConfirmation(restoreFocus = false) {
+  const confirmation = savedRunConfirmation;
+  savedRunConfirmation = null;
+  const dialog = $("#saved-run-confirmation");
+  if (dialog.open) dialog.close();
+  if (restoreFocus && confirmation?.sessionId === state.sessionId) confirmation.opener.focus();
+}
+
+function invalidateSavedRunActions() {
+  savedRunsVersion++;
+  savedRunErrors.clear();
+  closeSavedRunConfirmation();
+}
+
+function confirmSavedRunAction(run, kind, row, opener) {
+  if (savedRunConfirmation) return;
+  savedRunConfirmation = { run, kind, row, opener, sessionId: state.sessionId, busy: false };
+  const restarting = kind === "restart";
+  $("#saved-run-confirm-title").textContent = restarting ? "Full restart of this migration?" : "Ignore this saved migration?";
+  $("#saved-run-confirm-name").textContent = `${run.sourceWorkspaceName} → ${run.targetWorkspaceName}`;
+  $("#saved-run-confirm-target").textContent = run.targetWorkspaceId
+    ? `Destination workspace ID: ${run.targetWorkspaceId}`
+    : "No destination workspace was recorded for this migration.";
+  $("#saved-run-confirm-description").textContent = restarting
+    ? (run.targetWorkspaceId
+      ? "The recorded destination workspace and all its contents will be deleted. "
+      : "No destination workspace will be deleted because none was recorded. ") +
+      "The source workspace is left unchanged. Any temporary run workspace is cleaned up if needed."
+    : "Permanently hide this migration from the saved migrations list, including after signing in again.";
+  $("#saved-run-confirm-warning").textContent = restarting
+    ? "Deletion cannot be undone. After cleanup, choose a capacity and review a fresh migration. Nothing starts automatically, and no previous item IDs, mappings or copy checkpoints are reused."
+    : "This does not delete any workspace or data, and does not stop running jobs. The saved journal is kept.";
+  $("#saved-run-confirm-cancel").disabled = false;
+  const submit = $("#saved-run-confirm-submit");
+  submit.disabled = false;
+  submit.className = restarting ? "destructive" : "primary";
+  submit.textContent = restarting
+    ? (run.targetWorkspaceId ? "Delete destination and restart" : "Full restart")
+    : "Ignore migration";
+  $("#saved-run-confirm-progress").hidden = true;
+  $("#saved-run-confirmation").showModal();
+  $("#saved-run-confirm-cancel").focus();
+}
+
+$("#saved-run-confirm-cancel").addEventListener("click", () => {
+  if (!savedRunConfirmation?.busy) closeSavedRunConfirmation(true);
+});
+$("#saved-run-confirmation").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  if (!savedRunConfirmation?.busy) closeSavedRunConfirmation(true);
+});
+
+$("#saved-run-confirm-submit").addEventListener("click", async () => {
+  const confirmation = savedRunConfirmation;
+  if (!confirmation || confirmation.busy || confirmation.sessionId !== state.sessionId) return;
+  const { run, kind, row, sessionId } = confirmation;
+  confirmation.busy = true;
+  savedRunsVersion++;
+  const restore = lockSavedRunRow(row);
+  $("#saved-run-confirm-submit").disabled = true;
+  $("#saved-run-confirm-cancel").disabled = true;
+  const progress = $("#saved-run-confirm-progress");
+  progress.hidden = false;
+  progress.textContent = kind === "restart" ? "Cleaning up the recorded migration… Please wait."
+    : "Hiding this saved migration…";
+  const current = () => savedRunConfirmation === confirmation && state.sessionId === sessionId;
+  try {
+    const body = kind === "restart"
+      ? { confirmed: true, target_workspace_id: run.targetWorkspaceId || "" }
+      : { confirmed: true };
+    const result = await api(`/api/runs/${encodeURIComponent(run.runId)}/${kind}`, { method: "POST", body });
+    if (!current()) return;
+    savedRunErrors.delete(run.runId);
+    row.remove();
+    if (!$("#resumable").querySelector("ul").children.length) $("#resumable").hidden = true;
+    if (kind === "restart") {
+      resetForFullRestart(result.sourceWorkspace);
+      goTo("capacity");
+    }
+    closeSavedRunConfirmation();
+    if (kind === "restart") {
+      $("#capacity-title").focus();
+      // Cleanup has already succeeded; a discovery failure must not offer deletion again.
+      loadCapacities().catch((error) => {
+        if (sessionId === state.sessionId) showError(`Full restart cleanup completed. Could not load capacities: ${error.message}. Sign in again to choose a capacity.`);
+      });
+    }
+    await loadResumable();
+    if (sessionId !== state.sessionId) return;
+    if (kind === "ignore") {
+      ($("#resumable").hidden ? $("#capacity-title") : $("#resumable-title")).focus();
+    }
+  } catch (error) {
+    if (!current()) return;
+    restore();
+    if (kind === "restart") {
+      // Until the server reports otherwise, a failed response could mean partial deletion.
+      run.recoveryAction = "restart_pending";
+      row.querySelector("button").disabled = true;
+      confirmation.opener.textContent = "Finish full restart";
+    }
+    const message = `${error.message} ${kind === "restart"
+      ? "Could not confirm that full restart completed. Resolve the error, then try Full restart again."
+      : "Could not confirm that the migration was hidden. Resolve the error, then try Ignore again."}`;
+    savedRunErrors.set(run.runId, message);
+    closeSavedRunConfirmation();
+    showError(message);
+    confirmation.opener.focus();
+    await loadResumable();
+    if (sessionId === state.sessionId) {
+      const updated = Array.from($("#resumable").querySelector("ul").children)
+        .find((item) => item.dataset.runId === run.runId);
+      const action = updated?.querySelectorAll("button")[kind === "restart" ? 2 : 1];
+      if (action && !action.disabled) action.focus();
+      else ($("#resumable").hidden ? $("#capacity-title") : $("#resumable-title")).focus();
+    }
+  }
+});
+
+function resetForFullRestart(sourceWorkspace) {
+  if (state.events) state.events.close();
+  resetReadiness();
+  stopAssessmentTimer();
+  state.assessmentVersion++;
+  Object.assign(state, {
+    capacity: null, workspace: sourceWorkspace, workspaces: [], preview: null,
+    runId: null, resumeRunId: null, resumeReturnStage: "capacity", events: null,
+    assessmentPending: false, forceRebuild: true,
+  });
+  resetMappings();
+  busy($("#capacity-next"), false);
+  busy($("#workspace-next"), false);
+  $("#capacity-next").disabled = true;
+  $("#workspace-next").disabled = true;
+  $("#workspace-filter").value = "";
+  $("#workspace-list").innerHTML = "";
+  $("#target-name").value = "";
+  $("#target-name").disabled = false;
+  for (const id of ["opt-data", "opt-files", "opt-cleanup", "opt-permissions"]) {
+    $(`#${id}`).checked = id !== "opt-permissions" || !state.paired;
+    $(`#${id}`).disabled = id === "opt-permissions" && state.paired;
+  }
+  $("#opt-start-mirrors").checked = false;
+  $("#resume-artifacts").hidden = true;
+  $("#resume-artifacts").open = false;
+  for (const id of ["resume-target-id", "resume-item-ids", "source-connection-options",
+    "target-connection-options", "review-summary", "run-banner", "step-list"]) {
+    $(`#${id}`).textContent = "";
+  }
+  $("#connection-options-status").textContent = "";
+  $("#mapping-status").textContent = "Re-check after editing mappings.";
+  $("#review-title").textContent = "Review the move";
+  $("#review-back").hidden = false;
+  $("#resume-back").hidden = true;
+  $("#start-run").textContent = "Start migration";
+  $("#start-run").disabled = true;
+  for (const id of ["retry-run", "cleanup-run", "cancel-run", "start-over"]) $(`#${id}`).hidden = true;
+}
+
+async function resumeRun(runId, button, mappings) {
+  const sessionId = state.sessionId;
+  const version = state.assessmentVersion;
   busy(button, true, "Starting…");
   try {
-    const result = await api(`/api/runs/${runId}/resume`, { method: "POST" });
+    const result = await api(`/api/runs/${runId}/resume`, { method: "POST", body: mappings });
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
+    state.resumeRunId = null;
     state.runId = result.runId;
     goTo("progress");
     watchRun(result.runId);
   } catch (error) {
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
     showError(error.message);
     busy(button, false);
+    if (state.resumeRunId && state.preview) setStartEnabled(!state.preview.blockers.length);
+  }
+}
+
+async function prepareResume(runId, button, returnStage = "progress") {
+  busy(button, true, "Loading saved mappings…");
+  const sessionId = state.sessionId;
+  const version = ++state.assessmentVersion;
+  try {
+    const saved = await api(`/api/runs/${runId}/resume-plan`);
+    if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
+    const plan = saved.plan;
+    state.resumeRunId = runId;
+    state.resumeReturnStage = returnStage;
+    state.capacity = { id: plan.capacityId };
+    state.workspace = { id: plan.sourceWorkspaceId };
+    state.preview = {
+      ...plan, blockers: [], unsupportedSummary: [], dependencies: [],
+      counts: [], migratedTotal: 0, largeSemanticModels: [],
+      targetWorkspaceId: saved.targetWorkspaceId,
+    };
+    resetMappings();
+    $("#opt-data").checked = plan.includeData;
+    $("#opt-files").checked = plan.includeFiles;
+    $("#opt-permissions").checked = plan.copyPermissions;
+    $("#opt-cleanup").checked = saved.cleanupWhenDone;
+    $("#opt-start-mirrors").checked = false;
+    for (const [source, target] of Object.entries(plan.connectionMappings || {})) {
+      const inputs = addMappingRow("connection").querySelectorAll("input");
+      inputs[0].value = source;
+      inputs[1].value = target;
+    }
+    for (const mapping of plan.referenceMappings || []) {
+      addMappingRow("reference").querySelectorAll("input").forEach((input) => {
+        input.value = mapping[input.dataset.field] || "";
+      });
+    }
+    goTo("review");
+    renderReview();
+    $("#resume-target-id").textContent = saved.targetWorkspaceId
+      ? `Destination workspace ID: ${saved.targetWorkspaceId}`
+      : "No destination workspace was recorded yet. Resuming will create it.";
+    const items = $("#resume-item-ids");
+    items.innerHTML = "";
+    for (const item of saved.items) {
+      const row = document.createElement("li");
+      row.textContent = `${item.name || item.sourceId} (${item.type}) — destination item ID: ${item.targetId}`;
+      items.appendChild(row);
+    }
+    if (!saved.items.length) {
+      const row = document.createElement("li");
+      row.textContent = "No destination items were recorded. Inspect the migration warnings before resuming.";
+      items.appendChild(row);
+    }
+    loadConnectionOptions();
+    await recheckMappings();
+  } catch (error) {
+    if (sessionId === state.sessionId) showError(error.message);
+  } finally {
+    if (sessionId === state.sessionId) busy(button, false);
   }
 }
 
@@ -301,7 +677,10 @@ $("#restore-access").addEventListener("click", async () => {
 // ----------------------------------------------------------------- workspace
 
 async function loadWorkspaces() {
+  const sessionId = state.sessionId;
+  const version = state.assessmentVersion;
   const { workspaces } = await api("/api/workspaces");
+  if (sessionId !== state.sessionId || version !== state.assessmentVersion) return;
   state.workspaces = workspaces;
   renderWorkspaces("");
 }
@@ -321,6 +700,17 @@ function renderWorkspaces(filter) {
     state.workspace = entry.raw;
     $("#workspace-next").disabled = false;
   });
+  const selected = entries.find((entry) => entry.id === state.workspace?.id);
+  state.workspace = selected?.raw || null;
+  $("#workspace-next").disabled = !selected;
+  if (selected) {
+    const choice = Array.from($("#workspace-list").children).find((entry) => entry.dataset.id === selected.id);
+    choice.setAttribute("aria-checked", "true");
+  }
+  if (!entries.length && state.paired) {
+    $("#workspace-list").textContent = needle ? "No matching source workspaces. Clear the filter to see all workspaces."
+      : "No source workspaces are visible. Grant the source app workspace access, then sign in again.";
+  }
 }
 
 $("#workspace-filter").addEventListener("input", (event) => {
@@ -331,24 +721,34 @@ $("#workspace-filter").addEventListener("input", (event) => {
 
 $("#workspace-next").addEventListener("click", async () => {
   const button = $("#workspace-next");
+  if (button.disabled) return;
+  const sessionId = state.sessionId;
   busy(button, true, "Inspecting…");
   const params = new URLSearchParams({
     capacity_id: state.capacity.id,
     source_workspace_id: state.workspace.id,
   });
+  if (state.forceRebuild) params.set("strategy", "rebuild");
 
   // Both requests go out together, and the review screen appears straight away. The
   // dependency check walks the relations API and every connection in the tenant, so waiting
   // for it before showing anything left the wizard looking stuck.
-  const dependencies = api(`/api/preview/dependencies?${params}`);
-  dependencies.catch(() => {});
+  state.resumeRunId = null;
+  resetMappings();
+  state.assessmentPending = true;
+  const version = ++state.assessmentVersion;
+  const dependencies = state.paired ? null : api(`/api/preview/dependencies?${params}`);
+  dependencies?.catch(() => {});
 
   try {
     goTo("review");
     renderReviewPending();
-    state.preview = await api(`/api/preview?${params}`);
+    const preview = await api(`/api/preview?${params}`);
+    if (version !== state.assessmentVersion || sessionId !== state.sessionId) return;
+    state.preview = preview;
     renderReview();
   } catch (error) {
+    if (version !== state.assessmentVersion || sessionId !== state.sessionId) return;
     goTo("workspace");
     showError(error.message);
     busy(button, false);
@@ -356,13 +756,22 @@ $("#workspace-next").addEventListener("click", async () => {
   }
   busy(button, false);
 
-  await settleAssessment(dependencies);
+  if (state.paired) {
+    loadConnectionOptions();
+    await recheckMappings();
+  } else await settleAssessment(dependencies, version);
 });
 
 $("#recheck").addEventListener("click", async () => {
   const button = $("#recheck");
   busy(button, true, "Re-checking…");
+  if (state.paired) {
+    await recheckMappings();
+    busy(button, false);
+    return;
+  }
   const params = new URLSearchParams({ source_workspace_id: state.workspace.id });
+  if (state.forceRebuild) params.set("strategy", "rebuild");
 
   showDependenciesPending();
   setStartEnabled(false);
@@ -374,15 +783,24 @@ $("#recheck").addEventListener("click", async () => {
 });
 
 /** Apply the slow half of the assessment, however it was started. */
-async function settleAssessment(request) {
+async function settleAssessment(request, version = state.assessmentVersion) {
   try {
     const result = await request;
+    if (version !== state.assessmentVersion || !state.preview) return;
     state.preview.dependencies = result.dependencies;
     state.preview.connectionAccess = result.connectionAccess;
+    state.preview.mappingBlockers = result.blockers || [];
+    state.mappingsChecked = true;
+    $("#mapping-status").textContent = result.assessmentNotice ||
+      "Destination references checked. Validate copied items and data before cutover.";
   } catch (error) {
+    if (version !== state.assessmentVersion || !state.preview) return;
     state.preview.dependencies = [`Dependencies could not be checked: ${error.message}`];
     state.preview.connectionAccess = null;
+    state.mappingsChecked = false;
+    $("#mapping-status").textContent = `Check failed: ${error.message}. Re-check to retry.`;
   }
+  state.assessmentPending = false;
   stopAssessmentTimer();
   renderDependencies();
   renderConnectionAccess();
@@ -392,20 +810,190 @@ async function settleAssessment(request) {
 
 function setStartEnabled(enabled) {
   const start = $("#start-run");
-  start.disabled = !enabled;
-  start.title = enabled ? "" : "Waiting for the assessment to finish";
+  const freezeMissing = state.paired && ($("#opt-data").checked || $("#opt-files").checked) &&
+    !$("#opt-write-freeze").checked;
+  const mappingBlocked = state.paired && (!state.mappingsChecked || state.preview?.mappingBlockers?.length);
+  start.disabled = !enabled || state.assessmentPending || freezeMissing || !!mappingBlocked;
+  start.title = !enabled || state.assessmentPending ? "Finish the assessment and resolve its blockers"
+    : mappingBlocked ? "Re-check destination mappings and resolve their blockers"
+    : freezeMissing ? "Confirm the source write freeze, or turn off both data and file copying" : "";
 }
 
 
 // -------------------------------------------------------------------- review
 
+let mappingRowId = 0;
+let connectionOptionsVersion = 0;
+
+function invalidateMappings() {
+  state.assessmentVersion++;
+  state.assessmentPending = false;
+  state.mappingsChecked = false;
+  stopAssessmentTimer();
+  $("#mapping-status").textContent = "Mappings changed. Re-check before starting.";
+  setStartEnabled(!!state.preview && !state.preview.blockers.length);
+}
+
+function addMappingRow(kind) {
+  const row = document.createElement("div");
+  row.className = "mapping-row";
+  const names = kind === "connection"
+    ? [["source_connection_id", "Source connection ID"], ["target_connection_id", "Destination connection ID"]]
+    : [["source_workspace_id", "Source workspace ID"], ["source_item_id", "Source item ID"],
+      ["target_workspace_id", "Destination workspace ID"], ["target_item_id", "Destination item ID"]];
+  names.forEach(([name, title], index) => {
+    const label = document.createElement("label");
+    label.textContent = title;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = `mapping-${++mappingRowId}`;
+    input.dataset.field = name;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.maxLength = 128;
+    input.placeholder = "00000000-1111-2222-3333-444444444444";
+    if (kind === "connection") input.setAttribute("list", `${index ? "target" : "source"}-connection-options`);
+    input.addEventListener("input", invalidateMappings);
+    label.appendChild(input);
+    row.appendChild(label);
+  });
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "secondary";
+  remove.textContent = "Remove mapping";
+  remove.addEventListener("click", () => {
+    row.remove();
+    invalidateMappings();
+    $(`#add-${kind}-mapping`).focus();
+  });
+  row.appendChild(remove);
+  $(`#${kind}-mapping-rows`).appendChild(row);
+  invalidateMappings();
+  return row;
+}
+
+function resetMappings() {
+  connectionOptionsVersion++;
+  $("#connection-mapping-rows").innerHTML = "";
+  $("#reference-mapping-rows").innerHTML = "";
+  $("#opt-write-freeze").checked = false;
+  $("#opt-start-mirrors").checked = false;
+  state.mappingsChecked = false;
+}
+
+function mappingOptions() {
+  const result = { connection_mappings: {}, reference_mappings: [] };
+  if (!state.paired) return result;
+  for (const kind of ["connection", "reference"]) {
+    for (const row of $(`#${kind}-mapping-rows`).children) {
+      const entries = Array.from(row.querySelectorAll("input")).map((input) =>
+        [input.dataset.field, (input.value || "").trim()]);
+      if (entries.every(([, value]) => !value)) continue;
+      if (entries.some(([, value]) => !value)) {
+        throw new Error(`Complete every ID in the ${kind} mapping, or remove its row.`);
+      }
+      const values = Object.fromEntries(entries);
+      if (kind === "connection") {
+        if (Object.hasOwn(result.connection_mappings, values.source_connection_id)) {
+          throw new Error("Each source connection must have only one destination mapping.");
+        }
+        Object.defineProperty(result.connection_mappings, values.source_connection_id, {
+          value: values.target_connection_id, enumerable: true,
+        });
+      } else result.reference_mappings.push(values);
+    }
+  }
+  return result;
+}
+
+function migrationBody() {
+  const reassign = state.preview?.strategy === "reassign";
+  return {
+    capacity_id: state.capacity.id,
+    source_workspace_id: state.workspace.id,
+    strategy: state.paired ? "rebuild" : state.preview?.strategy,
+    target_workspace_name: reassign ? null : $("#target-name").value.trim() || null,
+    include_data: $("#opt-data").checked,
+    include_files: $("#opt-files").checked,
+    copy_permissions: state.paired ? false : $("#opt-permissions").checked,
+    cleanup_when_done: $("#opt-cleanup").checked,
+    write_freeze_confirmed: $("#opt-write-freeze").checked,
+    start_database_mirrors: !reassign && $("#opt-start-mirrors").checked,
+    ...mappingOptions(),
+  };
+}
+
+function resumeOptions() {
+  return {
+    ...(state.paired ? mappingOptions() : {}),
+    start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,
+  };
+}
+
+async function recheckMappings() {
+  const button = $("#recheck-mappings");
+  let body;
+  try { body = state.resumeRunId ? resumeOptions() : migrationBody(); } catch (error) {
+    showError(error.message);
+    return;
+  }
+  const version = ++state.assessmentVersion;
+  state.assessmentPending = true;
+  state.mappingsChecked = false;
+  busy(button, true, "Checking destination references…");
+  showDependenciesPending();
+  setStartEnabled(false);
+  try {
+    const path = state.resumeRunId
+      ? `/api/runs/${state.resumeRunId}/resume-preview` : "/api/preview/dependencies";
+    await settleAssessment(api(path, { method: "POST", body }), version);
+  } finally {
+    busy(button, false);
+  }
+}
+
+async function loadConnectionOptions() {
+  const sessionId = state.sessionId;
+  const version = ++connectionOptionsVersion;
+  const status = $("#connection-options-status");
+  status.textContent = "Loading source and destination connection IDs…";
+  const results = await Promise.all(["source", "target"].map(async (side) => {
+    try {
+      const result = await api(`/api/connections?side=${side}`);
+      if (sessionId !== state.sessionId || version !== connectionOptionsVersion) return "";
+      const options = $(`#${side}-connection-options`);
+      options.innerHTML = "";
+      result.connections.forEach((entry) => {
+        const option = document.createElement("option");
+        option.value = entry.id;
+        option.textContent = entry.displayName || entry.id;
+        options.appendChild(option);
+      });
+      return result.connections.length ? `${side}: ${result.connections.length} available`
+        : `${side}: no visible connections; create or share one, then re-check`;
+    } catch (error) { return `${side}: ${error.message}. Enter known IDs manually or re-check to retry`; }
+  }));
+  if (sessionId === state.sessionId && version === connectionOptionsVersion) status.textContent = results.join(". ");
+}
+
+$("#add-connection-mapping").addEventListener("click", () => addMappingRow("connection").querySelector("input").focus());
+$("#add-reference-mapping").addEventListener("click", () => addMappingRow("reference").querySelector("input").focus());
+$("#recheck-mappings").addEventListener("click", () => {
+  loadConnectionOptions();
+  recheckMappings();
+});
+["#opt-data", "#opt-files", "#opt-write-freeze"].forEach((id) => {
+  $(id).addEventListener("change", () => setStartEnabled(!!state.preview && !state.preview.blockers.length));
+});
+
 function renderReviewPending() {
   const callout = $("#strategy-callout");
   callout.className = "callout";
   callout.innerHTML = '<strong><span class="spin">◜</span> Inspecting the workspace</strong><p></p>';
-  callout.querySelector("p").textContent =
-    "Reading the items in the source workspace to work out whether it can be reassigned or " +
-    "has to be rebuilt.";
+  callout.querySelector("p").textContent = state.forceRebuild
+    ? "Reading the source items to plan a fresh workspace. Full restart always rebuilds; the source will not be reassigned."
+    : "Reading the items in the source workspace to work out whether it can be reassigned or " +
+      "has to be rebuilt.";
   $("#review-summary").innerHTML = "";
   ["#blockers", "#unsupported", "#dependencies", "#review-warnings", "#connection-access"].forEach(
     (id) => {
@@ -415,6 +1003,8 @@ function renderReviewPending() {
   // The name and options depend on the strategy, so they stay hidden until it is known.
   $("#target-name-field").hidden = true;
   $("#rebuild-options").hidden = true;
+  $("#destination-mappings").hidden = true;
+  $("#write-freeze").hidden = true;
   $("#start-run").disabled = true;
 }
 
@@ -423,7 +1013,12 @@ function renderDependencies() {
   container.classList.remove("pending");
   container.querySelector("h3").textContent = "Needs attention";
   container.querySelector(".hint").hidden = false;
-  fillList(container, state.preview.dependencies || []);
+  container.querySelector(".hint").textContent = state.paired
+    ? "Resolve these destination prerequisites. Items with unresolved source references are skipped, " +
+      "not created pointing back at the source."
+    : "References the migration cannot follow, and connections you will have to grant access to. " +
+      "The new workspace will be created, but these need fixing before it works.";
+  fillList(container, [...(state.preview.dependencies || []), ...(state.preview.mappingBlockers || [])]);
 }
 
 function renderConnectionAccess() {
@@ -535,13 +1130,20 @@ function itemTotal(counts) {
 function renderReview() {
   const preview = state.preview;
   const reassign = preview.strategy === "reassign";
+  const resuming = !!state.resumeRunId;
+  $("#review-title").textContent = resuming ? "Review options and resume" : "Review the move";
+  $("#resume-artifacts").hidden = !resuming;
+  $("#resume-artifacts").open = resuming;
+  $("#review-back").hidden = resuming;
+  $("#resume-back").hidden = !resuming;
 
   const callout = $("#strategy-callout");
   callout.className = `callout ${reassign ? "good" : ""}`;
   callout.innerHTML = "<strong></strong><p></p>";
   callout.querySelector("strong").textContent = reassign
     ? "This workspace can just be reassigned"
-    : "This workspace has to be rebuilt";
+    : state.crossTenant ? "Rebuild in the destination tenant"
+    : state.paired ? "Rebuild with destination credentials" : "This workspace has to be rebuilt";
   callout.querySelector("p").textContent = reassign
     ? "It only holds Power BI content, so Fab Shuffle moves the existing workspace onto the " +
       "target capacity instead of recreating it. Nothing is copied and no new workspace is made." +
@@ -549,14 +1151,32 @@ function renderReview() {
         ? ` ${preview.largeSemanticModels.length} semantic model(s) use large storage format and will be ` +
           "converted to small for the move, then switched back afterwards."
         : "")
+    : state.paired ? "Fab Shuffle creates a new workspace with destination credentials. " +
+      "Source permissions are not copied. " +
+      "Items with unresolved source references are not created."
     : "It contains Fabric items, which cannot move across regions on a capacity reassignment. " +
       "Fab Shuffle creates a new workspace in the target region and copies everything it supports.";
+  if (resuming) {
+    callout.querySelector("strong").textContent = "Resume the same migration";
+    callout.querySelector("p").textContent =
+      "The recorded destination workspace, tenant/app pair, options and copy checkpoints are kept. " +
+      "Only connection and external item mappings can be changed here. Unresolved consumers are safely skipped.";
+  }
 
   const rows = [
     ["Source workspace", preview.sourceWorkspaceName],
     ["Target capacity", `${preview.capacityName} (${preview.capacityRegion || "unknown region"})`],
   ];
-  if (reassign) {
+  if (state.paired) {
+    rows.unshift(["Source tenant", preview.sourceTenantId], ["Source app", preview.sourceClientId]);
+    rows.push(["Source workspace ID", state.workspace.id],
+      ["Destination tenant", preview.targetTenantId], ["Destination app", preview.targetClientId],
+      ["Destination capacity ID", state.capacity.id]);
+  }
+  if (resuming) {
+    rows.push(["Destination workspace", preview.targetWorkspaceName],
+      ["Destination workspace ID", preview.targetWorkspaceId || "Not created yet"]);
+  } else if (reassign) {
     rows.push(["Large semantic models", String(preview.largeSemanticModels.length)]);
   } else {
     // Every type that will move, in the order the migration creates them.
@@ -572,7 +1192,7 @@ function renderReview() {
 
   fillList($("#blockers"), preview.blockers);
   fillList($("#unsupported"), preview.unsupportedSummary);
-  fillList($("#review-warnings"), preview.capacityWarning ? [preview.capacityWarning] : []);
+  fillList($("#review-warnings"), [preview.capacityWarning, preview.assessmentNotice].filter(Boolean));
 
   if (preview.dependencies) {
     renderDependencies();
@@ -588,11 +1208,18 @@ function renderReview() {
   $("#target-name-field").hidden = reassign;
   $("#rebuild-options").hidden = reassign;
   $("#target-name").value = preview.targetWorkspaceName;
+  $("#target-name").disabled = resuming;
+  ["#opt-data", "#opt-files", "#opt-cleanup"].forEach((id) => { $(id).disabled = resuming; });
+  $("#destination-mappings").hidden = !state.paired || reassign;
+  $("#write-freeze").hidden = !state.paired;
+  $("#opt-permissions").disabled = state.paired || resuming;
+  if (state.paired) $("#opt-permissions").checked = false;
+  $("#opt-permissions").title = state.paired ? "Grant access to the destination workspace separately." : "";
 
   // The button stays disabled until the dependency and connection assessment has finished,
   // because until then it is not known whether anything blocks the run.
   setStartEnabled(reassign && preview.blockers.length === 0);
-  $("#start-run").textContent = reassign ? "Reassign workspace" : "Start migration";
+  $("#start-run").textContent = resuming ? "Resume migration" : reassign ? "Reassign workspace" : "Start migration";
 }
 
 function fillList(container, entries) {
@@ -609,30 +1236,38 @@ function fillList(container, entries) {
 
 $("#start-run").addEventListener("click", async () => {
   const button = $("#start-run");
+  if (button.disabled) return;
+  if (state.resumeRunId) {
+    try { await resumeRun(state.resumeRunId, button, resumeOptions()); }
+    catch (error) { showError(error.message); }
+    return;
+  }
+  const sessionId = state.sessionId;
   const reassign = state.preview.strategy === "reassign";
   busy(button, true, reassign ? "Reassigning…" : "Starting…");
   try {
     const result = await api("/api/runs", {
       method: "POST",
-      body: {
-        capacity_id: state.capacity.id,
-        source_workspace_id: state.workspace.id,
-        strategy: state.preview.strategy,
-        target_workspace_name: reassign ? null : $("#target-name").value.trim() || null,
-        include_data: $("#opt-data").checked,
-        include_files: $("#opt-files").checked,
-        copy_permissions: $("#opt-permissions").checked,
-        cleanup_when_done: $("#opt-cleanup").checked,
-      },
+      body: migrationBody(),
     });
+    if (sessionId !== state.sessionId) return;
+
     state.runId = result.runId;
     goTo("progress");
     watchRun(result.runId);
   } catch (error) {
-    showError(error.message);
+    if (sessionId === state.sessionId) showError(error.message);
   } finally {
     busy(button, false);
+    if (sessionId === state.sessionId && state.preview) setStartEnabled(!state.preview.blockers.length);
   }
+});
+
+$("#resume-back").addEventListener("click", () => {
+  state.resumeRunId = null;
+  state.assessmentVersion++;
+  stopAssessmentTimer();
+  goTo(state.resumeReturnStage);
 });
 
 // ------------------------------------------------------------------ progress
@@ -679,10 +1314,10 @@ function renderRun(run) {
   observeReadiness(run);
   const banner = $("#run-banner");
   banner.className = `run-banner ${run.status}`;
-  const spinner = run.status === "running" ? '<span class="spin">◐</span> ' : "";
-  banner.innerHTML = `${spinner}<strong></strong><span></span>`;
+  const spinner = run.status === "running" ? '<span class="spin" aria-hidden="true">◐</span> ' : "";
+  banner.innerHTML = `${spinner}<strong></strong><span class="run-target"></span>`;
   banner.querySelector("strong").textContent = RUN_MESSAGES[run.status] || run.status;
-  banner.querySelector("span").textContent = run.targetWorkspace
+  banner.querySelector(".run-target").textContent = run.targetWorkspace
     ? ` — target workspace: ${run.targetWorkspace.displayName}`
     : "";
 
@@ -728,6 +1363,7 @@ function renderRun(run) {
   // something behind. A clean run has nothing to retry.
   const leftSomething = (run.summary?.warnings || []).length > 0;
   $("#retry-run").hidden = !finished || !run.targetWorkspace || !leftSomething;
+  $("#retry-run").textContent = state.paired ? "Update mappings and retry" : "Retry what did not migrate";
 }
 
 // ---------------------------------------------------------- cutover readiness
@@ -740,18 +1376,25 @@ function readinessState(value) {
   return Object.hasOwn(READINESS_LABELS, value) ? value : "unknown";
 }
 
+function readinessAvailable(status) {
+  return ["succeeded", "failed", "cancelled", "interrupted"].includes(status);
+}
+
 function resetReadiness(runId = null) {
   const previous = state.readiness;
   if (previous) {
     clearTimeout(previous.timer);
     previous.controller?.abort();
     previous.downloadController?.abort();
+    previous.scriptController?.abort();
+    if (previous.scriptUrl) URL.revokeObjectURL(previous.scriptUrl);
   }
   state.readiness = runId ? {
     runId, report: null, revision: undefined, runStatus: null, version: 0,
     pending: false, urgent: false, timer: null, controller: null,
     lastFetch: Date.now(), error: "", downloadError: "", downloadController: null,
     page: 1, filter: "all", search: "",
+    scriptController: null, scriptError: "", scriptUrl: null,
   } : null;
   $("#readiness-filter").value = "all";
   $("#readiness-search").value = "";
@@ -761,18 +1404,28 @@ function resetReadiness(runId = null) {
   $("#readiness-pagination").hidden = true;
   $("#readiness-results").textContent = "";
   $("#readiness-empty").hidden = true;
+  resetConnectionLookupScript();
   renderReadinessStatus();
-  if (state.readiness) scheduleReadiness();
 }
 
 function observeReadiness(run) {
   const current = state.readiness;
   if (!current || current.runId !== state.runId) return;
-  const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
+  const terminal = readinessAvailable(run.status);
   const finishedNow = terminal && current.runStatus !== run.status;
   const changed = current.runStatus === null || current.revision !== run.readinessRevision;
   current.runStatus = run.status;
   current.revision = run.readinessRevision;
+  if (!terminal) {
+    if (current.report || current.controller || current.downloadController || current.pending ||
+        current.timer !== null || current.error || current.downloadError) {
+      resetReadiness(current.runId);
+      state.readiness.runStatus = run.status;
+      state.readiness.revision = run.readinessRevision;
+    }
+    renderReadinessStatus();
+    return;
+  }
   if (changed || finishedNow) {
     current.version += 1;
     scheduleReadiness(finishedNow);
@@ -781,7 +1434,7 @@ function observeReadiness(run) {
 
 function scheduleReadiness(immediate = false) {
   const current = state.readiness;
-  if (!current) return;
+  if (!current || !readinessAvailable(current.runStatus)) return;
   current.pending = true;
   current.urgent ||= immediate;
   if (immediate) {
@@ -798,7 +1451,8 @@ function scheduleReadiness(immediate = false) {
 }
 
 async function fetchReadiness(current) {
-  if (state.readiness !== current || state.runId !== current.runId) return;
+  if (state.readiness !== current || state.runId !== current.runId ||
+      !readinessAvailable(current.runStatus)) return;
   current.timer = null;
   current.pending = false;
   current.urgent = false;
@@ -821,6 +1475,7 @@ async function fetchReadiness(current) {
     (report.limits || []).forEach((limit) => {
       $("#readiness-limits").appendChild(readinessElement("li", limit));
     });
+    renderConnectionAdvisories();
   } catch (error) {
     if (state.readiness === current && version === current.version && error.name !== "AbortError") {
       current.error = error.message;
@@ -836,9 +1491,14 @@ async function fetchReadiness(current) {
 
 function renderReadinessStatus() {
   const current = state.readiness;
-  $("#cutover-readiness").hidden = !current;
-  $(".readiness-jump").hidden = !current;
-  if (!current) return;
+  const visible = current && readinessAvailable(current.runStatus);
+  $("#cutover-readiness").hidden = !visible;
+  $(".readiness-jump").hidden = !visible;
+  if (!visible) {
+    $("#readiness-export").disabled = true;
+    $("#connection-advisories").hidden = true;
+    return;
+  }
   const report = current.report;
   const loading = Boolean(current.controller || current.pending);
   const reportedState = current.error ? "unknown" : readinessState(report?.state);
@@ -856,9 +1516,7 @@ function renderReadinessStatus() {
       : "Readiness could not be established. Retry loading the report.")
     : loading
       ? (report ? "Updating readiness… Showing the last loaded snapshot." : "Loading readiness report…")
-      : ["pending", "running"].includes(current.runStatus)
-        ? "The migration is still running. Readiness will update as evidence is recorded."
-        : "Readiness report loaded.";
+      : "Readiness report loaded.";
   $("#readiness-error").textContent = current.error;
   $("#readiness-error").hidden = !current.error;
   $("#readiness-retry").hidden = !current.error;
@@ -945,6 +1603,169 @@ function readinessItem(item, key, open) {
   return row;
 }
 
+const CONNECTION_ADVISORY_LABELS = {
+  complete: "Reviewed", incomplete: "Incomplete", not_applicable: "Not applicable",
+  unknown: "Unknown", stale: "Stale",
+};
+
+function connectionAdvisoryTone(scanState, count) {
+  if (scanState === "complete") return count ? "needs_attention" : "ready";
+  if (scanState === "not_applicable") return "ready";
+  return "unknown";
+}
+
+function connectionAdvisoryItem(entry) {
+  const row = readinessElement("li", null, "connection-advisory-item");
+  row.appendChild(readinessElement("h5", entry.connectionName || entry.connectionId));
+  row.appendChild(readinessElement("p", `ID: ${entry.connectionId}`, "hint"));
+  row.appendChild(readinessElement(
+    "p", `${entry.connectivityType || "Unknown connectivity"} · ${entry.type || "Unknown type"}`, "hint",
+  ));
+  if (entry.path) row.appendChild(readinessElement("p", `Path: ${entry.path}`, "hint"));
+  if (entry.matchBasis === "sql_server_database") {
+    row.appendChild(readinessElement(
+      "p", "Matched SQL server and database together. Current consumers have not been checked.", "hint",
+    ));
+  }
+  if ((entry.matchedSourceItems || []).length) {
+    readinessTextList(row, "Matches source item(s)", entry.matchedSourceItems);
+  }
+  if (entry.expectedNewPath) {
+    row.appendChild(readinessElement("p", `If repointed: ${entry.expectedNewPath}`, "hint"));
+  }
+  row.appendChild(readinessElement(
+    "p",
+    entry.action || "Review current consumers and destination bindings before cutover. "
+      + "A listed connection is not proof that manual recreation is needed.",
+    "hint",
+  ));
+  return row;
+}
+
+function renderConnectionAdvisories() {
+  const current = state.readiness;
+  const section = $("#connection-advisories");
+  if (!current || !readinessAvailable(current.runStatus)) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const advisories = current.report?.connectionAdvisories;
+  const scanState = advisories?.scanState || "unknown";
+  const connections = advisories?.connections || [];
+  const notApplicable = scanState === "not_applicable";
+  const status = $("#connection-advisories-status");
+  status.replaceChildren(
+    readinessElement("span", CONNECTION_ADVISORY_LABELS[scanState] || "Unknown",
+      `readiness-state ${connectionAdvisoryTone(scanState, connections.length)}`),
+    readinessElement("span", advisories?.message ? ` ${advisories.message}` : ""),
+  );
+  $("#connection-advisories-action").textContent = advisories?.action || "";
+  $("#connection-advisories-action").hidden = !advisories?.action;
+  const context = [];
+  if (advisories?.generatedAt) context.push(`Snapshot: ${advisories.generatedAt}`);
+  if (advisories?.targetWorkspaceId) context.push(`Destination workspace: ${advisories.targetWorkspaceId}`);
+  $("#connection-advisories-context").textContent = context.join(" · ");
+  const limits = $("#connection-advisories-limits");
+  limits.replaceChildren();
+  (advisories?.limits || []).forEach((limit) => limits.appendChild(readinessElement("li", limit)));
+  $("#connection-advisories-scope").hidden = !(advisories?.limits || []).length;
+  $("#connection-advisories-items").replaceChildren(...connections.map(connectionAdvisoryItem));
+  $("#connection-advisories-empty").hidden = Boolean(connections.length) || notApplicable;
+  $("#connection-advisories-empty").textContent = connections.length ? "" : notApplicable ? "" : (
+    scanState === "complete"
+      ? "No tenant-visible connection's path was found to reference the source workspace. "
+        + "You can still download a lookup script below to list every connection you can see."
+      : "No verified connection matches are available in this snapshot. The lookup script below still works "
+        + "on its own - it lists every connection you can see."
+  );
+  // Only a reassign - which never scans, because nothing about a connection's path changes -
+  // has genuinely nothing to look up. Everything else still gets a usable script, even with
+  // zero recorded ids: it falls back to listing every connection the operator can see.
+  $("#connection-lookup-script").hidden = notApplicable;
+  if (notApplicable) resetConnectionLookupScript();
+}
+
+function resetConnectionLookupScript() {
+  const current = state.readiness;
+  current?.scriptController?.abort();
+  if (current?.scriptUrl) URL.revokeObjectURL(current.scriptUrl);
+  if (current) {
+    current.scriptUrl = null;
+    current.scriptController = null;
+    current.scriptError = "";
+  }
+  $("#connection-lookup-script").open = false;
+  $("#connection-lookup-pre").hidden = true;
+  $("#connection-lookup-pre").querySelector("code").textContent = "";
+  $("#connection-lookup-download").href = "";
+  $("#connection-lookup-error").hidden = true;
+  $("#connection-lookup-error").textContent = "";
+  $("#connection-lookup-fetch").disabled = false;
+  $("#connection-lookup-fetch").textContent = "View script";
+}
+
+$("#connection-lookup-fetch").addEventListener("click", async () => {
+  const current = state.readiness;
+  if (!current || !readinessAvailable(current.runStatus) || current.scriptController) return;
+  const version = current.version;
+  const button = $("#connection-lookup-fetch");
+  current.scriptController = new AbortController();
+  current.scriptError = "";
+  button.disabled = true;
+  button.textContent = "Loading…";
+  $("#connection-lookup-error").hidden = true;
+  try {
+    const blob = await api(`/api/runs/${encodeURIComponent(current.runId)}/connections/script`, {
+      download: true, signal: current.scriptController.signal,
+    });
+    if (state.readiness !== current || version !== current.version) return;
+    const text = await blob.text();
+    if (state.readiness !== current || version !== current.version ||
+        !readinessAvailable(current.runStatus)) return;
+    $("#connection-lookup-pre").querySelector("code").textContent = text;
+    $("#connection-lookup-pre").hidden = false;
+    if (current.scriptUrl) URL.revokeObjectURL(current.scriptUrl);
+    current.scriptUrl = URL.createObjectURL(blob);
+    const link = $("#connection-lookup-download");
+    link.href = current.scriptUrl;
+    link.download = `connection-lookup-${current.runId.replace(/[^a-zA-Z0-9_-]/g, "_")}.ps1`;
+  } catch (error) {
+    if (state.readiness === current && error.name !== "AbortError") {
+      current.scriptError = error.message;
+      $("#connection-lookup-error").textContent = error.message;
+      $("#connection-lookup-error").hidden = false;
+    }
+  } finally {
+    if (state.readiness === current) {
+      current.scriptController = null;
+      button.disabled = false;
+      button.textContent = "View script";
+    }
+  }
+});
+
+$("#connection-lookup-copy").addEventListener("click", async () => {
+  const button = $("#connection-lookup-copy");
+  const code = $("#connection-lookup-pre").querySelector("code");
+  if (!code.textContent) return;
+  try {
+    await navigator.clipboard.writeText(code.textContent);
+    button.textContent = "Copied";
+  } catch {
+    // Clipboard access needs a secure context, which a plain http:// host is not.
+    button.textContent = "Press Ctrl+C";
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  setTimeout(() => {
+    button.textContent = "Copy";
+  }, 2000);
+});
+
 function renderReadinessItems() {
   const current = state.readiness;
   if (!current?.report) return;
@@ -1015,7 +1836,7 @@ $("#readiness-retry").addEventListener("click", () => scheduleReadiness(true));
 
 $("#readiness-export").addEventListener("click", async () => {
   const current = state.readiness;
-  if (!current?.report || current.downloadController) return;
+  if (!current?.report || !readinessAvailable(current.runStatus) || current.downloadController) return;
   current.downloadController = new AbortController();
   current.downloadError = "";
   renderReadinessStatus();
@@ -1047,18 +1868,7 @@ $("#readiness-export").addEventListener("click", async () => {
 
 $("#retry-run").addEventListener("click", async () => {
   const button = $("#retry-run");
-  busy(button, true, "Starting…");
-  try {
-    // The same path as picking up an interrupted run: everything already in the new
-    // workspace is adopted, so only what did not make it is attempted again.
-    const result = await api(`/api/runs/${state.runId}/resume`, { method: "POST" });
-    state.runId = result.runId;
-    watchRun(result.runId);
-  } catch (error) {
-    showError(error.message);
-  } finally {
-    busy(button, false);
-  }
+  await prepareResume(state.runId, button);
 });
 
 $("#cancel-run").addEventListener("click", async () => {
@@ -1093,7 +1903,9 @@ $("#start-over").addEventListener("click", () => {
   state.runId = null;
   state.events = null;
   state.workspace = null;
+  state.forceRebuild = false;
   $("#workspace-next").disabled = true;
+  $("#opt-start-mirrors").checked = false;
   goTo("capacity");
 });
 

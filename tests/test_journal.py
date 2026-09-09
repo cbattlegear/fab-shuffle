@@ -165,6 +165,74 @@ def test_critical_resource_checkpoints_propagate_persistence_failure(tmp_path):
             write()
 
 
+# ------------------------------------------------------- connection advisory
+
+
+def test_a_connection_advisory_snapshot_survives_a_round_trip(tmp_path):
+    book = journal.Journal(tmp_path / "run.jsonl")
+    payload = {
+        "scanState": "complete", "sourceWorkspaceId": "src", "targetWorkspaceId": "tgt",
+        "attemptId": "run", "connections": [{"connectionId": "conn-1"}], "message": "1 found",
+    }
+    book.connection_advisory(payload)
+
+    assert journal.read(book.path).connection_advisory == payload
+
+
+def test_a_later_scan_replaces_the_earlier_one(tmp_path):
+    book = journal.Journal(tmp_path / "run.jsonl")
+    book.connection_advisory({"scanState": "incomplete", "connections": [], "attemptId": "run"})
+    book.connection_advisory({
+        "scanState": "complete", "connections": [{"connectionId": "c"}], "attemptId": "run",
+    })
+
+    assert journal.read(book.path).connection_advisory["scanState"] == "complete"
+
+
+def test_an_unwritable_connection_advisory_does_not_stop_the_migration(tmp_path):
+    """Advisory only, like ``warning``: a write failure here must not take the run down."""
+    unwritable = tmp_path / "sub" / "run.jsonl"
+    j = journal.Journal(unwritable)
+    unwritable.parent.rmdir()
+
+    j.connection_advisory({"scanState": "complete", "connections": []})
+
+
+def test_a_resumed_attempt_inherits_the_connection_advisory_from_its_prior(tmp_path):
+    """So a resume that fails again before the scan reruns still shows the previous one."""
+    first = journal.Journal(tmp_path / "first.jsonl")
+    payload = {"scanState": "complete", "connections": [{"connectionId": "c"}], "attemptId": "first"}
+    first.connection_advisory(payload)
+    first.finished("failed", "boom")
+    prior = journal.read(first.path)
+
+    second = journal.Journal(tmp_path / "second.jsonl")
+    second.run_created(prior.plan, cleanup=prior.cleanup, prior=prior)
+
+    assert journal.read(second.path).connection_advisory == payload
+
+
+def test_a_full_restart_clears_the_inherited_connection_advisory():
+    """The destination this scan was taken against is being torn down; an old snapshot would
+    describe a workspace that no longer exists rather than the one about to be rebuilt."""
+    replay = journal.Replay(connection_advisory={"scanState": "complete", "connections": []})
+
+    journal._apply(replay, {"t": journal.RECOVERY_ACTION, "action": "restart_started"})
+
+    assert replay.connection_advisory is None
+
+
+def test_an_unrecognised_connection_advisory_payload_is_ignored_not_fatal(tmp_path):
+    path = tmp_path / "run.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"t": "connection_advisory", "payload": "not-an-object"}) + "\n")
+
+    replay = journal.read(path)
+
+    assert replay.connection_advisory is None
+    assert replay.damaged_lines == 0
+
+
 # -------------------------------------------------------------- compatibility
 
 

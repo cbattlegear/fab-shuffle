@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 FABRIC_API_BASE = "https://api.fabric.microsoft.com/v1"
 POWERBI_API_BASE = "https://api.powerbi.com/v1.0/myorg"
@@ -59,6 +62,9 @@ class Settings:
     # disk. Several at once compete for the same memory and disk rather than going faster.
     schema_transfer_concurrency: int = _env_int("FAB_SHUFFLE_SCHEMA_CONCURRENCY", 2)
     file_transfer_concurrency: int = _env_int("FAB_SHUFFLE_FILE_CONCURRENCY", 2)
+    max_staging_bytes: int = field(
+        default_factory=lambda: _env_int("FAB_SHUFFLE_MAX_STAGING_BYTES", 1024 ** 3)
+    )
     sqlpackage_path: str = os.environ.get("FAB_SHUFFLE_SQLPACKAGE", "sqlpackage")
     unpackdacpac_path: str = os.environ.get("FAB_SHUFFLE_UNPACKDACPAC", "unpackdacpac")
     azcopy_path: str = os.environ.get("FAB_SHUFFLE_AZCOPY", "azcopy")
@@ -79,8 +85,35 @@ class Settings:
         """
         return self.scratch_root / "journal"
 
-    def journal_for(self, run_id: str) -> Path:
-        return self.journal_dir / f"{run_id}.jsonl"
+    def journal_dir_for(
+        self, *, source_tenant_id: str = "", target_tenant_id: str = "",
+    ) -> Path:
+        """Keep paired runs outside the directory consumed by legacy single-client builds."""
+        source = source_tenant_id.strip().casefold()
+        target = target_tenant_id.strip().casefold()
+        if bool(source) != bool(target):
+            raise ValueError("Journal access requires both source and target tenant IDs.")
+        if not source:
+            return self.journal_dir
+        pair = sha256(f"{source}\0{target}".encode()).hexdigest()
+        return self.scratch_root / "journal-paired-v1" / pair
+
+    def journal_for(
+        self, run_id: str, *, source_tenant_id: str = "", target_tenant_id: str = "",
+    ) -> Path:
+        return self.journal_dir_for(
+            source_tenant_id=source_tenant_id, target_tenant_id=target_tenant_id,
+        ) / f"{run_id}.jsonl"
+
+    def journal_dir_for_plan(self, plan: Mapping[str, Any]) -> Path:
+        """Select recovery storage from the same serialized plan used for admission."""
+        return self.journal_dir_for(
+            source_tenant_id=plan.get("source_tenant_id", ""),
+            target_tenant_id=plan.get("target_tenant_id", ""),
+        )
+
+    def journal_for_plan(self, run_id: str, plan: Mapping[str, Any]) -> Path:
+        return self.journal_dir_for_plan(plan) / f"{run_id}.jsonl"
 
 
 SETTINGS = Settings()

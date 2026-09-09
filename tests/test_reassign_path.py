@@ -154,3 +154,72 @@ def test_failed_assignment_restores_large_storage(monkeypatch):
 
     assert run.status == RunStatus.FAILED
     assert fake.conversions == [("Big", powerbi.SMALL), ("Big", powerbi.LARGE)]
+
+
+def test_a_workspace_with_a_missing_capacity_explains_a_matching_assignment_failure(monkeypatch):
+    """Fabric's error names the target capacity, which sends the operator to the wrong end;
+    the source's missing capacity id is offered as a possibility, not asserted as the cause."""
+    fake = FakePowerBi([small("A")])
+    service_error = orchestrator.FabricApiError(
+        "POST", "workspaces/ws-1/assignToCapacity", 400,
+        '{"errorCode":"AssignWorkspaceToCapacityFailed",'
+        '"message":"Workspace capacity assignment was failed"}',
+    )
+
+    def explode(client, workspace_id, capacity_id):
+        raise service_error
+
+    monkeypatch.setattr(orchestrator.workspaces, "assign_to_capacity", explode)
+    plan = make_plan()
+    plan.source_capacity_id_missing = True
+    run = run_reassign(monkeypatch, fake, plan=plan)
+
+    assert run.status == RunStatus.FAILED
+    # What the service said is kept first, unchanged, and the interpretation is added
+    # alongside it - phrased as a possibility, with no promise that restoring a capacity
+    # will actually resolve it.
+    assert "AssignWorkspaceToCapacityFailed" in run.error
+    assert run.error.index("AssignWorkspaceToCapacityFailed") < run.error.index("names no capacity")
+    assert "names no capacity" in run.error
+    assert "has not been confirmed" in run.error
+    assert "deleted" not in run.error.split("names no capacity")[0]
+
+
+def test_an_ordinary_assignment_failure_is_not_blamed_on_a_missing_capacity(monkeypatch):
+    fake = FakePowerBi([small("A")])
+
+    def explode(client, workspace_id, capacity_id):
+        raise RuntimeError("capacity is full")
+
+    monkeypatch.setattr(orchestrator.workspaces, "assign_to_capacity", explode)
+    plan = make_plan()
+    plan.source_capacity_id_missing = True  # even with the hint set...
+    run = run_reassign(monkeypatch, fake, plan=plan)
+
+    assert run.status == RunStatus.FAILED
+    assert "capacity is full" in run.error
+    # ...a plain exception that is not the service's own AssignWorkspaceToCapacityFailed is
+    # never reinterpreted as a missing-capacity condition.
+    assert "names no capacity" not in run.error
+
+
+def test_a_matching_error_code_is_not_misdiagnosed_without_the_missing_capacity_hint(monkeypatch):
+    """The hint only ever adds context to a failure that already carries the exact service
+    error; it is never volunteered when the source's own capacity was never missing."""
+    fake = FakePowerBi([small("A")])
+    service_error = orchestrator.FabricApiError(
+        "POST", "workspaces/ws-1/assignToCapacity", 400,
+        '{"errorCode":"AssignWorkspaceToCapacityFailed","message":"Workspace capacity '
+        'assignment was failed"}',
+    )
+
+    def explode(client, workspace_id, capacity_id):
+        raise service_error
+
+    monkeypatch.setattr(orchestrator.workspaces, "assign_to_capacity", explode)
+    run = run_reassign(monkeypatch, fake, plan=make_plan())
+
+    assert run.status == RunStatus.FAILED
+    assert "AssignWorkspaceToCapacityFailed" in run.error
+    assert "names no capacity" not in run.error
+

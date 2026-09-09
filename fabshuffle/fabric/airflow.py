@@ -80,8 +80,13 @@ def preflight_references(
     job_name: str,
     id_map: Mapping[str, str],
     source_items: Mapping[str, Mapping[str, Any]],
+    cross_tenant: bool = False,
+    strict_references: bool | None = None,
 ) -> None:
     """Refuse operational self references unless an existing target ID can replace them."""
+    strict = cross_tenant or bool(strict_references)
+    if strict:
+        analytics.validate_cross_tenant_identities(parts, item_type=APACHE_AIRFLOW_JOB)
     own_item = {
         source_job_id: {"id": source_job_id, "type": APACHE_AIRFLOW_JOB, "displayName": job_name},
     }
@@ -93,7 +98,10 @@ def preflight_references(
             "from the source configuration or DAG, retry, then configure the destination job ID "
             "before running it"
         )
-    needed = analytics.dangling_references(parts, id_map, source_items)
+    references = (
+        analytics.with_connection_references(parts, source_items) if strict else source_items
+    )
+    needed = analytics.dangling_references(parts, id_map, references)
     if needed:
         raise analytics.StrandedReference(needed)
 
@@ -107,12 +115,19 @@ def preflight_files(
     id_map: Mapping[str, str],
     source_items: Mapping[str, Mapping[str, Any]],
     on_progress: Callable[[str], None] | None = None,
+    target_client: FabricClient | None = None,
+    cross_tenant: bool = False,
+    strict_references: bool | None = None,
 ) -> list[tuple[str, bytes]]:
     """Read and rebind supported UTF-8 files before creating a job.
 
     Literal known IDs and endpoint/path strings only: this does not evaluate Python,
     environment lookups, imported packages, or dynamically assembled references.
+    Cross-tenant calls also check literal exported connection mappings and read
+    rewritten workspace references as the destination before a caller creates the job.
     """
+    destination = client if target_client is None else target_client
+    strict = cross_tenant or bool(strict_references)
     prepared: list[tuple[str, bytes]] = []
     rewrite = build_rewriter(id_map)
     for entry in list_files(client, source_workspace_id, source_job_id):
@@ -146,8 +161,13 @@ def preflight_files(
                 job_name=job_name,
                 id_map=id_map,
                 source_items=source_items,
+                strict_references=strict,
             )
             content = (rewrite(text) if rewrite else text).encode("utf-8")
+            if strict:
+                analytics.validate_target_workspaces(
+                    destination, [part(file_path, content)], source_workspace_id=source_workspace_id,
+                )
         prepared.append((file_path, content))
     return prepared
 
@@ -164,8 +184,13 @@ def copy_files(
     prepared_files: list[tuple[str, bytes]] | None = None,
     id_map: Mapping[str, str] | None = None,
     source_items: Mapping[str, Mapping[str, Any]] | None = None,
+    target_client: FabricClient | None = None,
+    cross_tenant: bool = False,
+    strict_references: bool | None = None,
 ) -> tuple[int, list[str]]:
-    """Upload preflighted files, or preflight with explicit reference context first."""
+    """Read/preflight with ``client`` and upload with ``target_client`` when supplied."""
+    destination = client if target_client is None else target_client
+    strict = cross_tenant or bool(strict_references)
     try:
         if prepared_files is None and (id_map is None or source_items is None):
             raise FabricError("file copying requires preflighted files or a migration reference map")
@@ -177,7 +202,27 @@ def copy_files(
             id_map=id_map or {},
             source_items=source_items or {},
             on_progress=on_progress,
+            **({"target_client": target_client} if target_client is not None else {}),
+            **({"cross_tenant": True} if cross_tenant else {}),
+            **({"strict_references": strict_references} if strict_references is not None else {}),
         )
+        if strict and prepared_files is not None:
+            parts = [part(path, content) for path, content in files if is_text_part(path)]
+            analytics.validate_cross_tenant_identities(parts, item_type=APACHE_AIRFLOW_JOB)
+            target_connections = {
+                value.casefold() for key, value in (id_map or {}).items()
+                if value and key.casefold() != value.casefold()
+            }
+            unverified = [
+                f"connection '{connection_id}' without a verified destination mapping"
+                for connection_id in analytics.with_connection_references(parts)
+                if connection_id.casefold() not in target_connections
+            ]
+            if unverified:
+                raise analytics.StrandedReference(unverified)
+            analytics.validate_target_workspaces(
+                destination, parts, source_workspace_id=source_workspace_id,
+            )
     except FabricError as error:
         return 0, [
             f"Apache Airflow job '{job_name}': files could not be prepared: {error}. "
@@ -190,7 +235,7 @@ def copy_files(
         if on_progress:
             on_progress(f"Copying '{file_path}' for Apache Airflow job '{job_name}'")
         try:
-            write_file(client, target_workspace_id, target_job_id, file_path, content)
+            write_file(destination, target_workspace_id, target_job_id, file_path, content)
             copied += 1
         except FabricApiError as error:
             warnings.append(

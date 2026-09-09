@@ -20,9 +20,18 @@ NODE = shutil.which("node")
         "run_races",
         "filters",
         "safe_text_and_focus",
+        "connection_advisories_render",
+        "connection_advisories_states",
+        "connection_advisories_personal_and_retired",
+        "connection_advisories_safe_text",
+        "connection_lookup_script_flow",
+        "connection_lookup_races",
         "errors_and_empty",
         "export",
         "sign_out",
+        "hidden_until_halted",
+        "active_again",
+        "target_is_not_spinner",
     ],
 )
 def test_readiness_ui(scenario: str) -> None:

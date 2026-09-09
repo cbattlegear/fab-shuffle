@@ -71,6 +71,13 @@ replicating or firing rules the moment it exists is doing the original's job twi
   A phase may only reference items created by an earlier one. `tests/test_rebuild_ordering.py`
   pins it.
 - Every change needs tests, and a failure worth fixing is worth a test that reproduces it.
-- Run `python -m pytest -q` and `python -m ruff check .` before rebuilding the container.
+- Run tests, lint and application execution only inside the Linux Docker runtime, never
+  a host Python/Windows preview. Build the validation image with
+  `docker build --platform linux/amd64 --target test -t fab-shuffle:test .`, then run
+  `docker run --rm --platform linux/amd64 --network none fab-shuffle:test`.
+  Its entrypoint checks tools, locks, runtime smoke, Ruff and pytest before a production
+  build/publish. Rebuild the test target after source edits; append related pytest paths
+  to the run command for targeted validation. Never mount live recovery volumes or
+  a Docker daemon socket into tests, and never supply Fabric credentials.
 - Commit messages explain *why*, in prose, including what was rejected and what is still
   unverified.

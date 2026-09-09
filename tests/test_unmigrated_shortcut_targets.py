@@ -40,16 +40,31 @@ def onelake(workspace_id, item_id, path="Tables/dbo/movies"):
 
 
 class FakeClient:
-    def __init__(self, shortcuts_) -> None:
+    def __init__(self, shortcuts_, target=()) -> None:
         self.shortcuts = shortcuts_
+        self.target = list(target)
         self.created: list[dict] = []
 
     def list_all(self, path, params=None, value_key="value"):
-        return self.shortcuts
+        workspace = path.split("/", 2)[1] if path.startswith("workspaces/") else ""
+        if identity(workspace) in {identity(SOURCE_WS), identity(GUID_WS)}:
+            return list(self.shortcuts)
+        return list(self.target)
 
     def post(self, path, json=None, params=None, wait=True):
         self.created.append(json or {})
+        self.target.append(dict(json or {}))
         return {}
+
+    def get(self, path):
+        for shortcut in self.target:
+            if path.endswith(f"{shortcut.get('path', '')}/{shortcut.get('name')}"):
+                return shortcut
+        raise FabricApiError("GET", path, 404, "not found")
+
+
+def identity(value: str) -> str:
+    return value.lower() if "-" in value else value
 
 
 def copy(shortcuts_):

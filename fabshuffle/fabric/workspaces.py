@@ -122,6 +122,30 @@ def workspace_capacity_sku(client: FabricClient, workspace: Mapping[str, Any]) -
         return ""
 
 
+def unresolved_capacity_assignment(workspace: Mapping[str, Any]) -> bool:
+    """Whether a workspace reports a finished capacity assignment without naming a capacity.
+
+    ``GET /workspaces/{id}`` documents ``capacityId`` as part of ``WorkspaceInfo`` and
+    ``capacityAssignmentProgress: "Completed"`` as "last capacity assignment operation was
+    completed successfully" (Microsoft Learn's Get Workspace reference), but does not say
+    ``capacityId`` is guaranteed present, and does not document what a missing one means.
+    This combination - assignment reported complete, no capacity named - was observed live
+    against a tenant whose trial capacity had expired: three workspaces showed exactly this
+    shape, and ``assignToCapacity`` on each answered
+    ``400 AssignWorkspaceToCapacityFailed``. That is one plausible explanation (the capacity
+    behind the assignment was deleted or an expired trial expired), not a confirmed one; the
+    API gives no way to distinguish "deleted" from an otherwise-incomplete read here, and
+    other causes are not ruled out. Treat this as a hint worth mentioning alongside a real
+    assignment failure, not as proof.
+
+    A workspace that has never been assigned reports ``capacityAssignmentProgress`` of
+    ``"NotStarted"`` or nothing at all, so it is not caught here.
+    """
+    if workspace.get("capacityId"):
+        return False
+    return str(workspace.get("capacityAssignmentProgress") or "") == "Completed"
+
+
 # ------------------------------------------------------------------- workspaces
 
 
@@ -308,6 +332,8 @@ def clone_folder_tree(
     client: FabricClient,
     source_workspace_id: str,
     target_workspace_id: str,
+    *,
+    target_client: FabricClient | None = None,
 ) -> dict[str, str]:
     """Recreate the source workspace folder hierarchy, returning old id -> new id.
 
@@ -315,14 +341,17 @@ def clone_folder_tree(
     second time, so a resumed run reuses the tree the earlier attempt built instead of failing
     on the name. Folders are matched on name within a parent, which is what Fabric enforces
     uniqueness on.
+
+    ``client`` reads the source; ``target_client`` reads and writes the destination.
     """
+    destination = client if target_client is None else target_client
     source_folders = list_folders(client, source_workspace_id)
     if not source_folders:
         return {}
 
     existing = {
         (folder.get("parentFolderId") or "", folder.get("displayName") or ""): folder["id"]
-        for folder in list_folders(client, target_workspace_id)
+        for folder in list_folders(destination, target_workspace_id)
     }
 
     by_parent: dict[str | None, list[dict[str, Any]]] = {}
@@ -339,7 +368,7 @@ def clone_folder_tree(
                 mapping[folder["id"]] = found
             else:
                 created = create_folder(
-                    client, target_workspace_id, folder["displayName"], new_parent
+                    destination, target_workspace_id, folder["displayName"], new_parent
                 )
                 mapping[folder["id"]] = created["id"]
             create_level(folder["id"])
@@ -369,5 +398,6 @@ __all__ = [
     "list_scratch_workspaces",
     "list_workspaces",
     "scratch_workspace_name",
+    "unresolved_capacity_assignment",
     "workspace_capacity_sku",
 ]

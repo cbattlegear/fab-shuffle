@@ -21,12 +21,19 @@ rather than failing on the first document that already arrived.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 from fabshuffle.auth import TokenProvider
 from fabshuffle.lifecycle import CopyOutcome
+from fabshuffle.transfer.common import (
+    DEFAULT_MAX_STAGING_BYTES,
+    StagingBudgetError,
+    check_budget,
+    check_cancelled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +105,7 @@ def container_names(endpoint: str, database: str, tokens: TokenProvider) -> list
 
 def _read_all(container: Any) -> Iterator[dict[str, Any]]:
     # Cross-partition is required: a container is partitioned and we want all of it.
-    return container.query_items("SELECT * FROM c", enable_cross_partition_query=True)
+    return container.query_items("SELECT * FROM c", enable_cross_partition_query=True, max_item_count=1)
 
 
 def copy_documents(
@@ -108,6 +115,9 @@ def copy_documents(
     target_endpoint: str,
     target_database: str,
     tokens: TokenProvider,
+    target_tokens: TokenProvider | None = None,
+    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    cancel_requested: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
 ) -> list[str]:
@@ -118,28 +128,42 @@ def copy_documents(
     """
     from azure.cosmos import exceptions
 
+    check_budget(max_staging_bytes)
+    check_cancelled(cancel_requested)
     warnings: list[str] = []
+    clients: list[Any] = []
     try:
-        source = _client(source_endpoint, tokens).get_database_client(source_database)
-        target = _client(target_endpoint, tokens).get_database_client(target_database)
+        clients.append(_client(source_endpoint, tokens))
+        clients.append(_client(target_endpoint, target_tokens or tokens))
+        source = clients[0].get_database_client(source_database)
+        target = clients[1].get_database_client(target_database)
         containers = [c["id"] for c in source.list_containers() if c.get("id")]
+
+        total_copied = 0
+        for name in containers:
+            check_cancelled(cancel_requested)
+            if on_progress:
+                on_progress(f"Copying documents in container '{name}'")
+            try:
+                copied = _copy_container(
+                    source, target, name, on_progress, max_staging_bytes, cancel_requested,
+                )
+                total_copied += copied
+                logger.debug("Copied %s documents into %s", copied, name)
+            except exceptions.CosmosHttpResponseError as error:
+                warnings.append(f"Documents in container '{name}' did not copy: {_describe(error)}")
+
+        check_cancelled(cancel_requested)
+        if not warnings and on_complete:
+            on_complete(CopyOutcome("documents", empty=total_copied == 0))
+        return warnings
     except exceptions.CosmosHttpResponseError as error:
         raise CosmosTransferError(_describe(error)) from error
-
-    total_copied = 0
-    for name in containers:
-        if on_progress:
-            on_progress(f"Copying documents in container '{name}'")
-        try:
-            copied = _copy_container(source, target, name, on_progress)
-            total_copied += copied
-            logger.debug("Copied %s documents into %s", copied, name)
-        except exceptions.CosmosHttpResponseError as error:
-            warnings.append(f"Documents in container '{name}' did not copy: {_describe(error)}")
-
-    if not warnings and on_complete:
-        on_complete(CopyOutcome("documents", empty=total_copied == 0))
-    return warnings
+    finally:
+        for client in clients:
+            close = getattr(client, "close", None)
+            if close:
+                close()
 
 
 def _copy_container(
@@ -147,13 +171,23 @@ def _copy_container(
     target: Any,
     name: str,
     on_progress: Callable[[str], None] | None,
+    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> int:
     reader = source.get_container_client(name)
     writer = target.get_container_client(name)
 
     copied = 0
     for document in _read_all(reader):
-        writer.upsert_item(strip_system_properties(document))
+        check_cancelled(cancel_requested)
+        payload = strip_system_properties(document)
+        size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        if size > max_staging_bytes:
+            raise StagingBudgetError(
+                f"Document in container '{name}' needs {size} bytes, above the "
+                f"{max_staging_bytes}-byte staging budget. Increase the budget and retry."
+            )
+        writer.upsert_item(payload)
         copied += 1
         if on_progress and copied % PROGRESS_EVERY == 0:
             on_progress(f"Copied {copied} document(s) into container '{name}'")
@@ -161,18 +195,21 @@ def _copy_container(
 
 
 def _describe(error: Any) -> str:
-    """Say what Cosmos actually refused, rather than repeating a stack of SDK wrapping."""
+    """Retain multiline error codes/details, excluding the SDK's activity-ID trace line."""
     status = getattr(error, "status_code", None)
     message = (getattr(error, "message", "") or str(error)).strip()
-    # The SDK appends its own multi-line activity trace, which is noise in a warning.
-    first_line = message.splitlines()[0] if message else ""
+    message = "\n".join(line for line in message.splitlines() if not line.lstrip().startswith("ActivityId:"))
+    detail = f"HTTP {status}: {message}" if status else message
     if status == 403:
+        # Fabric maps item permissions onto data access, unlike separate Azure RBAC setup.
+        # https://learn.microsoft.com/fabric/database/cosmos-db/authorization
         return (
-            "access was denied. A Cosmos database in Fabric authorises the data plane "
-            "separately from the item, so grant this service principal a data reader role on "
-            f"the source and a writer role on the copy ({first_line})"
+            f"{detail}. Check data-plane read access for the source service principal and "
+            "write access for the destination service principal. Grant Read and Write respectively "
+            "only on their respective databases' Fabric items, rather than configuring the data plane "
+            "separately from the item, then retry"
         )
-    return f"HTTP {status}: {first_line}" if status else first_line
+    return detail
 
 
 __all__ = [

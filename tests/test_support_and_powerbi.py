@@ -116,6 +116,7 @@ def test_list_semantic_models_reads_storage_mode():
     assert [m.is_large for m in models] == [True, False, False]
     # A model with no reported mode behaves as small rather than blocking the move.
     assert models[2].storage_mode == powerbi.SMALL
+    assert [model.storage_mode_known for model in models] == [True, True, False]
 
 
 def test_push_models_are_not_convertible():
@@ -179,6 +180,41 @@ def test_convert_times_out_if_the_mode_never_changes(monkeypatch):
     with make_pbi(handler) as pbi:
         with pytest.raises(powerbi.PowerBiError, match="still PremiumFiles"):
             pbi.convert("ws", model, powerbi.SMALL)
+
+
+def test_conversion_checks_cancellation_while_polling(monkeypatch):
+    from fabshuffle.run import CancelledError
+
+    monkeypatch.setattr(powerbi.time, "sleep", lambda _: None)
+    checks = 0
+    requests = []
+
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise CancelledError("Stopped by operator")
+
+    def handler(request):
+        requests.append(request.method)
+        if request.method == "PATCH":
+            return httpx.Response(200)
+        return httpx.Response(200, json={
+            "value": [{"id": "model", "name": "Model", "targetStorageMode": powerbi.SMALL}],
+        })
+
+    with make_pbi(handler) as pbi, pytest.raises(CancelledError):
+        pbi.convert("workspace", powerbi.SemanticModel("model", "Model", powerbi.SMALL, ""),
+                    powerbi.LARGE, check_cancelled=cancelled)
+    assert requests == ["PATCH", "GET"]
+
+
+def test_transport_error_retains_native_reason():
+    def handler(request):
+        raise httpx.ConnectError("connection reset", request=request)
+
+    with make_pbi(handler) as pbi, pytest.raises(powerbi.PowerBiError, match="connection reset"):
+        pbi.list_semantic_models("workspace")
 
 
 def test_failed_request_raises():

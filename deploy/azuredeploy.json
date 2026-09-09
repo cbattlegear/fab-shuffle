@@ -49,6 +49,15 @@
       "metadata": {
         "description": "Your public IP address or CIDR range, for example 203.0.113.4/32. Strongly recommended: Fab Shuffle has no sign-in of its own, so leaving this empty publishes the wizard to the whole internet."
       }
+    },
+    "shareQuotaGiB": {
+      "type": "int",
+      "defaultValue": 100,
+      "minValue": 1,
+      "maxValue": 102400,
+      "metadata": {
+        "description": "Quota, in GiB, for the Azure Files share mounted at /app/local. Default is 100 GiB; the classic pay-as-you-go share maximum is 102400 GiB (100 TiB). This backs staging and journal capacity only, not the per-transfer size, which the app still bounds separately (FAB_SHUFFLE_MAX_STAGING_BYTES, 1 GiB by default)."
+      }
     }
   },
   "variables": {
@@ -62,7 +71,12 @@
         "ipAddressRange": "[parameters('allowedClientIpAddress')]",
         "description": "The only address allowed to reach the wizard."
       }
-    ]
+    ],
+    "storageAccountName": "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, parameters('appName'))))]",
+    "fileShareName": "fab-shuffle-share",
+    "storageMountName": "fab-shuffle-storage",
+    "scratchVolumeName": "fab-shuffle-scratch",
+    "scratchMountPath": "/app/local"
   },
   "resources": [
     {
@@ -94,12 +108,61 @@
       }
     },
     {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "kind": "StorageV2",
+      "sku": { "name": "Standard_LRS" },
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true,
+        "allowBlobPublicAccess": false,
+        "allowSharedKeyAccess": true,
+        "largeFileSharesState": "Enabled"
+      },
+      "metadata": {
+        "description": "Persistent SMB storage authenticated with an account key. Large file shares are explicitly enabled because the shares API still documents that gate for quotas above 5120 GiB, even though newer guidance calls it a legacy setting. The authenticated public storage endpoint is not restricted by the wizard's ingress rule; see README for private-network requirements and key rotation."
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}/default/{1}', variables('storageAccountName'), variables('fileShareName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "properties": {
+        "shareQuota": "[parameters('shareQuotaGiB')]",
+        "enabledProtocols": "SMB",
+        "accessTier": "TransactionOptimized"
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments/storages",
+      "apiVersion": "2024-03-01",
+      "name": "[format('{0}/{1}', variables('environmentName'), variables('storageMountName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', variables('storageAccountName'), 'default', variables('fileShareName'))]"
+      ],
+      "properties": {
+        "azureFile": {
+          "accountName": "[variables('storageAccountName')]",
+          "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2023-01-01').keys[0].value]",
+          "shareName": "[variables('fileShareName')]",
+          "accessMode": "ReadWrite"
+        }
+      }
+    },
+    {
       "type": "Microsoft.App/containerApps",
       "apiVersion": "2024-03-01",
       "name": "[parameters('appName')]",
       "location": "[parameters('location')]",
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+        "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+        "[resourceId('Microsoft.App/managedEnvironments/storages', variables('environmentName'), variables('storageMountName'))]"
       ],
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
@@ -123,6 +186,18 @@
                 "cpu": "[json(parameters('cpuCores'))]",
                 "memory": "[concat(parameters('memoryGb'), 'Gi')]"
               },
+              "env": [
+                {
+                  "name": "FAB_SHUFFLE_SCRATCH",
+                  "value": "[variables('scratchMountPath')]"
+                }
+              ],
+              "volumeMounts": [
+                {
+                  "volumeName": "[variables('scratchVolumeName')]",
+                  "mountPath": "[variables('scratchMountPath')]"
+                }
+              ],
               "probes": [
                 {
                   "type": "Readiness",
@@ -138,6 +213,13 @@
                   "failureThreshold": 5
                 }
               ]
+            }
+          ],
+          "volumes": [
+            {
+              "name": "[variables('scratchVolumeName')]",
+              "storageType": "AzureFile",
+              "storageName": "[variables('storageMountName')]"
             }
           ],
           "scale": {

@@ -71,11 +71,14 @@ def copy_pools(
     prior_map: Mapping[str, str] | None = None,
     on_mapped: Callable[[str, str], None] | None = None,
     on_missing: Callable[[str], None] | None = None,
+    target_client: FabricClient | None = None,
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """Recreate the source workspace's custom pools.
 
     Returns the old id to new id map, the names created, and any warnings.
+    ``target_client`` verifies recorded destination pools and creates missing ones.
     """
+    destination = client if target_client is None else target_client
     source = list(pools) if pools is not None else list_pools(client, source_workspace_id)
     recorded_pools = {
         pool["id"]: prior_map[pool["id"]]
@@ -86,7 +89,7 @@ def copy_pools(
     # Unlike workspace items, pools have their own enumeration endpoint. A failed read
     # cannot establish absence, so do not use list_pools' preview-friendly empty fallback.
     existing = {
-        pool["id"] for pool in client.list_all(f"workspaces/{target_workspace_id}/spark/pools")
+        pool["id"] for pool in destination.list_all(f"workspaces/{target_workspace_id}/spark/pools")
         if pool.get("id")
     } if recorded_pools else set()
 
@@ -116,7 +119,7 @@ def copy_pools(
             on_missing(source_id)
 
         try:
-            new_pool = create_pool(client, target_workspace_id, pool)
+            new_pool = create_pool(destination, target_workspace_id, pool)
         except FabricApiError as error:
             warnings.append(
                 f"Spark pool '{name}' could not be recreated: {error}. "

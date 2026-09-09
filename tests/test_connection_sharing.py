@@ -162,43 +162,49 @@ def test_a_named_connection_shows_its_name_rather_than_its_id() -> None:
     assert "Sales SQL" in entry.message()
 
 
-def test_connections_pointing_inward_are_a_count_not_a_list_each() -> None:
-    """They are the customer's job to repoint, so one line is enough."""
-    prerequisites = [
-        connections.ConnectionPrerequisite(
-            connection_id="a",
-            connection_name="Warehouse conn",
-            path="p",
-            matched="m",
-            credential_type="unknown",
-            connectivity_type="ShareableCloud",
-            manageable=False,
-        ),
-        connections.ConnectionPrerequisite(
-            connection_id="b",
-            connection_name="",
-            path="p2",
-            matched="m2",
-            credential_type="unknown",
-            connectivity_type="ShareableCloud",
-            manageable=False,
-        ),
-    ]
-
-    summary = orchestrator.inward_connection_summary(prerequisites)
-
-    assert summary.startswith("2 connection(s) point at items in this workspace")
-    assert "Warehouse conn" in summary
-    assert "b" in summary
-
-
 def test_access_problems_are_not_repeated_in_the_dependency_warnings() -> None:
     """They have their own section; listing them twice showed the same lines under two heads."""
     report = orchestrator.DependencyReport(
         graph=None,
         issues=[],
-        prerequisites=[],
         access=[orchestrator.ConnectionAccess(connection_id="c-1", used_by=("CopyJob 'j'",))],
     )
 
     assert report.messages() == []
+
+
+# --------------------------------------------------------------- ownership by app id
+
+
+SPN_APP_ID = "99999999-9999-9999-9999-999999999999"
+
+OWNER_ASSIGNMENT = {
+    "role": "Owner",
+    "principal": {"type": "ServicePrincipal", "servicePrincipalDetails": {"aadAppId": SPN_APP_ID}},
+}
+USER_ASSIGNMENT = {
+    "role": "User",
+    "principal": {"type": "ServicePrincipal", "servicePrincipalDetails": {"aadAppId": SPN_APP_ID}},
+}
+
+
+def test_owner_is_detected_by_app_id():
+    assert connections.is_owned_by([OWNER_ASSIGNMENT], SPN_APP_ID) is True
+
+
+def test_lesser_roles_are_not_ownership():
+    # User and UserWithReshare can use a connection but not manage it.
+    assert connections.is_owned_by([USER_ASSIGNMENT], SPN_APP_ID) is False
+
+
+def test_another_principals_ownership_does_not_count():
+    other = {
+        "role": "Owner",
+        "principal": {"type": "ServicePrincipal", "servicePrincipalDetails": {"aadAppId": "other"}},
+    }
+    assert connections.is_owned_by([other], SPN_APP_ID) is False
+
+
+def test_no_assignments_is_not_ownership():
+    assert connections.is_owned_by(None, SPN_APP_ID) is False
+    assert connections.is_owned_by([], SPN_APP_ID) is False

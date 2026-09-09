@@ -46,6 +46,7 @@ class SemanticModel:
     name: str
     storage_mode: str
     content_provider: str
+    storage_mode_known: bool = True
 
     @property
     def is_large(self) -> bool:
@@ -77,15 +78,18 @@ class PowerBiClient:
         self.close()
 
     def _request(self, method: str, path: str, json: Any | None = None) -> httpx.Response:
-        response = self._http.request(
-            method,
-            path,
-            json=json,
-            headers={
-                "Authorization": f"Bearer {self._tokens.powerbi_token()}",
-                "Accept": "application/json",
-            },
-        )
+        try:
+            response = self._http.request(
+                method,
+                path,
+                json=json,
+                headers={
+                    "Authorization": f"Bearer {self._tokens.powerbi_token()}",
+                    "Accept": "application/json",
+                },
+            )
+        except httpx.RequestError as error:
+            raise PowerBiError(f"{method} {path} could not reach Power BI: {error}") from error
         if not response.is_success:
             raise PowerBiError(f"{method} {path} failed with HTTP {response.status_code}: {response.text}")
         return response
@@ -96,10 +100,11 @@ class PowerBiClient:
             SemanticModel(
                 id=str(dataset.get("id")),
                 name=dataset.get("name") or str(dataset.get("id")),
-                # Absent means the caller lacks write permission, or the model predates the
-                # setting. Both behave as the small format.
+                # Retain the legacy small-format fallback, but mark unreported settings
+                # so rebuild restoration cannot mistake missing metadata for a known format.
                 storage_mode=dataset.get("targetStorageMode") or SMALL,
                 content_provider=dataset.get("ContentProviderType") or "",
+                storage_mode_known=dataset.get("targetStorageMode") in (SMALL, LARGE),
             )
             for dataset in payload.get("value") or []
         ]
@@ -124,20 +129,24 @@ class PowerBiClient:
         storage_mode: str,
         *,
         on_progress: Callable[[str], None] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> None:
-        """Switch a model's storage format and wait for the conversion to land.
+        """Request a storage format and wait for the reported target setting.
 
-        The PATCH returns immediately, so the new format has to be confirmed by polling;
-        otherwise a reassignment could start while a model is still Premium Files backed.
+        This checks targetStorageMode, not model data or query readiness.
         """
         target = "small" if storage_mode == SMALL else "large"
         if on_progress:
             on_progress(f"Converting '{model.name}' to {target} semantic model storage")
 
+        if check_cancelled:
+            check_cancelled()
         self.set_storage_mode(workspace_id, model.id, storage_mode)
 
         deadline = time.monotonic() + CONVERSION_TIMEOUT_SECONDS
         while True:
+            if check_cancelled:
+                check_cancelled()
             current = self.get_semantic_model(workspace_id, model.id)
             if current is None:
                 raise PowerBiError(f"Semantic model '{model.name}' disappeared during conversion")

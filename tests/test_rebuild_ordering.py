@@ -170,6 +170,23 @@ class FakeFabric:
         return None
 
 
+class StubPowerBi:
+    """Power BI stub for the rebuild path. None of these models use the large storage format,
+    so listing the source returns nothing to restore and no storage format is changed."""
+
+    def __call__(self, _tokens) -> StubPowerBi:
+        return self
+
+    def __enter__(self) -> StubPowerBi:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def list_semantic_models(self, _workspace_id: str) -> list:
+        return []
+
+
 @pytest.fixture
 def fabric(monkeypatch) -> FakeFabric:
     fake = FakeFabric()
@@ -178,6 +195,7 @@ def fabric(monkeypatch) -> FakeFabric:
 
     monkeypatch.setattr(orchestrator, "FabricClient", fake)
     monkeypatch.setattr(orchestrator, "TokenProvider", lambda principal: object())
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", StubPowerBi())
 
     # Everything that leaves the process is stubbed; this test is about ordering and rebinding.
     monkeypatch.setattr(orchestrator.workspaces, "clone_folder_tree", lambda c, s, t: {})
@@ -219,14 +237,15 @@ def test_phases_run_in_dependency_order(fabric):
         "lakehouses",
         "warehouses",
         "sqldatabases",
+        "connections",
         "mirrored",
         "shortcuts",
-        "connections",
         "realtime",
         "engineering",
         "analytics",
         "orchestration",
         "reflexes",
+        "connectionadvisory",
         "permissions",
     ]
 
@@ -704,6 +723,7 @@ def test_a_composite_model_is_created_after_the_model_it_reads(monkeypatch):
     monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
     monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
     monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", StubPowerBi())
 
     run(fabric)
 

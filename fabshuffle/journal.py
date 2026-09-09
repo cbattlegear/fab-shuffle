@@ -24,11 +24,13 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from fabshuffle.lifecycle import ItemOutcome
 
@@ -51,10 +53,148 @@ COPY_JOB = "copy_job"
 FOLLOWER = "follower"
 OUTCOME = "outcome"
 INVENTORY = "inventory"
+REFERENCE_BLOCK = "reference_block"
+RECOVERY_ACTION = "recovery_action"
+CONNECTION_ADVISORY = "connection_advisory"
 
 #: How many run journals to keep. They are small, but the directory sits on a volume that
 #: outlives the container and nothing else ever removes them.
 KEEP_JOURNALS = 100
+PAIRED_JOURNAL_VERSION = 1
+TENANT_BINDING_FIELDS = (
+    "source_tenant_id", "target_tenant_id", "source_client_id", "target_client_id",
+)
+_OWNED_RECORDS = {
+    WORKSPACE, ITEM, MAPPING, DATA, INVALIDATED, REFRESH, COPY_JOB, FOLLOWER,
+    REFERENCE_BLOCK, RECOVERY_ACTION,
+}
+
+
+class TenantBindingError(ValueError):
+    """Recovery cannot prove which tenant pair and applications own the recorded resources."""
+
+
+def tenant_binding(plan: Mapping[str, Any]) -> dict[str, str]:
+    """Return the complete paired identity, or an empty binding for legacy one-client plans."""
+    binding = {}
+    for key in TENANT_BINDING_FIELDS:
+        value = plan.get(key, "")
+        if not isinstance(value, str):
+            raise TenantBindingError(f"The journal requires a string {key}.")
+        binding[key] = value.strip().casefold()
+    if not any(binding.values()):
+        return {}
+    missing = [key for key, value in binding.items() if not value]
+    if missing:
+        raise TenantBindingError(
+            "Paired recovery requires both tenant IDs and both application IDs; missing "
+            + ", ".join(missing) + ". Sign in with the original source and destination applications."
+        )
+    return binding
+
+
+def validate_tenant_binding(
+    plan: Mapping[str, Any], *, source_tenant_id: str = "", target_tenant_id: str = "",
+    source_client_id: str = "", target_client_id: str = "",
+) -> bool:
+    """Require the same ordered identities, including paired use within a single tenant."""
+    recorded = tenant_binding(plan)
+    expected = tenant_binding({
+        "source_tenant_id": source_tenant_id, "target_tenant_id": target_tenant_id,
+        "source_client_id": source_client_id, "target_client_id": target_client_id,
+    })
+    if bool(recorded) != bool(expected):
+        raise TenantBindingError(
+            "Legacy one-principal runs and paired runs cannot be interchanged. "
+            "Use this run's original source and destination sign-in mode."
+        )
+    for key, value in recorded.items():
+        if value != expected[key]:
+            raise TenantBindingError(
+                f"The recorded {key} does not match the signed-in {key}. "
+                "Sign in with the original source and destination tenants and applications."
+            )
+    return bool(recorded)
+
+
+def validate_replay_binding(replay: Replay, **expected: str) -> bool:
+    """Validate strict persisted ownership before consuming checkpoints or deleting resources."""
+    paired = validate_tenant_binding(replay.plan, **expected)
+    if replay.ownership_error:
+        raise TenantBindingError(replay.ownership_error)
+    if paired and (
+        replay.binding_version != PAIRED_JOURNAL_VERSION
+        or replay.tenant_binding != tenant_binding(replay.plan)
+    ):
+        raise TenantBindingError(
+            "This journal has no supported paired ownership record. "
+            "Do not adopt a legacy journal into a paired migration."
+        )
+    return paired
+
+
+def validate_resume_plan(plan: Mapping[str, Any], prior: Replay) -> None:
+    if prior.ignored or prior.restart_state:
+        raise TenantBindingError(
+            "This saved migration was ignored or marked for a full restart and cannot be resumed. "
+            "Finish its full restart or start a fresh migration instead."
+        )
+    binding = tenant_binding(plan)
+    validate_replay_binding(prior, **binding)
+    if binding:
+        for key in ("source_workspace_id", "capacity_id", "target_workspace_name", "strategy"):
+            if plan.get(key, "") != prior.plan.get(key, ""):
+                raise TenantBindingError(
+                    f"The resumed {key} differs from the recorded migration. "
+                    "Resume with the original source workspace and destination plan."
+                )
+
+
+def _removed_reference_record(plan: Mapping[str, Any], prior: Replay) -> dict[str, Any] | None:
+    primary = {*prior.items, *prior.outcomes}
+    for identifier in prior.id_map:
+        if not prior.mapping_owners.get(identifier):
+            try:
+                UUID(identifier)
+            except ValueError:
+                continue
+            primary.add(identifier)
+    previous = {key.casefold() for key in (prior.plan.get("connection_mappings") or {})}
+    current = {key.casefold() for key in (plan.get("connection_mappings") or {})}
+    removed = {key: key for key in previous - current}
+    fields = ("source_workspace_id", "source_item_id", "target_workspace_id", "target_item_id")
+    before = {
+        tuple(str(entry.get(key) or "").casefold() for key in fields)
+        for entry in (prior.plan.get("reference_mappings") or [])
+    }
+    after = {
+        tuple(str(entry.get(key) or "").casefold() for key in fields)
+        for entry in (plan.get("reference_mappings") or [])
+    }
+    if before - after:
+        preserved = {*primary, str(prior.plan.get("source_workspace_id") or "")}
+        explicit = {value for entry in before - after for value in entry[:2]}
+        removed.update({
+            key: key for key in prior.id_map if key not in preserved or key.casefold() in explicit
+        })
+    if not removed:
+        return None
+    record: dict[str, Any] = {
+        "t": REFERENCE_BLOCK, "references": removed, "invalidate": True,
+        "refresh": sorted(primary),
+    }
+    if prior.tenant_binding:
+        record["ownership"] = _ownership(prior)
+    return record
+
+
+def binding_scope(plan: Mapping[str, Any]) -> tuple[str, ...]:
+    binding = tenant_binding(plan)
+    return tuple(binding.get(key, "") for key in TENANT_BINDING_FIELDS)
+
+
+def target_scope(plan: Mapping[str, Any], workspace_id: str) -> tuple[str, str]:
+    return tenant_binding(plan).get("target_tenant_id", ""), workspace_id
 
 
 def _now() -> str:
@@ -71,12 +211,38 @@ class Journal:
     def __init__(self, path: Path | None) -> None:
         self.path = path
         self._lock = threading.Lock()
+        self._binding: dict[str, str] = {}
+        self._source_workspace_id = ""
+        self._workspaces: dict[str, str] = {}
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_file():
+                replay = read(path)
+                self._binding = tenant_binding(replay.plan)
+                validate_replay_binding(replay, **self._binding)
+                self._source_workspace_id = str(replay.plan.get("source_workspace_id") or "")
+                self._workspaces = {
+                    "target": replay.target_workspace_id, "scratch": replay.scratch_workspace_id,
+                }
 
     def _write(self, _kind: str, *, strict: bool = False, **fields: Any) -> None:
         if self.path is None:
             return
+        if self._binding and _kind in _OWNED_RECORDS:
+            fields["ownership"] = {
+                **self._binding, "source_workspace_id": self._source_workspace_id,
+                "target_workspace_id": self._workspaces.get("target", ""),
+                "scratch_workspace_id": self._workspaces.get("scratch", ""),
+            }
+            if _kind == WORKSPACE:
+                fields["ownership"][f"{fields['role']}_workspace_id"] = fields["id"]
+            elif _kind == COPY_JOB:
+                workspace = fields["job"].get("workspace_id")
+                if not workspace or workspace not in self._workspaces.values():
+                    raise TenantBindingError(
+                        "The Copy Job workspace is not owned by this run. "
+                        "Reconcile the recorded destination scratch workspace before continuing."
+                    )
         record = {"t": _kind, "at": _now(), **fields}
         line = json.dumps(record, separators=(",", ":"), default=str)
         try:
@@ -99,12 +265,24 @@ class Journal:
         self, plan: dict[str, Any], *, cleanup: bool, prior: Replay | None = None
     ) -> None:
         """Persist admission and its inherited state in one record, before starting work."""
+        binding = tenant_binding(plan)
+        if prior is not None:
+            validate_resume_plan(plan, prior)
+        extra = (
+            {"tenant_binding_version": PAIRED_JOURNAL_VERSION, "tenant_binding": binding}
+            if binding else {}
+        )
+        inherited = _state_records(prior) if prior else []
+        if prior is not None:
+            removed = _removed_reference_record(plan, prior)
+            if removed is not None:
+                inherited.append(removed)
         self._write(
             RUN, strict=True, plan=plan, cleanup=cleanup,
             lineage_id=(prior.lineage_id or prior.run_id) if prior else "",
             resumed_from=prior.run_id if prior else "",
             ancestors=[*prior.ancestors, prior.run_id] if prior else [],
-            inherited=_state_records(prior) if prior else [],
+            inherited=inherited,
             attempts=[
                 *prior.attempts,
                 {
@@ -113,7 +291,14 @@ class Journal:
                     "damaged_lines": prior.damaged_lines,
                 },
             ] if prior else [],
+            **extra,
         )
+        self._binding = binding
+        self._source_workspace_id = str(plan.get("source_workspace_id") or "")
+        if prior is not None:
+            self._workspaces = {
+                "target": prior.target_workspace_id, "scratch": prior.scratch_workspace_id,
+            }
 
     def phase_started(self, phase: str) -> None:
         self._write(PHASE, phase=phase, state="started")
@@ -122,7 +307,14 @@ class Journal:
         self._write(PHASE, phase=phase, state="finished")
 
     def workspace(self, role: str, workspace_id: str, name: str = "") -> None:
+        if self._binding and role not in ("target", "scratch"):
+            raise TenantBindingError(
+                "Paired journals record only target-owned target and scratch workspaces."
+            )
+        if self._binding and role == "target" and self._workspaces.get(role) not in (None, "", workspace_id):
+            raise TenantBindingError("The recorded destination workspace cannot be replaced during recovery.")
         self._write(WORKSPACE, role=role, id=workspace_id, name=name, strict=True)
+        self._workspaces[role] = workspace_id
 
     def item(self, source_id: str, target_id: str, item_type: str, name: str) -> None:
         """One item created in the target workspace, and the mapping it establishes."""
@@ -138,6 +330,12 @@ class Journal:
 
     def invalidate(self, sources: Iterable[str], *, refresh: Iterable[str] = ()) -> None:
         self._write(INVALIDATED, sources=list(sources), refresh=list(refresh), strict=True)
+
+    def block_references(self, references: Mapping[str, str], *, refresh: Iterable[str] = ()) -> None:
+        self._write(
+            REFERENCE_BLOCK, references=dict(references), invalidate=True,
+            refresh=list(refresh), strict=True,
+        )
 
     def refresh(self, sources: Iterable[str], *, required: bool = True) -> None:
         self._write(REFRESH, sources=list(sources), required=required, strict=True)
@@ -162,6 +360,23 @@ class Journal:
 
     def inventory(self) -> None:
         self._write(INVENTORY)
+
+    def recovery_action(self, action: str, *, workspace_id: str = "") -> None:
+        if action not in ("ignore", "restart_started", "workspace_deleted", "restart_completed"):
+            raise ValueError("Unknown saved-migration action.")
+        self._write(RECOVERY_ACTION, action=action, workspace_id=workspace_id, strict=True)
+
+    def connection_advisory(self, payload: dict[str, Any]) -> None:
+        """A point-in-time advisory scan of tenant connections against the source workspace.
+
+        Purely informational, like ``warning`` and ``outcome``: nothing here is a resource
+        that resume has to reconcile, so a write failure must never take the migration down
+        (the default, non-strict ``_write``), and the record is not tenant-ownership checked
+        the way an owned resource record is. A stale or foreign snapshot is instead caught at
+        read time, by comparing its own recorded run id against the current one (see
+        ``fabshuffle.fabric.connection_advisory.section_for_report``).
+        """
+        self._write(CONNECTION_ADVISORY, payload=payload)
 
 
 #: A journal that records nothing, for a preview or a test that has nothing to resume.
@@ -222,12 +437,20 @@ class Replay:
     attempts: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = ""
     plan: dict[str, Any] = field(default_factory=dict)
+    tenant_binding: dict[str, str] = field(default_factory=dict)
+    binding_version: int = 0
+    ownership_error: str = ""
+    ignored: bool = False
+    restart_state: str = ""
+    deleted_workspaces: set[str] = field(default_factory=set)
+    workspace_owners: dict[str, dict[str, str]] = field(default_factory=dict)
     cleanup: bool = True
     target_workspace_id: str = ""
     target_workspace_name: str = ""
     scratch_workspace_id: str = ""
     id_map: dict[str, str] = field(default_factory=dict)
     mapping_owners: dict[str, str] = field(default_factory=dict)
+    blocked_references: dict[str, str] = field(default_factory=dict)
     refresh_needed: set[str] = field(default_factory=set)
     copy_jobs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     follower_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -245,6 +468,11 @@ class Replay:
     phases_finished: set[str] = field(default_factory=set)
     status: str = ""
     error: str | None = None
+    # The latest connection advisory scan recorded for this run, verbatim as
+    # ``connection_advisory.ConnectionAdvisoryScan.as_dict()`` produced it. Purely advisory:
+    # never checked against tenant ownership the way a resource record is, and staleness is
+    # judged at report time instead, by comparing its own recorded attempt id.
+    connection_advisory: dict[str, Any] | None = None
     # Lines that could not be read. A truncated last line is expected after a crash; anything
     # else is worth knowing about.
     damaged_lines: int = 0
@@ -261,6 +489,31 @@ class Replay:
     def data_is_done(self, item_id: str, kind: str, key: str = "") -> bool:
         return (item_id, kind, key) in self.data_done
 
+    def owned_workspace_id(self, role: str, *, tenant_id: str, client_id: str) -> str:
+        """Return a workspace only when its durable destination ownership matches the caller."""
+        validate_replay_binding(self, **self.tenant_binding)
+        if not self.tenant_binding:
+            raise TenantBindingError("Legacy journals do not prove paired workspace ownership.")
+        owner = self.workspace_owners.get(role)
+        if not owner:
+            raise TenantBindingError(f"This run did not record ownership of a {role} workspace.")
+        if (owner["tenant_id"], owner["client_id"]) != (
+            tenant_id.strip().casefold(), client_id.strip().casefold(),
+        ):
+            raise TenantBindingError(
+                f"The recorded {role} workspace belongs to another destination tenant or application."
+            )
+        return owner["id"]
+
+
+def _ownership(replay: Replay) -> dict[str, str]:
+    return {
+        **replay.tenant_binding,
+        "source_workspace_id": str(replay.plan.get("source_workspace_id") or ""),
+        "target_workspace_id": replay.target_workspace_id,
+        "scratch_workspace_id": replay.scratch_workspace_id,
+    }
+
 
 def _state_records(replay: Replay) -> list[dict[str, Any]]:
     """A flat snapshot: another resume must not depend on an ancestor surviving retention."""
@@ -269,6 +522,11 @@ def _state_records(replay: Replay) -> list[dict[str, Any]]:
          "name": replay.target_workspace_name},
         {"t": WORKSPACE, "role": "scratch", "id": replay.scratch_workspace_id},
     ]
+    if replay.blocked_references:
+        records.append({
+            "t": REFERENCE_BLOCK, "references": replay.blocked_references,
+            "invalidate": False, "refresh": [],
+        })
     records.extend(
         {"t": ITEM, "source": source, **item} for source, item in replay.items.items()
     )
@@ -293,6 +551,12 @@ def _state_records(replay: Replay) -> list[dict[str, Any]]:
     records.extend({"t": OUTCOME, "item": item.record()} for item in replay.outcomes.values())
     if replay.inventory_complete:
         records.append({"t": INVENTORY})
+    if replay.connection_advisory:
+        records.append({"t": CONNECTION_ADVISORY, "payload": replay.connection_advisory})
+    if replay.tenant_binding:
+        for record in records:
+            if record["t"] in _OWNED_RECORDS:
+                record["ownership"] = _ownership(replay)
     return records
 
 
@@ -333,7 +597,39 @@ def _records(path: Path, replay: Replay) -> Iterator[dict[str, Any]]:
 def _apply(replay: Replay, record: dict[str, Any]) -> None:
     kind = record.get("t")
     if kind == RUN:
-        replay.plan = record.get("plan") or {}
+        plan = record.get("plan") or {}
+        if not isinstance(plan, dict):
+            replay.ownership_error = "The journal's migration plan is not a valid object."
+            return
+        try:
+            binding = tenant_binding(plan)
+        except TenantBindingError as error:
+            replay.ownership_error = str(error)
+            binding = {}
+        if replay.plan and (
+            replay.plan != plan or replay.tenant_binding != binding
+        ):
+            replay.ownership_error = "The journal contains conflicting admission identities."
+            return
+        if binding and not replay.plan and (
+            replay.id_map or replay.target_workspace_id or replay.scratch_workspace_id
+            or replay.copy_jobs or replay.data_done
+        ):
+            replay.ownership_error = (
+                "Resource records precede this journal's paired admission. "
+                "Do not adopt a legacy journal into a paired migration."
+            )
+        replay.plan = deepcopy(plan)
+        replay.binding_version = record.get("tenant_binding_version", 0)
+        replay.tenant_binding = binding
+        if (binding or replay.binding_version or record.get("tenant_binding")) and (
+            not binding or replay.binding_version != PAIRED_JOURNAL_VERSION
+            or record.get("tenant_binding") != binding
+        ):
+            replay.ownership_error = (
+                "The journal has no supported paired ownership record. "
+                "Do not adopt a legacy journal into a paired migration."
+            )
         replay.cleanup = bool(record.get("cleanup", True))
         replay.created_at = str(record.get("at") or "")
         replay.lineage_id = str(record.get("lineage_id") or replay.run_id)
@@ -342,7 +638,10 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
         replay.attempts = list(record.get("attempts") or [])
         for inherited in record.get("inherited") or []:
             _apply(replay, inherited)
-    elif kind == PHASE:
+        return
+    if kind in _OWNED_RECORDS and not _valid_ownership(replay, record):
+        return
+    if kind == PHASE:
         phase = str(record.get("phase") or "")
         if record.get("state") == "finished":
             replay.phases_finished.add(phase)
@@ -354,6 +653,42 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
         else:
             replay.target_workspace_id = str(record.get("id") or "")
             replay.target_workspace_name = str(record.get("name") or "")
+        if replay.tenant_binding:
+            replay.workspace_owners[record["role"]] = {
+                "id": str(record.get("id") or ""),
+                "tenant_id": replay.tenant_binding["target_tenant_id"],
+                "client_id": replay.tenant_binding["target_client_id"],
+            }
+    elif kind == RECOVERY_ACTION:
+        action = record.get("action")
+        if action == "ignore":
+            replay.ignored = True
+        elif action == "restart_started" and replay.restart_state != "complete":
+            replay.restart_state = "pending"
+            replay.inventory_complete = False
+            for outcome in replay.outcomes.values():
+                outcome.invalidate(
+                    replay.run_id, target_lost=True,
+                    reason="Full restart was requested; destination contents may have been deleted.",
+                )
+            # The destination this scan was taken against is being torn down; an inherited
+            # snapshot from before the restart would describe a workspace that no longer
+            # exists, not the one about to be rebuilt.
+            replay.connection_advisory = None
+        elif action == "workspace_deleted" and replay.restart_state == "pending":
+            workspace_id = record.get("workspace_id")
+            if workspace_id and workspace_id in (replay.target_workspace_id, replay.scratch_workspace_id):
+                replay.deleted_workspaces.add(workspace_id)
+            else:
+                replay.ownership_error = "Full restart records a workspace not owned by this migration."
+        elif action == "restart_completed" and replay.restart_state in ("pending", "complete"):
+            expected = {value for value in (replay.target_workspace_id, replay.scratch_workspace_id) if value}
+            if expected.issubset(replay.deleted_workspaces):
+                replay.restart_state = "complete"
+            else:
+                replay.ownership_error = "Full restart completed without recording every workspace deletion."
+        else:
+            replay.ownership_error = "The saved migration has invalid full-restart state."
     elif kind == ITEM:
         source = str(record.get("source") or "")
         target = str(record.get("target") or "")
@@ -373,6 +708,24 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
             replay.id_map[source] = target
             if record.get("owner"):
                 replay.mapping_owners[source] = str(record["owner"])
+    elif kind == REFERENCE_BLOCK:
+        references = record.get("references")
+        if not isinstance(references, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) for key, value in references.items()
+        ):
+            replay.ownership_error = "The journal's blocked source references cannot be read safely."
+            return
+        replay.blocked_references.update(references)
+        if record.get("invalidate", True):
+            removed = {key.casefold() for key in references}
+            for key in list(replay.id_map):
+                if key.casefold() in removed:
+                    replay.id_map.pop(key, None)
+                    replay.mapping_owners.pop(key, None)
+            replay.refresh_needed.update(record.get("refresh") or [])
+            for source in record.get("refresh") or []:
+                if source in replay.outcomes:
+                    replay.outcomes[source].invalidate(replay.run_id, target_lost=False)
     elif kind == DATA:
         key = (
             str(record.get("item") or ""),
@@ -437,7 +790,47 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
             replay.outcomes[outcome.sourceId] = outcome
     elif kind == INVENTORY:
         replay.inventory_complete = True
-    # An unknown kind is ignored on purpose, so an older build can read a newer journal.
+    elif kind == CONNECTION_ADVISORY:
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            replay.connection_advisory = payload
+    # Unknown advisory kinds are ignored. Paired formats live outside legacy journal discovery.
+
+
+def _valid_ownership(replay: Replay, record: dict[str, Any]) -> bool:
+    owner = record.get("ownership")
+    if not replay.tenant_binding and not owner:
+        return True
+    expected = _ownership(replay)
+    kind = record["t"]
+    valid = bool(replay.tenant_binding) and isinstance(owner, dict)
+    if valid:
+        valid = all(owner.get(key) == value for key, value in expected.items() if key not in (
+            "target_workspace_id", "scratch_workspace_id",
+        ))
+    if valid and kind == WORKSPACE:
+        role = record.get("role")
+        valid = role in ("target", "scratch") and owner.get(f"{role}_workspace_id") == record.get("id")
+        if role == "scratch" and replay.target_workspace_id:
+            valid = valid and owner.get("target_workspace_id") == replay.target_workspace_id
+        if role == "target" and replay.target_workspace_id:
+            valid = valid and record.get("id") == replay.target_workspace_id
+    elif valid:
+        valid = all(owner.get(key) == expected[key] for key in (
+            "target_workspace_id", "scratch_workspace_id",
+        ))
+        if kind == COPY_JOB:
+            job = record.get("job") or {}
+            workspace = job.get("workspace_id") if isinstance(job, dict) else ""
+            valid = valid and bool(workspace) and workspace in (
+                replay.target_workspace_id, replay.scratch_workspace_id,
+            )
+    if not valid:
+        replay.ownership_error = (
+            f"The journal's {kind} record has missing or mismatched tenant/workspace ownership. "
+            "Reconcile the recorded resources with the original tenant pair before recovery or cleanup."
+        )
+    return valid
 
 
 def _retarget_outcome(replay: Replay, source: str, target: str) -> None:
@@ -462,17 +855,27 @@ def list_runs(directory: Path) -> list[Replay]:
 
 def latest_runs(directory: Path) -> list[Replay]:
     replays = list_runs(directory)
-    ancestors = {ancestor for replay in replays for ancestor in replay.ancestors}
-    lineages: set[str] = set()
-    targets: set[str] = set()
+    ancestors = {
+        (binding_scope(replay.plan), ancestor)
+        for replay in replays if not replay.ownership_error for ancestor in replay.ancestors
+    }
+    lineages: set[tuple[tuple[str, ...], str]] = set()
+    targets: set[tuple[str, str]] = set()
     latest = []
     for replay in replays:
-        lineage = replay.lineage_id or replay.run_id
-        target = replay.target_workspace_id
-        if replay.run_id in ancestors or lineage in lineages or (target and target in targets):
+        if replay.ownership_error:
+            latest.append(replay)
+            continue
+        scope = binding_scope(replay.plan)
+        lineage = (scope, replay.lineage_id or replay.run_id)
+        target = target_scope(replay.plan, replay.target_workspace_id)
+        if (
+            (scope, replay.run_id) in ancestors or lineage in lineages
+            or (replay.target_workspace_id and target in targets)
+        ):
             continue
         lineages.add(lineage)
-        if target:
+        if replay.target_workspace_id:
             targets.add(target)
         latest.append(replay)
     return latest
@@ -490,7 +893,11 @@ def prune(directory: Path, keep: int = KEEP_JOURNALS) -> int:
         return 0
     files = sorted(directory.glob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
     protected = {
-        replay.run_id for replay in latest_runs(directory) if replay.interrupted or replay.copy_jobs
+        replay.run_id for replay in latest_runs(directory)
+        if (
+            replay.interrupted or replay.copy_jobs or replay.ownership_error
+            or replay.ignored or replay.restart_state
+        )
     }
     removed = 0
     for path in files[keep:]:
@@ -520,8 +927,15 @@ __all__ = [
     "RecordingList",
     "RecordingMap",
     "Replay",
+    "TenantBindingError",
+    "binding_scope",
     "latest_runs",
     "list_runs",
     "prune",
     "read",
+    "target_scope",
+    "tenant_binding",
+    "validate_replay_binding",
+    "validate_resume_plan",
+    "validate_tenant_binding",
 ]
