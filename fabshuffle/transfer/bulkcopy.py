@@ -38,10 +38,9 @@ from fabshuffle.fabric.data_stores import TableRef
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer import sqlschema
 from fabshuffle.transfer.common import (
-    DEFAULT_MAX_STAGING_BYTES,
     StagingBudgetError,
-    check_budget,
     check_cancelled,
+    resolve_memory_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,7 +189,8 @@ def copy_tables(
     tokens: TokenProvider,
     scratch_dir: Path,
     target_tokens: TokenProvider | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
     target_type: str = "SQLDatabase",
     cancel_requested: Callable[[], bool] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
@@ -217,6 +217,7 @@ def copy_tables(
             source_server=source_server, source_database=source_database,
             target_server=target_server, target_database=target_database, tables=tables,
             tokens=tokens, target_tokens=target_tokens, max_staging_bytes=max_staging_bytes,
+            max_memory_bytes=max_memory_bytes,
             cancel_requested=cancel_requested, on_progress=on_progress,
             on_copied=on_copied, on_complete=on_complete, target_type=target_type,
         )
@@ -360,7 +361,8 @@ def copy_tables_streaming(
     tables: Iterable[TableRef],
     tokens: TokenProvider,
     target_tokens: TokenProvider,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
     target_type: str = "SQLDatabase",
     scratch_dir: Path | None = None,
     on_progress: Callable[[str], None] | None = None,
@@ -382,7 +384,10 @@ def copy_tables_streaming(
     https://learn.microsoft.com/fabric/data-warehouse/identity
     https://learn.microsoft.com/sql/t-sql/statements/set-identity-insert-transact-sql
     """
-    check_budget(max_staging_bytes)
+    memory_budget = resolve_memory_budget(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+    )
     check_cancelled(cancel_requested)
     if source_server == target_server and source_database == target_database:
         raise BulkCopyError("Source and destination SQL databases must differ.")
@@ -460,13 +465,13 @@ def copy_tables_streaming(
                             break
                         values = tuple(row)
                         size = _row_bytes(values)
-                        if size > max_staging_bytes:
+                        if size > memory_budget:
                             raise StagingBudgetError(
                                 f"A row in {_qualified(table)} needs {size} bytes, above the "
-                                f"{max_staging_bytes}-byte staging budget. Increase the budget and retry."
+                                f"{memory_budget}-byte memory budget. Increase max_memory_bytes and retry."
                             )
                         if batch and (
-                            batch_bytes + size > min(max_staging_bytes, 4 * 1024 * 1024)
+                            batch_bytes + size > min(memory_budget, 4 * 1024 * 1024)
                             or len(batch) >= 1000
                         ):
                             writer.executemany(statement, batch)

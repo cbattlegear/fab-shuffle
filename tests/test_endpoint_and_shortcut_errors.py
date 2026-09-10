@@ -62,7 +62,11 @@ def test_both_endpoints_are_waited_for(monkeypatch, tmp_path: Path) -> None:
         sqlschema, "wait_for_database", lambda server, db, tokens, on_progress=None: waited.append(server)
     )
     monkeypatch.setattr(sqlschema, "extract_dacpac", lambda **kwargs: tmp_path / "a.dacpac")
-    monkeypatch.setattr(sqlschema, "unpack_dacpac", lambda *a, **k: tmp_path / "Deploy.sql")
+    monkeypatch.setattr(
+        sqlschema,
+        "unpack_dacpac",
+        lambda *a, **k: (k["staging_root"] / "script" / "Deploy.sql"),
+    )
     monkeypatch.setattr(sqlschema, "apply_script", lambda *a, **k: [])
 
     sqlschema.transfer_schema(
@@ -91,7 +95,11 @@ def test_the_source_is_waited_for_before_extracting(monkeypatch, tmp_path: Path)
         return tmp_path / "a.dacpac"
 
     monkeypatch.setattr(sqlschema, "extract_dacpac", fake_extract)
-    monkeypatch.setattr(sqlschema, "unpack_dacpac", lambda *a, **k: tmp_path / "Deploy.sql")
+    monkeypatch.setattr(
+        sqlschema,
+        "unpack_dacpac",
+        lambda *a, **k: (k["staging_root"] / "script" / "Deploy.sql"),
+    )
     monkeypatch.setattr(sqlschema, "apply_script", lambda *a, **k: [])
 
     sqlschema.transfer_schema(

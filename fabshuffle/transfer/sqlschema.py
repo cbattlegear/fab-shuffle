@@ -13,9 +13,10 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -25,10 +26,11 @@ from fabshuffle.auth import ServicePrincipal, TokenProvider, sql_access_token_st
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric.definitions import build_rewriter
 from fabshuffle.transfer.common import (
-    DEFAULT_MAX_STAGING_BYTES,
     StagingBudgetError,
     check_budget,
     check_cancelled,
+    resolve_memory_budget,
+    resolve_transfer_budgets,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,6 +123,10 @@ class SchemaTransferError(RuntimeError):
 
 class SchemaStagingError(SchemaTransferError, StagingBudgetError):
     """The schema tool's private staging exceeds the operator's configured budget."""
+
+
+class SchemaMemoryError(SchemaTransferError, StagingBudgetError):
+    """A schema script cannot be processed safely inside the configured memory budget."""
 
 
 def _driver() -> str:
@@ -222,7 +228,8 @@ def extract_dacpac(
     output: Path,
     attempts: int = EXTRACT_ATTEMPTS,
     staging_root: Path | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> Path:
     """Extract a database's schema, retrying a connection that does not answer in time.
@@ -246,6 +253,10 @@ def extract_dacpac(
             extra: list[str] = []
             options = {}
             if staging_root is not None:
+                disk_budget = resolve_transfer_budgets(
+                    max_staging_bytes=max_staging_bytes,
+                    max_disk_staging_bytes=max_disk_staging_bytes,
+                ).max_disk_staging_bytes
                 table_temp = staging_root / ".tool-work" / "table-data"
                 table_temp.mkdir(parents=True, exist_ok=True)
                 extra = [
@@ -253,7 +264,7 @@ def extract_dacpac(
                     f"/p:TempDirectoryForTableData={table_temp.resolve()}",
                 ]
                 options = {
-                    "staging_root": staging_root, "max_staging_bytes": max_staging_bytes,
+                    "staging_root": staging_root, "max_disk_staging_bytes": disk_budget,
                     "cancel_requested": cancel_requested,
                 }
             runner(
@@ -302,7 +313,15 @@ def _is_transient_tool_failure(message: str) -> bool:
 
 
 def unpack_dacpac(
-    dacpac: Path, destination: Path, *, exclude_tables: bool, exclude_security: bool = False,
+    dacpac: Path,
+    destination: Path,
+    *,
+    exclude_tables: bool,
+    exclude_security: bool = False,
+    staging_root: Path | None = None,
+    max_staging_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> Path:
     """Turn a DACPAC into a deployable script, optionally without table DDL.
 
@@ -322,7 +341,17 @@ def unpack_dacpac(
         command.append("--deploy-script-ignore-permissions")
         for object_type in SECURITY_OBJECT_TYPES:
             command += ["--deploy-script-exclude-object-type", object_type]
-    _run(command, what=f"unpackdacpac of {dacpac.name}")
+    if staging_root is None:
+        _run(command, what=f"unpackdacpac of {dacpac.name}")
+    else:
+        disk_budget = resolve_transfer_budgets(
+            max_staging_bytes=max_staging_bytes,
+            max_disk_staging_bytes=max_disk_staging_bytes,
+        ).max_disk_staging_bytes
+        _run_bounded(
+            command, what=f"unpackdacpac of {dacpac.name}", staging_root=staging_root,
+            max_disk_staging_bytes=disk_budget, cancel_requested=cancel_requested,
+        )
 
     script = destination / "Deploy.sql"
     if not script.exists():
@@ -340,7 +369,8 @@ def script_dacpac(
     exclude_tables: bool = False,
     exclude_security: bool = True,
     staging_root: Path | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> Path:
     """Generate a target-aware DacFx schema script with optional typed security exclusions.
@@ -370,9 +400,13 @@ def script_dacpac(
     if staging_root is None:
         _run(command, what=f"sqlpackage script of {dacpac.name}")
     else:
+        disk_budget = resolve_transfer_budgets(
+            max_staging_bytes=max_staging_bytes,
+            max_disk_staging_bytes=max_disk_staging_bytes,
+        ).max_disk_staging_bytes
         _run_bounded(
             command, what=f"sqlpackage script of {dacpac.name}", staging_root=staging_root,
-            max_staging_bytes=max_staging_bytes, cancel_requested=cancel_requested,
+            max_disk_staging_bytes=disk_budget, cancel_requested=cancel_requested,
         )
     if not output.exists():
         raise SchemaTransferError(f"sqlpackage did not produce {output}")
@@ -384,6 +418,7 @@ def rewrite_schema_script(
     *,
     id_map: Mapping[str, str],
     source_identifiers: Collection[str] = (),
+    max_memory_bytes: int | None = None,
 ) -> str:
     """Rebind known identities, refusing an incomplete rewrite before any SQL executes.
 
@@ -392,8 +427,17 @@ def rewrite_schema_script(
     in their names, but a shorter target value must not hide a longer unresolved source ID.
     SQL security is excluded by DacFx before this step, never by editing SQL statements.
     """
+    memory_budget = (
+        resolve_memory_budget(max_memory_bytes=max_memory_bytes)
+        if max_memory_bytes is not None
+        else None
+    )
+    if memory_budget is not None:
+        _check_text_memory(script, memory_budget, "SQL schema rewrite input")
     rewrite = build_rewriter(id_map)
     rebound = rewrite(script) if rewrite else script
+    if memory_budget is not None:
+        _check_text_memory(rebound, memory_budget, "Rewritten SQL schema script")
     known = {value.casefold(): value for value in source_identifiers if value}
     if not known:
         return rebound
@@ -407,6 +451,8 @@ def rewrite_schema_script(
     }
     inspect = build_rewriter({**markers, **targets})
     inspected = inspect(rebound)
+    if memory_budget is not None:
+        _check_text_memory(inspected, memory_budget, "SQL schema source-reference scan")
     unresolved = sorted(key for key, token in markers.items() if token in inspected)
     if unresolved:
         raise SchemaTransferError(
@@ -435,9 +481,33 @@ def _check_staging(root: Path, maximum: int, *, additional: int = 0) -> None:
     used = _staging_size(root) + additional
     if used > maximum:
         raise SchemaStagingError(
-            f"SQL schema staging requires {used} bytes, above the {maximum}-byte staging budget. "
-            "Schema transfer stopped; increase max_staging_bytes or reduce the schema before retrying."
+            f"SQL schema staging requires {used} bytes, above the {maximum}-byte staging budget "
+            "for disk artifacts. Schema transfer stopped; increase max_disk_staging_bytes or "
+            "reduce the schema before retrying. This is an estimated staging check, not a "
+            "filesystem quota."
         )
+
+
+def _check_schema_memory(required: int, maximum: int, what: str) -> None:
+    check_budget(maximum, "max_memory_bytes")
+    if required > maximum:
+        raise SchemaMemoryError(
+            f"{what} needs an estimated {required} memory bytes, above the "
+            f"{maximum}-byte memory budget. Increase max_memory_bytes or reduce the schema; "
+            "raising the disk staging budget does not raise this in-memory limit."
+        )
+
+
+def _check_text_memory(text: str, maximum: int, what: str) -> None:
+    _check_schema_memory(sys.getsizeof(text), maximum, what)
+
+
+def _read_text_bounded(path: Path, *, encoding: str, max_memory_bytes: int, what: str) -> str:
+    size = path.stat().st_size
+    _check_schema_memory(size, max_memory_bytes, what)
+    text = path.read_text(encoding=encoding)
+    _check_text_memory(text, max_memory_bytes, f"{what} decoded text")
+    return text
 
 
 def _stage_member(path: Path, root: Path) -> None:
@@ -469,7 +539,7 @@ def _strip_sqlcmd_header(script: str) -> str:
     return script[match.end() :] if match else script
 
 
-def resolve_sqlcmd(script: str) -> str:
+def resolve_sqlcmd(script: str, *, max_memory_bytes: int | None = None) -> str:
     """Turn a sqlpackage deployment script into something a plain TDS connection can run.
 
     sqlpackage writes for the sqlcmd utility: ``:setvar`` directives define variables, and the
@@ -487,6 +557,14 @@ def resolve_sqlcmd(script: str) -> str:
     }
     script = _SQLCMD_DIRECTIVE.sub("", script)
     script = _USE_STATEMENT.sub("", script)
+    if max_memory_bytes is not None:
+        characters = len(script)
+        width = 1 if script.isascii() and all(value.isascii() for value in variables.values()) else 4
+        for match in _SQLCMD_VARIABLE.finditer(script):
+            characters += len(variables.get(match.group(1), match.group(0))) - len(match.group(0))
+        _check_schema_memory(
+            sys.getsizeof("") + characters * width, max_memory_bytes, "SQLCMD expansion",
+        )
     return _SQLCMD_VARIABLE.sub(lambda m: variables.get(m.group(1), m.group(0)), script)
 
 
@@ -564,12 +642,33 @@ def _is_noise(batch: str) -> bool:
     )
 
 
-def _batches(script: str) -> list[str]:
-    return [
-        batch.strip()
-        for batch in _BATCH_SEPARATOR.split(script)
-        if batch.strip() and not _is_noise(batch.strip())
-    ]
+def _batch_candidates(script: str) -> Iterator[str]:
+    start = 0
+    for match in _BATCH_SEPARATOR.finditer(script):
+        yield script[start : match.start()]
+        start = match.end()
+    yield script[start:]
+
+
+def _batches(script: str, *, max_memory_bytes: int | None = None) -> list[str]:
+    memory_budget = (
+        resolve_memory_budget(max_memory_bytes=max_memory_bytes)
+        if max_memory_bytes is not None
+        else None
+    )
+    retained = sys.getsizeof([]) + (sys.getsizeof(script) if memory_budget is not None else 0)
+    if memory_budget is not None:
+        _check_schema_memory(retained, memory_budget, "SQL schema batch input")
+    batches: list[str] = []
+    for candidate in _batch_candidates(script):
+        batch = candidate.strip()
+        if not batch or _is_noise(batch):
+            continue
+        if memory_budget is not None:
+            retained += sys.getsizeof(batch) + 8
+            _check_schema_memory(retained, memory_budget, "SQL schema batch list")
+        batches.append(batch)
+    return batches
 
 
 def _already_exists(error: pyodbc.Error) -> bool:
@@ -591,12 +690,27 @@ def apply_script(
     server: str,
     database: str,
     tokens: TokenProvider,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Execute a deployment script batch by batch, collecting per-batch failures."""
-    script = resolve_sqlcmd(_strip_sqlcmd_header(script_path.read_text(encoding="utf-8-sig")))
-    batches = _batches(script)
+    memory_budget = resolve_memory_budget(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+    )
+    script = _read_text_bounded(
+        script_path,
+        encoding="utf-8-sig",
+        max_memory_bytes=memory_budget,
+        what=f"SQL schema script '{script_path.name}'",
+    )
+    script = _strip_sqlcmd_header(script)
+    _check_text_memory(script, memory_budget, "SQL schema script after header trim")
+    script = resolve_sqlcmd(script, max_memory_bytes=memory_budget)
+    _check_text_memory(script, memory_budget, "SQL schema script after SQLCMD expansion")
+    batches = _batches(script, max_memory_bytes=memory_budget)
     if not batches:
         return []
 
@@ -634,7 +748,9 @@ def transfer_schema(
     target_database: str | None = None,
     id_map: Mapping[str, str] | None = None,
     source_identifiers: Collection[str] = (),
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     exclude_security: bool | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
@@ -648,19 +764,26 @@ def transfer_schema(
     credentials; an explicit ``exclude_security=False`` preserves same-tenant security handling.
     ``database`` is the source SQL catalog, not its Fabric item ID. ``target_database`` may
     differ. ``id_map`` and ``source_identifiers`` cover the other migrating items/endpoints.
-    Paired transfers clean their private package/script/tool staging on every exit. Tool
-    output and redirected temporary files count toward ``max_staging_bytes``; an external
-    tool can exceed the limit between checks, which is detected, stopped and reported.
+    Schema transfers clean their private package/script/tool staging on every exit. Tool
+    output and redirected temporary files count toward ``max_disk_staging_bytes``; SQL text
+    reads, SQLCMD expansion, rewrite checks and batch materialization count toward
+    ``max_memory_bytes``. ``max_staging_bytes`` remains a compatibility fallback for both
+    when supplied. These are estimated process checks, not filesystem or OS memory quotas.
     """
     # Both ends are waited for. The target may still be provisioning, and a source SQL
     # analytics endpoint can be cold enough that sqlpackage's own connection attempt times
     # out before it has answered once.
     check_cancelled(cancel_requested)
+    budgets = resolve_transfer_budgets(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+        max_disk_staging_bytes=max_disk_staging_bytes,
+    )
+    memory_budget = budgets.max_memory_bytes
+    disk_budget = budgets.max_disk_staging_bytes
     if exclude_security is None:
         exclude_security = target_tokens is not None
-    bounded = target_tokens is not None or exclude_security
-    if bounded:
-        check_budget(max_staging_bytes)
+    target_aware_script = target_tokens is not None or exclude_security
     destination_tokens = target_tokens or tokens
     destination_database = target_database or database
     wait_for_database(source_server, database, tokens, on_progress=on_progress)
@@ -669,14 +792,13 @@ def transfer_schema(
         target_server, destination_database, destination_tokens, on_progress=on_progress,
     )
 
-    with _schema_staging(scratch_dir, bounded) as staging:
-        transfer_id = uuid.uuid4().hex[:8]
-        dacpac = staging / ("schema.dacpac" if bounded else f"{database}-{transfer_id}.dacpac")
-        unpacked = staging / ("script" if bounded else f"{database}-{transfer_id}")
+    with _schema_staging(scratch_dir, True) as staging:
+        dacpac = staging / "schema.dacpac"
+        unpacked = staging / "script"
         tool_options = {
-            "staging_root": staging, "max_staging_bytes": max_staging_bytes,
+            "staging_root": staging, "max_disk_staging_bytes": disk_budget,
             "cancel_requested": cancel_requested,
-        } if bounded else {}
+        }
 
         if on_progress:
             on_progress(f"Extracting schema from {database}")
@@ -685,17 +807,19 @@ def transfer_schema(
         )
 
         check_cancelled(cancel_requested)
-        if bounded:
-            _check_staging(staging, max_staging_bytes)
+        _check_staging(staging, disk_budget)
+        if target_aware_script:
             script = script_dacpac(
                 dacpac, unpacked / "Deploy.sql", server=target_server, database=destination_database,
                 tokens=destination_tokens, exclude_tables=source_type == "Lakehouse",
                 exclude_security=exclude_security, **tool_options,
             )
-            _stage_member(script, staging)
-            _check_staging(staging, max_staging_bytes)
         else:
-            script = unpack_dacpac(dacpac, unpacked, exclude_tables=source_type == "Lakehouse")
+            script = unpack_dacpac(
+                dacpac, unpacked, exclude_tables=source_type == "Lakehouse", **tool_options,
+            )
+        _stage_member(script, staging)
+        _check_staging(staging, disk_budget)
 
         if target_tokens is not None or id_map is not None or source_identifiers:
             replacements = dict(id_map or {})
@@ -718,20 +842,30 @@ def transfer_schema(
                         )
                     replacements[old] = new
                     known.add(old)
-            text = script.read_text(encoding="utf-8-sig")
-            rebound = rewrite_schema_script(text, id_map=replacements, source_identifiers=known)
+            text = _read_text_bounded(
+                script,
+                encoding="utf-8-sig",
+                max_memory_bytes=memory_budget,
+                what=f"SQL schema script '{script.name}'",
+            )
+            rebound = rewrite_schema_script(
+                text,
+                id_map=replacements,
+                source_identifiers=known,
+                max_memory_bytes=memory_budget,
+            )
             if rebound != text:
+                _check_text_memory(rebound, memory_budget, "Rewritten SQL schema script")
                 encoded = rebound.encode("utf-8")
-                if bounded:
-                    _check_staging(
-                        staging, max_staging_bytes,
-                        additional=max(0, len(encoded) - script.stat().st_size),
-                    )
+                _check_schema_memory(len(encoded), memory_budget, "Encoded rewritten SQL schema script")
+                _check_staging(
+                    staging, disk_budget,
+                    additional=max(0, len(encoded) - script.stat().st_size),
+                )
                 script.write_bytes(encoded)
 
         check_cancelled(cancel_requested)
-        if bounded:
-            _check_staging(staging, max_staging_bytes)
+        _check_staging(staging, disk_budget)
         if on_progress:
             on_progress(f"Applying schema to {database}")
         return apply_script(
@@ -739,6 +873,7 @@ def transfer_schema(
             server=target_server,
             database=destination_database,
             tokens=destination_tokens,
+            max_memory_bytes=memory_budget,
             on_progress=on_progress,
             **({"cancel_requested": cancel_requested} if cancel_requested else {}),
         )
@@ -813,7 +948,8 @@ def _run_bounded(
     *,
     what: str,
     staging_root: Path,
-    max_staging_bytes: int,
+    max_staging_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
     """Monitor all owned files while SqlPackage runs, retaining the service's own error.
@@ -824,12 +960,16 @@ def _run_bounded(
     https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage#temporary-files
     https://learn.microsoft.com/dotnet/core/tools/dotnet-environment-variables
     """
-    check_budget(max_staging_bytes)
+    disk_budget = resolve_transfer_budgets(
+        max_staging_bytes=max_staging_bytes,
+        max_disk_staging_bytes=max_disk_staging_bytes,
+    ).max_disk_staging_bytes
+    check_budget(disk_budget, "max_disk_staging_bytes")
     check_cancelled(cancel_requested)
     root = staging_root.resolve()
     work = root / ".tool-work"
     work.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _check_staging(root, max_staging_bytes)
+    _check_staging(root, disk_budget)
     environment = {
         **os.environ,
         **dict.fromkeys(("TMP", "TEMP", "TMPDIR", "DOTNET_CLI_HOME"), str(work)),
@@ -858,11 +998,11 @@ def _run_bounded(
         try:
             while True:
                 check_cancelled(cancel_requested)
-                _check_staging(root, max_staging_bytes)
+                _check_staging(root, disk_budget)
                 if process.poll() is not None:
                     break
                 time.sleep(0.05)
-            _check_staging(root, max_staging_bytes)
+            _check_staging(root, disk_budget)
             check_cancelled(cancel_requested)
         except SchemaStagingError as error:
             _stop_tool(process, environment)
@@ -894,6 +1034,7 @@ def _run(command: list[str], *, what: str) -> None:
 
 __all__ = [
     "SECURITY_OBJECT_TYPES",
+    "SchemaMemoryError",
     "SchemaStagingError",
     "SchemaTransferError",
     "apply_script",

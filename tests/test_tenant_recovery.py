@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from copy import deepcopy
 
 import pytest
 
+from fabshuffle import config as config_module
 from fabshuffle import journal
 from fabshuffle.config import Settings
 from fabshuffle.run import MigrationRun, RunConflict, RunRegistry, RunStatus
@@ -86,13 +88,76 @@ def test_settings_isolate_ordered_pairs_and_paired_same_tenant_from_legacy(tmp_p
         settings.journal_dir_for(source_tenant_id=SOURCE_TENANT)
 
 
-def test_staging_budget_environment_is_read_when_settings_are_created(monkeypatch):
-    monkeypatch.delenv("FAB_SHUFFLE_MAX_STAGING_BYTES", raising=False)
+def test_staging_budget_environment_is_read_when_settings_are_created(monkeypatch, caplog):
+    for name in (
+        "FAB_SHUFFLE_MAX_STAGING_BYTES",
+        "FAB_SHUFFLE_MAX_MEMORY_BYTES",
+        "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert Settings().max_memory_bytes == 1024 ** 3
+    assert Settings().max_disk_staging_bytes == 10 * 1024 ** 3
     assert Settings().max_staging_bytes == 1024 ** 3
+
+    monkeypatch.setattr(config_module, "_legacy_staging_warning_emitted", False)
+    caplog.set_level(logging.WARNING, logger="fabshuffle.config")
     monkeypatch.setenv("FAB_SHUFFLE_MAX_STAGING_BYTES", "1024")
-    assert Settings().max_staging_bytes == 1024
-    monkeypatch.setenv("FAB_SHUFFLE_MAX_STAGING_BYTES", "not-a-number")
-    assert Settings().max_staging_bytes == 1024 ** 3
+    settings = Settings()
+    assert settings.max_memory_bytes == 1024
+    assert settings.max_disk_staging_bytes == 1024
+    assert settings.max_staging_bytes == 1024
+    Settings()
+    warnings = [
+        record.message for record in caplog.records
+        if "FAB_SHUFFLE_MAX_STAGING_BYTES is deprecated" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "FAB_SHUFFLE_MAX_MEMORY_BYTES" in warnings[0]
+    assert "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES" in warnings[0]
+
+    monkeypatch.setenv("FAB_SHUFFLE_MAX_MEMORY_BYTES", "2048")
+    settings = Settings()
+    assert settings.max_memory_bytes == 2048
+    assert settings.max_disk_staging_bytes == 1024
+    assert settings.max_staging_bytes == 1024
+
+    monkeypatch.setenv("FAB_SHUFFLE_MAX_DISK_STAGING_BYTES", "4096")
+    settings = Settings()
+    assert settings.max_memory_bytes == 2048
+    assert settings.max_disk_staging_bytes == 4096
+    assert settings.max_staging_bytes == 1024
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("FAB_SHUFFLE_MAX_MEMORY_BYTES", "not-a-number"),
+        ("FAB_SHUFFLE_MAX_MEMORY_BYTES", "0"),
+        ("FAB_SHUFFLE_MAX_DISK_STAGING_BYTES", "-1"),
+        ("FAB_SHUFFLE_MAX_STAGING_BYTES", "not-a-number"),
+    ],
+)
+def test_budget_environment_rejects_invalid_values(monkeypatch, name, value):
+    monkeypatch.delenv("FAB_SHUFFLE_MAX_STAGING_BYTES", raising=False)
+    monkeypatch.delenv("FAB_SHUFFLE_MAX_MEMORY_BYTES", raising=False)
+    monkeypatch.delenv("FAB_SHUFFLE_MAX_DISK_STAGING_BYTES", raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        Settings()
+
+
+def test_legacy_constructor_budget_is_a_fallback_for_each_new_side(monkeypatch):
+    for name in ("FAB_SHUFFLE_MAX_STAGING_BYTES", "FAB_SHUFFLE_MAX_MEMORY_BYTES",
+                 "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    combined = Settings(max_staging_bytes=2048)
+    assert combined.max_memory_bytes == combined.max_disk_staging_bytes == 2048
+    memory_override = Settings(max_staging_bytes=2048, max_memory_bytes=1024 ** 3)
+    assert memory_override.max_memory_bytes == 1024 ** 3
+    assert memory_override.max_disk_staging_bytes == 2048
+    disk_override = Settings(max_staging_bytes=2048, max_disk_staging_bytes=4096)
+    assert disk_override.max_memory_bytes == 2048
+    assert disk_override.max_disk_staging_bytes == 4096
 
 
 @pytest.mark.parametrize("key", IDENTITY)

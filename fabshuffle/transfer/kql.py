@@ -24,10 +24,9 @@ from azure.kusto.data.exceptions import KustoServiceError
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer.common import (
-    DEFAULT_MAX_STAGING_BYTES,
     StagingBudgetError,
-    check_budget,
     check_cancelled,
+    resolve_memory_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,7 +147,8 @@ def copy_database(
     target_principal: ServicePrincipal | None = None,
     source_database: str | None = None,
     target_database: str | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     on_copied: Callable[[str], None] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
@@ -173,6 +173,7 @@ def copy_database(
             database=database, source_database=source_database, target_database=target_database,
             principal=principal,
             target_principal=target_principal, max_staging_bytes=max_staging_bytes,
+            max_memory_bytes=max_memory_bytes,
             cancel_requested=cancel_requested, exclude=exclude, on_progress=on_progress,
             on_copied=on_copied, on_complete=on_complete, on_warning=on_warning,
         )
@@ -431,7 +432,7 @@ def stop_database_update_policies(
 
 def _stream_table(
     source: KustoClient, target: KustoClient, database: str, target_database: str,
-    table: str, max_staging_bytes: int, cancel_requested: Callable[[], bool] | None,
+    table: str, max_memory_bytes: int, cancel_requested: Callable[[], bool] | None,
 ) -> int:
     properties = _stream_properties()
     expected = _count(source, database, table)
@@ -455,7 +456,7 @@ def _stream_table(
     response = source.execute_streaming_query(
         database, _table_data(table), timeout=INGEST_TIMEOUT, properties=properties,
     )
-    limit = min(max_staging_bytes, 1024 * 1024)
+    limit = min(max_memory_bytes, 1024 * 1024)
     payload = bytearray()
     count = 0
     primary_seen = False
@@ -504,7 +505,7 @@ def _stream_table(
                 if len(encoded) > limit:
                     raise StagingBudgetError(
                         f"A KQL row in {table} requires {len(encoded)} bytes, above the "
-                        f"{limit}-byte streaming batch limit. Increase the staging budget "
+                        f"{limit}-byte memory streaming batch limit. Increase max_memory_bytes "
                         "or use an operator-managed queued ingestion for oversized rows."
                     )
                 if len(payload) + len(encoded) > limit:
@@ -544,7 +545,8 @@ def copy_database_streaming(
     target_principal: ServicePrincipal,
     source_database: str | None = None,
     target_database: str | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
     exclude: Collection[str] = (),
     on_progress: Callable[[str], None] | None = None,
     on_copied: Callable[[str], None] | None = None,
@@ -565,7 +567,10 @@ def copy_database_streaming(
     https://learn.microsoft.com/kusto/api/rest/streaming-ingest
     https://learn.microsoft.com/kusto/management/clear-table-data-command
     """
-    check_budget(max_staging_bytes)
+    memory_budget = resolve_memory_budget(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+    )
     check_cancelled(cancel_requested)
     origin = source_database or database
     destination = target_database or database
@@ -586,7 +591,7 @@ def copy_database_streaming(
             if on_progress:
                 on_progress(f"Streaming KQL table {origin}.{table}")
             rows += _stream_table(
-                source, target, origin, destination, table, max_staging_bytes, cancel_requested,
+                source, target, origin, destination, table, memory_budget, cancel_requested,
             )
             check_cancelled(cancel_requested)
             if on_copied:

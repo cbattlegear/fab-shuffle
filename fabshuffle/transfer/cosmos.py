@@ -29,10 +29,9 @@ from typing import Any
 from fabshuffle.auth import TokenProvider
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer.common import (
-    DEFAULT_MAX_STAGING_BYTES,
     StagingBudgetError,
-    check_budget,
     check_cancelled,
+    resolve_memory_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,7 +115,8 @@ def copy_documents(
     target_database: str,
     tokens: TokenProvider,
     target_tokens: TokenProvider | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
@@ -128,7 +128,10 @@ def copy_documents(
     """
     from azure.cosmos import exceptions
 
-    check_budget(max_staging_bytes)
+    memory_budget = resolve_memory_budget(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+    )
     check_cancelled(cancel_requested)
     warnings: list[str] = []
     clients: list[Any] = []
@@ -146,7 +149,12 @@ def copy_documents(
                 on_progress(f"Copying documents in container '{name}'")
             try:
                 copied = _copy_container(
-                    source, target, name, on_progress, max_staging_bytes, cancel_requested,
+                    source,
+                    target,
+                    name,
+                    on_progress,
+                    max_memory_bytes=memory_budget,
+                    cancel_requested=cancel_requested,
                 )
                 total_copied += copied
                 logger.debug("Copied %s documents into %s", copied, name)
@@ -171,9 +179,15 @@ def _copy_container(
     target: Any,
     name: str,
     on_progress: Callable[[str], None] | None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    *,
+    max_memory_bytes: int | None = None,
 ) -> int:
+    memory_budget = resolve_memory_budget(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+    )
     reader = source.get_container_client(name)
     writer = target.get_container_client(name)
 
@@ -182,10 +196,10 @@ def _copy_container(
         check_cancelled(cancel_requested)
         payload = strip_system_properties(document)
         size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        if size > max_staging_bytes:
+        if size > memory_budget:
             raise StagingBudgetError(
                 f"Document in container '{name}' needs {size} bytes, above the "
-                f"{max_staging_bytes}-byte staging budget. Increase the budget and retry."
+                f"{memory_budget}-byte memory budget. Increase max_memory_bytes and retry."
             )
         writer.upsert_item(payload)
         copied += 1

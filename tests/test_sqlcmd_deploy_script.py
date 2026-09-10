@@ -74,6 +74,22 @@ def resolved(script: str = DEPLOY_SQL) -> list[str]:
     return sqlschema._batches(sqlschema.resolve_sqlcmd(trimmed))
 
 
+def test_sqlcmd_expansion_budget_is_checked_before_materializing_the_output(monkeypatch):
+    script = ':setvar Wide "' + ("x" * 128) + '"\nSELECT ' + ", ".join(["$(Wide)"] * 20)
+    original = sqlschema._SQLCMD_VARIABLE
+
+    class NoExpansion:
+        def finditer(self, value):
+            return original.finditer(value)
+
+        def sub(self, *args):
+            pytest.fail("Oversized SQLCMD expansion must be refused before allocation")
+
+    monkeypatch.setattr(sqlschema, "_SQLCMD_VARIABLE", NoExpansion())
+    with pytest.raises(sqlschema.SchemaMemoryError, match="SQLCMD expansion"):
+        sqlschema.resolve_sqlcmd(script, max_memory_bytes=1024)
+
+
 def test_no_batch_still_contains_a_sqlcmd_directive() -> None:
     """These are utility directives; the server reports them as syntax errors (42000)."""
     for batch in resolved():
@@ -185,6 +201,34 @@ def test_the_whole_preamble_costs_no_warnings(tmp_path: Path, monkeypatch) -> No
     assert not any(sqlschema._NOEXEC.search(batch) for batch in executed)
     # Every batch sent must be executable, not leftover commentary.
     assert all(batch.strip() for batch in executed)
+
+
+def test_apply_script_refuses_file_larger_than_memory_budget(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(sqlschema, "connect", lambda *a, **k: pytest.fail("script was not preflighted"))
+    script = tmp_path / "Deploy.sql"
+    script.write_text("CREATE TABLE [dbo].[T] ([Id] INT);\n", encoding="utf-8")
+
+    with pytest.raises(sqlschema.SchemaMemoryError, match="memory budget"):
+        sqlschema.apply_script(
+            script, server="srv", database="target", tokens=object(), max_memory_bytes=10,
+        )
+
+
+def test_apply_script_refuses_sqlcmd_expansion_over_memory_budget(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(sqlschema, "connect", lambda *a, **k: pytest.fail("expanded script was executed"))
+    script = tmp_path / "Deploy.sql"
+    references = "$(Big)" * 20
+    script.write_text(
+        f"/* generated header */\nGO\n:setvar Big \"{'x' * 80}\"\nGO\nPRINT N'{references}';\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(sqlschema.SchemaMemoryError, match="SQLCMD expansion"):
+        sqlschema.apply_script(
+            script, server="srv", database="target", tokens=object(), max_memory_bytes=600,
+        )
 
 
 @pytest.mark.parametrize(
