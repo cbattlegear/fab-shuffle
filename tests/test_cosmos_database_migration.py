@@ -160,6 +160,8 @@ def test_documents_are_copied_between_the_two_endpoints(monkeypatch):
     assert calls[0]["source_endpoint"] == "https://src.xyz.cosmos.fabric.microsoft.com:443/"
     assert calls[0]["target_endpoint"] == "https://dst.xyz.cosmos.fabric.microsoft.com:443/"
     assert calls[0]["source_database"] == "CosmosTestItem"
+    assert calls[0]["max_memory_bytes"] == orchestrator.SETTINGS.max_memory_bytes
+    assert "max_staging_bytes" not in calls[0]
 
 
 def test_no_documents_are_copied_when_the_plan_says_not_to(monkeypatch):

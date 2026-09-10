@@ -2224,7 +2224,7 @@ def _migrate_kql_database(
             options = {
                 "target_database": target["id"],
                 "target_principal": ctx.destination_principal,
-                "max_staging_bytes": SETTINGS.max_staging_bytes,
+                "max_memory_bytes": SETTINGS.max_memory_bytes,
                 "cancel_requested": lambda: ctx.run.cancelled,
             }
         result = copy(
@@ -2389,7 +2389,8 @@ def _copy_lakehouse_tables(
                     outcome = file_transfer.copy_tree_streaming(
                         source_path=source_path, target_path=target_path,
                         tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
-                        max_staging_bytes=SETTINGS.max_staging_bytes,
+                        max_memory_bytes=SETTINGS.max_memory_bytes,
+                        max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
                         exclude_paths=_shortcut_exclusions(ctx, lakehouse["id"], "Tables"),
                         kind="lakehouse", scratch_dir=ctx.scratch_dir / f"delta-{lakehouse['id']}",
                         cancel_requested=lambda: ctx.run.cancelled,
@@ -2663,7 +2664,8 @@ def _lakehouse_file_job(
                 result = file_transfer.copy_tree_streaming(
                     source_path=source_files, target_path=target_files,
                     tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
-                    max_staging_bytes=SETTINGS.max_staging_bytes,
+                    max_memory_bytes=SETTINGS.max_memory_bytes,
+                    max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
                     exclude_paths=_shortcut_exclusions(ctx, lakehouse["id"], "Files"),
                     scratch_dir=ctx.scratch_dir / f"delta-files-{lakehouse['id']}",
                     cancel_requested=lambda: ctx.run.cancelled,
@@ -2777,10 +2779,11 @@ def _transfer_warehouse_schemas(
                     tokens=ctx.tokens,
                     scratch_dir=ctx.scratch_dir / "sql",
                     source_type="Warehouse",
+                    max_memory_bytes=SETTINGS.max_memory_bytes,
+                    max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
                     **({
                         "target_tokens": ctx.destination_tokens,
                         "exclude_security": True,
-                        "max_staging_bytes": SETTINGS.max_staging_bytes,
                         "cancel_requested": lambda: ctx.run.cancelled,
                         "id_map": ctx.id_map,
                         "source_identifiers": tuple(analytics.reference_identifiers(ctx.source_items)),
@@ -2899,7 +2902,7 @@ def _stream_relational_tables(
             source_server=source_server, source_database=source_database,
             target_server=target_server, target_database=target_database,
             tables=remaining, tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
-            max_staging_bytes=SETTINGS.max_staging_bytes,
+            max_memory_bytes=SETTINGS.max_memory_bytes,
             target_type=target_type,
             cancel_requested=lambda: ctx.run.cancelled,
             on_progress=_bulk_copy_progress(ctx, step, name),
@@ -2988,7 +2991,8 @@ def _migrate_sql_databases(ctx: _Context) -> None:
                         database=source_catalog, target_database=target_catalog,
                         principal=ctx.principal, tokens=ctx.tokens,
                         target_tokens=ctx.destination_tokens, exclude_security=True,
-                        max_staging_bytes=SETTINGS.max_staging_bytes,
+                        max_memory_bytes=SETTINGS.max_memory_bytes,
+                        max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
                         cancel_requested=lambda: ctx.run.cancelled,
                         scratch_dir=ctx.scratch_dir / f"schema-{database['id']}",
                         source_type="SQLDatabase", id_map=ctx.id_map,
@@ -3256,12 +3260,12 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
                     target_endpoint=target_endpoint,
                     target_database=cosmosdb.database_name(target),
                     tokens=ctx.tokens,
+                    max_memory_bytes=SETTINGS.max_memory_bytes,
+                    cancel_requested=lambda: ctx.run.cancelled,
                     on_progress=progress,
                     on_complete=observed.append,
                     **({
                         "target_tokens": ctx.destination_tokens,
-                        "max_staging_bytes": SETTINGS.max_staging_bytes,
-                        "cancel_requested": lambda: ctx.run.cancelled,
                     } if ctx.plan.paired else {}),
                 )
             ]
@@ -3816,10 +3820,11 @@ def _transfer_endpoint_schemas(
                     tokens=ctx.tokens,
                     scratch_dir=ctx.scratch_dir / "sql",
                     source_type="Lakehouse",
+                    max_memory_bytes=SETTINGS.max_memory_bytes,
+                    max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
                     **({
                         "target_tokens": ctx.destination_tokens,
                         "exclude_security": True,
-                        "max_staging_bytes": SETTINGS.max_staging_bytes,
                         "cancel_requested": lambda: ctx.run.cancelled,
                         "id_map": ctx.id_map,
                         "source_identifiers": tuple(analytics.reference_identifiers(ctx.source_items)),

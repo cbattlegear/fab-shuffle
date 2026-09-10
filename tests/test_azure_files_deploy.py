@@ -102,7 +102,7 @@ def test_storage_account_name_is_deterministic_lowercase_and_within_length_limit
     template = _load_template()
     expression = template["variables"]["storageAccountName"]
     assert expression == (
-        "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, parameters('appName'))))]"
+        "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, variables('appName'))))]"
     )
     # Extract the literal prefix concatenated ahead of the uniqueString(...) hash.
     match = re.search(r"concat\('([a-z0-9]+)',\s*uniqueString\(", expression)
@@ -287,10 +287,7 @@ def test_ingress_and_ip_restriction_settings_unchanged() -> None:
     )
 
 
-def test_existing_parameters_and_pinned_defaults_unchanged() -> None:
-    """This change should only add shareQuotaGiB; it must not touch the existing, already
-    reviewed parameters or the pinned public image reference.
-    """
+def test_existing_sizing_and_image_defaults_unchanged() -> None:
     template = _load_template()
     params = template["parameters"]
     assert params["containerImage"]["defaultValue"] == "ghcr.io/cbattlegear/fab-shuffle:latest"
@@ -299,7 +296,7 @@ def test_existing_parameters_and_pinned_defaults_unchanged() -> None:
     assert params["appName"]["maxLength"] == 32
     # appName still isn't reused verbatim as the storage account name (see the dedicated test
     # above); this just confirms the parameter's own shape survived.
-    assert params["appName"]["defaultValue"] == "[concat('fab-shuffle-', uniqueString(resourceGroup().id))]"
+    assert params["appName"]["defaultValue"] == ""
 
 
 def test_app_and_environment_api_versions_unchanged() -> None:
@@ -308,3 +305,85 @@ def test_app_and_environment_api_versions_unchanged() -> None:
     environment = _one(template, "Microsoft.App/managedEnvironments")
     assert container_app["apiVersion"] == "2024-03-01"
     assert environment["apiVersion"] == "2024-03-01"
+
+
+def test_portal_parameters_do_not_display_unevaluated_arm_expressions() -> None:
+    """The generated portal form displayed concat/resourceGroup expressions in text inputs."""
+    template = _load_template()
+    for name, parameter in template["parameters"].items():
+        default = parameter.get("defaultValue")
+        assert not (isinstance(default, str) and default.startswith("[")), name
+    for name in ("appName", "location"):
+        assert template["parameters"][name]["defaultValue"] == ""
+        assert "leave blank" in template["parameters"][name]["metadata"]["description"].lower()
+
+
+def test_blank_inputs_keep_the_previous_defaults_and_explicit_overrides() -> None:
+    variables = _load_template()["variables"]
+    assert variables["appName"] == (
+        "[if(empty(parameters('appName')), "
+        "concat('fab-shuffle-', uniqueString(resourceGroup().id)), parameters('appName'))]"
+    )
+    assert variables["location"] == (
+        "[if(empty(parameters('location')), resourceGroup().location, parameters('location'))]"
+    )
+
+
+def test_every_deployed_name_uses_the_resolved_app_name_including_storage() -> None:
+    template = _load_template()
+    variables = template["variables"]
+    assert variables["environmentName"] == "[concat(variables('appName'), '-env')]"
+    assert variables["logAnalyticsName"] == "[concat(variables('appName'), '-logs')]"
+    assert _one(template, "Microsoft.App/containerApps")["name"] == "[variables('appName')]"
+    assert "resourceGroup().id, variables('appName')" in variables["storageAccountName"]
+    assert "resourceId('Microsoft.App/containerApps', variables('appName'))" in (
+        template["outputs"]["url"]["value"]
+    )
+    # Leaving a raw parameter reference behind would create empty resource names or a
+    # differently named share, losing the operator's existing persistent staging/journals.
+    downstream = json.dumps({
+        "variables": {key: value for key, value in variables.items() if key not in ("appName", "location")},
+        "resources": template["resources"],
+        "outputs": template["outputs"],
+    })
+    assert "parameters('appName')" not in downstream
+    assert "parameters('location')" not in downstream
+
+
+def test_every_regional_resource_uses_the_resolved_location() -> None:
+    resources = [item for item in _load_template()["resources"] if "location" in item]
+    assert len(resources) == 4
+    assert all(item["location"] == "[variables('location')]" for item in resources)
+
+
+def test_disk_memory_and_share_capacity_are_independent_parameters() -> None:
+    template = _load_template()
+    params = template["parameters"]
+    assert params["shareQuotaGiB"]["defaultValue"] == 100
+    assert params["maxDiskStagingGiB"]["defaultValue"] == 10
+    assert params["maxMemoryMiB"]["defaultValue"] == 1024
+    for key in ("maxDiskStagingGiB", "maxMemoryMiB"):
+        assert params[key]["type"] == "int"
+        assert params[key]["minValue"] > 0
+    container = _one(template, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
+    env = {entry["name"]: entry["value"] for entry in container["env"]}
+    assert env["FAB_SHUFFLE_MAX_DISK_STAGING_BYTES"] == (
+        "[string(mul(parameters('maxDiskStagingGiB'), 1073741824))]"
+    )
+    assert env["FAB_SHUFFLE_MAX_MEMORY_BYTES"] == (
+        "[string(mul(parameters('maxMemoryMiB'), 1048576))]"
+    )
+    assert "FAB_SHUFFLE_MAX_STAGING_BYTES" not in env
+    assert "shareQuotaGiB" not in json.dumps(env)
+
+
+def test_template_budget_defaults_match_the_runtime_without_legacy_overrides(monkeypatch) -> None:
+    from fabshuffle.config import Settings
+
+    for name in ("FAB_SHUFFLE_MAX_STAGING_BYTES", "FAB_SHUFFLE_MAX_MEMORY_BYTES",
+                 "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings()
+    params = _load_template()["parameters"]
+    assert params["maxDiskStagingGiB"]["defaultValue"] * 1024 ** 3 == settings.max_disk_staging_bytes
+    assert params["maxMemoryMiB"]["defaultValue"] * 1024 ** 2 == settings.max_memory_bytes

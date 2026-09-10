@@ -380,10 +380,27 @@ def test_oversized_checkpoint_never_exceeds_disk_budget(monkeypatch, tmp_path):
     sentinel = tmp_path / "keep.txt"
     sentinel.write_text("keep")
     with pytest.raises(StagingBudgetError, match="staging bytes"):
-        copy(tmp_path, max_staging_bytes=32768)
+        copy(tmp_path, max_memory_bytes=256 * 1024, max_disk_staging_bytes=32768)
     no_uploads(lake, tmp_path)
     assert sentinel.read_text() == "keep"
     assert not any(request.headers.get("Range") for request in lake.requests)
+
+
+def test_checkpoint_disk_budget_can_exceed_arrow_memory_budget(monkeypatch, tmp_path):
+    content = parquet(
+        PROTOCOL,
+        METADATA,
+        {"add": {"path": "part.parquet", "stats": "".join(chr(33 + i % 80) for i in range(50000))}},
+        compression="NONE",
+    )
+    assert len(content) > 8192
+    source = {CHECKPOINT: content, TABLE + "/part.parquet": b"data"}
+    lake = install(monkeypatch, source)
+
+    copy(tmp_path, max_memory_bytes=8192, max_disk_staging_bytes=len(content) + 1024)
+
+    assert {name: bytes(value) for name, value in lake.uploads.items()} == source
+    assert not list(tmp_path.glob("delta-preflight-*"))
 
 
 def test_cancel_during_checkpoint_decode_always_cleans_staging(monkeypatch, tmp_path):
@@ -592,7 +609,7 @@ def test_json_record_budget_is_enforced_without_staging_the_log(monkeypatch, tmp
         },
     )
     with pytest.raises(StagingBudgetError, match="Delta JSON record"):
-        copy(tmp_path, max_staging_bytes=8192)
+        copy(tmp_path, max_memory_bytes=8192, max_disk_staging_bytes=10 * 1024 * 1024)
     no_uploads(lake, tmp_path)
 
 
@@ -601,7 +618,7 @@ def test_checkpoint_decompression_is_bounded_before_reading_batches(monkeypatch,
     assert len(content) < 8192
     lake = install(monkeypatch, {CHECKPOINT: content})
     with pytest.raises(StagingBudgetError, match="Projected Delta checkpoint row group"):
-        copy(tmp_path, max_staging_bytes=8192)
+        copy(tmp_path, max_memory_bytes=8192, max_disk_staging_bytes=10 * 1024 * 1024)
     no_uploads(lake, tmp_path)
 
 

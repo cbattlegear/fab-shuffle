@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -22,6 +23,12 @@ SCOPE_SQL = "https://database.windows.net/.default"
 SCOPE_POWERBI = "https://analysis.windows.net/powerbi/api/.default"
 
 AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
+DEFAULT_MAX_MEMORY_BYTES = 1024 ** 3
+DEFAULT_MAX_DISK_STAGING_BYTES = 10 * 1024 ** 3
+_LEGACY_MAX_STAGING_ENV = "FAB_SHUFFLE_MAX_STAGING_BYTES"
+_legacy_staging_warning_emitted = False
+
+logger = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -29,6 +36,42 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ[name])
     except (KeyError, ValueError):
         return default
+
+
+def _positive_env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_setting(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _legacy_staging_budget() -> int | None:
+    value = _positive_env_int(_LEGACY_MAX_STAGING_ENV)
+    if value is None:
+        return None
+    global _legacy_staging_warning_emitted
+    if not _legacy_staging_warning_emitted:
+        logger.warning(
+            "%s is deprecated. Set FAB_SHUFFLE_MAX_MEMORY_BYTES for in-memory rows, "
+            "documents, metadata and script processing, and FAB_SHUFFLE_MAX_DISK_STAGING_BYTES "
+            "for bounded schema/checkpoint disk staging; the legacy value is used only where "
+            "the matching new setting is not set.",
+            _LEGACY_MAX_STAGING_ENV,
+        )
+        _legacy_staging_warning_emitted = True
+    return value
 
 
 @dataclass(slots=True)
@@ -62,13 +105,33 @@ class Settings:
     # disk. Several at once compete for the same memory and disk rather than going faster.
     schema_transfer_concurrency: int = _env_int("FAB_SHUFFLE_SCHEMA_CONCURRENCY", 2)
     file_transfer_concurrency: int = _env_int("FAB_SHUFFLE_FILE_CONCURRENCY", 2)
-    max_staging_bytes: int = field(
-        default_factory=lambda: _env_int("FAB_SHUFFLE_MAX_STAGING_BYTES", 1024 ** 3)
+    max_memory_bytes: int | None = field(
+        default_factory=lambda: _positive_env_int("FAB_SHUFFLE_MAX_MEMORY_BYTES")
     )
+    max_disk_staging_bytes: int | None = field(
+        default_factory=lambda: _positive_env_int("FAB_SHUFFLE_MAX_DISK_STAGING_BYTES")
+    )
+    # Legacy constructor/environment fallback. Runtime consumers use the resolved new fields.
+    max_staging_bytes: int | None = field(default_factory=_legacy_staging_budget)
     sqlpackage_path: str = os.environ.get("FAB_SHUFFLE_SQLPACKAGE", "sqlpackage")
     unpackdacpac_path: str = os.environ.get("FAB_SHUFFLE_UNPACKDACPAC", "unpackdacpac")
     azcopy_path: str = os.environ.get("FAB_SHUFFLE_AZCOPY", "azcopy")
     bcp_path: str = os.environ.get("FAB_SHUFFLE_BCP", "bcp")
+
+    def __post_init__(self) -> None:
+        legacy = self.max_staging_bytes
+        if legacy is not None:
+            legacy = _positive_setting("max_staging_bytes", legacy)
+        self.max_memory_bytes = _positive_setting(
+            "max_memory_bytes", self.max_memory_bytes if self.max_memory_bytes is not None
+            else legacy if legacy is not None else DEFAULT_MAX_MEMORY_BYTES,
+        )
+        self.max_disk_staging_bytes = _positive_setting(
+            "max_disk_staging_bytes", self.max_disk_staging_bytes if self.max_disk_staging_bytes is not None
+            else legacy if legacy is not None else DEFAULT_MAX_DISK_STAGING_BYTES,
+        )
+        if self.max_staging_bytes is None:
+            self.max_staging_bytes = self.max_memory_bytes
 
     def scratch_dir_for(self, run_id: str) -> Path:
         path = self.scratch_root / run_id

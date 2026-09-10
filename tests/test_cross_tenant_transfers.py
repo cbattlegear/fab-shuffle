@@ -145,6 +145,17 @@ def test_onelake_chunks_route_each_credential_and_bound_bytes(monkeypatch):
     assert not any(r.method == "PUT" and r.url.path.endswith(root) for r in service.requests)
 
 
+def test_onelake_disk_budget_does_not_increase_http_chunk_size(monkeypatch):
+    service = OneLake(payload=b"0123456789abcdef")
+    install_onelake(monkeypatch, service)
+
+    relay_files(max_memory_bytes=8, max_disk_staging_bytes=10 * 1024 * 1024)
+
+    chunks = [r.content for r in service.requests if r.url.params.get("action") == "append"]
+    assert chunks
+    assert max(map(len, chunks)) == 4
+
+
 @pytest.mark.parametrize("kind", ["lakehouse", "files"])
 def test_unvalidated_delta_layout_fails_before_upload_or_completion(monkeypatch, kind, tmp_path):
     service = OneLake(root="Tables")
@@ -343,7 +354,7 @@ def test_sql_streams_typed_rows_to_correct_tenant_and_preserves_identity_precisi
 def test_sql_indivisible_oversize_row_fails_without_checkpoint(monkeypatch):
     source, target, _ = install_sql(monkeypatch, [(1, Decimal("1"), "x" * 1000)])
     checkpoints = []
-    with pytest.raises(StagingBudgetError, match="staging budget"):
+    with pytest.raises(StagingBudgetError, match="memory budget"):
         relay_sql(max_staging_bytes=128, on_copied=checkpoints.append)
     assert not target.rows and not checkpoints and target.rollbacks == 1
     assert source.closed and target.closed
@@ -876,6 +887,35 @@ def _write_script(path, text):
     return path
 
 
+def test_schema_unpack_path_is_disk_bounded_without_target_aware_script(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(sqlschema, "wait_for_database", lambda *a, **kw: None)
+
+    def extract(**kwargs):
+        calls.append(("extract", kwargs))
+        kwargs["output"].write_bytes(b"dacpac")
+
+    def unpack(dacpac, destination, **kwargs):
+        calls.append(("unpack", kwargs))
+        assert dacpac.parent == kwargs["staging_root"]
+        return _write_script(destination / "Deploy.sql", "SELECT 1")
+
+    monkeypatch.setattr(sqlschema, "extract_dacpac", extract)
+    monkeypatch.setattr(sqlschema, "unpack_dacpac", unpack)
+    monkeypatch.setattr(sqlschema, "script_dacpac", lambda *a, **kw: pytest.fail("legacy script changed"))
+    monkeypatch.setattr(sqlschema, "apply_script", lambda *a, **kw: calls.append(("apply", kw)) or [])
+
+    assert sqlschema.transfer_schema(
+        source_server="source", target_server="target", database="original",
+        principal=SOURCE, tokens="source", scratch_dir=tmp_path, source_type="Warehouse",
+        max_memory_bytes=1024, max_disk_staging_bytes=2048,
+    ) == []
+
+    assert calls[0][1]["max_disk_staging_bytes"] == 2048
+    assert calls[1][1]["max_disk_staging_bytes"] == 2048
+    assert calls[2][1]["max_memory_bytes"] == 1024
+
+
 def test_schema_rewrites_source_workspace_item_server_and_catalog_before_apply(monkeypatch, tmp_path):
     script = tmp_path / "Deploy.sql"
     script.write_text(
@@ -984,7 +1024,7 @@ def test_paired_schema_cleans_only_owned_staging_on_every_exit(monkeypatch, tmp_
         stage = kwargs["staging_root"]
         stages.append(stage)
         assert stage.parent == scratch and stage != scratch
-        assert kwargs["max_staging_bytes"] == 32
+        assert kwargs["max_disk_staging_bytes"] == 32
         kwargs["output"].write_bytes(b"x" * (33 if outcome == "budget" else 7))
         if outcome == "extract-error":
             raise sqlschema.SchemaTransferError("SourceReadDenied: cannot extract")
@@ -993,6 +1033,7 @@ def test_paired_schema_cleans_only_owned_staging_on_every_exit(monkeypatch, tmp_
 
     def script(dacpac, output, **kwargs):
         assert dacpac.parent == stages[0] and kwargs["staging_root"] == stages[0]
+        assert kwargs["max_disk_staging_bytes"] == 32
         text = "SELECT 'old';" if outcome == "rewrite-budget" else "SELECT 1"
         _write_script(output, text)
         if outcome == "script-error":
@@ -1014,7 +1055,8 @@ def test_paired_schema_cleans_only_owned_staging_on_every_exit(monkeypatch, tmp_
         return sqlschema.transfer_schema(
             source_server="source.example", target_server="target.example", database="original",
             target_database="copy", principal=SOURCE, tokens="source", target_tokens="target",
-            scratch_dir=scratch, source_type="SQLDatabase", max_staging_bytes=32,
+            scratch_dir=scratch, source_type="SQLDatabase", max_disk_staging_bytes=32,
+            max_memory_bytes=128 if outcome == "rewrite-budget" else 1024,
             cancel_requested=lambda: cancelled,
             id_map={"old": "x" * 100} if outcome == "rewrite-budget" else {},
         )
@@ -1067,7 +1109,7 @@ def test_bounded_schema_extract_explicitly_excludes_rows_and_redirects_table_tem
         assert (
             f"/p:TempDirectoryForTableData={(root / '.tool-work' / 'table-data').resolve()}" in command
         )
-        assert options["staging_root"] == root and options["max_staging_bytes"] == 64
+        assert options["staging_root"] == root and options["max_disk_staging_bytes"] == 64
     assert not root.exists()
 
 

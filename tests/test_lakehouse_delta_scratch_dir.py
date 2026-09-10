@@ -88,6 +88,9 @@ def test_paired_table_copy_stages_delta_preflight_under_the_run_scratch_dir(monk
     assert captured["scratch_dir"] == tmp_path / f"delta-{LAKEHOUSE_ID}"
     # Never the implicit default: a live server has no meaningful working directory to stage in.
     assert captured["scratch_dir"] != Path.cwd()
+    assert captured["max_memory_bytes"] == orchestrator.SETTINGS.max_memory_bytes
+    assert captured["max_disk_staging_bytes"] == orchestrator.SETTINGS.max_disk_staging_bytes
+    assert "max_staging_bytes" not in captured
 
 
 def test_paired_files_copy_stages_delta_preflight_under_the_run_scratch_dir(monkeypatch, tmp_path):
@@ -108,3 +111,6 @@ def test_paired_files_copy_stages_delta_preflight_under_the_run_scratch_dir(monk
     # Distinct from the Tables/ scratch subdirectory, so a table and a file copy for the same
     # lakehouse never contend over (or race the cleanup of) the same staging directory.
     assert captured["scratch_dir"] != tmp_path / f"delta-{LAKEHOUSE_ID}"
+    assert captured["max_memory_bytes"] == orchestrator.SETTINGS.max_memory_bytes
+    assert captured["max_disk_staging_bytes"] == orchestrator.SETTINGS.max_disk_staging_bytes
+    assert "max_staging_bytes" not in captured

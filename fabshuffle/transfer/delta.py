@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from fabshuffle.auth import TokenProvider
-from fabshuffle.transfer.common import StagingBudgetError, check_cancelled
+from fabshuffle.transfer.common import StagingBudgetError, check_cancelled, resolve_transfer_budgets
 from fabshuffle.transfer.files import DeltaValidationRequired, _file_properties, _listed_paths, _read_chunks
 
 FEATURES = {
@@ -184,7 +184,8 @@ class Snapshot:
             self.retained_bytes += len(name.encode("utf-8")) + 128
             if self.retained_bytes > self.budget:
                 raise StagingBudgetError(
-                    f"Delta reference inventory exceeds {self.budget} bytes; increase the budget."
+                    f"Delta reference inventory exceeds the {self.budget}-byte memory budget; "
+                    "increase max_memory_bytes."
                 )
             self.pointers.add(name)
 
@@ -193,7 +194,9 @@ class Snapshot:
         if descriptor not in self.checkpoints:
             self.retained_bytes += len(log.encode("utf-8")) + 128
             if self.retained_bytes > self.budget:
-                raise StagingBudgetError(f"Delta checkpoint inventory exceeds {self.budget} bytes.")
+                raise StagingBudgetError(
+                    f"Delta checkpoint inventory exceeds the {self.budget}-byte memory budget."
+                )
             self.checkpoints.add(descriptor)
 
     def pin(self, entry: dict[str, Any]) -> dict[str, Any]:
@@ -407,7 +410,8 @@ def _json_records(chunks: Iterator[bytes], budget: int, where: str) -> Iterator[
             prefix, separator, chunk = chunk.partition(b"\n")
             if len(pending) + len(prefix) > budget:
                 raise StagingBudgetError(
-                    f"Delta JSON record in '{where}' exceeds {budget} bytes; raise the budget."
+                    f"Delta JSON record in '{where}' exceeds the {budget}-byte memory budget; "
+                    "increase max_memory_bytes."
                 )
             pending.extend(prefix)
             if separator:
@@ -453,8 +457,9 @@ def _parquet(path: Path, inspector: Inspector, budget: int, cancelled: Callable[
                     uncompressed += column.total_uncompressed_size
             if uncompressed > budget:
                 raise StagingBudgetError(
-                    f"Projected Delta checkpoint row group requires {uncompressed} bytes, above {budget}; "
-                    "increase the budget or produce smaller checkpoint row groups."
+                    f"Projected Delta checkpoint row group requires {uncompressed} bytes, above the "
+                    f"{budget}-byte memory budget; increase max_memory_bytes or produce smaller "
+                    "checkpoint row groups."
                 )
             for batch in parquet.iter_batches(
                 batch_size=max(1, min(128, budget // 4096)),
@@ -464,7 +469,9 @@ def _parquet(path: Path, inspector: Inspector, budget: int, cancelled: Callable[
             ):
                 check_cancelled(cancelled)
                 if batch.nbytes > budget:
-                    raise StagingBudgetError(f"Decoded Delta checkpoint batch exceeds {budget} bytes.")
+                    raise StagingBudgetError(
+                        f"Decoded Delta checkpoint batch exceeds the {budget}-byte memory budget."
+                    )
                 for row in batch.to_pylist():
                     inspector.action(row)
 
@@ -475,7 +482,9 @@ def preflight(
     root: str,
     tokens: TokenProvider,
     *,
-    max_staging_bytes: int,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     scratch_dir: Path | None,
     is_excluded: Callable[[str], bool],
     on_progress: Callable[[str], None] | None,
@@ -491,9 +500,19 @@ def preflight(
     mixes ordinary content with zero or more unmanaged Delta tables) files outside any
     discovered table are left for the caller to copy unvalidated, and only files actually
     inside a discovered table's ``_delta_log`` are inspected for escaping/unsafe references.
+    Checkpoint and sidecar Parquet files are staged one at a time, so
+    ``max_disk_staging_bytes`` is a per-active-artifact check, not a cumulative cap for every
+    metadata file observed during the preflight. Retained inventories and decoded Arrow/JSON
+    data remain bounded by ``max_memory_bytes``.
     """
-    snapshot = Snapshot(budget=max_staging_bytes, strict=strict)
-    budget = max_staging_bytes
+    budgets = resolve_transfer_budgets(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+        max_disk_staging_bytes=max_disk_staging_bytes,
+    )
+    memory_budget = budgets.max_memory_bytes
+    disk_budget = budgets.max_disk_staging_bytes
+    snapshot = Snapshot(budget=memory_budget, strict=strict)
 
     def walk(directory: str) -> Iterator[dict[str, Any]]:
         for entry in _listed_paths(client, filesystem, directory, tokens, cancel_requested):
@@ -527,9 +546,10 @@ def preflight(
             size, etag = _file_properties(client, url, entry, tokens)
             snapshot.files[name] = etag, size
             snapshot.retained_bytes += len(name.encode()) + len(etag.encode()) + 256
-            if snapshot.retained_bytes > budget:
+            if snapshot.retained_bytes > memory_budget:
                 raise StagingBudgetError(
-                    f"Delta metadata inventory exceeds {budget} bytes; increase the budget."
+                    f"Delta metadata inventory exceeds the {memory_budget}-byte memory budget; "
+                    "increase max_memory_bytes."
                 )
             if on_progress:
                 on_progress(f"Validating Delta references in {name}")
@@ -540,7 +560,7 @@ def preflight(
                 tokens,
                 size,
                 etag,
-                max(1, min(budget // 2, 1024 * 1024)),
+                max(1, min(memory_budget // 2, 1024 * 1024)),
                 cancel_requested,
             )
             try:
@@ -550,22 +570,23 @@ def preflight(
                         or re.fullmatch(r"\d{20}\.checkpoint(?:\.[^.]+)*\.parquet", relative)
                     ):
                         _fail(name, "unrecognized checkpoint/sidecar file")
-                    if size > budget:
+                    if size > disk_budget:
                         raise StagingBudgetError(
-                            f"Delta checkpoint '{name}' needs {size} staging bytes, above {budget}; "
-                            "increase the budget or produce smaller checkpoints."
+                            f"Delta checkpoint '{name}' needs {size} staging bytes, above the "
+                            f"{disk_budget}-byte disk staging budget. Increase "
+                            "max_disk_staging_bytes or produce smaller checkpoints."
                         )
                     try:
                         written = 0
                         with staged.open("wb") as output:
                             for chunk in chunks:
-                                if written + len(chunk) > budget:
+                                if written + len(chunk) > disk_budget:
                                     raise StagingBudgetError(
-                                        "Delta checkpoint download would exceed its staging budget."
+                                        "Delta checkpoint download would exceed its disk staging budget."
                                     )
                                 output.write(chunk)
                                 written += len(chunk)
-                        _parquet(staged, inspector, budget, cancel_requested)
+                        _parquet(staged, inspector, memory_budget, cancel_requested)
                     finally:
                         staged.unlink(missing_ok=True)
                 else:
@@ -576,7 +597,7 @@ def preflight(
                     ):
                         _fail(name, "unrecognized Delta metadata file")
                     records = 0
-                    for value in _json_records(chunks, budget, name):
+                    for value in _json_records(chunks, memory_budget, name):
                         check_cancelled(cancel_requested)
                         records += 1
                         if relative == "_last_checkpoint":

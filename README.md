@@ -2,21 +2,156 @@
 
 Region and tenant transfer tool for Microsoft Fabric workspaces.
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
+## Setup prerequisites
+
+Configure access **before deploying or running Fab Shuffle**:
+
+1. **Create a service principal.** [Register a Microsoft Entra application and create a client secret](https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal).
+   Keep its **tenant ID, application (client) ID, and client secret value** for the wizard.
+   Add the service principal to an [Entra security group](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-manage-groups).
+2. **Allow normal Fabric APIs.** Have a Fabric administrator open **Admin portal > Tenant settings > Developer settings**.
+   Enable **Service principals can call Fabric public APIs** and
+   **Service principals can create workspaces, connections, and deployment pipelines** for that security group.
+   See [Developer tenant settings](https://learn.microsoft.com/en-us/fabric/admin/service-admin-portal-developer).
+3. **Allow read-only admin APIs.** Under **Tenant settings > Admin API settings**, enable
+   **Service principals can access read-only admin APIs** for the same security group.
+   Follow the [admin API setup guidance](https://learn.microsoft.com/en-us/fabric/admin/enable-service-principal-admin-apis);
+   do not assign admin-consent-required Power BI application permissions to the app for this authentication.
+4. **Assign it to the source workspace.** In the Fabric workspace you want to migrate,
+   open **Manage access**, add the service principal, and give it the **Admin** workspace role.
+   Enabling the tenant settings does not grant workspace access.
+
+Also grant the principal **Contributor or Admin on the destination Fabric capacity**
+([required for workspace creation](https://learn.microsoft.com/en-us/rest/api/fabric/core/workspaces/create-workspace));
+Azure capacity Reader alone is not sufficient. Share the [connections](#connections) used by
+the selected items and shortcuts with it.
+
+For [cross-tenant migrations](#cross-tenant-migrations), use one principal per tenant:
+configure the applicable tenant settings in each, source-workspace access for the source
+principal, and destination-capacity access for the destination principal.
+
+## Run it
+
+Choose a local Docker container or Azure Container Apps. **Run and test through the Docker
+image, not a host Python preview.** It includes the required AzCopy, SqlPackage,
+UnpackDacPac, bcp and ODBC tools. SQL authentication uses service-principal access tokens,
+not your desktop identity.
+
+### Locally
+
+Install Docker and use **Linux containers** mode on Windows, then run:
 
 ```bash
-docker run --rm -p 8080:8080 -v fab-shuffle-scratch:/app/local ghcr.io/cbattlegear/fab-shuffle:latest
+docker run --rm -p 8080:8080 -v fab-shuffle-scratch:/app/local \
+  ghcr.io/cbattlegear/fab-shuffle:latest
 ```
+
+Open <http://localhost:8080>. The volume preserves staging files and recovery journals when
+the container is replaced; without it, they are lost with the container.
+
+### In Azure
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
+
+Deploys [`deploy/azuredeploy.json`](deploy/azuredeploy.json): a Container App running the
+same public image, its environment, a Log Analytics workspace for the container's logs,
+and a storage account with a classic Azure Files SMB share mounted at `/app/local`.
+The template's output `url` is the wizard. Staging files and recovery journals use the share;
+session credentials and active workers remain in memory.
+
+**App Name** and **Location** are optional overrides. Leave them blank to generate the
+app name and use the selected resource group's region; ARM resolves these defaults during
+deployment instead of showing expressions in the form. To update an existing deployment,
+keep its app name (or leave blank if it used the generated default) and deployment region.
+If you override Location, enter an Azure region code such as `canadacentral`.
+
+Worth knowing before you use it:
+
+- **Set `allowedClientIpAddress` to your own public IP.** Fab Shuffle has no sign-in of its
+  own, so leaving it empty publishes the wizard to the internet. Nobody can do anything
+  without supplying their own service principal, but an open migration console is not
+  something to leave lying around.
+- **It runs as exactly one replica, deliberately.** Sessions and run progress are held in the
+  process, so a second replica would not know about your sign-in or your migration. Do not
+  raise `maxReplicas`.
+- **Clean up after the migration.** Compute, logs, and storage incur charges. Retain the share
+  while you need recovery journals or staged files; deleting the storage account or resource
+  group deletes those too.
+- The region you deploy into has nothing to do with the region you are migrating *to*. That
+  comes from the capacity you pick in the wizard.
+
+The `shareQuotaGiB` parameter defaults to **100 GiB** and accepts **1 through 102400 GiB**
+(100 TiB). This is persistent Azure Files storage, **not Azure Blob storage and not unlimited
+disk**. File-size, IOPS and throughput limits still apply, and storage operations, capacity
+and data transfer have costs. Size the share for concurrent staging, retained interrupted
+runs and journals; monitor free space and usage. See
+[Azure Files scale targets](https://learn.microsoft.com/en-us/azure/storage/files/storage-files-scale-targets).
+The separate template settings `maxDiskStagingGiB` (default **10**) and `maxMemoryMiB`
+(default **1024**) control bounded temporary artifacts and in-memory processing respectively.
+Neither resizes the share nor changes the container's RAM allocation.
+
+#### Choosing the Azure Files size
+
+Size for **peak concurrent staging plus retained files and headroom**, not simply the largest
+data store. Single-principal lakehouse copies stage whole `Files/` areas; bcp stages one SQL
+table export at a time. Paired-credential transfers stream data and primarily need schema
+and Delta-checkpoint staging instead.
+
+Run [`Get-FabShuffleStorageEstimate.ps1`](scripts/Get-FabShuffleStorageEstimate.ps1) in
+PowerShell 7+ with **Az.Accounts** and **Az.Storage**, using your user account with access
+to every source item and file:
+
+```powershell
+.\scripts\Get-FabShuffleStorageEstimate.ps1 -TenantId <tenant-guid> -WorkspaceId <workspace-guid>
+```
+
+Use `-Mode Paired` for two-principal migrations, even within one tenant. The script reports
+`SuggestedShareQuotaGiB` using paged Files metadata, staging allowances and **25% headroom**;
+it downloads no file contents and changes no resources. Match `-FileConcurrency`,
+`-SchemaConcurrency` and `-DiskStagingGiB` to the run, use `-SkipFiles`/`-SkipData` as needed,
+and add `-ExistingStagingGiB` for a reused share.
+
+If a single-principal run includes SQLDatabase data, supply `-LargestBcpTableGiB`: the
+largest measured or conservatively estimated native table export, **not compressed database
+storage size**. This size is not available from Fabric item metadata. Missing measurements
+or access failures produce **Incomplete**, with no quota recommendation. Metadata scans
+can take time and incur read costs; the estimate is not a guarantee against source growth.
+
+The template mounts the share through the Container Apps environment's `AzureFile` storage
+configuration, using an account key obtained by ARM `listKeys`. The key is not an application
+environment variable or a template output. The deployment identity needs permission to
+create the storage resources and list the account keys. Restrict management access to the
+account and environment, and update the environment storage configuration when rotating the
+key. This simple template uses an authenticated public storage endpoint; the wizard's IP
+restriction does not firewall storage. A private deployment needs compatible VNet, DNS,
+storage firewall and SMB connectivity (TCP 445), not just a deny rule on the account.
+See [Container Apps storage mounts](https://learn.microsoft.com/en-us/azure/container-apps/storage-mounts).
+
+Replacing a revision does not erase the share, but **wait for active migrations to finish
+before deploying an update**: an in-memory worker can still be interrupted. After a restart,
+sign in again to resume from the retained journals. Do not point a second Fab Shuffle
+instance at the same share. Existing deployments without a mount need their old journals
+copied to the share before switching; adding the mount does not copy the old ephemeral data.
+
+### The wizard
+
+1. **Sign in** with the service principal's tenant ID, client ID, and secret.
+2. **Pick the target capacity** — its region is the destination region.
+3. **Pick the source workspace.**
+4. **Review** the plan. Fab Shuffle tells you whether the workspace can simply be reassigned
+   or has to be rebuilt, lists anything it cannot move, and refuses to start if there is a
+   blocker.
+5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
+
+Credentials are held in the container's memory for the life of the session and are never
+written to disk.
+
+## Current state
 
 Fab Shuffle recreates a Fabric workspace on a capacity in a different region and moves the
 data across. Fabric blocks reassigning a workspace that contains Fabric items to a capacity
 in another region, so the only way to "move" a workspace is to rebuild it — that is what
 this tool automates.
-
-See [Run it](#run-it) for what you need first: this needs a service principal with a handful
-of Fabric settings turned on, and it will not get far without them.
-
-## Current state
 
 v2 is a Python application driven almost entirely by the
 [Fabric REST API](https://learn.microsoft.com/en-us/rest/api/fabric/articles/), wrapped in a
@@ -72,10 +207,16 @@ Copy Jobs:
 | KQL | Source query streaming and destination ingestion; target update policies are stopped before copying |
 | Cosmos DB | Separate source/destination SDK clients and bounded document transfer |
 
-`FAB_SHUFFLE_MAX_STAGING_BYTES` defaults to **1073741824** (1 GiB). Streaming buffers are
-bounded and transfers do not silently switch to cloud staging. Schema-tool staging usage is
-monitored and excessive usage terminates the tool with an error; a filesystem-enforced hard
-disk limit requires an operator-configured volume quota.
+`FAB_SHUFFLE_MAX_MEMORY_BYTES` defaults to **1073741824** (1 GiB) for in-memory
+rows, documents, metadata and script processing. `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES`
+defaults to **10737418240** (10 GiB) for bounded schema artifacts and on-disk Delta
+checkpoints. Raising the disk budget does not increase streaming buffers or the memory
+budget. These are per-operation application checks, not aggregate RAM/filesystem quotas.
+Schema tools can briefly overshoot between checks and are stopped when excess is detected.
+SQL schema transfers use private, disk-budgeted staging in both credential modes and remove
+those artifacts after the transfer; script processing keeps its separate memory budget.
+The older single-principal AzCopy/bcp disk-staging paths remain uncapped by these settings;
+size the share for their complete staging workload.
 Complex Delta features, schema-tool limitations, or service/network restrictions are reported
 with their required corrective action. PyArrow inspects Delta checkpoint references wherever
 a `_delta_log` is found, whether under a Tables/ root (managed tables only) or an unmanaged
@@ -488,118 +629,7 @@ principal, the step is skipped and the migration continues.
 
 ## Usage
 
-### Requirements
-
-- Docker
-- A service principal
-
-Fab Shuffle uses a service principal to automate data movement and to avoid a pile of
-permission problems.
-
-Steps to set up your service principal:
-
-1. [Create a service principal](https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal#register-an-application-with-microsoft-entra-id-and-create-a-service-principal)
-   and a [client secret](https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal#option-3-create-a-new-client-secret).
-   **Record your tenant ID, client ID, and client secret.**
-2. Add the service principal to an [Entra ID group](https://learn.microsoft.com/en-us/entra/fundamentals/quickstart-create-group-add-members).
-3. Enable [service principal access to Fabric APIs](https://learn.microsoft.com/en-us/fabric/admin/enable-service-principal-admin-apis)
-   in the Fabric admin portal, including "Service principals can create workspaces,
-   connections, and deployment pipelines".
-
-   ![Screenshot showing Service Principal settings in Fabric Admin Portal](docs/images/service_principal_fabric.png)
-
-4. Give the service principal the Reader role on the target Fabric capacity in Azure.
-5. Give the service principal Admin on the Fabric workspace you want to move.
-6. Make the service principal Owner of any connections used by your shortcuts.
-
-### Run it
-
-Fab Shuffle is a container with a web wizard. Run it wherever you like — your own machine is
-the simplest, and Azure Container Apps takes one click.
-
-**Run and test the application through its Docker image, not a host Python preview.** The image
-provides the pinned AzCopy, SqlPackage, UnpackDacPac, bcp and ODBC runtime. Windows bcp does not
-support the access-token-file mode used here; the application refuses that invocation rather
-than attempting Windows integrated authentication. SQL authentication remains service-principal
-access tokens, never the current desktop user's identity.
-
-#### Locally
-
-```bash
-docker run --rm -p 8080:8080 -v fab-shuffle-scratch:/app/local \
-  ghcr.io/cbattlegear/fab-shuffle:latest
-```
-
-Then open <http://localhost:8080>.
-
-The volume is worth having. Lakehouse files and warehouse schema are staged on local disk on
-the way past, and without it that goes into the container's writable layer and is thrown away
-with the container.
-
-#### In Azure
-
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy.json)
-
-Deploys [`deploy/azuredeploy.json`](deploy/azuredeploy.json): a Container App running the
-same public image, its environment, a Log Analytics workspace for the container's logs,
-and a storage account with a classic Azure Files SMB share mounted at `/app/local`.
-The template's output `url` is the wizard. Staging files and recovery journals use the share;
-session credentials and active workers remain in memory.
-
-Worth knowing before you use it:
-
-- **Set `allowedClientIpAddress` to your own public IP.** Fab Shuffle has no sign-in of its
-  own, so leaving it empty publishes the wizard to the internet. Nobody can do anything
-  without supplying their own service principal, but an open migration console is not
-  something to leave lying around.
-- **It runs as exactly one replica, deliberately.** Sessions and run progress are held in the
-  process, so a second replica would not know about your sign-in or your migration. Do not
-  raise `maxReplicas`.
-- **Clean up after the migration.** Compute, logs, and storage incur charges. Retain the share
-  while you need recovery journals or staged files; deleting the storage account or resource
-  group deletes those too.
-- The region you deploy into has nothing to do with the region you are migrating *to*. That
-  comes from the capacity you pick in the wizard.
-
-The `shareQuotaGiB` parameter defaults to **100 GiB** and accepts **1 through 102400 GiB**
-(100 TiB). This is persistent Azure Files storage, **not Azure Blob storage and not unlimited
-disk**. File-size, IOPS and throughput limits still apply, and storage operations, capacity
-and data transfer have costs. Size the share for concurrent staging, retained interrupted
-runs and journals; monitor free space and usage. See
-[Azure Files scale targets](https://learn.microsoft.com/en-us/azure/storage/files/storage-files-scale-targets).
-The existing `FAB_SHUFFLE_MAX_STAGING_BYTES` safety limit still defaults to 1 GiB per bounded
-transfer; increasing the share quota does not change it or introduce a Blob transfer backend.
-
-The template mounts the share through the Container Apps environment's `AzureFile` storage
-configuration, using an account key obtained by ARM `listKeys`. The key is not an application
-environment variable or a template output. The deployment identity needs permission to
-create the storage resources and list the account keys. Restrict management access to the
-account and environment, and update the environment storage configuration when rotating the
-key. This simple template uses an authenticated public storage endpoint; the wizard's IP
-restriction does not firewall storage. A private deployment needs compatible VNet, DNS,
-storage firewall and SMB connectivity (TCP 445), not just a deny rule on the account.
-See [Container Apps storage mounts](https://learn.microsoft.com/en-us/azure/container-apps/storage-mounts).
-
-Replacing a revision does not erase the share, but **wait for active migrations to finish
-before deploying an update**: an in-memory worker can still be interrupted. After a restart,
-sign in again to resume from the retained journals. Do not point a second Fab Shuffle
-instance at the same share. Existing deployments without a mount need their old journals
-copied to the share before switching; adding the mount does not copy the old ephemeral data.
-
-#### The wizard
-
-1. **Sign in** with the service principal's tenant ID, client ID, and secret.
-2. **Pick the target capacity** — its region is the destination region.
-3. **Pick the source workspace.**
-4. **Review** the plan. Fab Shuffle tells you whether the workspace can simply be reassigned
-   or has to be rebuilt, lists anything it cannot move, and refuses to start if there is a
-   blocker.
-5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
-
-Credentials are held in the container's memory for the life of the session and are never
-written to disk.
-
-#### Picking up a migration that stopped
+### Picking up a migration that stopped
 
 Rebuilding a large workspace takes hours, so a run keeps a journal of what it has done: the
 plan it was given, every item it created, and every table and file set it moved. If the
@@ -669,10 +699,6 @@ Two things follow from this:
 Without a mounted volume the journal goes when the container does, and there is nothing to
 pick up. That is the main reason the `docker run` line above mounts one.
 
-The service principal also needs the **"Service principals can use Fabric APIs"** tenant
-setting for Power BI, since the reassignment path calls the Power BI semantic model APIs and
-must be able to update those models.
-
 ### Building the image yourself
 
 ```bash
@@ -729,10 +755,19 @@ Every setting has a sensible default; override with environment variables when n
 | `FAB_SHUFFLE_PORT` | `8080` | Web UI port |
 | `FAB_SHUFFLE_HOST` | `0.0.0.0` | Bind address |
 | `FAB_SHUFFLE_SCRATCH` | `/app/local` | Local staging directory |
+| `FAB_SHUFFLE_MAX_MEMORY_BYTES` | `1073741824` (1 GiB) | Per-operation in-memory processing budget; not a container RAM cap |
+| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota or legacy AzCopy/bcp cap |
+| `FAB_SHUFFLE_FILE_CONCURRENCY` | `2` | Concurrent file transfers; include their combined staging in share sizing |
+| `FAB_SHUFFLE_SCHEMA_CONCURRENCY` | `2` | Concurrent schema transfers |
 | `FAB_SHUFFLE_MAX_RETRIES` | `6` | Retries for throttled/transient Fabric calls |
 | `FAB_SHUFFLE_COPY_JOB_TIMEOUT_SECONDS` | `43200` | Copy Job budget |
 | `FAB_SHUFFLE_LRO_TIMEOUT_SECONDS` | `3600` | Long-running-operation budget |
 | `FAB_SHUFFLE_SQL_ENDPOINT_TIMEOUT_SECONDS` | `1800` | Wait for SQL endpoint provisioning |
+
+`FAB_SHUFFLE_MAX_STAGING_BYTES` is retained as a compatibility fallback: when set, it
+supplies both budgets unless the corresponding new setting explicitly overrides it.
+Use the new variables for independent control. Values must be positive byte counts;
+`0` does not mean unlimited.
 
 ## How it works
 

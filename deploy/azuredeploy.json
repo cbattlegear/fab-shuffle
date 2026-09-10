@@ -7,17 +7,17 @@
   "parameters": {
     "appName": {
       "type": "string",
-      "defaultValue": "[concat('fab-shuffle-', uniqueString(resourceGroup().id))]",
+      "defaultValue": "",
       "maxLength": 32,
       "metadata": {
-        "description": "Name for the container app. Also forms the first label of its public hostname."
+        "description": "Optional. Leave blank to generate a stable fab-shuffle name for this resource group. To update an existing deployment, use its current app name (or leave blank if it used the generated default)."
       }
     },
     "location": {
       "type": "string",
-      "defaultValue": "[resourceGroup().location]",
+      "defaultValue": "",
       "metadata": {
-        "description": "Region to deploy into. This is where Fab Shuffle itself runs, and has nothing to do with the region you are migrating a workspace to."
+        "description": "Optional Azure region code, such as canadacentral. Leave blank to use the selected resource group's region. This is where Fab Shuffle runs, not the migration's destination capacity region."
       }
     },
     "containerImage": {
@@ -56,13 +56,33 @@
       "minValue": 1,
       "maxValue": 102400,
       "metadata": {
-        "description": "Quota, in GiB, for the Azure Files share mounted at /app/local. Default is 100 GiB; the classic pay-as-you-go share maximum is 102400 GiB (100 TiB). This backs staging and journal capacity only, not the per-transfer size, which the app still bounds separately (FAB_SHUFFLE_MAX_STAGING_BYTES, 1 GiB by default)."
+        "description": "Total Azure Files share quota in GiB, including concurrent staging and retained journals. Default 100 GiB is not a measured requirement. Use scripts/Get-FabShuffleStorageEstimate.ps1 to estimate your workload; this quota is separate from the per-operation disk and memory budgets."
+      }
+    },
+    "maxDiskStagingGiB": {
+      "type": "int",
+      "defaultValue": 10,
+      "minValue": 1,
+      "maxValue": 102400,
+      "metadata": {
+        "description": "Disk budget per bounded schema/checkpoint operation, in GiB. Does not reserve space or resize the Azure Files share. Legacy single-principal AzCopy/bcp exports are not capped by this setting; size the share for their full staging requirements."
+      }
+    },
+    "maxMemoryMiB": {
+      "type": "int",
+      "defaultValue": 1024,
+      "minValue": 1,
+      "maxValue": 8192,
+      "metadata": {
+        "description": "In-memory transfer/metadata budget per operation, in MiB. This is not the container RAM limit or a hard process cap. Leave room for concurrent workers, Python and external tools; increasing disk staging does not require increasing this budget."
       }
     }
   },
   "variables": {
-    "environmentName": "[concat(parameters('appName'), '-env')]",
-    "logAnalyticsName": "[concat(parameters('appName'), '-logs')]",
+    "appName": "[if(empty(parameters('appName')), concat('fab-shuffle-', uniqueString(resourceGroup().id)), parameters('appName'))]",
+    "location": "[if(empty(parameters('location')), resourceGroup().location, parameters('location'))]",
+    "environmentName": "[concat(variables('appName'), '-env')]",
+    "logAnalyticsName": "[concat(variables('appName'), '-logs')]",
     "restrictIngress": "[not(empty(parameters('allowedClientIpAddress')))]",
     "ipRestrictions": [
       {
@@ -72,7 +92,7 @@
         "description": "The only address allowed to reach the wizard."
       }
     ],
-    "storageAccountName": "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, parameters('appName'))))]",
+    "storageAccountName": "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, variables('appName'))))]",
     "fileShareName": "fab-shuffle-share",
     "storageMountName": "fab-shuffle-storage",
     "scratchVolumeName": "fab-shuffle-scratch",
@@ -83,7 +103,7 @@
       "type": "Microsoft.OperationalInsights/workspaces",
       "apiVersion": "2023-09-01",
       "name": "[variables('logAnalyticsName')]",
-      "location": "[parameters('location')]",
+      "location": "[variables('location')]",
       "properties": {
         "sku": { "name": "PerGB2018" },
         "retentionInDays": 30
@@ -93,7 +113,7 @@
       "type": "Microsoft.App/managedEnvironments",
       "apiVersion": "2024-03-01",
       "name": "[variables('environmentName')]",
-      "location": "[parameters('location')]",
+      "location": "[variables('location')]",
       "dependsOn": [
         "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
       ],
@@ -111,7 +131,7 @@
       "type": "Microsoft.Storage/storageAccounts",
       "apiVersion": "2023-01-01",
       "name": "[variables('storageAccountName')]",
-      "location": "[parameters('location')]",
+      "location": "[variables('location')]",
       "kind": "StorageV2",
       "sku": { "name": "Standard_LRS" },
       "properties": {
@@ -158,8 +178,8 @@
     {
       "type": "Microsoft.App/containerApps",
       "apiVersion": "2024-03-01",
-      "name": "[parameters('appName')]",
-      "location": "[parameters('location')]",
+      "name": "[variables('appName')]",
+      "location": "[variables('location')]",
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
         "[resourceId('Microsoft.App/managedEnvironments/storages', variables('environmentName'), variables('storageMountName'))]"
@@ -190,6 +210,14 @@
                 {
                   "name": "FAB_SHUFFLE_SCRATCH",
                   "value": "[variables('scratchMountPath')]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES",
+                  "value": "[string(mul(parameters('maxDiskStagingGiB'), 1073741824))]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_MAX_MEMORY_BYTES",
+                  "value": "[string(mul(parameters('maxMemoryMiB'), 1048576))]"
                 }
               ],
               "volumeMounts": [
@@ -233,7 +261,7 @@
   "outputs": {
     "url": {
       "type": "string",
-      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', parameters('appName')), '2024-03-01').configuration.ingress.fqdn)]",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', variables('appName')), '2024-03-01').configuration.ingress.fqdn)]",
       "metadata": { "description": "Open this to start the wizard." }
     },
     "ingressIsPublic": {

@@ -20,9 +20,8 @@ from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer.common import (
-    DEFAULT_MAX_STAGING_BYTES,
-    check_budget,
     check_cancelled,
+    resolve_transfer_budgets,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,7 +58,9 @@ def copy_files(
     target_principal: ServicePrincipal | None = None,
     target_tokens: TokenProvider | None = None,
     tokens: TokenProvider | None = None,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
@@ -70,7 +71,10 @@ def copy_files(
             source_path=source_files_path, target_path=target_files_path,
             tokens=tokens or TokenProvider(principal),
             target_tokens=target_tokens or TokenProvider(target_principal),
-            max_staging_bytes=max_staging_bytes, cancel_requested=cancel_requested,
+            max_staging_bytes=max_staging_bytes,
+            max_memory_bytes=max_memory_bytes,
+            max_disk_staging_bytes=max_disk_staging_bytes,
+            cancel_requested=cancel_requested,
             on_progress=on_progress, on_complete=on_complete,
         )
     check_cancelled(cancel_requested)
@@ -280,7 +284,9 @@ def copy_tree_streaming(
     target_path: str,
     tokens: TokenProvider,
     target_tokens: TokenProvider,
-    max_staging_bytes: int = DEFAULT_MAX_STAGING_BYTES,
+    max_staging_bytes: int | None = None,
+    max_memory_bytes: int | None = None,
+    max_disk_staging_bytes: int | None = None,
     exclude_paths: Collection[str] = (),
     kind: str = "files",
     scratch_dir: Path | None = None,
@@ -288,7 +294,7 @@ def copy_tree_streaming(
     on_complete: Callable[[CopyOutcome], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> CopyOutcome:
-    """Relay a frozen OneLake tree through bounded RAM, using no staging disk.
+    """Relay a frozen OneLake tree through bounded RAM and bounded checkpoint disk.
 
     Fabric must already have created the item and its Files/Tables roots. The caller must
     exclude shortcut paths and keep source writes frozen through successful completion.
@@ -301,8 +307,10 @@ def copy_tree_streaming(
     is unexpected and refused. A Files/ root is not strict: ordinary content may freely mix
     with zero or more unmanaged Delta tables, and only files inside a discovered table's
     ``_delta_log`` are inspected.
-    Checkpoints are staged individually within the budget and inspected in Arrow batches;
-    unsafe/unknown path features fail without rewriting logs. Source writes must remain frozen.
+    Checkpoints are staged individually within the disk budget and inspected in Arrow batches
+    within the memory budget; unsafe/unknown path features fail without rewriting logs.
+    ``max_staging_bytes`` remains a compatibility fallback for both budgets when supplied.
+    Source writes must remain frozen.
     ``scratch_dir`` defaults to the working directory; private checkpoint staging is always removed.
     A successful byte copy does not establish destination SQL catalog readiness.
     The destination must be fresh, or a retry of the same operator-frozen source snapshot.
@@ -312,7 +320,11 @@ def copy_tree_streaming(
     https://learn.microsoft.com/rest/api/storageservices/datalakestoragegen2/path/read
     https://learn.microsoft.com/rest/api/storageservices/datalakestoragegen2/path/update
     """
-    check_budget(max_staging_bytes)
+    budgets = resolve_transfer_budgets(
+        max_staging_bytes=max_staging_bytes,
+        max_memory_bytes=max_memory_bytes,
+        max_disk_staging_bytes=max_disk_staging_bytes,
+    )
     check_cancelled(cancel_requested)
     source_fs, source_root = _tree_location(source_path)
     target_fs, target_root = _tree_location(target_path)
@@ -322,7 +334,7 @@ def copy_tree_streaming(
         root.split("/", 2)[1] == "Tables" for root in (source_root, target_root)
     )
     # Leave room for the bytearray and immutable HTTP request payload simultaneously.
-    chunk_size = max(1, min(4 * 1024 * 1024, max_staging_bytes // 2))
+    chunk_size = max(1, min(4 * 1024 * 1024, budgets.max_memory_bytes // 2))
     excluded = {value.strip("/") for value in exclude_paths}
     count = 0
     copied_metadata: set[str] = set()
@@ -370,7 +382,9 @@ def copy_tree_streaming(
         from fabshuffle.transfer.delta import preflight
 
         snapshot = preflight(
-            client, source_fs, source_root, tokens, max_staging_bytes=max_staging_bytes,
+            client, source_fs, source_root, tokens,
+            max_memory_bytes=budgets.max_memory_bytes,
+            max_disk_staging_bytes=budgets.max_disk_staging_bytes,
             scratch_dir=scratch_dir, is_excluded=is_excluded, on_progress=on_progress,
             cancel_requested=cancel_requested, strict=strict_tables,
         )
