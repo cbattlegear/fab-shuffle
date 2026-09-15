@@ -1,6 +1,10 @@
 # Fab Shuffle
 
-Region and tenant transfer tool for Microsoft Fabric workspaces.
+This solves two scenarios: 
+1) I need to move a workspace from a capacity in Region 1 to a capacity in Region 2.
+2) I need to move a workspace from Tenant 1 to Tenant 2.
+
+It does this by automating the API calls, data copy processes, and ID remapping needed to get the workspace items from point A to point B. 
 
 ## Setup prerequisites
 
