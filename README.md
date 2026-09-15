@@ -13,11 +13,7 @@ Configure access **before deploying or running Fab Shuffle**:
    Enable **Service principals can call Fabric public APIs** and
    **Service principals can create workspaces, connections, and deployment pipelines** for that security group.
    See [Developer tenant settings](https://learn.microsoft.com/en-us/fabric/admin/service-admin-portal-developer).
-3. **Allow read-only admin APIs.** Under **Tenant settings > Admin API settings**, enable
-   **Service principals can access read-only admin APIs** for the same security group.
-   Follow the [admin API setup guidance](https://learn.microsoft.com/en-us/fabric/admin/enable-service-principal-admin-apis);
-   do not assign admin-consent-required Power BI application permissions to the app for this authentication.
-4. **Assign it to the source workspace.** In the Fabric workspace you want to migrate,
+3. **Assign it to the source workspace.** In the Fabric workspace you want to migrate,
    open **Manage access**, add the service principal, and give it the **Admin** workspace role.
    Enabling the tenant settings does not grant workspace access.
 
@@ -25,6 +21,15 @@ Also grant the principal **Contributor or Admin on the destination Fabric capaci
 ([required for workspace creation](https://learn.microsoft.com/en-us/rest/api/fabric/core/workspaces/create-workspace));
 Azure capacity Reader alone is not sufficient. Share the [connections](#connections) used by
 the selected items and shortcuts with it.
+
+**Optional admin API fallback:** workspace role discovery normally uses the
+[workspace-scoped API](https://learn.microsoft.com/en-us/rest/api/fabric/core/workspaces/list-workspace-role-assignments).
+If that read is denied, the tool tries an admin endpoint. To permit the fallback, a Fabric
+administrator can enable **Service principals can access read-only admin APIs** for the
+security group under **Tenant settings > Admin API settings**. This grants broader,
+tenant-wide read visibility; it is not a blanket prerequisite for workspace-scoped migration.
+Follow the [admin API setup guidance](https://learn.microsoft.com/en-us/fabric/admin/enable-service-principal-admin-apis),
+including its restriction on admin-consent-required Power BI application permissions.
 
 For [cross-tenant migrations](#cross-tenant-migrations), use one principal per tenant:
 configure the applicable tenant settings in each, source-workspace access for the source
@@ -42,7 +47,7 @@ not your desktop identity.
 Install Docker and use **Linux containers** mode on Windows, then run:
 
 ```bash
-docker run --rm -p 8080:8080 -v fab-shuffle-scratch:/app/local \
+docker run --rm --platform linux/amd64 -p 8080:8080 -v fab-shuffle-scratch:/app/local \
   ghcr.io/cbattlegear/fab-shuffle:latest
 ```
 
@@ -143,20 +148,21 @@ copied to the share before switching; adding the mount does not copy the old eph
    blocker.
 5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
 
-Credentials are held in the container's memory for the life of the session and are never
-written to disk.
+Session client secrets and the token cache are held in memory, not persisted for recovery.
+The single-principal bcp path does write a SQL access token to an owner-only temporary file
+and removes it afterward. Protect the container filesystem; an abrupt process termination
+can bypass normal cleanup.
 
-## Current state
+## Migration modes
 
-Fab Shuffle recreates a Fabric workspace on a capacity in a different region and moves the
-data across. Fabric blocks reassigning a workspace that contains Fabric items to a capacity
-in another region, so the only way to "move" a workspace is to rebuild it — that is what
-this tool automates.
+Fab Shuffle is a Linux-container application with a web wizard. It either reassigns a
+Power BI-only workspace or rebuilds supported content on a destination capacity. Published
+versions and upgrade notes are listed under [Releases](https://github.com/cbattlegear/fab-shuffle/releases).
 
-v2 is a Python application driven almost entirely by the
-[Fabric REST API](https://learn.microsoft.com/en-us/rest/api/fabric/articles/), wrapped in a
-small web UI that walks you through the move. (v1 was a PowerShell script around the `fab`
-CLI; it still lives on the `main` branch's history.)
+| Sign-in mode | Strategy | Access assignments |
+| --- | --- | --- |
+| One principal, same tenant | Reassign Power BI-only workspaces; otherwise rebuild | Source admins are preserved during rebuild; remaining workspace roles are optional |
+| Two principals, same or different tenants (*paired*) | Always rebuild with separate source/destination credentials | Not copied; arrange destination access separately |
 
 ### Cross-tenant migrations
 
@@ -164,7 +170,6 @@ Select **Another tenant** on the sign-in screen and enter separate source and de
 service principals. The wizard lists source workspaces with the source identity and
 destination capacities with the destination identity. Neither principal needs access to the
 other tenant. This creates a new destination workspace; it never reassigns or deletes the source.
-The existing single-principal same-tenant workflow is unchanged.
 
 Prepare access in each tenant before starting. Both principals need the Fabric API tenant
 settings and the item/data-plane permissions for their side of the migration. The destination
@@ -196,16 +201,10 @@ left uncreated, with the required destination coordinates reported. Use **Retry*
 the saved mappings, recheck them, and resume into the same destination. Changed mappings
 invalidate affected bindings so existing consumers are refreshed instead of retaining old IDs.
 
-Paired data transfers use independently authenticated clients, not native cross-tenant
-Copy Jobs:
-
-| Data | Paired transfer |
-| --- | --- |
-| Lakehouse Files | Bounded OneLake reads/writes, excluding shortcut paths; any unmanaged Delta table discovered under Files/ is also path-safety inspected |
-| Lakehouse Tables | Quiesced Delta files/logs/checkpoints with path-safety inspection; SQL catalog visibility checked after endpoint refresh |
-| Warehouse / SQL database | Destination-aware schema deployment with security-object exclusions, then bounded SQL row streaming |
-| KQL | Source query streaming and destination ingestion; target update policies are stopped before copying |
-| Cosmos DB | Separate source/destination SDK clients and bounded document transfer |
+Paired transfers stream OneLake files, SQL rows, KQL results and Cosmos DB documents with
+independent source/destination authentication; they do not use native cross-tenant Copy Jobs.
+See the [mode-aware support table](#what-gets-migrated) and
+[data movement reference](docs/migration-details.md#credential-modes-and-data-movement).
 
 `FAB_SHUFFLE_MAX_MEMORY_BYTES` defaults to **1073741824** (1 GiB) for in-memory
 rows, documents, metadata and script processing. `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES`
@@ -217,12 +216,10 @@ SQL schema transfers use private, disk-budgeted staging in both credential modes
 those artifacts after the transfer; script processing keeps its separate memory budget.
 The older single-principal AzCopy/bcp disk-staging paths remain uncapped by these settings;
 size the share for their complete staging workload.
-Complex Delta features, schema-tool limitations, or service/network restrictions are reported
-with their required corrective action. PyArrow inspects Delta checkpoint references wherever
-a `_delta_log` is found, whether under a Tables/ root (managed tables only) or an unmanaged
-Delta table written directly under Files/; table files are not rewritten to conceal an
-external or escaping storage dependency. Ordinary, non-Delta content under Files/ is not
-Delta-inspected, since it has no checkpoint references to validate.
+Delta preflight checks managed Tables and unmanaged Delta tables under Files for unsafe
+references; it does not rewrite logs to conceal dependencies. Unsupported features and
+budget failures are reported with corrective actions. See
+[Delta and SQL staging](docs/migration-details.md#delta-and-sql-staging) for the mechanics.
 
 Definitions are recreated only after known references have destination mappings. Mirrors,
 Activator rules and Databricks catalog sync retain their stopped-arrival behavior.
@@ -245,32 +242,9 @@ manual activation and omitted access configuration are distinct. Keep the source
 operator has checked destination queries, data and application access. No live two-tenant
 service qualification is implied by the automated test suite.
 
-For API clients, `POST /api/login` accepts the existing source credentials and an optional
-`destination` object:
-
-```json
-{
-  "tenant_id": "<source-directory-tenant-id>",
-  "client_id": "<source-application-id>",
-  "client_secret": "<source-secret>",
-  "destination": {
-    "tenant_id": "<destination-directory-tenant-id>",
-    "client_id": "<destination-application-id>",
-    "client_secret": "<destination-secret>"
-  }
-}
-```
-
-Use the returned `sessionId` in `X-Fab-Shuffle-Session`. `POST /api/preview/dependencies`
-accepts the same options and mappings as `POST /api/runs`, including
-`write_freeze_confirmed`, `connection_mappings`, and `reference_mappings`. Reference entries
-contain `source_workspace_id`, `source_item_id`, `target_workspace_id`, and `target_item_id`.
-Resume accepts updated mappings, not a different tenant pair or destination workspace.
-The interactive API schema is at `/api/docs`.
-
-Supplying two principals in the same tenant also uses the paired rebuild/freeze workflow.
-Omit `destination` for the original reassignment behavior. Multi-workspace batches, optional
-cloud staging and incremental/low-downtime cutover remain later roadmap phases.
+For API clients, see [API integration](docs/migration-details.md#api-integration) and the
+interactive schema at `/api/docs`. Omitting destination credentials selects the
+single-principal workflow; it does not force reassignment for a workspace with Fabric items.
 
 ### Two ways to move a workspace
 
@@ -286,8 +260,8 @@ Large semantic models are the wrinkle: they are backed by Azure Premium Files, w
 workspace to its region. Fab Shuffle converts each large model to the small storage format,
 performs the reassignment, then switches them back. If a model can't be converted, or the
 target region [doesn't support large models](https://learn.microsoft.com/en-us/power-bi/enterprise/service-premium-large-models#region-availability),
-the move is refused up front — and if a conversion fails midway, the models already converted
-are restored before anything else happens.
+the move is refused up front. If conversion or assignment fails, restoration is attempted
+for models already converted; any restoration failure is reported for manual recovery.
 
 **Rebuild** — as soon as a single Fabric item is present, the workspace cannot be reassigned
 across regions. Fab Shuffle creates a new workspace in the target region and recreates and
@@ -295,75 +269,66 @@ copies everything it supports.
 
 ### What gets migrated
 
-| Item | Schema | Data | Notes |
+The columns describe **rebuild** behavior. Paired includes two-principal runs within the same
+tenant. A supported path can still be blocked by missing access, unavailable definitions or
+unresolved dependencies; the review screen and per-item results report those separately.
+
+| Item or feature | Single-principal rebuild | Paired rebuild | Limits / operator work |
 | --- | --- | --- | --- |
-| Lakehouse | ✅ | ✅ tables + files | Schema-enabled lakehouses supported |
-| Lakehouse SQL analytics endpoint | ✅ | n/a | Views, procedures, and functions |
-| Warehouse | ✅ | ✅ | Collation preserved |
-| Eventhouse | ✅ | n/a | |
-| KQL database (`ReadWrite`) | ✅ | ✅ | Table shortcuts recreated and excluded from the copy |
-| Mirrored database | ✅ | n/a | Created stopped; optional explicit start after creation |
-| Eventstream | ✅ | n/a | Same-tenant single-principal rebuilds; manual inactive creation for paired migrations |
-| KQL queryset | ✅ | n/a | Rebound to the migrated eventhouse |
-| KQL dashboard | ✅ | n/a | Rebound to the migrated eventhouse |
-| Semantic model | ✅ | n/a | Rebound to the migrated lakehouse or warehouse |
-| Report | ✅ | n/a | Rebound to the migrated semantic model |
-| Notebook | ✅ | n/a | Default lakehouse and environment attachment rebound |
-| Environment | ✅ | n/a | Libraries and Spark settings; needs publishing afterwards |
-| Dataflow Gen2 (CI/CD) | ✅ | n/a | Rebound to migrated items |
-| Data pipeline | ✅ | n/a | Rebound to migrated items; a connection still pointing at the source needs an explicit destination mapping |
-| Copy Job | ✅ | n/a | Rebound to migrated items; a connection still pointing at the source needs an explicit destination mapping |
-| OneLake shortcuts | ✅ | n/a | Internal targets remapped to the new workspace |
-| Workspace folders | ✅ | n/a | Hierarchy recreated, and items placed back into it |
-| Custom Spark pools | ✅ | n/a | Recreated, and environments repointed at them |
-| Workspace Spark settings | ✅ | n/a | Default pool, starter pool, and job settings |
-| Spark job definition | ✅ | n/a | Exported as V2 so the code files come too |
-| API for GraphQL | ✅ | n/a | In-Fabric data sources rebound; external ones left alone |
-| Variable library | ✅ | n/a | Item references rebound |
-| Mounted data factory | ✅ | n/a | Points at the same Azure Data Factory |
-| Graph model / query set | ✅ | n/a | Mappings rebound; the index needs rebuilding |
-| Map | ✅ | n/a | Lakehouse and KQL sources rebound |
-| Activator (Reflex) | ✅ | n/a | Rules arrive switched off |
-| Mirrored Azure Databricks catalog | ✅ | n/a | Arrives with automatic sync off |
-| Snowflake database | ✅ | n/a | Points at the same Snowflake database |
-| Workspace permissions | ✅ | n/a | Role assignments replayed |
+| Lakehouse | Schema; tables via Copy Jobs; Files via AzCopy | Schema; tables and Files via OneLake streaming | Schema-enabled lakehouses supported; shortcuts excluded from table-data copy |
+| Lakehouse SQL analytics endpoint | Refresh and schema transfer | Refresh and schema transfer | Views, procedures and functions; catalog readiness is separate from byte-copy success |
+| Warehouse | T-SQL schema and Copy Job data | T-SQL schema and streamed rows | Collation preserved; paired transfer excludes source security assignments |
+| Fabric SQL database | Definition schema and bcp rows | T-SQL schema and streamed rows | Native bcp stages one table export at a time; paired schema excludes source security assignments |
+| Cosmos DB database | Container definitions and SDK document copy | Container definitions and independently authenticated document copy | Destination connectivity and data access required |
+| Eventhouse | Recreated | Recreated | Created before its KQL databases |
+| KQL database (`ReadWrite`) | Definition and cross-cluster data copy | Definition and streamed data | Paired target update policies remain disabled; table shortcuts reconciled separately |
+| KQL follower database | Recreated where leader identity is resolvable | Recreated with validated destination references | [Follower constraints](docs/migration-details.md#kql-follower-databases) apply |
+| Mirrored database | Definition; optional start | Definition; optional start | Created stopped; start does not prove replication catch-up |
+| Eventstream | Definition and rebinding | Manual | Paired inactive creation is not established for every node |
+| KQL queryset / dashboard | Definition and rebinding | Definition and rebinding | Points at migrated data stores |
+| Semantic model | Definition and rebinding | Definition and rebinding, without role memberships | Includes former default models; cached data is not copied |
+| Report | Definition and model rebinding | Definition and model rebinding | Verify destination model and report access |
+| Notebook | Definition and rebinding | Definition and rebinding | Default lakehouse and environment attachment remapped |
+| Environment | Libraries and Spark settings | Libraries and Spark settings | Publish before running dependent jobs |
+| Dataflow Gen2 (CI/CD) | Definition and rebinding | Definition and rebinding | Gen1 and classic Gen2 are not supported |
+| Data pipeline / Copy Job | Definition and rebinding | Definition and rebinding | Referenced source-bound connections need explicit replacement mappings |
+| Apache Airflow job | Configuration and DAG files | Configuration and DAG files with reference checks | Inspect scheduler pause settings and runtime dependencies before enabling |
+| OneLake / KQL table shortcuts | Create missing; reuse identical | Create missing; reuse identical after destination checks | No overwrite of conflicting targets |
+| Workspace folders | Recreated hierarchy and placement | Recreated hierarchy and placement | Item identities are remapped |
+| Custom Spark pools / workspace Spark settings | Recreated or updated | Recreated or updated | Capacity-level pools and capacity limits need operator review |
+| Spark job definition | V2 definition and supported files | V2 definition and supported files | JVM/JAR payloads require manual handling |
+| API for GraphQL | Definition and source rebinding | Definition and validated source rebinding | External dependencies need mode-appropriate review/mappings |
+| Variable library | Definition and item rebinding | Definition and item rebinding | Known references must resolve |
+| Mounted data factory | Definition | Definition | Still refers to the Azure Data Factory; it is not copied |
+| Graph model / query set | Definition and rebinding | Definition and rebinding | Rebuild/refresh the graph index |
+| Map | Definition and rebinding | Definition and rebinding | Lakehouse and KQL sources remapped |
+| Activator (Reflex) | Definition with rules disabled | Definition with rules disabled | Enable rules manually |
+| Mirrored Azure Databricks catalog | Definition with auto-sync disabled | Definition with auto-sync disabled | Enable sync manually |
+| Snowflake database | Recreated reference | Recreated reference with destination connection checks | Snowflake data stays in Snowflake |
+| Workspace permissions | Source admins preserved; other roles optional | Not copied | Destination administrators arrange paired-run access |
+| Dashboard / paginated report | Not rebuilt | Not rebuilt | Retained only when the existing Power BI-only workspace is reassigned |
 
-On a rebuild, anything not in that table is reported by name and type — on the review screen
-before you commit, and again as a warning on the run itself — so you know exactly what stays
-behind in the source workspace.
+Unsupported user items are reported on the review screen and in run warnings. Derived and
+system/monitoring items have separate handling; use the actual assessment rather than
+assuming that every entry in the raw Fabric inventory is independently migrated.
 
-KQL *shortcut* (follower) databases are recreated pointing at the same leader. The item's
-properties do not name that leader, so it is read from the follower's own cluster with
-`.show follower database`, whose `OriginalDatabaseName` is the leader's KQL Database item id
-when the leader is another Fabric eventhouse. If the leader is in the workspace being
-migrated the copy follows the copy, otherwise it keeps following the original. A follower of
-an *Azure Data Explorer* database is reported instead, because the leader is identified by
-name and its cluster URI is not exposed anywhere.
+In single-principal rebuilds, source **Admin** assignments are attempted during workspace
+creation even if **Copy workspace permissions** is off; that option controls the remaining
+roles. Paired runs copy neither, including when both principals are in the same tenant.
 
-**Every semantic model migrates, including one named after a lakehouse or warehouse.** Those
-used to be Fabric's default semantic models, provisioned alongside their parent, and were
-skipped because the target workspace got its own. Fabric
-[stopped creating them on 5 September 2025](https://learn.microsoft.com/fabric/data-warehouse/semantic-models)
-and decoupled the existing ones into independent semantic models by 30 November 2025, so
-there is no longer an auto-created copy to collide with — and skipping one now would quietly
-lose a model somebody is using.
+**Former default semantic models are included**, not skipped because of their names.
+See [semantic-model history](docs/migration-details.md#semantic-models) for why they are
+independent of the destination lakehouse or warehouse.
 
 On a rebuild, models whose source uses large (`PremiumFiles`) storage have that setting
 confirmed or restored in the destination. A destination already configured as large is left
 alone. Missing source format metadata and failures are reported explicitly, with storage
 evidence in the cutover report; importing a definition does not prove data/query readiness.
 
-**Dataflows only migrate when they are Gen2 (CI/CD).** The item definition APIs do not
-support Dataflow Gen1 or classic Gen2, so each dataflow is classified by probing its
-definition — Fabric documents that filtering the item list by dataflow type does not return
-reliable information. Anything that is not CI/CD-enabled is reported by name, telling you to
-upgrade it with the upgrade wizard or Save As and migrate again.
-
-**Some items arrive switched off.** Anything that acts on its own is created inactive, because
-leaving it running would mean two copies acting on the same source at once. Mirrored databases
-arrive with mirroring stopped, a mirrored Azure Databricks catalog with `autoSync` disabled,
-and an Activator with every rule's `shouldRun` set to false — otherwise every alert fires
-twice and every pipeline it triggers runs twice, once from each region.
+**Some items need manual preparation or activation.** Upgrade unsupported dataflows to
+Gen2 (CI/CD), publish environments, and rebuild graph indexes. Database mirrors are created
+stopped, Databricks catalog auto-sync is disabled, and Activator rules arrive disabled.
+Do not enable a second copy until its dependencies and intended cutover behavior are ready.
 
 **Start destination database mirrors** is an off-by-default option on the review screen,
 including when retrying a saved migration. Selecting it authorizes a separate start action
@@ -383,27 +348,9 @@ started mirror is still stopped. See
 [Start Mirroring](https://learn.microsoft.com/en-us/rest/api/fabric/mirroreddatabase/mirroring/start-mirroring)
 and [Get Mirroring Status](https://learn.microsoft.com/en-us/rest/api/fabric/mirroreddatabase/mirroring/get-mirroring-status).
 
-**A graph model's index is not copied.** The mappings and graph type come across, and the delta
-tables they read migrate with their lakehouse, but the index itself is built from the data.
-Refresh the model in the new workspace before running queries against it.
-
-**A Spark job definition is exported as `SparkJobDefinitionV2`.** V1 and V2 share a payload
-schema *and* a part filename, and only V2 carries the `Main/` and `Libs/` parts, so exporting
-with the default would silently produce a job whose executable does not exist. Jars cannot be
-carried inline at all, so a JVM job is reported instead.
-
-**Environments arrive unpublished.** Publish them in the new workspace before running
-anything that depends on them. Custom Spark pools are recreated with the workspace, so an
-environment that pins one is repointed automatically; a *capacity* level pool belongs to the
-capacity rather than the workspace and is reported instead.
-
-**The target capacity should be the same size as the source's.** Capacity SKU caps Spark pool
-and starter pool node counts, and the memory a semantic model may use, so moving to a smaller
-capacity succeeds right up until something no longer fits. Fab Shuffle compares the two SKUs
-while it builds the plan and warns on the review screen if they differ. Workspace Spark
-settings are only patched where they actually differ from the new workspace's own defaults,
-so a workspace that never customised them is left alone and never trips the capacity's node
-count limits.
+**Review destination capacity limits.** A smaller capacity may not fit the source's Spark
+pools or semantic models. Fab Shuffle warns when SKUs differ; that warning is not proof
+that the destination workload will run successfully.
 
 ### Cutover readiness (advisory)
 
@@ -446,88 +393,26 @@ repeat; they are not a substitute for missing lifecycle evidence.
 
 ### Dependency order
 
-Phase order is load bearing. Each phase records the source-to-target ids it created in an id
-map, and later phases rewrite their exported definitions through it, so a phase can only
-reference items created by an earlier one:
-
-0. **Assessment and dependency check** — both run before anything is created, so a workspace
-   that cannot migrate cleanly can be abandoned rather than left half built. The dependency
-   check also detects which tenant connections the migrated items and shortcuts actually
-   reference; it does not validate a supplied `connection_mappings` entry yet, because the
-   data store its path might name does not exist yet.
-1. **Workspaces** — target and scratch workspaces, the folder tree, and the custom Spark
-   pools plus workspace Spark settings. Pools come first because an environment pins one by
-   id, so it has to exist before the engineering phase runs.
-2. **Eventhouses** — before their KQL databases, which are created against
-   `parentEventhouseItemId`.
-3. **Lakehouses** — before warehouses, because warehouse views can reference lakehouse
-   tables through the SQL analytics endpoint.
-4. **Warehouses** — schema before data, so Copy Job activities have tables to land in.
-5. **Fabric SQL databases** — schema through the item definition, rows through a Copy Job;
-   a data store like the rest, read by GraphQL APIs, pipelines and Copy Jobs.
-6. **Connection mappings** — only runs when the operator supplied `connection_mappings`; with
-   none supplied, there is no step and no rebuild noise about connections nothing referenced.
-   Each supplied mapping is validated now that every phase above it that can add to the id map
-   has run, so a connection whose path names a lakehouse or warehouse endpoint is not
-   misdiagnosed as broken before that endpoint existed.
-7. **Mirrored databases** — data stores with their own SQL analytics endpoint that can also
-   bind a connection directly, so they go with the others, after connection mappings are
-   validated, and before anything that reads them.
-8. **Shortcuts** — after every data item exists, since a shortcut can point at any of them.
-   This covers lakehouse shortcuts and KQL database table shortcuts. The SQL analytics
-   endpoint is refreshed only now, so it sees both the copied tables and the new shortcuts,
-   and only then is its schema copied.
-9. **Eventstreams, KQL querysets, and KQL dashboards** — all three read the eventhouses and
-   data stores above, and an eventstream sources from connections.
-10. **Environments, notebooks, then dataflows, then the rest** — a notebook attaches to an
-    environment and reads a lakehouse, and a semantic model can read a dataflow, so those come
-    first. Spark job definitions, GraphQL APIs, graph models and query sets, maps, variable
-    libraries and mounted data factories follow, since each reads something built earlier.
-11. **Semantic models, then reports** — a Direct Lake or DirectQuery model embeds the SQL
-    endpoint and GUID of the lakehouse or warehouse it reads, so it needs the data store phases
-    finished; a report embeds its model's GUID, so it runs after the models. Models are ordered
-    among themselves using the relations graph, so a composite model follows what it reads.
-12. **Data pipelines and Copy Jobs** — these orchestrate everything above, reading lakehouses,
-    refreshing models, and invoking each other, so they are ordered among themselves by the
-    relations graph.
-13. **Activators** — last of the content phases. An Activator watches an eventstream or KQL
-    database and acts by running pipelines and notebooks, so everything on both sides has to
-    exist first.
-14. **Connection advisories** — read-only inventory of visible connections whose paths still
-    target the source workspace. The cutover report shows manual review actions; this phase
-    does not recreate connections or modify item mappings.
-15. **Permissions** — the source workspace's admins are granted as soon as the workspace is
-    created, so a failed run never leaves a workspace nobody can open. The remaining roles
-    are replayed here, last, so nothing is visible half built.
-16. **Cleanup** — drop the scratch workspace and local staging.
+Stores are created before their consumers, environments before notebooks, and semantic
+models before reports. Shortcuts are reconciled after their targets exist. The
+[implementation reference](docs/migration-details.md#dependency-order) documents the full
+phase sequence and the single-principal versus paired differences.
 
 ### Connections
 
 Fab Shuffle never creates, adopts by name, or deletes a connection on the operator's behalf,
 in any mode. A connection id is tenant scoped: it can be reused within that tenant when its
 target and access are still appropriate, but it does not resolve in another tenant.
-The API never returns an existing connection's credentials, so a faithful copy would not
-be possible even if Fabric allowed it.
-(An earlier version of this tool tried to recreate source-bound connections automatically;
-that was removed because it could only ever cover a narrow, verified-credential-free subset
-of connectors, guessed at "the same" connection by name, and left every other connector
-either silently unreplaced or wrongly adopted.)
+Existing connection credentials are not exported. Automatic connection recreation was
+deliberately removed; see the [reference-safety rationale](docs/migration-details.md#reference-and-connection-safety).
 
-An operator who has already created — or wants to point at — a replacement connection
-supplies its destination connection ID by source connection ID in the plan's
-`connection_mappings`. That supplied mapping is validated in its own phase, after every data
-store phase above it that can add to the id map has run: read back from the destination with
-destination credentials, and checked that it still targets the migrated store now that the
-store exists, then rewritten through the id map so items migrated afterwards bind to it.
-Changed or removed mappings invalidate the previously accepted binding rather than silently
-keeping the old id — see [Cross-tenant migrations](#cross-tenant-migrations) above for the
-same mechanism from the operator's side. With no `connection_mappings` supplied at all, this
-phase does not run: there is nothing to validate, and no rebuild noise about connections
-nothing referenced.
+Supply replacement connection IDs through `connection_mappings`, keyed by source connection
+ID. They are read back with destination credentials and validated once the relevant stores
+exist. Changed or removed mappings invalidate the old binding instead of silently preserving
+it. Without supplied mappings there is no connection-replacement phase.
 
 Migration dependency checks apply only to connections that a *migrated* item or shortcut
-actually references: a
-data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported
+actually references: a data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported
 definition names one, or a lakehouse/KQL database shortcut whose target does (a shortcut's
 connection lives on the shortcut target, not in the item's own definition). Separately,
 cutover advisories report visible connections pointing into the source workspace, including
@@ -541,10 +426,11 @@ connection and the item and asks for a destination replacement to be created and
 hand in `connection_mappings`; it does not create one and does not promise that doing so will
 fix the underlying data source.
 
-Connections that migrated items merely *use*, and that already point at something outside the
-workspace being migrated, are left alone and checked instead, reporting:
+In single-principal mode, referenced connections that target something outside the moving
+workspace can be reused without recreation. Paired mode still needs explicit destination
+connection mappings. Connection checks report:
 
-- connections the service principal **cannot see**, which will make the item fail to run;
+- connections the service principal **cannot see**, requiring an access check before their consumers run;
 - **personal cloud** connections, which cannot be shared;
 - connections routed through a **gateway**. A virtual network gateway in particular stays in
   its original region, so it may no longer be the right path to the data.
@@ -614,18 +500,13 @@ files before running the new job.
 
 ### Dependency checking
 
-Before creating anything, Fab Shuffle reads the [relations
-APIs](https://learn.microsoft.com/en-us/rest/api/fabric/core/items/get-upstream-relations(beta))
-for every item it plans to migrate and reports references that will not survive the move:
+The tool reads [upstream relations](https://learn.microsoft.com/en-us/rest/api/fabric/core/items/get-upstream-relations(beta))
+and inspects known references in definitions and shortcuts. It reports dependencies outside
+the migration and dependencies on unsupported items. Paired moves require explicit
+destination references; single-principal external dependencies still need operator review.
 
-- a dependency in **another workspace**, which is not part of the migration, so the copy
-  keeps reading from the original region;
-- a dependency on an item **Fab Shuffle does not migrate**, which leaves the copy without
-  its source.
-
-Neither is visible by inspecting item definitions, and both otherwise fail silently. These
-APIs are in beta and must be called with `?beta=true`; if they are unavailable to the service
-principal, the step is skipped and the migration continues.
+The relations API is beta. If unavailable, the report says the graph could not be checked;
+that is not evidence that dependencies are safe. Definition/reference checks still apply.
 
 ## Usage
 
@@ -662,8 +543,9 @@ workspace while completion is unknown.
 
 The same machinery retries a run that *did* finish but left items behind — a connection that
 was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
-what did not migrate** on the progress screen, and only the missing items are attempted. The
-scratch workspace it deleted on the way out is rebuilt automatically.
+what did not migrate** on the progress screen to review and resume the saved attempt. Missing
+work is retried; retained targets and bindings are checked rather than blindly skipped. The
+scratch workspace, when needed for single-principal Copy Jobs, is recreated if it was removed.
 Completed runs with recorded failed steps also appear under **Saved migrations needing
 attention** after a container restart, so a runtime handoff does not lose the retry controls.
 Resume and Retry open a review screen for that attempt's mirror-start choice. Existing
@@ -690,9 +572,10 @@ deletions are skipped on the next restart attempt. Service errors are retained i
 
 Two things follow from this:
 
-- **Resuming needs you to sign in again.** Credentials are never written down, so nothing can
-  restart a migration on its own. This is deliberate.
-- **Journals live on the volume**, under `local/journal`. They hold workspace and item ids and
+- **Resuming after a process restart needs a new sign-in.** Session credentials are not
+  persisted for automatic recovery.
+- **Journals live on the volume**, under `local/journal` for single-principal runs or
+  `local/journal-paired-v1` for paired runs. They hold workspace and item ids and
   names — the same things the screen shows — and no credentials. The hundred most recent are
   kept, along with the latest recoverable attempts and unresolved Copy Jobs.
 
@@ -701,9 +584,11 @@ pick up. That is the main reason the `docker run` line above mounts one.
 
 ### Building the image yourself
 
+Use the [container validation workflow](#development) before publishing a custom build.
+
 ```bash
-docker build -t fab-shuffle .
-docker run --rm -p 8080:8080 fab-shuffle
+docker build --platform linux/amd64 --target production -t fab-shuffle .
+docker run --rm --platform linux/amd64 -p 8080:8080 -v fab-shuffle-scratch:/app/local fab-shuffle
 ```
 
 The image supports `linux/amd64` and `linux/arm64`. Its Python base is pinned by patch
@@ -717,10 +602,8 @@ loopback to check HTTP health and packaged UI assets without tenant credentials.
 names x64 only. Use `--platform linux/amd64` for vendor-supported SqlPackage use. Neither
 architecture's version/import/health smoke checks exercise a live database or Fabric tenant.
 
-Current tool pins are .NET SDK **10.0.400** / runtime **10.0.11**, Microsoft ODBC and SQL
-tools **18.6.2.1-1**, SqlPackage **170.5.76**, UnpackDacPac **2026.7.15.390**, and AzCopy
-**10.32.8**. Both tools' NuGet packages include net10.0 payloads and bundle their library
-dependencies; package hashes plus the pinned SDK/runtime fix that selection.
+For exact .NET, ODBC, SQL-tool and AzCopy versions, use [tools.lock.json](tools.lock.json)
+rather than a second version list in this README.
 
 Two build args exist for networks that block the public package feeds:
 
@@ -771,36 +654,10 @@ Use the new variables for independent control. Values must be positive byte coun
 
 ## How it works
 
-On the reassign path, the whole migration is: convert large semantic models to the small
-storage format, `assignToCapacity`, convert them back.
-
-On the rebuild path:
-
-1. Assess the workspace and warn about every item that will be left behind.
-2. Create the target workspace on the chosen capacity, plus a short-lived scratch workspace
-   that holds the Copy Jobs (so they never pollute the migrated workspace).
-3. Recreate eventhouses, then import each KQL database definition retargeted at the new
-   eventhouse, and copy table data with a cross-cluster `.set-or-replace`.
-4. Recreate lakehouses, copy table data with Copy Jobs, and copy `Files/` with azcopy.
-5. Recreate warehouses, transfer their T-SQL schema, and copy table data with Copy Jobs.
-6. Recreate shortcuts, both lakehouse and KQL table shortcuts, refresh the SQL analytics
-   endpoints, then copy their schema.
-7. Recreate semantic models and then reports, rewriting their definitions so they bind to
-   the items just created rather than the ones in the old region.
-8. Recreate data pipelines and Copy Jobs, and check the connections they bind.
-9. Replay workspace role assignments.
-10. Delete the scratch workspace and local staging.
-
-See [Dependency order](#dependency-order) for why the sequence is what it is.
-
-### Why some things are not pure REST
-
-Three gaps in the Fabric REST API are covered by external tooling bundled in the image:
-
-- **Warehouse / SQL endpoint schema** — there is no definition or schema-export API for
-  `Warehouse`, so `sqlpackage` extracts a DACPAC and the generated script is applied over TDS.
-- **OneLake files** — OneLake has no server-side copy API, so `azcopy` moves `Files/`.
-- **KQL data** — no REST API copies KQL table data, so the Kusto control plane is used.
+See the [migration implementation reference](docs/migration-details.md) for mode-specific
+data movement, dependency ordering, reference safety, staging, item-specific history and
+API integration. The [support matrix](fabshuffle/fabric/support.py) and
+[orchestrator](fabshuffle/orchestrator.py) are the implementation authorities.
 
 ## Development
 
@@ -841,63 +698,18 @@ that is dependency metadata, not a promise of native Windows application support
 
 ### Deliberate release upgrades
 
-Review dependency and tool updates at least monthly, and promptly for security fixes. A
-scheduled image rebuild does **not** update the pins. Make updates on a branch:
-
-For dependency maintenance only, start a shell in the test image with your checkout mounted
-at `/workspace` (replace the placeholder with its absolute host path). This container needs
-network access to fetch the explicitly selected package versions; do not mount recovery
-volumes or provide Fabric credentials.
-
-```text
-docker run --rm -it --mount "type=bind,source=<absolute-checkout-path>,target=/workspace" --workdir /workspace --entrypoint /bin/sh fab-shuffle:test
-```
-
-1. Inside that container, for a selected dependency run
-   `python -m uv lock --upgrade-package NAME==VERSION`; use `python -m uv lock --upgrade`
-   only for a deliberate full refresh. Preserve the declared dependency compatibility.
-   To update the resolver/installer, edit the exact `lock` group pins and
-   `tool.uv.required-version` together, install that exact uv version into this isolated
-   environment, and regenerate. To update the build backend, change both
-   `build-system.requires` and the `build` group. The lock includes their transitives.
-2. Run `python scripts/lock_dependencies.py` to regenerate all four hashed exports.
-   Exit and rebuild the test target with the updated inputs, then run its validation
-   entrypoint. Commit `pyproject.toml`, `uv.lock`, and
-   the exports together. Do not edit generated hashes or replace them with `pip freeze`.
-3. Review `tools.lock.json` and the Dockerfile base digest using the official upstream
-   release metadata linked in the manifest's `sources`. Select each exact version's
-   `Filename`/`SHA256` stanza from both Microsoft package indexes, including the SDK's
-   Microsoft runtime/host/targeting-pack dependency closure. For NuGet, download the exact
-   `.nupkg` from the official flat-container feed, compare its SHA-512 with the catalog,
-   and record its SHA-256. Use the versioned AzCopy release assets and their published
-   `digest` values, never an evergreen download link. Verify both architectures' downloads
-   and hashes before changing pins. Resolve the Python image's multi-architecture digest
-   with `docker buildx imagetools inspect python:VERSION-bookworm`.
-   Check the Microsoft Learn per-tool pages
-   for supported architectures and runtime changes, not assumptions about roll-forward.
-   The Dockerfile also pins validation-only Node and PowerShell image digests. The workflows
-   pin action SHAs, cosign, Buildx, BuildKit, and QEMU; review those explicitly rather than
-   letting a setup action download latest.
-4. Run the test image's validation entrypoint (including pytest and Ruff) **before**
-   building or publishing the production target.
-   Build a unique local tag with
-   `docker build --platform linux/amd64 --target production -t fab-shuffle:release-review-UNIQUE .`;
-   repeat for `linux/arm64` with a different tag on an ARM runner or under emulation.
-   Both builds must pass the embedded CLI/import/HTTP smoke checks. Do not push from the
-   refresh procedure. The existing `v*.*.*` release workflow still controls publication,
-   semver tags, `latest`, and signing.
-
-The reproducibility boundary is **dependency/artifact selection**, not byte-for-byte OCI
-images. The base image is immutable, Python wheels are hash checked, and external tool
-inputs are pinned. Debian apt repositories and OS dependency packages are not fully
-snapshotted; their transitive updates, maintainer scripts, timestamps, and hosted runner
-updates can change image bytes. A withdrawn pinned artifact makes the build fail until an
-operator deliberately refreshes it. For an identical deployed image, retain and run its
-published digest rather than rebuilding a tag.
+See [Development and release maintenance](docs/development.md) for dependency refreshes,
+artifact verification, version alignment, publication and reproducibility boundaries.
+Scheduled rebuilds do not update dependency pins, and a merge alone does not update the
+stable `latest` tag.
 
 ## Planned features
 
-- Migration of the remaining definition-backed item types (notebooks, pipelines, semantic
-  models, eventstreams, and friends)
-- Configurable parallelism for data transfers
-- Multiple workspace support in a single run
+- Coordinated multi-workspace migrations, including dependencies between workspaces.
+- Incremental/low-downtime copying and cutover.
+- Broader live cross-tenant qualification and additional currently unsupported item scenarios.
+
+Single-workspace paired migration, configurable transfer concurrency, saved-run controls,
+connection advisories and Azure Files-backed staging are already available. Published
+support is subject to the limits in [What gets migrated](#what-gets-migrated), not a promise
+that every configuration has been qualified live.
