@@ -7,9 +7,11 @@ source writes until an explicit, successful cutback and rearm.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -32,6 +34,7 @@ from fabshuffle.bcdr.catalog import CapturedGeneration, RecoveryCatalog
 from fabshuffle.bcdr.contracts import (
     AppliedItem,
     ConnectionIdentity,
+    ControllerLease,
     EndpointIdentity,
     ItemIdentity,
     ItemRecord,
@@ -74,11 +77,13 @@ from fabshuffle.bcdr.service import (
     GroupStatus,
     ItemReadiness,
     PlanRequest,
+    ReconcileOperationRequest,
     ServiceResult,
     SyncRequest,
 )
 from fabshuffle.fabric.client import FabricClient
 from fabshuffle.fabric.workspaces import create_workspace
+from fabshuffle.lifecycle import safe_text
 
 
 def workspace_key(identity: WorkspaceIdentity) -> tuple[str, str]:
@@ -112,11 +117,23 @@ class DataRecovery(Protocol):
     ) -> tuple[bool, tuple[str, ...]]: ...
 
 
+class CoordinatorCatalog(RecoveryCatalog, Protocol):
+    def takeover_controller(
+        self,
+        controller_id: str,
+        *,
+        expected_controller_id: str,
+        expected_epoch: int,
+        fencing_evidence: str,
+        operation_id: str,
+    ) -> ControllerLease: ...
+
+
 class RecoveryCoordinator:
     def __init__(
         self,
         recovery_set: RecoverySet,
-        catalog: RecoveryCatalog,
+        catalog: CoordinatorCatalog,
         destination: FabricClient,
         capacities: CapacityLifecycle,
         *,
@@ -186,13 +203,27 @@ class RecoveryCoordinator:
             if row.document["generation_id"] == generation_id
         )
 
-    def _save_group(self, generation_id: str, group: GroupStatus) -> None:
+    def _save_group(
+        self,
+        generation_id: str,
+        group: GroupStatus,
+        *,
+        metadata_blockers: tuple[str, ...] | None = None,
+    ) -> None:
+        previous = self.runtime.get("groups", group.group_id)
+        if metadata_blockers is None:
+            metadata_blockers = (
+                tuple(previous.get("metadata_blockers", group.blockers))
+                if (previous and previous["generation_id"] == generation_id)
+                else group.blockers
+            )
         self.runtime.put(
             "groups",
             group.group_id,
             {
                 "generation_id": generation_id,
                 "group": group.model_dump(mode="json"),
+                "metadata_blockers": list(metadata_blockers),
             },
         )
 
@@ -330,7 +361,16 @@ class RecoveryCoordinator:
         }
 
     def item_mappings(self) -> dict[str, AppliedItem]:
-        return {row.source.key: row for row in self.catalog.applied_items()}
+        rows = self.catalog.applied_items()
+        if self.workspace_namespace != "workspaces":
+            owned = self.workspace_mappings()
+            rows = tuple(
+                row
+                for row in rows
+                if owned.get("/".join(row.source.key.split("/")[:2]))
+                == (WorkspaceIdentity(tenant_id=row.target.tenant_id, workspace_id=row.target.workspace_id))
+            )
+        return {row.source.key: row for row in rows}
 
     def _endpoint_pairs(
         self,
@@ -388,7 +428,7 @@ class RecoveryCoordinator:
                 item_key(row.target),
                 row.operation_id,
             )
-            for row in self.catalog.applied_items()
+            for row in self.item_mappings().values()
             if row.source.key in known_items
         )
         replacements = []
@@ -398,6 +438,25 @@ class RecoveryCoordinator:
             for item in generation.snapshot.items
             for value in (item.identity.workspace_id, item.identity.item_id)
         }
+        for item in generation.snapshot.items:
+            sql_endpoint = item.properties.get("sqlEndpointProperties") or {}
+            for value in (
+                item.properties.get("serverFqdn"),
+                item.properties.get("queryServiceUri"),
+                item.properties.get("ingestionServiceUri"),
+                sql_endpoint.get("connectionString"),
+            ):
+                if isinstance(value, str) and value:
+                    source_literals.add(value.split(",", 1)[0].lower())
+            connection = item.properties.get("connectionString")
+            if isinstance(connection, str) and connection and ";" not in connection:
+                source_literals.add(connection.lower())
+        for edge in generation.snapshot.dependencies:
+            if (
+                isinstance(edge.prerequisite, EndpointIdentity)
+                and edge.prerequisite.endpoint_kind != "sql_database_name"
+            ):
+                source_literals.add(edge.prerequisite.endpoint_id.lower())
         for route in request.connection_mappings:
             if route.source.key in seen_connections:
                 raise RecoveryBlocked("Map each captured connection exactly once")
@@ -607,6 +666,7 @@ class RecoveryCoordinator:
         completed = set()
         blockers: dict[str, list[str]] = {}
         warnings = []
+        plan_settings = self.runtime.get("plans", generation_id) or {}
         connections = {
             row.key: ConnectionIdentity.model_validate(row.document["target"])
             for row in self.catalog.list_records("connections")
@@ -624,7 +684,7 @@ class RecoveryCoordinator:
                     placement = placements[op.subject]
                     result = self.runtime.effect(
                         "workspace-create",
-                        workspace.identity.key,
+                        f"{self.workspace_namespace}/{workspace.identity.key}",
                         lambda w=workspace, p=placement: create_workspace(
                             self.destination,
                             w.display_name + suffix,
@@ -667,6 +727,19 @@ class RecoveryCoordinator:
                         applied[item.identity.key] = current
                 shell_only = owns_schema(generation, item, self.catalog)
                 hashes = captured_hashes(item, generation.payloads)
+                prerequisites = {
+                    edge.prerequisite.key
+                    for edge in snapshot.dependencies
+                    if edge.consumer == item.identity and isinstance(edge.prerequisite, ItemIdentity)
+                } | {item.identity.key}
+                try:
+                    endpoint_pairs = self._endpoint_pairs(
+                        generation,
+                        {key: row for key, row in applied.items() if key in prerequisites},
+                    )
+                except RecoveryBlocked as error:
+                    blockers.setdefault(item.identity.key, []).append(str(error))
+                    continue
                 binding_hash = digest(
                     canonical_json(
                         {
@@ -676,7 +749,9 @@ class RecoveryCoordinator:
                                 if edge.consumer == item.identity
                                 and isinstance(edge.prerequisite, ItemIdentity)
                                 and edge.prerequisite.key in applied
-                            }
+                            },
+                            "connections": {source: target.key for source, target in connections.items()},
+                            "endpoints": [[source.key, target] for source, target in endpoint_pairs],
                         }
                     )
                 )
@@ -720,23 +795,11 @@ class RecoveryCoordinator:
                         completed.add(key)
                         continue
                 target_workspace = workspaces["/".join(op.subject[:2])]
-                prerequisites = {
-                    edge.prerequisite.key
-                    for edge in snapshot.dependencies
-                    if edge.consumer == item.identity and isinstance(edge.prerequisite, ItemIdentity)
-                } | {item.identity.key}
-                try:
-                    endpoint_pairs = self._endpoint_pairs(
-                        generation,
-                        {key: row for key, row in applied.items() if key in prerequisites},
-                    )
-                except RecoveryBlocked as error:
-                    blockers.setdefault(item.identity.key, []).append(str(error))
-                    continue
                 mapping_digest = digest(
                     canonical_json(
                         {
                             "maps": {key: value.target.key for key, value in applied.items()},
+                            "bindings": binding_hash,
                         }
                     )
                 )
@@ -765,6 +828,10 @@ class RecoveryCoordinator:
                         tokens=self.tokens,
                         shell_only=shell,
                         mutation_guard=self.runtime.fence,
+                        destination_quiescence=plan_settings.get("target_quiescence_evidence"),
+                        verified_external_connections=tuple(
+                            target for key, target in connections.items() if key == target.key
+                        ),
                         endpoint_mappings=endpoints,
                         connection_mappings=tuple(
                             (
@@ -831,7 +898,7 @@ class RecoveryCoordinator:
                 )
         groups = self._build_groups(generation, plan, applied, blockers)
         for group in groups:
-            self._save_group(generation_id, group)
+            self._save_group(generation_id, group, metadata_blockers=group.blockers)
         return groups, tuple(warnings)
 
     def _rearmed_item(self, generation: CapturedGeneration, item: ItemRecord) -> AppliedItem | None:
@@ -994,7 +1061,8 @@ class RecoveryCoordinator:
     def enable_recovery(self, request: EnableRecoveryRequest) -> ServiceResult:
         self._wake()
         with self.runtime.controller({RecoveryMode.STANDBY, RecoveryMode.ENABLING_RECOVERY}):
-            if self.runtime.mode == RecoveryMode.STANDBY:
+            starting = self.runtime.mode == RecoveryMode.STANDBY
+            if starting:
                 self.runtime.transition(RecoveryMode.ENABLING_RECOVERY)
                 self.runtime.put("lifecycle", "enabled-generation", {"generation_id": request.generation_id})
             pinned = self.runtime.get("lifecycle", "enabled-generation")
@@ -1002,6 +1070,14 @@ class RecoveryCoordinator:
                 raise RecoveryBlocked("Recovery is already pinned to another generation; do not overwrite it")
             self.capacities.resume_business(self.runtime)
             generation = self.catalog.load_generation(request.generation_id)
+            if starting or not any(group.access_enabled for group in self._groups(request.generation_id)):
+                stored = self.runtime.get("plans", request.generation_id)
+                if stored is None:
+                    raise RecoveryBlocked("Preview and synchronize a pinned plan before enabling recovery")
+                planned = PlanRequest.model_validate(
+                    {key: value for key, value in stored.items() if key not in {"capture", "park"}}
+                )
+                self._apply_plan(generation, self._plan(generation, planned), planned.suffix)
             groups = self._selected_groups(request.generation_id, request.group_ids)
             applied = self.item_mappings()
             workspaces = self.workspace_mappings()
@@ -1018,6 +1094,12 @@ class RecoveryCoordinator:
                 raise RecoveryBlocked("Approve only ACL IDs from the selected captured generation")
             self.access.restrict_workspace(self.recovery_set.control_workspace)
             for group in groups:
+                stored_group = self.runtime.get("groups", group.group_id)
+                group = group.model_copy(
+                    update={
+                        "blockers": tuple(stored_group.get("metadata_blockers", group.blockers)),
+                    }
+                )
                 metadata_pending = {
                     f"Complete provider-owned metadata for '{items[source.key].display_name}'"
                     for source in group.items
@@ -1070,6 +1152,7 @@ class RecoveryCoordinator:
                     self._save_group(request.generation_id, result)
                     results.append(result)
                     continue
+                attempted_grants = []
                 try:
                     self.validate_readiness(generation, (group,), request.readiness, security=False)
                     group_sources = {row.key for row in group.items}
@@ -1089,7 +1172,9 @@ class RecoveryCoordinator:
                     ]
                     for identity in group.items:
                         security = self.runtime.get("item-security", identity.key)
-                        if security and security["deferred_grants"]:
+                        if security and any(
+                            grant.get("scope") != "schedule" for grant in security["deferred_grants"]
+                        ):
                             raise RecoveryBlocked(
                                 f"Apply the captured security memberships/policies for {identity.key} "
                                 "through a qualified workload security adapter before admission"
@@ -1101,12 +1186,14 @@ class RecoveryCoordinator:
                         )
                         for acl in relevant
                     ]
+                    mapped.sort(key=lambda acl: acl.workspace is not None)
                     for acl in mapped:
                         self.access.fabric.path(acl)
                         if acl.acl_id not in approved:
                             raise RecoveryBlocked(f"Approve deferred ACL {acl.acl_id} for this group")
                     for acl in mapped:
                         self.access.apply(acl, approved=True)
+                        attempted_grants.append(acl)
                     result = group.model_copy(
                         update={
                             "access_enabled": True,
@@ -1117,6 +1204,7 @@ class RecoveryCoordinator:
                 except RecoveryBlocked as error:
                     if self.catalog.pending_operations():
                         raise
+                    self.access.rollback_grants(attempted_grants)
                     result = group.model_copy(update={"blockers": (str(error),)})
                 self._save_group(request.generation_id, result)
                 results.append(result)
@@ -1197,3 +1285,193 @@ class RecoveryCoordinator:
                     "ingestion process was executed automatically; follow its workload activation runbook.",
                 ),
             )
+
+    def reconcile_operation(self, request: ReconcileOperationRequest) -> ServiceResult:
+        self._wake()
+        state = self.catalog.state()
+        if state.mode not in {
+            RecoveryMode.SYNCING,
+            RecoveryMode.ENABLING_RECOVERY,
+            RecoveryMode.FAILING_BACK,
+        }:
+            raise RecoveryBlocked("Business reconciliation is not allowed while serving or parking")
+        if not request.previous_controller_stopped:
+            raise RecoveryBlocked("Stop and fence the previous controller before resuming its operation")
+        operation = next(
+            (row for row in self.catalog.operations() if row.operation_id == request.operation_id),
+            None,
+        )
+        if operation is not None and operation.state == OperationState.SUCCEEDED:
+            return self._reconcile_saved_result(operation, request)
+        if (
+            operation is None
+            or operation.kind != "item-apply"
+            or operation.source is None
+            or operation.generation_id is None
+            or operation.service_operation_id is None
+        ):
+            raise RecoveryBlocked(
+                "This operation lacks a reconcilable item service receipt. Inspect its exact request/audit "
+                "evidence manually; a same-name target is not ownership proof."
+            )
+        service_state = self.destination.get(f"operations/{operation.service_operation_id}")
+        if service_state.get("status") != "Succeeded":
+            raise RecoveryBlocked(
+                safe_text(
+                    f"Service operation {operation.service_operation_id} is {service_state.get('status')}; "
+                    f"{service_state.get('error')}. Settle or inspect it before resuming metadata."
+                )
+            )
+        receipt = self.destination.get(f"operations/{operation.service_operation_id}/result")
+        generation = self.catalog.load_generation(operation.generation_id)
+        item = next(row for row in generation.snapshot.items if row.identity == operation.source)
+        namespace = "workspaces"
+        if generation.snapshot.capture_kind == "recovery":
+            plans = [
+                row
+                for row in self.catalog.list_records("failback")
+                if row.document["dr_generation_id"] == generation.snapshot.generation_id
+            ]
+            if len(plans) != 1:
+                raise RecoveryBlocked("Resolve the unique linked return plan before reconciling its target")
+            namespace = f"return-{plans[0].key}"
+        mapping = self.runtime.get(namespace, "/".join(operation.source.key.split("/")[:2]))
+        receipt_id = receipt.get("id") or (operation.target.item_id if operation.target else None)
+        if mapping is None or not receipt_id:
+            raise RecoveryBlocked("The service receipt has no exact target ID and owned workspace placement")
+        workspace = WorkspaceIdentity.model_validate(mapping["target"])
+        target = ItemIdentity(
+            tenant_id=workspace.tenant_id,
+            workspace_id=workspace.workspace_id,
+            item_id=receipt_id,
+        )
+        if (
+            receipt.get("workspaceId", workspace.workspace_id) != workspace.workspace_id
+            or receipt.get("type", item.item_type) != item.item_type
+            or (operation.target is not None and operation.target != target)
+        ):
+            raise RecoveryBlocked("The service receipt disagrees with the committed operation target")
+        item_document(self.destination, target, item.item_type)
+        self.runtime.lease = self.catalog.takeover_controller(
+            self.runtime.controller_id,
+            expected_controller_id=request.expected_controller_id,
+            expected_epoch=request.expected_epoch,
+            fencing_evidence=request.fencing_evidence,
+            operation_id=str(uuid4()),
+        )
+        self.runtime.mode = state.mode
+        observed = operation.model_copy(
+            update={
+                "target": target,
+                "state": OperationState.RUNNING,
+                "recorded_at": now(),
+                "message": "Exact Fabric operation result reconciled under explicit controller fencing",
+            }
+        )
+        self.catalog.record_operation(self.runtime.require_lease(), observed)
+        self.runtime.put("reconciliation-evidence", operation.operation_id, request.model_dump(mode="json"))
+        source_ids = {row.identity.key for row in generation.snapshot.items}
+        applied = {key: row for key, row in self.item_mappings().items() if key in source_ids}
+        source_workspaces = {row.identity.key for row in generation.snapshot.workspaces}
+        workspaces = {
+            row.key: WorkspaceIdentity.model_validate(row.document["target"])
+            for row in self.catalog.list_records(namespace)
+            if row.key in source_workspaces
+        }
+
+        def finish():
+            result = self.apply(
+                self.destination,
+                item,
+                generation.payloads,
+                generation_id=operation.generation_id,
+                operation_id=operation.operation_id,
+                target_workspace=workspace,
+                source_items=generation.snapshot.items,
+                target_id=target.item_id,
+                tokens=self.tokens,
+                item_mappings={item_key(row.source): row.target for row in applied.values()},
+                workspace_mappings={tuple(key.split("/")): value for key, value in workspaces.items()},
+                endpoint_mappings=self._endpoint_pairs(generation, applied),
+                mutation_guard=self.runtime.fence,
+                destination_quiescence=request.target_quiescence_evidence,
+            )
+            if result.applied is None:
+                raise RecoveryBlocked("; ".join(result.diagnostics))
+            return {
+                "applied": result.applied.model_dump(mode="json"),
+                "metadata_applied": result.metadata_applied,
+                "deferred_grants": list(result.deferred_grants),
+            }
+
+        result = self.runtime.resume_effect(observed, finish)
+        row = AppliedItem.model_validate(result["applied"])
+        self.catalog.record_applied(self.runtime.require_lease(), row)
+        self.runtime.put(
+            "item-security",
+            item.identity.key,
+            {
+                "generation_id": operation.generation_id,
+                "target": target.model_dump(mode="json"),
+                "metadata_applied": result["metadata_applied"],
+                "deferred_grants": result["deferred_grants"],
+            },
+        )
+        if not self.catalog.pending_operations():
+            self.catalog.release_controller(self.runtime.require_lease())
+            self.runtime.lease = None
+        return ServiceResult(
+            mode=state.mode,
+            generation_id=operation.generation_id,
+            details={"reconciled_operation": operation.operation_id, "applied": row.model_dump(mode="json")},
+            warnings=(
+                "The exact returned item was reconciled without recreating it; resume the pinned plan.",
+            ),
+        )
+
+    def _reconcile_saved_result(self, operation, request) -> ServiceResult:
+        result = json.loads(operation.message or "{}")
+        if operation.kind != "item-apply" or not result.get("applied"):
+            raise RecoveryBlocked("This settled operation has no applied-item receipt to reconcile")
+        applied = AppliedItem.model_validate(result["applied"])
+        generation = self.catalog.load_generation(applied.capture_generation_id)
+        if (
+            generation.snapshot.capture_kind == "source"
+            and self.catalog.state().current_generation_id != applied.capture_generation_id
+        ):
+            raise RecoveryBlocked("Do not restore a superseded operation over the current capture generation")
+        item = next(row for row in generation.snapshot.items if row.identity == applied.source)
+        if self.observe(self.destination, applied.target, item.item_type) != applied.target_observed_sha256:
+            raise RecoveryBlocked(
+                "The recorded successful target has drifted; inspect it before reconciliation"
+            )
+        self.runtime.lease = self.catalog.takeover_controller(
+            self.runtime.controller_id,
+            expected_controller_id=request.expected_controller_id,
+            expected_epoch=request.expected_epoch,
+            fencing_evidence=request.fencing_evidence,
+            operation_id=str(uuid4()),
+        )
+        self.runtime.mode = self.catalog.state().mode
+        self.catalog.record_applied(self.runtime.require_lease(), applied)
+        self.runtime.put(
+            "item-security",
+            applied.source.key,
+            {
+                "generation_id": applied.capture_generation_id,
+                "target": applied.target.model_dump(mode="json"),
+                "metadata_applied": result["metadata_applied"],
+                "deferred_grants": result["deferred_grants"],
+            },
+        )
+        if not self.catalog.pending_operations():
+            self.catalog.release_controller(self.runtime.require_lease())
+            self.runtime.lease = None
+        return ServiceResult(
+            mode=self.runtime.mode,
+            generation_id=applied.capture_generation_id,
+            details={
+                "reconciled_operation": operation.operation_id,
+                "applied": applied.model_dump(mode="json"),
+            },
+        )
