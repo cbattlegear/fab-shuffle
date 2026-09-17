@@ -500,3 +500,22 @@ def test_parking_intents_are_scoped_and_final_outcome_reconciles_after_resume(ca
     catalog.record_operation(lease, intent.model_copy(update={"state": OperationState.SUCCEEDED}))
     catalog.transition_mode(lease, RecoveryMode.PARKING, RecoveryMode.STANDBY, guid())
     assert catalog.state().mode == RecoveryMode.STANDBY
+
+
+def test_drained_controller_can_release_between_active_recovery_requests(catalog):
+    catalog, _harness, lease = catalog
+    for expected, desired in (
+        (RecoveryMode.SYNCING, RecoveryMode.STANDBY),
+        (RecoveryMode.STANDBY, RecoveryMode.ENABLING_RECOVERY),
+        (RecoveryMode.ENABLING_RECOVERY, RecoveryMode.ACTIVE_RECOVERY),
+    ):
+        catalog.transition_mode(lease, expected, desired, guid())
+    catalog.release_controller(lease)
+    assert catalog.state().controller_id is None
+    assert catalog.state().mode == RecoveryMode.ACTIVE_RECOVERY
+    replacement = catalog.acquire_controller(guid())
+    assert replacement.epoch == lease.epoch + 1
+    with pytest.raises(CatalogConflict):
+        catalog.stage_generation(replacement, snapshot(catalog.recovery_set), ())
+    with pytest.raises(CatalogConflict):
+        catalog.transition_mode(replacement, RecoveryMode.ACTIVE_RECOVERY, RecoveryMode.PARKING, guid())

@@ -351,8 +351,11 @@ class RecoveryDataBinding(Record):
             or not self.read_only_verified or not self.retention_acknowledged
         ):
             raise ValueError("Qualify read-only access and acknowledge retained-source obligations first")
-        if self.source.tenant_id != self.consumer.tenant_id or self.source == self.consumer:
-            raise ValueError("A temporary binding needs distinct same-tenant source and recovery items")
+        if (
+            self.source.tenant_id != self.consumer.tenant_id
+            or self.source.workspace_id == self.consumer.workspace_id
+        ):
+            raise ValueError("A temporary binding needs distinct same-tenant source and recovery workspaces")
         return self
 
 
