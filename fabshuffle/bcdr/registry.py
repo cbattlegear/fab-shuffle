@@ -33,8 +33,13 @@ def _contract(
 
 
 _CONTRACTS = (
-    _contract("Lakehouse", "schema_mode,schemas,tables,non_delta_ddl,files_inventory,shortcuts",
-              "consistent_delta_or_qualified_attachment,non_delta_data,files"),
+    # Per-type getDefinition endpoints now include Lakehouse/Eventhouse. A Lakehouse
+    # definition still is not a complete security or physical-data inventory.
+    # rest/api/fabric/{lakehouse,eventhouse}/items/get-{lakehouse,eventhouse}-definition
+    _contract(
+        "Lakehouse", "definition,data_access_roles,schema_mode,schemas,tables,non_delta_ddl,"
+        "files_inventory,shortcuts", "consistent_delta_or_qualified_attachment,non_delta_data,files",
+    ),
     _contract("Warehouse", "sql_schema,security_objects,table_storage_paths", "independent_warehouse_load"),
     _contract("SQLDatabase", "sql_schema,security_objects", "off_region_portable_export",
               ("Native backups are same-workspace and not geo-replicated; supply an off-region export.",)),
@@ -42,7 +47,7 @@ _CONTRACTS = (
         "CosmosDBDatabase", "containers,partition_keys,ttl,consistency_evidence",
         "protected_logical_export", ("Analytical OneLake data is not a qualified transactional restore.",),
     ),
-    _contract("Eventhouse", "topology,kql_schema,policies", "independent_kql_standby_or_export"),
+    _contract("Eventhouse", "definition,topology,kql_schema,policies", "independent_kql_standby_or_export"),
     _contract("KQLDatabase", "kql_schema,policies,mappings,follower_relationships",
               "independent_kql_standby_or_export"),
     _contract("MirroredDatabase", "definition,connection_requirements,mirroring_settings", "external_source"),
