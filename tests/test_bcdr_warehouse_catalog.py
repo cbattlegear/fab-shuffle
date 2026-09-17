@@ -241,6 +241,7 @@ def test_incomplete_metadata_cannot_be_published(catalog):
     with pytest.raises(ValueError, match="inventory"):
         catalog.publish_generation(lease, capture.generation_id, expected_current=None)
     assert catalog.state().current_generation_id is None
+    assert catalog.generations()[0].status == "sealed"
 
 
 def test_sql_conflict_retries_are_bounded_and_never_report_default_success(catalog):
@@ -347,6 +348,31 @@ def test_endpoint_rejects_odbc_option_injection_before_getting_any_token():
     tokens.sql_token.assert_not_called()
 
 
+def test_open_existing_catalog_loads_configuration_from_sql_not_bootstrap(catalog, monkeypatch):
+    catalog, harness, _lease = catalog
+    tokens = Mock()
+    tokens.principal.tenant_id = catalog.recovery_set.tenant_id
+    connector = Mock(side_effect=harness.connect)
+    monkeypatch.setattr("fabshuffle.bcdr.warehouse_catalog.connect", lambda *_args: connector())
+    opened = WarehouseCatalog.open_from_endpoint(
+        "control.datawarehouse.fabric.microsoft.com", catalog.recovery_set.control_warehouse.item_id,
+        tokens, expected_recovery_set_id=catalog.recovery_set.recovery_set_id,
+    )
+    assert opened.recovery_set == catalog.recovery_set
+    assert opened.state() == catalog.state()
+    assert all(connection.closed for connection in harness.connections)
+    with pytest.raises(IntegrityError, match="bootstrap"):
+        WarehouseCatalog.open_from_endpoint(
+            "control.datawarehouse.fabric.microsoft.com", catalog.recovery_set.control_warehouse.item_id,
+            tokens, expected_recovery_set_id=guid(),
+        )
+    with pytest.raises(IntegrityError, match="bootstrap"):
+        WarehouseCatalog.open_from_endpoint(
+            "control.datawarehouse.fabric.microsoft.com", guid(), tokens,
+            expected_recovery_set_id=catalog.recovery_set.recovery_set_id,
+        )
+
+
 def test_coordinator_records_have_cas_revision_and_durable_history(catalog):
     catalog, harness, lease = catalog
     assert catalog.get_record("writer-epochs", "business-a") is None
@@ -377,3 +403,100 @@ def test_sql_conflict_exhaustion_preserves_state_and_original_service_error(cata
         catalog.transition_mode(lease, RecoveryMode.SYNCING, RecoveryMode.STANDBY, guid())
     assert catalog._sleep.call_count == 2
     assert catalog.state().mode == RecoveryMode.SYNCING
+
+
+def test_generation_listing_keeps_published_and_partial_points_distinct(catalog):
+    catalog, harness, lease = catalog
+    first = publish(catalog, lease)
+    partial = snapshot(catalog.recovery_set, parent=first.generation_id)
+    harness.fail_statement = "INSERT INTO bcdr.payload_chunks"
+    with pytest.raises(pyodbc.Error):
+        catalog.stage_generation(lease, partial, ())
+    assert {row.generation_id: row.status for row in catalog.generations()} == {
+        first.generation_id: "complete", partial.generation_id: "staging",
+    }
+
+
+def test_failback_capture_uses_recovery_scope_without_changing_source_authority(catalog):
+    catalog, _harness, lease = catalog
+    original = publish(catalog, lease)
+    for expected, desired in (
+        (RecoveryMode.SYNCING, RecoveryMode.STANDBY),
+        (RecoveryMode.STANDBY, RecoveryMode.ENABLING_RECOVERY),
+        (RecoveryMode.ENABLING_RECOVERY, RecoveryMode.ACTIVE_RECOVERY),
+        (RecoveryMode.ACTIVE_RECOVERY, RecoveryMode.FAILING_BACK),
+    ):
+        catalog.transition_mode(lease, expected, desired, guid())
+    recovery = snapshot(catalog.recovery_set, parent=original.generation_id)
+    recovery = recovery.model_copy(update={
+        "capture_kind": "recovery",
+        "workspaces": (recovery.workspaces[0].model_copy(update={
+            "capacity_id": catalog.recovery_set.target_capacity_ids[0],
+        }),),
+    })
+    catalog.stage_failback_generation(lease, recovery, ())
+    with pytest.raises(ValueError, match="publish_failback_generation"):
+        catalog.publish_generation(lease, recovery.generation_id, expected_current=original.generation_id)
+    catalog.publish_failback_generation(
+        lease, recovery.generation_id, failover_generation_id=original.generation_id,
+    )
+    assert catalog.load_generation(recovery.generation_id).snapshot == recovery
+    assert catalog.load_generation().snapshot == original
+    assert catalog.state().current_generation_id == original.generation_id
+    with pytest.raises(CatalogConflict, match="mode"):
+        catalog.stage_generation(lease, snapshot(catalog.recovery_set), ())
+
+
+def test_failback_capture_does_not_allow_unrelated_or_control_workspace(catalog):
+    catalog, _harness, _lease = catalog
+    recovery = snapshot(catalog.recovery_set).model_copy(update={"capture_kind": "recovery"})
+    with pytest.raises(ValueError, match="out-of-scope"):
+        recovery.require_publishable(catalog.recovery_set)
+    control = recovery.workspaces[0].model_copy(update={
+        "identity": catalog.recovery_set.control_workspace,
+        "capacity_id": catalog.recovery_set.target_capacity_ids[0],
+    })
+    with pytest.raises(ValueError, match="control workspace"):
+        recovery.model_copy(update={"workspaces": (control,)}).require_publishable(catalog.recovery_set)
+
+
+@pytest.mark.parametrize("target_kind", ["control", "foreign", "source"])
+def test_invalid_business_target_rejected_before_intent_and_on_late_observation(catalog, target_kind):
+    catalog, _harness, lease = catalog
+    capture = publish(catalog, lease)
+    target = {
+        "control": catalog.recovery_set.control_warehouse,
+        "foreign": ItemIdentity(tenant_id=guid(), workspace_id=guid(), item_id=guid()),
+        "source": capture.items[0].identity.model_copy(update={"item_id": guid()}),
+    }[target_kind]
+    intent = operation(capture, target=target)
+    with pytest.raises(ValueError):
+        catalog.begin_operation(lease, intent)
+    assert not catalog.pending_operations()
+    intent = operation(capture)
+    catalog.begin_operation(lease, intent)
+    with pytest.raises(ValueError):
+        catalog.record_operation(
+            lease, intent.model_copy(update={"target": target, "state": OperationState.SUCCEEDED}),
+        )
+    assert catalog.pending_operations() == (intent,)
+
+
+def test_parking_intents_are_scoped_and_final_outcome_reconciles_after_resume(catalog):
+    catalog, _harness, lease = catalog
+    catalog.transition_mode(lease, RecoveryMode.SYNCING, RecoveryMode.STANDBY, guid())
+    catalog.transition_mode(lease, RecoveryMode.STANDBY, RecoveryMode.PARKING, guid())
+    intent = OperationRecord(
+        operation_id=guid(), kind="suspend_capacity", state=OperationState.INTENT,
+        recorded_at=datetime.now(UTC), capacity_id=catalog.recovery_set.target_capacity_ids[0],
+        ownership_evidence="explicit dedicated recovery capacity; serving inventory drained",
+    )
+    with pytest.raises(ValueError, match="configured recovery capacity"):
+        catalog.begin_parking_operation(lease, intent.model_copy(update={"capacity_id": guid()}))
+    catalog.begin_parking_operation(lease, intent)
+    with pytest.raises(CatalogConflict, match="Reconcile"):
+        catalog.transition_mode(lease, RecoveryMode.PARKING, RecoveryMode.STANDBY, guid())
+    # The bootstrap controller resumes SQL first, then supplies its persisted ARM observation.
+    catalog.record_operation(lease, intent.model_copy(update={"state": OperationState.SUCCEEDED}))
+    catalog.transition_mode(lease, RecoveryMode.PARKING, RecoveryMode.STANDBY, guid())
+    assert catalog.state().mode == RecoveryMode.STANDBY

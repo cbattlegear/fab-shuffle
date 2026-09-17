@@ -36,6 +36,7 @@ from fabshuffle.bcdr.contracts import (
     CatalogDocument,
     CatalogState,
     ControllerLease,
+    GenerationInfo,
     OperationRecord,
     OperationState,
     RecoveryMode,
@@ -146,6 +147,15 @@ def _conflict(error: pyodbc.Error) -> bool:
     return bool(re.search(r"\b(?:24556|24706)\b", str(error)))
 
 
+def _validate_endpoint(server: str, database: str) -> None:
+    if not re.fullmatch(
+        r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.datawarehouse\.fabric\.microsoft\.com", server,
+    ):
+        raise ValueError("Use the returned public Fabric Warehouse SQL hostname, without URL or options")
+    if not database or any(char in database for char in ";{}\r\n\x00") or database.casefold() == "master":
+        raise ValueError("Specify a safe explicit control Warehouse catalog, not master")
+
+
 class WarehouseCatalog(RecoveryCatalog):
     """One catalog Warehouse and one explicitly authorized controller per recovery set.
 
@@ -172,15 +182,39 @@ class WarehouseCatalog(RecoveryCatalog):
     ) -> WarehouseCatalog:
         # The legacy connector constructs an ODBC string. Validate its inputs here
         # rather than changing migration connection behavior.
-        if not re.fullmatch(
-            r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.datawarehouse\.fabric\.microsoft\.com", server,
-        ):
-            raise ValueError("Use the returned public Fabric Warehouse SQL hostname, without URL or options")
-        if not database or any(char in database for char in ";{}\r\n\x00") or database.casefold() == "master":
-            raise ValueError("Specify a safe explicit control Warehouse catalog, not master")
+        _validate_endpoint(server, database)
         if canonical_id(tokens.principal.tenant_id) != recovery_set.tenant_id:
             raise ValueError("The SQL token provider belongs to a different recovery tenant")
         return cls(lambda: connect(server, database, tokens), recovery_set)
+
+    @classmethod
+    def open_from_endpoint(
+        cls, server: str, database: str, tokens: TokenProvider, *, expected_recovery_set_id: str,
+    ) -> WarehouseCatalog:
+        """Open existing authoritative configuration after bootstrap resumed capacity.
+
+        Only coordinates and recovery-set identity come from deployment storage.
+        Owner ACLs, capacity scope and all recovery configuration remain in SQL.
+        """
+        _validate_endpoint(server, database)
+        warehouse_id = canonical_id(database)
+        expected_recovery_set_id = canonical_id(expected_recovery_set_id)
+        connection = connect(server, warehouse_id, tokens)
+        try:
+            row = _one(connection.cursor().execute(
+                "SELECT config FROM bcdr.control",
+            ).fetchall(), "catalog configuration")
+            config = RecoverySet.model_validate_json(bytes(row[0]))
+        finally:
+            connection.close()
+        if (
+            config.recovery_set_id != expected_recovery_set_id
+            or config.control_warehouse.item_id != warehouse_id
+        ):
+            raise IntegrityError("Warehouse configuration does not match bootstrap recovery/control identity")
+        result = cls.from_endpoint(server, warehouse_id, tokens, config)
+        result.state()
+        return result
 
     @contextmanager
     def _connection(self) -> Iterator[pyodbc.Connection]:
@@ -460,7 +494,9 @@ class WarehouseCatalog(RecoveryCatalog):
                 snapshot.generation_id, "staging", manifest, len(documents),
             )
 
-        allowed = {RecoveryMode.SYNCING, RecoveryMode.FAILING_BACK}
+        allowed = (
+            {RecoveryMode.SYNCING} if snapshot.capture_kind == "source" else {RecoveryMode.FAILING_BACK}
+        )
         self._transaction(lease, begin, allowed_modes=allowed)
         for info, data in documents:
             def put_info(cursor, state, info=info):
@@ -496,11 +532,32 @@ class WarehouseCatalog(RecoveryCatalog):
 
         self._transaction(lease, seal, allowed_modes=allowed)
 
+    def stage_failback_generation(
+        self, lease: ControllerLease, snapshot: CaptureSnapshot, payloads: Sequence[CapturedPayload],
+    ) -> None:
+        if snapshot.capture_kind != "recovery":
+            raise ValueError("Failback captures must explicitly identify the recovery estate as their source")
+        self.stage_generation(lease, snapshot, payloads)
+
     def inspect_generation(self, generation_id: str) -> CapturedGeneration:
         """Validate complete staged content without treating it as a published recovery point."""
         with self._connection() as connection:
             self._read_state(connection.cursor())
             return self._load(connection.cursor(), canonical_id(generation_id), require_complete=False)
+
+    def generations(self) -> tuple[GenerationInfo, ...]:
+        """Enumerate recovery points and unfinished captures without promoting either."""
+        with self._connection() as connection:
+            cursor = connection.cursor()
+            self._read_state(cursor)
+            rows = cursor.execute(
+                "SELECT generation_id, status, manifest_sha256, payload_count FROM bcdr.generations",
+            ).fetchall()
+            if len(rows) != len({row[0] for row in rows}):
+                raise IntegrityError("Duplicate generation identities")
+            return tuple(GenerationInfo(
+                generation_id=row[0], status=row[1], manifest_sha256=row[2], payload_count=row[3],
+            ) for row in rows)
 
     def load_generation(self, generation_id: str | None = None) -> CapturedGeneration:
         with self._connection() as connection:
@@ -611,6 +668,8 @@ class WarehouseCatalog(RecoveryCatalog):
         generation_id = canonical_id(generation_id)
         expected_current = canonical_id(expected_current) if expected_current is not None else None
         result = self.inspect_generation(generation_id)
+        if result.snapshot.capture_kind != "source":
+            raise ValueError("Recovery-estate captures need publish_failback_generation")
         result.snapshot.require_publishable(self.recovery_set)
 
         def publish(cursor, state):
@@ -631,7 +690,36 @@ class WarehouseCatalog(RecoveryCatalog):
                 "UPDATE bcdr.control SET current_generation_id = ? WHERE singleton = 1", generation_id,
             )
 
-        self._transaction(lease, publish, allowed_modes={RecoveryMode.SYNCING, RecoveryMode.FAILING_BACK})
+        self._transaction(lease, publish, allowed_modes={RecoveryMode.SYNCING})
+        return result
+
+    def publish_failback_generation(
+        self, lease: ControllerLease, generation_id: str, *, failover_generation_id: str,
+    ) -> CapturedGeneration:
+        """Publish an immutable DR recovery point without changing source authority."""
+        generation_id, failover_generation_id = map(canonical_id, (generation_id, failover_generation_id))
+        result = self.inspect_generation(generation_id)
+        result.snapshot.require_publishable(self.recovery_set)
+        if (
+            result.snapshot.capture_kind != "recovery"
+            or result.snapshot.parent_generation_id != failover_generation_id
+        ):
+            raise ValueError("Failback capture must link the recovery estate to its failover generation")
+        original = self.load_generation(failover_generation_id)
+        if original.snapshot.capture_kind != "source":
+            raise ValueError("Failback must reference a published original-source capture")
+
+        def publish(cursor, state):
+            row = _one(cursor.execute(
+                "SELECT status FROM bcdr.generations WHERE generation_id = ?", generation_id,
+            ).fetchall(), "sealed failback generation")
+            if row[0] != "sealed":
+                raise CatalogConflict("Only a sealed, unpublished failback generation may be published")
+            cursor.execute(
+                "UPDATE bcdr.generations SET status = ? WHERE generation_id = ?", "complete", generation_id,
+            )
+
+        self._transaction(lease, publish, allowed_modes={RecoveryMode.FAILING_BACK})
         return result
 
     def _operations(self, cursor) -> tuple[OperationRecord, ...]:
@@ -672,9 +760,46 @@ class WarehouseCatalog(RecoveryCatalog):
         if any(op.state in _PENDING for op in self._operations(cursor)):
             raise CatalogConflict("Reconcile or settle every pending operation before changing recovery mode")
 
+    def _validate_operation_scope(self, operation: OperationRecord) -> None:
+        for identity in (operation.source, operation.target):
+            if identity is None:
+                continue
+            if identity.tenant_id != self.recovery_set.tenant_id:
+                raise ValueError("Business operation identities must belong to the recovery tenant")
+            if identity.workspace_id == self.recovery_set.control_workspace.workspace_id:
+                raise ValueError("The control workspace cannot be a business operation source or target")
+        if (
+            operation.source is not None and operation.target is not None
+            and operation.source.workspace_id == operation.target.workspace_id
+        ):
+            raise ValueError("Business recovery targets must be outside their source workspace")
+
+    def begin_parking_operation(self, lease: ControllerLease, operation: OperationRecord) -> None:
+        """Record a scoped suspension intent after the serialized PARKING transition.
+
+        The final catalog-capacity result must be observed in bootstrap storage and
+        reconciled with ``record_operation`` after resume, not written to a paused DB.
+        Dedicated-capacity/serving-workspace authorization is additionally checked by
+        the bootstrap capacity controller before the ARM request.
+        """
+        if (
+            operation.kind != "suspend_capacity"
+            or operation.capacity_id not in self.recovery_set.target_capacity_ids
+            or operation.source is not None or operation.target is not None
+            or operation.generation_id is not None
+        ):
+            raise ValueError("Parking intents must name only an explicitly configured recovery capacity")
+        self._begin_operation(lease, operation, allowed_modes={RecoveryMode.PARKING})
+
     def begin_operation(self, lease: ControllerLease, operation: OperationRecord) -> None:
+        self._begin_operation(lease, operation, allowed_modes=_BUSINESS_MODES)
+
+    def _begin_operation(
+        self, lease: ControllerLease, operation: OperationRecord, *, allowed_modes: set[RecoveryMode],
+    ) -> None:
         if operation.state != OperationState.INTENT:
             raise ValueError("Persist an intent before issuing a service mutation")
+        self._validate_operation_scope(operation)
         document = _small_document(operation)
 
         def begin(cursor, state):
@@ -686,6 +811,19 @@ class WarehouseCatalog(RecoveryCatalog):
                 ).fetchall(), "operation capture generation")
                 if row[0] != "complete":
                     raise IntegrityError("Business mutations require a published capture")
+                if operation.source is not None:
+                    _one(cursor.execute(
+                        "SELECT record_key FROM bcdr.source_items WHERE generation_id = ? AND record_key = ?",
+                        operation.generation_id, operation.source.key,
+                    ).fetchall(), "captured operation source")
+                if operation.target is not None:
+                    target_workspace = f"{operation.target.tenant_id}/{operation.target.workspace_id}"
+                    if cursor.execute(
+                        "SELECT record_key FROM bcdr.source_workspaces "
+                        "WHERE generation_id = ? AND record_key = ?",
+                        operation.generation_id, target_workspace,
+                    ).fetchall():
+                        raise ValueError("Recovery targets cannot modify a captured source workspace")
             cursor.execute(
                 "INSERT INTO bcdr.operations VALUES (?, ?, ?)",
                 operation.operation_id, operation.state.value, document,
@@ -694,9 +832,10 @@ class WarehouseCatalog(RecoveryCatalog):
                 "INSERT INTO bcdr.operation_events VALUES (?, ?, ?)", operation.operation_id, 0, document,
             )
 
-        self._transaction(lease, begin, allowed_modes=_BUSINESS_MODES)
+        self._transaction(lease, begin, allowed_modes=allowed_modes)
 
     def record_operation(self, lease: ControllerLease, operation: OperationRecord) -> None:
+        self._validate_operation_scope(operation)
         document = _small_document(operation)
 
         def update(cursor, state):
@@ -715,6 +854,13 @@ class WarehouseCatalog(RecoveryCatalog):
                     raise CatalogConflict(f"Operation {field} differs from its durable intent")
             if previous.target is not None and operation.target != previous.target:
                 raise CatalogConflict("Operation target identity changed")
+            if operation.target is not None and operation.generation_id is not None:
+                target_workspace = f"{operation.target.tenant_id}/{operation.target.workspace_id}"
+                if cursor.execute(
+                    "SELECT record_key FROM bcdr.source_workspaces "
+                    "WHERE generation_id = ? AND record_key = ?", operation.generation_id, target_workspace,
+                ).fetchall():
+                    raise ValueError("Observed business targets cannot modify a captured source workspace")
             if operation.recorded_at < previous.recorded_at:
                 raise CatalogConflict("Operation observation precedes its previous durable record")
             history = cursor.execute(
