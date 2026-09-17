@@ -11,10 +11,11 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
+import httpx
 from azure.core.exceptions import AzureError
 from azure.kusto.data.exceptions import KustoServiceError
 from pydantic import AfterValidator, ConfigDict, Field, JsonValue, model_validator
@@ -23,6 +24,7 @@ from fabshuffle.auth import TokenProvider
 from fabshuffle.bcdr.catalog import CapturedGeneration, CatalogConflict, RecoveryCatalog
 from fabshuffle.bcdr.contracts import (
     Digest,
+    Guid,
     ItemIdentity,
     ItemRecord,
     OperationState,
@@ -49,18 +51,36 @@ from fabshuffle.bcdr.protection import (
 )
 from fabshuffle.bcdr.protection_cosmos import CosmosProtection, restore_cosmos
 from fabshuffle.bcdr.protection_kql import KqlProtection, validate_kql
+from fabshuffle.bcdr.protection_kql_binding import (
+    KqlMaterializedInput,
+    restore_materialized_kql,
+    validate_materialized_bindings,
+)
+from fabshuffle.bcdr.protection_lakehouse import (
+    LakehouseCopyReceipt,
+    LakehouseProtection,
+    restore_lakehouse,
+    validate_lakehouse,
+)
 from fabshuffle.bcdr.protection_sql import SqlProtection, restore_sql
 from fabshuffle.fabric import cosmosdb, sqldatabases
 from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.workspaces import capacity_region, get_workspace
 from fabshuffle.lifecycle import safe_text
 from fabshuffle.transfer.common import StagingBudgetError
+from fabshuffle.transfer.files import FileTransferError
 from fabshuffle.transfer.sqlschema import SchemaTransferError
 
 if TYPE_CHECKING:
     from fabshuffle.bcdr.backend import DurableRuntime
 
 EvidenceRef = Annotated[str, AfterValidator(evidence_ref)]
-_ITEM_TYPES = {"sql": "SQLDatabase", "cosmos": "CosmosDBDatabase", "kql": "KQLDatabase"}
+_ITEM_TYPES = {
+    "sql": "SQLDatabase",
+    "cosmos": "CosmosDBDatabase",
+    "kql": "KQLDatabase",
+    "lakehouse": "Lakehouse",
+}
 _PROVIDER_ERRORS = (
     ProtectionError,
     SchemaTransferError,
@@ -72,6 +92,8 @@ _PROVIDER_ERRORS = (
     OSError,
     BadZipFile,
     ParseError,
+    FileTransferError,
+    httpx.HTTPError,
 )
 
 
@@ -89,23 +111,38 @@ class ProtectionStorage(Record):
 
 class ProtectionConfiguration(Record):
     model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True, hide_input_in_errors=True)
-    provider: Literal["sql", "cosmos", "kql"]
-    descriptor: SqlProtection | CosmosProtection | KqlProtection
+    provider: Literal["sql", "cosmos", "kql", "lakehouse"]
+    descriptor: SqlProtection | CosmosProtection | KqlProtection | LakehouseProtection
     storage: ProtectionStorage | None = None
     max_age_seconds: Annotated[int, Field(strict=True, gt=0, le=86399999913600)]
     target_approval_ref: EvidenceRef
+    kql_materialized_inputs: tuple[KqlMaterializedInput, ...] = ()
 
     @model_validator(mode="after")
     def provider_matches(self) -> Self:
-        expected = {"sql": SqlProtection, "cosmos": CosmosProtection, "kql": KqlProtection}[self.provider]
+        expected = {
+            "sql": SqlProtection,
+            "cosmos": CosmosProtection,
+            "kql": KqlProtection,
+            "lakehouse": LakehouseProtection,
+        }[self.provider]
         if not isinstance(self.descriptor, expected):
             raise ValueError("Protection provider and typed descriptor do not match.")
-        if isinstance(self.descriptor, KqlProtection):
+        if isinstance(self.descriptor, LakehouseProtection):
+            if self.storage is not None or self.kql_materialized_inputs:
+                raise ValueError(
+                    "Qualified OneLake snapshots do not use external-file or KQL input configuration."
+                )
+        elif isinstance(self.descriptor, KqlProtection):
             if self.storage is not None:
                 raise ValueError("Prepared KQL data does not use a portable-file storage configuration.")
             if self.target_approval_ref != self.descriptor.target_approval_ref:
                 raise ValueError("KQL target approval must match the prepared mapping.")
+            if self.kql_materialized_inputs:
+                validate_materialized_bindings(self.descriptor, self.kql_materialized_inputs)
         else:
+            if self.kql_materialized_inputs:
+                raise ValueError("Materialized KQL inputs are only valid for the KQL provider.")
             manifest = self.descriptor.manifest
             if self.storage is None or (
                 self.storage.storage_region != manifest.storage_region
@@ -128,12 +165,16 @@ class ProtectionConfiguration(Record):
 
     @property
     def source(self) -> DataIdentity:
+        if isinstance(self.descriptor, LakehouseProtection):
+            return self.descriptor.source
         if isinstance(self.descriptor, KqlProtection):
             return self.descriptor.source.identity
         return self.descriptor.manifest.source.identity
 
     @property
     def recovery_point(self) -> datetime:
+        if isinstance(self.descriptor, LakehouseProtection):
+            return self.descriptor.captured_at
         if isinstance(self.descriptor, KqlProtection):
             return self.descriptor.data_as_of
         return self.descriptor.manifest.captured_at
@@ -164,6 +205,8 @@ class _RestoreResult(Record):
     data_ready: Annotated[bool, Field(strict=True)]
     ready_for_cutover: Literal[False] = False
     warnings: tuple[str, ...]
+    preparation: LakehouseCopyReceipt | None = None
+    preparation_operation_id: Guid | None = None
 
 
 class ProviderRestoreFailed(ProtectionError):
@@ -188,9 +231,7 @@ def _load_config(record: ProtectionRecord, catalog: RecoveryCatalog) -> Protecti
             "Pinned protection configuration integrity failed; do not replace its captured input."
         )
     configuration = ProtectionConfiguration.model_validate(row.document)
-    expected_kind = (
-        ProtectionKind.PREPARED_STANDBY if configuration.provider == "kql" else ProtectionKind.PORTABLE_EXPORT
-    )
+    expected_kind = _protection_kind(configuration.provider)
     if record.kind != expected_kind:
         raise ProtectionError("The captured protection kind does not match its configured provider.")
     if (
@@ -201,6 +242,12 @@ def _load_config(record: ProtectionRecord, catalog: RecoveryCatalog) -> Protecti
             "Pinned protection identity or recovery point differs from the captured generation."
         )
     return configuration
+
+
+def _protection_kind(provider: str) -> ProtectionKind:
+    if provider == "lakehouse":
+        return ProtectionKind.NATIVE_ONELAKE
+    return ProtectionKind.PREPARED_STANDBY if provider == "kql" else ProtectionKind.PORTABLE_EXPORT
 
 
 def _selected_record(generation: CapturedGeneration, item: ItemRecord) -> ProtectionRecord | None:
@@ -215,15 +262,49 @@ def _selected_record(generation: CapturedGeneration, item: ItemRecord) -> Protec
 
 
 def owns_schema(generation: CapturedGeneration, item: ItemRecord, catalog: RecoveryCatalog) -> bool:
-    """Reserve an empty SQL shell even when a configured data export later proves stale."""
+    """Reserve provider-owned empty storage shells; this is not metadata-readiness evidence."""
     record = _selected_record(generation, item)
-    if item.item_type != "SQLDatabase" or record is None or not record.artifact_reference:
+    if item.item_type not in ("SQLDatabase", "Lakehouse") or record is None or not record.artifact_reference:
         return False
     configuration = _load_config(record, catalog)
+    if item.item_type == "Lakehouse":
+        return configuration.provider == "lakehouse" and isinstance(
+            configuration.descriptor,
+            LakehouseProtection,
+        )
     return (
         configuration.provider == "sql"
         and isinstance(configuration.descriptor, SqlProtection)
         and configuration.descriptor.manifest.provider == "sql-dacpac"
+    )
+
+
+def prepared_target(
+    generation: CapturedGeneration,
+    item: ItemRecord,
+    catalog: RecoveryCatalog,
+) -> ItemIdentity | None:
+    """Nominate an explicit prepared mapping, never certify metadata or adopt by name.
+
+    The coordinator must independently qualify the prepared target's metadata,
+    ownership, placement and restricted ACLs before registering this mapping.
+    """
+    record = _selected_record(generation, item)
+    if item.item_type != "KQLDatabase" or record is None or not record.artifact_reference:
+        return None
+    configuration = _load_config(record, catalog)
+    descriptor = configuration.descriptor
+    if (
+        not isinstance(descriptor, KqlProtection)
+        or not configuration.kql_materialized_inputs
+        or descriptor.continuous
+    ):
+        return None
+    identity = descriptor.target.identity
+    return ItemIdentity(
+        tenant_id=identity.tenant_id,
+        workspace_id=identity.workspace_id,
+        item_id=identity.item_id,
     )
 
 
@@ -262,7 +343,21 @@ def configure_protection(
         )
     configuration = request.configuration
     point = configuration.recovery_point
-    if isinstance(configuration.descriptor, KqlProtection):
+    if isinstance(configuration.descriptor, LakehouseProtection):
+        validate_lakehouse(
+            configuration.descriptor,
+            source=configuration.source,
+            max_age=timedelta(seconds=configuration.max_age_seconds),
+            limits=limits,
+        )
+        outcome = RecoveryOutcome.PROTECTED
+        qualification = Qualification.UNVERIFIED
+        limitations = (
+            "Qualified OneLake file pins are configured; source replica access and destination byte copy "
+            "must be observed. Neither the descriptor nor structural Delta preflight "
+            "proves data/engine readiness.",
+        )
+    elif isinstance(configuration.descriptor, KqlProtection):
         status = validate_kql(
             configuration.descriptor,
             source=configuration.source,
@@ -272,10 +367,18 @@ def configure_protection(
             limits=limits,
         )
         outcome = RecoveryOutcome.MANUAL
-        qualification = Qualification.NEEDS_PROVIDER
+        concrete = bool(configuration.kql_materialized_inputs) and not configuration.descriptor.continuous
+        qualification = Qualification.UNVERIFIED if concrete else Qualification.NEEDS_PROVIDER
         limitations = (
             *status.warnings,
-            "Resolve and independently verify the named KQL data inputs before declaring data ready.",
+            (
+                "Materialized KQL data bindings are configured but unverified; qualify the exact prepared "
+                "target metadata and run authenticated local-table probes before data readiness."
+                if concrete
+                else "Manual KQL protection only: opaque or continuous ingestion inputs have no executable "
+                "default binding. Supply typed materialized KQL inputs "
+                "or a qualified workload-specific provider."
+            ),
         )
     else:
 
@@ -304,9 +407,7 @@ def configure_protection(
     record = ProtectionRecord(
         protection_id=str(uuid5(UUID(request.source.item_id), reference)),
         item=request.source,
-        kind=ProtectionKind.PREPARED_STANDBY
-        if configuration.provider == "kql"
-        else ProtectionKind.PORTABLE_EXPORT,
+        kind=_protection_kind(configuration.provider),
         outcome=outcome,
         qualification=qualification,
         artifact_reference=reference,
@@ -407,6 +508,113 @@ class ProviderDataRecovery:
             endpoint = cosmosdb.endpoint_url(response)
         return DataEndpoint(_data_identity(target), endpoint, database)
 
+    def _lakehouse_target(
+        self,
+        target: ItemIdentity,
+        protection: LakehouseProtection,
+        runtime: DurableRuntime,
+    ) -> None:
+        runtime.fence()
+        response = self.client.get(f"workspaces/{target.workspace_id}/lakehouses/{target.item_id}")
+        returned = ItemIdentity(
+            tenant_id=target.tenant_id,
+            workspace_id=response.get("workspaceId"),
+            item_id=response.get("id"),
+        )
+        if returned != target or response.get("type") != "Lakehouse":
+            raise ProtectionError("The destination returned a different Lakehouse identity/type.")
+        runtime.fence()
+        workspace = get_workspace(self.client, target.workspace_id)
+        if (
+            str(workspace.get("id", "")).casefold() != target.workspace_id
+            or capacity_region({"region": workspace.get("capacityRegion")}) != protection.recovery_region
+            or workspace.get("capacityAssignmentProgress") != "Completed"
+        ):
+            raise ProtectionError(
+                "The destination Lakehouse is not in its approved assigned recovery region."
+            )
+
+    def _materialized_kql(
+        self,
+        generation: CapturedGeneration,
+        item: ItemRecord,
+        target: ItemIdentity,
+        runtime: DurableRuntime,
+        record: ProtectionRecord,
+        configuration: ProtectionConfiguration,
+    ) -> tuple[bool, tuple[str, ...]]:
+        descriptor = configuration.descriptor
+        if not isinstance(descriptor, KqlProtection):
+            raise ProtectionError("Materialized KQL validation needs a KQL protection descriptor.")
+        if runtime.catalog.pending_operations():
+            raise CatalogConflict("Reconcile pending operations before validating prepared KQL data.")
+
+        def fence() -> bool:
+            runtime.fence()
+            return False
+
+        def action() -> dict[str, JsonValue]:
+            try:
+                assessment = restore_materialized_kql(
+                    client=self.client,
+                    tokens=self.tokens,
+                    protection=descriptor,
+                    bindings=configuration.kql_materialized_inputs,
+                    target=_data_identity(target),
+                    max_age=timedelta(seconds=configuration.max_age_seconds),
+                    limits=self.limits,
+                    cancel=fence,
+                )
+                runtime.fence()
+                return _RestoreResult(
+                    configuration_digest=record.sha256,
+                    source=item.identity,
+                    target=target,
+                    state=assessment.state,
+                    data_ready=assessment.data_ready,
+                    warnings=tuple(safe_text(warning) for warning in assessment.warnings),
+                ).model_dump(mode="json")
+            except _PROVIDER_ERRORS as error:
+                # Every service operation in this branch is read-only. Record the
+                # failed observation without making an unrelated group ambiguous.
+                runtime.fence()
+                return _RestoreResult(
+                    configuration_digest=record.sha256,
+                    source=item.identity,
+                    target=target,
+                    state="deferred",
+                    data_ready=False,
+                    warnings=(
+                        f"{item.display_name}: {safe_text(str(error))}. "
+                        "Repair the independent prepared KQL input and repeat its authenticated checks.",
+                    ),
+                ).model_dump(mode="json")
+
+        # Readiness probes are observations, not imports. Requery every time; never
+        # infer current availability from yesterday's successful validation journal.
+        key = (
+            f"{generation.snapshot.generation_id}:{item.identity.key}:{target.key}:"
+            f"{record.artifact_reference}:{uuid4()}"
+        )
+        result = _RestoreResult.model_validate(
+            runtime.effect(
+                "data-validate",
+                key,
+                action,
+                generation_id=generation.snapshot.generation_id,
+                source=item.identity,
+                target=target,
+            )
+        )
+        runtime.fence()
+        if (
+            result.configuration_digest != record.sha256
+            or result.source != item.identity
+            or result.target != target
+        ):
+            raise ProtectionError("KQL validation result does not match the pinned recovery mapping.")
+        return result.data_ready and result.state == "restored_stopped", result.warnings
+
     def restore(
         self,
         generation: CapturedGeneration,
@@ -432,14 +640,25 @@ class ProviderDataRecovery:
                 limits=self.limits,
             )
             if configuration.descriptor.target.identity != _data_identity(target):
-                raise ProtectionError("The KQL prepared data belongs to a different target mapping.")
+                return False, (
+                    f"{item.display_name}: manual prepared-target mapping is required. "
+                    "The configured KQL data belongs to a different target ID; do not treat a newly "
+                    "cloned empty database as the approved prepared standby.",
+                )
+            if status.state != "protected":
+                return False, status.warnings
+            if configuration.kql_materialized_inputs and not configuration.descriptor.continuous:
+                return self._materialized_kql(generation, item, target, runtime, record, configuration)
             unresolved = ", ".join(value.resource_ref for value in configuration.descriptor.inputs)
             return False, (
                 *status.warnings,
-                f"{item.display_name}: independently resolve and verify KQL "
-                f"data inputs [{unresolved}]; the default binder cannot certify opaque input evidence.",
+                f"{item.display_name}: manual KQL protection only for data inputs [{unresolved}]. "
+                "Opaque or continuous ingestion inputs have no executable default binding. "
+                "Supply typed independent materialized KQL data inputs "
+                "or qualify a workload-specific provider.",
             )
-        if self.protected_root is None:
+        is_lakehouse = isinstance(configuration.descriptor, LakehouseProtection)
+        if self.protected_root is None and not is_lakehouse:
             return False, (
                 f"{item.display_name}: configure the server's approved protected-data root "
                 "and make the pinned export accessible before restoration.",
@@ -450,21 +669,31 @@ class ProviderDataRecovery:
             return False
 
         try:
-            location = _location(configuration, self.protected_root)
-            preflight = validate_manifest(
-                configuration.descriptor.manifest,
-                source=_data_identity(item.identity),
-                location=location,
-                max_age=timedelta(seconds=configuration.max_age_seconds),
-                limits=self.limits,
-                cancel=fence,
-            )
+            location = None
+            if isinstance(configuration.descriptor, LakehouseProtection):
+                validate_lakehouse(
+                    configuration.descriptor,
+                    source=_data_identity(item.identity),
+                    max_age=timedelta(seconds=configuration.max_age_seconds),
+                    limits=self.limits,
+                )
+                preflight = None
+            else:
+                location = _location(configuration, self.protected_root)
+                preflight = validate_manifest(
+                    configuration.descriptor.manifest,
+                    source=_data_identity(item.identity),
+                    location=location,
+                    max_age=timedelta(seconds=configuration.max_age_seconds),
+                    limits=self.limits,
+                    cancel=fence,
+                )
         except (ProtectionError, ValueError, OSError, StagingBudgetError) as error:
             return False, (
                 f"{item.display_name}: {safe_text(str(error))} "
                 "Repair the protected input before attempting destination data restoration.",
             )
-        if preflight.state != "protected":
+        if preflight is not None and preflight.state != "protected":
             return False, tuple(f"{item.display_name}: {warning}" for warning in preflight.warnings)
         if runtime.catalog.pending_operations():
             raise CatalogConflict("Reconcile pending operations before starting another data restore.")
@@ -481,6 +710,33 @@ class ProviderDataRecovery:
             executed = True
             try:
                 runtime.fence()
+                if isinstance(configuration.descriptor, LakehouseProtection):
+                    self._lakehouse_target(target, configuration.descriptor, runtime)
+                    preparation = restore_lakehouse(
+                        configuration.descriptor,
+                        source=_data_identity(item.identity),
+                        target=_data_identity(target),
+                        tokens=self.tokens,
+                        scratch=self.scratch,
+                        max_age=timedelta(seconds=configuration.max_age_seconds),
+                        target_approval_ref=configuration.target_approval_ref,
+                        limits=self.limits,
+                        cancel=fence,
+                    )
+                    runtime.fence()
+                    operation = runtime.current_operation
+                    if operation is None:
+                        raise ProtectionError("Lakehouse copy requires a committed durable operation.")
+                    return _RestoreResult(
+                        configuration_digest=record.sha256,
+                        source=item.identity,
+                        target=target,
+                        state="restored_stopped",
+                        data_ready=False,
+                        warnings=preparation.warnings,
+                        preparation=preparation,
+                        preparation_operation_id=operation.operation_id,
+                    ).model_dump(mode="json")
                 endpoint = self._target(configuration.provider, target)
                 require_independent(configuration.descriptor.manifest.source, endpoint)
                 kwargs = dict(
@@ -574,6 +830,23 @@ class ProviderDataRecovery:
                 f"{item.display_name}: data was restored previously; "
                 "verify current target data and supply fresh coordinator readiness evidence "
                 "rather than replaying the import.",
+            )
+        if result.preparation is not None:
+            if not is_lakehouse or result.preparation_operation_id is None:
+                raise ProtectionError(
+                    "Stored preparation receipt is not a complete Lakehouse copy observation."
+                )
+            runtime.put(
+                "data-prepared",
+                f"{generation.snapshot.generation_id}/{item.identity.key}",
+                {
+                    "target": target.model_dump(mode="json"),
+                    "source": item.identity.model_dump(mode="json"),
+                    "generation_id": generation.snapshot.generation_id,
+                    "configuration_digest": record.sha256,
+                    "operation_id": result.preparation_operation_id,
+                    **result.preparation.model_dump(mode="json"),
+                },
             )
         return result.data_ready and result.state == "restored_stopped", result.warnings
 

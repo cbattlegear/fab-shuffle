@@ -84,8 +84,38 @@ def _probe_tables(
 ) -> None:
     properties = ClientRequestProperties()
     properties.set_option("servertimeout", timedelta(seconds=limits.timeout_seconds))
+    # A named entity can resolve to a function. Do not let a readiness check call the
+    # failed primary, external tables, a plugin or an RLS function on the caller's behalf.
+    # https://learn.microsoft.com/kusto/api/rest/request-properties?view=microsoft-fabric
+    for option in (
+        "request_readonly",
+        "request_readonly_hardline",
+        "request_remote_entities_disabled",
+        "request_external_data_disabled",
+        "request_external_table_disabled",
+        "request_impersonation_disabled",
+        "request_callout_disabled",
+        "request_sandboxed_execution_disabled",
+        "request_block_row_level_security",
+    ):
+        properties.set_option(option, True)
+    properties.set_option("query_datascope", "all")
+    properties.set_option("query_results_cache_max_age", timedelta(0))
+    properties.set_option("truncationmaxrecords", 2)
+    properties.set_option("truncationmaxsize", limits.max_record_bytes)
     with kql_client(protection.target.endpoint, tokens.principal) as client:
         for table in protection.tables:
+            check_cancelled(cancel)
+            details = client.execute_mgmt(
+                protection.target.database,
+                f".show table {kql_identifier(table.name)} details | project TableName",
+                properties=properties,
+            ).primary_results[0]
+            if len(details) != 1 or details[0]["TableName"] != table.name:
+                raise ProtectionError(
+                    f"Prepared KQL input '{table.name}' is not an exact physical table; "
+                    "materialize its data independently before recovery."
+                )
             check_cancelled(cancel)
             response = client.execute_query(
                 protection.target.database,
