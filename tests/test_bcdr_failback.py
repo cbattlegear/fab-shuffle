@@ -148,6 +148,37 @@ def test_metadata_return_creates_fresh_targets_then_requires_cutback_and_rearm(s
     assert len(system.estate.items) == 2
     assert not any(method == "DELETE" and "/items" in path for method, path in system.estate.calls)
     assert system.c.runtime.get("lifecycle", "authority")["source"] == "fresh_return_targets"
+    fresh = next(
+        row.target for row in system.catalog.applied_items() if row.capture_generation_id == return_id
+    )
+    source_workspace = system.captured.workspaces[0].model_copy(
+        update={
+            "identity": WorkspaceIdentity(tenant_id=fresh.tenant_id, workspace_id=fresh.workspace_id),
+        }
+    )
+    source_item = system.captured.items[0].model_copy(update={"identity": fresh})
+
+    def returned_source(*args, **kwargs):
+        assert kwargs["workspace_ids"] == [fresh.workspace_id]
+        return CapturedGeneration(
+            system.captured.model_copy(
+                update={
+                    "generation_id": guid(),
+                    "parent_generation_id": kwargs["parent_generation_id"],
+                    "workspaces": (source_workspace,),
+                    "items": (source_item,),
+                }
+            ),
+            (),
+        )
+
+    system.c.capture = returned_source
+    resynced = system.service.synchronize(system.request)
+    assert all(group.metadata_applied for group in resynced.groups)
+    assert len(system.estate.items) == 2
+    retained = next(row for row in system.catalog.applied_items() if row.source == fresh)
+    assert retained.target != fresh
+    assert retained.target in targets
 
 
 def test_failed_primary_availability_does_not_enter_failback(system):

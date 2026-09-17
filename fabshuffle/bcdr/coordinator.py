@@ -27,7 +27,7 @@ from fabshuffle.bcdr.backend import (
     RecoveryBlocked,
     now,
 )
-from fabshuffle.bcdr.capture import capture_workspaces
+from fabshuffle.bcdr.capture import capture_workspaces, item_document
 from fabshuffle.bcdr.catalog import CapturedGeneration, RecoveryCatalog
 from fabshuffle.bcdr.contracts import (
     AppliedItem,
@@ -35,6 +35,7 @@ from fabshuffle.bcdr.contracts import (
     EndpointIdentity,
     ItemIdentity,
     ItemRecord,
+    OperationState,
     RecoveryMode,
     RecoveryOutcome,
     RecoverySet,
@@ -52,6 +53,7 @@ from fabshuffle.bcdr.planner import (
     Item,
     OperationPlan,
     Phase,
+    Replacement,
     Resource,
     ResourceKey,
     Selection,
@@ -97,6 +99,7 @@ class CapacityLifecycle(Protocol):
     def resume_business(self, runtime: DurableRuntime) -> None: ...
     def park(self, runtime: DurableRuntime, workspaces: Sequence[WorkspaceIdentity]) -> None: ...
     def close(self) -> None: ...
+    def observations(self) -> tuple[dict[str, JsonValue], ...]: ...
 
 
 class DataRecovery(Protocol):
@@ -209,6 +212,7 @@ class RecoveryCoordinator:
                 ],
                 "controller_id": state.controller_id,
                 "controller_epoch": state.epoch,
+                "capacities": list(self.capacities.observations()),
                 "desired_acls": [row.model_dump(mode="json") for row in inventory.desired_acls]
                 if inventory
                 else [],
@@ -274,7 +278,12 @@ class RecoveryCoordinator:
                     prerequisite.item.workspace_id,
                     prerequisite.item.item_id,
                 )
-                resources[key] = Resource(key, owner=item_key(prerequisite.item))
+                resources[key] = Resource(
+                    key,
+                    owner=item_key(prerequisite.item),
+                    prepare_supported=True,
+                    provenance="Exact typed destination endpoint observation",
+                )
             elif isinstance(prerequisite, ConnectionIdentity):
                 key = ResourceKey("connection", prerequisite.tenant_id, prerequisite.connection_id)
                 resources[key] = Resource(key)
@@ -323,6 +332,46 @@ class RecoveryCoordinator:
     def item_mappings(self) -> dict[str, AppliedItem]:
         return {row.source.key: row for row in self.catalog.applied_items()}
 
+    def _endpoint_pairs(
+        self,
+        generation: CapturedGeneration,
+        applied: Mapping[str, AppliedItem],
+    ) -> tuple[tuple[EndpointIdentity, str], ...]:
+        pairs = []
+        for item in generation.snapshot.items:
+            target = applied.get(item.identity.key)
+            if target is None:
+                continue
+            source = item.properties
+            if not any(
+                source.get(key) for key in ("sqlEndpointProperties", "serverFqdn", "connectionString")
+            ):
+                continue
+            observed = item_document(self.destination, target.target, item.item_type).get("properties", {})
+            old_sql = source.get("sqlEndpointProperties") or {}
+            new_sql = observed.get("sqlEndpointProperties") or {}
+            if old_sql and new_sql.get("provisioningStatus") != "Success":
+                raise RecoveryBlocked(
+                    f"Wait for the destination SQL endpoint of '{item.display_name}' to report Success"
+                )
+            values = (
+                ("sql_endpoint_id", old_sql.get("id"), new_sql.get("id")),
+                ("sql_endpoint_server", old_sql.get("connectionString"), new_sql.get("connectionString")),
+                ("sql_server", source.get("serverFqdn"), observed.get("serverFqdn")),
+                ("sql_connection", source.get("connectionString"), observed.get("connectionString")),
+                ("sql_database_name", source.get("databaseName"), observed.get("databaseName")),
+            )
+            for kind, old, new in values:
+                if old:
+                    if not isinstance(old, str) or not isinstance(new, str) or not new:
+                        raise RecoveryBlocked(
+                            f"Capture and observe the complete {kind} binding for {item.identity.key}"
+                        )
+                    pairs.append(
+                        (EndpointIdentity(item=item.identity, endpoint_kind=kind, endpoint_id=old), new)
+                    )
+        return tuple(pairs)
+
     def _plan(self, generation: CapturedGeneration, request: PlanRequest) -> OperationPlan:
         tenant = self.recovery_set.tenant_id
         routes = request.capacity_routes
@@ -332,7 +381,7 @@ class RecoveryCoordinator:
             for route in routes
         ):
             raise RecoveryBlocked("Choose only the configured source and dedicated recovery capacities")
-        known_items = {row.identity.key for row in generation.snapshot.items}
+        known_items = {row.identity.key for row in generation.snapshot.items if not row.tombstone}
         mappings = tuple(
             TargetMapping(
                 item_key(row.source),
@@ -342,6 +391,42 @@ class RecoveryCoordinator:
             for row in self.catalog.applied_items()
             if row.source.key in known_items
         )
+        replacements = []
+        seen_connections = set()
+        source_literals = {
+            value
+            for item in generation.snapshot.items
+            for value in (item.identity.workspace_id, item.identity.item_id)
+        }
+        for route in request.connection_mappings:
+            if route.source.key in seen_connections:
+                raise RecoveryBlocked("Map each captured connection exactly once")
+            seen_connections.add(route.source.key)
+            if route.source.tenant_id != tenant or route.target.tenant_id != tenant:
+                raise RecoveryBlocked("Connection mappings must stay in the recovery tenant")
+            observed = self.destination.get(f"connections/{route.target.connection_id}")
+            if observed.get("id") != route.target.connection_id:
+                raise RecoveryBlocked("Connection lookup did not return the exact approved identity")
+            description = canonical_json(observed).decode("utf-8").lower()
+            if any(value in description for value in source_literals):
+                raise RecoveryBlocked(
+                    f"Connection {route.target.connection_id} still names the source estate; "
+                    "provision and map an independent recovery connection"
+                )
+            mapping = TargetMapping(
+                ResourceKey("connection", tenant, route.source.connection_id),
+                ResourceKey("connection", tenant, route.target.connection_id),
+                digest(canonical_json(observed)),
+            )
+            replacements.append(
+                Replacement(
+                    mapping=mapping,
+                    validated=True,
+                    independent=True,
+                    ready=False,
+                    provenance=route.evidence,
+                )
+            )
         return build_operation_plan(
             self._inventory(generation),
             Selection(
@@ -363,6 +448,7 @@ class RecoveryCoordinator:
             control_workspace=workspace_key(self.recovery_set.control_workspace),
             control_warehouse=item_key(self.recovery_set.control_warehouse),
             target_mappings=mappings,
+            replacements=tuple(replacements),
         )
 
     def plan(self, request: PlanRequest) -> ServiceResult:
@@ -473,6 +559,16 @@ class RecoveryCoordinator:
             )
             plan = self._plan(generation, request)
             self.runtime.put("plans", generation.snapshot.generation_id, request.model_dump(mode="json"))
+            for route in request.connection_mappings:
+                self.runtime.put(
+                    "connections",
+                    route.source.key,
+                    {
+                        "generation_id": generation.snapshot.generation_id,
+                        "target": route.target.model_dump(mode="json"),
+                        "evidence": route.evidence,
+                    },
+                )
             groups, warnings = self._apply_plan(generation, plan, request.suffix)
             self.runtime.transition(RecoveryMode.STANDBY)
             result = ServiceResult(
@@ -483,7 +579,12 @@ class RecoveryCoordinator:
             )
             if request.park:
                 self.capacities.park(self.runtime, tuple(self.workspace_mappings().values()))
-            return result.model_copy(update={"mode": self.runtime.mode})
+            return result.model_copy(
+                update={
+                    "mode": self.runtime.mode,
+                    "details": {"capacities": list(self.capacities.observations())},
+                }
+            )
 
     def _apply_plan(
         self,
@@ -506,6 +607,11 @@ class RecoveryCoordinator:
         completed = set()
         blockers: dict[str, list[str]] = {}
         warnings = []
+        connections = {
+            row.key: ConnectionIdentity.model_validate(row.document["target"])
+            for row in self.catalog.list_records("connections")
+            if row.document["generation_id"] == generation_id
+        }
         self.access.restrict_workspace(self.recovery_set.control_workspace)
         for key in plan.executable_order:
             op = operations[key]
@@ -555,6 +661,10 @@ class RecoveryCoordinator:
             elif op.kind in {"store_create", "item_create"}:
                 item = items[op.subject]
                 current = applied.get(item.identity.key)
+                if current is None:
+                    current = self._rearmed_item(generation, item)
+                    if current is not None:
+                        applied[item.identity.key] = current
                 shell_only = owns_schema(generation, item, self.catalog)
                 hashes = captured_hashes(item, generation.payloads)
                 binding_hash = digest(
@@ -610,6 +720,19 @@ class RecoveryCoordinator:
                         completed.add(key)
                         continue
                 target_workspace = workspaces["/".join(op.subject[:2])]
+                prerequisites = {
+                    edge.prerequisite.key
+                    for edge in snapshot.dependencies
+                    if edge.consumer == item.identity and isinstance(edge.prerequisite, ItemIdentity)
+                } | {item.identity.key}
+                try:
+                    endpoint_pairs = self._endpoint_pairs(
+                        generation,
+                        {key: row for key, row in applied.items() if key in prerequisites},
+                    )
+                except RecoveryBlocked as error:
+                    blockers.setdefault(item.identity.key, []).append(str(error))
+                    continue
                 mapping_digest = digest(
                     canonical_json(
                         {
@@ -620,7 +743,11 @@ class RecoveryCoordinator:
                 effect_key = f"{generation_id}/{item.identity.key}/{mapping_digest}"
 
                 def apply_item(
-                    i=item, old=current, ws=target_workspace, shell=shell_only,
+                    i=item,
+                    old=current,
+                    ws=target_workspace,
+                    shell=shell_only,
+                    endpoints=endpoint_pairs,
                 ) -> dict[str, JsonValue]:
                     result = self.apply(
                         self.destination,
@@ -638,6 +765,17 @@ class RecoveryCoordinator:
                         tokens=self.tokens,
                         shell_only=shell,
                         mutation_guard=self.runtime.fence,
+                        endpoint_mappings=endpoints,
+                        connection_mappings=tuple(
+                            (
+                                ConnectionIdentity(
+                                    tenant_id=key.split("/")[0],
+                                    connection_id=key.split("/")[-1],
+                                ),
+                                target,
+                            )
+                            for key, target in connections.items()
+                        ),
                     )
                     return {
                         "applied": result.applied.model_dump(mode="json") if result.applied else None,
@@ -676,6 +814,15 @@ class RecoveryCoordinator:
                 # Only bind is a metadata milestone. The data/ready operations need separate evidence.
                 if op.kind == "bind":
                     completed.add(key)
+            elif op.kind == "replacement":
+                completed.add(key)
+            elif op.kind == "endpoint_ready":
+                endpoint = op.subject
+                if any(
+                    source.endpoint_id == endpoint.resource_id and source.item.item_id == endpoint.item_id
+                    for source, _ in self._endpoint_pairs(generation, applied)
+                ):
+                    completed.add(key)
         for item in snapshot.items:
             if item.tombstone:
                 warnings.append(
@@ -686,6 +833,49 @@ class RecoveryCoordinator:
         for group in groups:
             self._save_group(generation_id, group)
         return groups, tuple(warnings)
+
+    def _rearmed_item(self, generation: CapturedGeneration, item: ItemRecord) -> AppliedItem | None:
+        alias = self.runtime.get("rearmed-items", item.identity.key)
+        if alias is None:
+            return None
+        target = ItemIdentity.model_validate(alias["target"])
+        ownership = next(
+            (row for row in self.catalog.operations() if row.operation_id == alias["ownership_operation"]),
+            None,
+        )
+        if ownership is None or ownership.state != OperationState.SUCCEEDED or ownership.target != target:
+            raise RecoveryBlocked("The retained standby target has no successful ownership receipt")
+        observed = self.observe(self.destination, target, item.item_type)
+        if observed != alias["observed_sha256"]:
+            raise RecoveryBlocked(
+                f"Retained standby {target.key} changed after rearm; review drift before syncing"
+            )
+
+        def receipt():
+            row = AppliedItem(
+                source=item.identity,
+                target=target,
+                capture_generation_id=generation.snapshot.generation_id,
+                applied_at=now(),
+                definition_sha256=digest(b"rearm invalidated"),
+                properties_sha256=digest(b"rearm invalidated"),
+                target_observed_sha256=observed,
+                outcome=RecoveryOutcome.PARTIAL,
+                operation_id=self.runtime.current_operation.operation_id,
+            )
+            return {"applied": row.model_dump(mode="json")}
+
+        result = self.runtime.effect(
+            "rearm-owned-mapping",
+            f"{generation.snapshot.generation_id}/{item.identity.key}",
+            receipt,
+            generation_id=generation.snapshot.generation_id,
+            source=item.identity,
+            target=target,
+        )
+        row = AppliedItem.model_validate(result["applied"])
+        self.catalog.record_applied(self.runtime.require_lease(), row)
+        return row
 
     def _build_groups(
         self,
@@ -706,6 +896,15 @@ class RecoveryCoordinator:
             (edge.consumer, edge.prerequisite)
             for edge in plan.dependencies
             if isinstance(edge.prerequisite, tuple)
+        )
+        resource_consumers = {}
+        for edge in plan.dependencies:
+            if isinstance(edge.prerequisite, ResourceKey):
+                resource_consumers.setdefault(edge.prerequisite, []).append(edge.consumer)
+        links.extend(
+            (consumers[0], consumer)
+            for consumers in resource_consumers.values()
+            for consumer in consumers[1:]
         )
         for left, right in links:
             matches = [component for component in components if left in component or right in component]
@@ -806,6 +1005,11 @@ class RecoveryCoordinator:
             groups = self._selected_groups(request.generation_id, request.group_ids)
             applied = self.item_mappings()
             workspaces = self.workspace_mappings()
+            connections = {
+                row.key: ConnectionIdentity.model_validate(row.document["target"])
+                for row in self.catalog.list_records("connections")
+                if row.document["generation_id"] == request.generation_id
+            }
             items = {row.identity.key: row for row in generation.snapshot.items}
             results = []
             approved = set(request.approved_acl_ids)
@@ -875,6 +1079,13 @@ class RecoveryCoordinator:
                         for acl in desired.values()
                         if (acl.item and acl.item.key in group_sources)
                         or (acl.workspace and acl.workspace.key in group_workspaces)
+                        or (
+                            acl.connection
+                            and any(
+                                edge.consumer.key in group_sources and edge.prerequisite == acl.connection
+                                for edge in generation.snapshot.dependencies
+                            )
+                        )
                     ]
                     for identity in group.items:
                         security = self.runtime.get("item-security", identity.key)
@@ -885,7 +1096,9 @@ class RecoveryCoordinator:
                             )
                     # Check all surfaces first; an unsupported policy must not expose the group.
                     mapped = [
-                        remap_acl(acl, workspaces, {key: row.target for key, row in applied.items()}, {})
+                        remap_acl(
+                            acl, workspaces, {key: row.target for key, row in applied.items()}, connections
+                        )
                         for acl in relevant
                     ]
                     for acl in mapped:

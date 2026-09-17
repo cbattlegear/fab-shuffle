@@ -141,10 +141,18 @@ class DurableRuntime:
                         "Stored effect result is not an object; inspect the operation journal"
                     )
                 return result
-            raise RecoveryBlocked(
-                f"Operation {operation_id} is {previous.state}; "
-                "reconcile its exact target before another attempt"
-            )
+            if previous.state == OperationState.FAILED:
+                operation_id = str(
+                    uuid5(
+                        UUID(self.require_lease().recovery_set_id),
+                        f"{kind}:{key}:retry:{self.require_lease().epoch}",
+                    )
+                )
+            else:
+                raise RecoveryBlocked(
+                    f"Operation {operation_id} is {previous.state}; "
+                    "reconcile its exact target before another attempt"
+                )
         intent = OperationRecord(
             operation_id=operation_id,
             kind=kind,
@@ -163,11 +171,17 @@ class DurableRuntime:
             code, message, request_id = safe_error(error)
             # Even a definite rejection may follow earlier successful calls in a composite adapter.
             observed = self.current_operation or intent
+            rejected = (
+                observed.state == OperationState.INTENT
+                and isinstance(error, FabricApiError)
+                and 400 <= error.status_code < 500
+                and error.status_code != 408
+            )
             self.catalog.record_operation(
                 self.require_lease(),
                 observed.model_copy(
                     update={
-                        "state": OperationState.AMBIGUOUS,
+                        "state": OperationState.FAILED if rejected else OperationState.AMBIGUOUS,
                         "recorded_at": now(),
                         "error_code": code,
                         "message": message,
@@ -175,7 +189,12 @@ class DurableRuntime:
                     }
                 ),
             )
-            raise RecoveryBlocked(message + "; reconcile the recorded operation before retrying") from error
+            action = (
+                "; correct the service-reported problem before retrying"
+                if rejected
+                else "; reconcile the recorded operation before retrying"
+            )
+            raise RecoveryBlocked(message + action) from error
         finally:
             observed = self.current_operation or intent
             self.current_operation = None

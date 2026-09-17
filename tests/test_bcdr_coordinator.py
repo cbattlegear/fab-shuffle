@@ -47,6 +47,11 @@ class Capacities:
     def close(self):
         self.events.append("close")
 
+    def observations(self):
+        return (
+            {"state": "Suspended" if any(isinstance(event, tuple) for event in self.events) else "Active"},
+        )
+
     def resume_business(self, runtime):
         runtime.fence()
         self.events.append("resume_business")
@@ -76,9 +81,25 @@ class Estate:
         body = json.loads(request.content) if request.content else {}
         if path.startswith("capacities/"):
             return httpx.Response(200, json={"id": path.split("/")[1], "state": "Active"})
+        if path == "admin/workspaces":
+            return httpx.Response(
+                200,
+                json={
+                    "workspaces": [
+                        row
+                        for row in self.workspaces.values()
+                        if row["capacityId"] == request.url.params.get("capacityId")
+                    ]
+                },
+            )
         if path == "workspaces" and request.method == "POST":
             identifier = guid()
-            self.workspaces[identifier] = {"id": identifier, **body}
+            self.workspaces[identifier] = {
+                "id": identifier,
+                "type": "Workspace",
+                "capacityAssignmentProgress": "Completed",
+                **body,
+            }
             self.roles[identifier] = [
                 {
                     "id": guid(),
@@ -117,7 +138,7 @@ class Estate:
             return httpx.Response(200, json={"accessDetails": values})
         if path.endswith("/items") and request.method == "POST":
             identifier = guid()
-            self.items[identifier] = {"id": identifier, **body}
+            self.items[identifier] = {"id": identifier, "workspaceId": path.split("/")[1], **body}
             if self.lost_create:
                 raise httpx.ReadError("connection lost after destination accepted create", request=request)
             return httpx.Response(201, json=self.items[identifier])
@@ -125,6 +146,13 @@ class Estate:
             identifier = path.split("/")[-1]
             self.items[identifier].update(body)
             return httpx.Response(200, json=self.items[identifier])
+        if path.endswith("/items") and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "value": [row for row in self.items.values() if row["workspaceId"] == path.split("/")[1]]
+                },
+            )
         if path.startswith("workspaces/") and request.method == "GET":
             identifier = path.split("/")[1]
             return httpx.Response(200, json=self.workspaces.get(identifier, {"id": identifier}))
@@ -485,3 +513,259 @@ def test_optional_data_missing_does_not_abort_independent_metadata_group(system)
     blocked = next(row for row in result.groups if not row.access_enabled)
     assert "unprotected SQL" in " ".join(blocked.blockers)
     assert result.exit_code == 2
+
+
+def production_capacities(system, tmp_path, monkeypatch):
+    from fabshuffle.bcdr.bootstrap import BootstrapDescriptor, BootstrapStore, CapacityAuthorization
+    from fabshuffle.bcdr.capacity import ArmCapacityClient, CapacityCoordinator
+    from fabshuffle.bcdr.production import ProductionCapacities
+
+    config = system.config
+    resource = (
+        f"/subscriptions/{config.tenant_id}/resourcegroups/recovery/"
+        "providers/microsoft.fabric/capacities/catalog"
+    )
+    descriptor = BootstrapDescriptor(
+        recovery_set_id=config.recovery_set_id,
+        tenant_id=config.tenant_id,
+        application_id=system.c.tokens.principal.client_id,
+        controller_id=system.c.runtime.controller_id,
+        capacities=(
+            CapacityAuthorization(
+                arm_resource_id=resource,
+                fabric_capacity_id=config.target_capacity_ids[0],
+                dedicated_recovery=True,
+                authorized_for_suspend=True,
+            ),
+        ),
+        catalog_capacity_id=resource,
+        control_workspace_id=config.control_workspace.workspace_id,
+        control_warehouse_id=config.control_warehouse.item_id,
+        tds_host="example.datawarehouse.fabric.microsoft.com",
+        tds_catalog=config.control_warehouse.item_id,
+    )
+    store = BootstrapStore(tmp_path / "bootstrap.json")
+    store.save(descriptor, expected_revision=None)
+    state = {"value": "Active", "calls": []}
+
+    def arm_handler(request):
+        state["calls"].append((request.method, request.url.path))
+        if request.method == "POST":
+            state["value"] = "Suspended" if request.url.path.endswith("/suspend") else "Active"
+            return httpx.Response(200)
+        return httpx.Response(
+            200,
+            json={
+                "id": resource,
+                "type": "Microsoft.Fabric/capacities",
+                "sku": {"name": "F2", "tier": "Fabric"},
+                "properties": {"state": state["value"], "provisioningState": "Succeeded"},
+            },
+        )
+
+    capacities = ProductionCapacities(store, system.c.tokens, system.c.destination.client)
+    capacities.arm.close()
+    capacities.arm = ArmCapacityClient(system.c.tokens, transport=httpx.MockTransport(arm_handler))
+    capacities.driver = CapacityCoordinator(store, capacities.arm)
+    capacities.catalog = system.catalog
+    monkeypatch.setattr(WarehouseCatalog, "open_from_endpoint", lambda *args, **kwargs: system.catalog)
+    return capacities, store, state
+
+
+def test_production_parking_then_source_free_resume_reconciles_epoch(system, tmp_path, monkeypatch):
+    system.service.synchronize(system.request)
+    capacities, store, state = production_capacities(system, tmp_path, monkeypatch)
+    runtime = system.c.runtime
+    with runtime.controller({RecoveryMode.STANDBY}):
+        capacities.park(runtime, tuple(system.c.workspace_mappings().values()))
+    assert system.catalog.state().mode == RecoveryMode.PARKING
+    assert system.catalog.pending_operations()[0].kind == "suspend_capacity"
+    assert state["value"] == "Suspended"
+    assert store.load().parking.epoch == system.catalog.state().epoch
+    capacities.resume_catalog()
+    assert state["value"] == "Active"
+    assert system.catalog.state().mode == RecoveryMode.STANDBY
+    assert not system.catalog.pending_operations()
+    assert system.catalog.state().controller_id is None
+    assert store.load().parking is None
+    capacities.close()
+
+
+def test_production_pause_refuses_unrelated_workspace(system, tmp_path, monkeypatch):
+    system.service.synchronize(system.request)
+    capacities, _, state = production_capacities(system, tmp_path, monkeypatch)
+    rogue = guid()
+    system.estate.workspaces[rogue] = {"id": rogue, "capacityId": system.config.target_capacity_ids[0]}
+    with system.c.runtime.controller({RecoveryMode.STANDBY}):
+        with pytest.raises(RecoveryBlocked, match="unowned workspace"):
+            capacities.park(system.c.runtime, tuple(system.c.workspace_mappings().values()))
+    assert not any(method == "POST" for method, _ in state["calls"])
+    assert system.catalog.state().mode == RecoveryMode.STANDBY
+    capacities.close()
+
+
+def test_production_pause_refuses_untracked_item(system, tmp_path, monkeypatch):
+    system.service.synchronize(system.request)
+    capacities, _, state = production_capacities(system, tmp_path, monkeypatch)
+    workspace = next(iter(system.c.workspace_mappings().values()))
+    rogue = guid()
+    system.estate.items[rogue] = {"id": rogue, "workspaceId": workspace.workspace_id}
+    with system.c.runtime.controller({RecoveryMode.STANDBY}):
+        with pytest.raises(RecoveryBlocked, match="untracked item"):
+            capacities.park(system.c.runtime, (workspace,))
+    assert not any(method == "POST" for method, _ in state["calls"])
+    capacities.close()
+
+
+def test_deployment_lock_is_exclusive_and_released(tmp_path):
+    from fabshuffle.bcdr.production import DeploymentLock
+
+    path = tmp_path / "bootstrap.json"
+    first = DeploymentLock(path)
+    with pytest.raises(RecoveryBlocked, match="Another worker"):
+        DeploymentLock(path)
+    first.close()
+    second = DeploymentLock(path)
+    second.close()
+
+
+def test_production_factory_opens_sql_only_after_arm_resume(system, tmp_path, monkeypatch):
+    from fabshuffle.bcdr import production
+    from fabshuffle.bcdr.capacity import ArmCapacityClient
+    from fabshuffle.bcdr.service import create_service
+
+    capacities, store, state = production_capacities(system, tmp_path, monkeypatch)
+    transport = capacities.arm.http._transport
+    state["value"] = "Suspended"
+    actual_arm = ArmCapacityClient
+    monkeypatch.setattr(
+        production, "ArmCapacityClient", lambda tokens: actual_arm(tokens, transport=transport)
+    )
+    monkeypatch.setattr(production, "FabricClient", lambda tokens: system.c.destination.client)
+
+    def opened(*args, **kwargs):
+        assert state["value"] == "Active"
+        assert kwargs["expected_recovery_set_id"] == system.config.recovery_set_id
+        return system.catalog
+
+    monkeypatch.setattr(WarehouseCatalog, "open_from_endpoint", opened)
+    service = create_service(store.path, target_tokens=system.c.tokens)
+    assert service.coordinator.source is None
+    assert service.coordinator.catalog is system.catalog
+    service.close()
+    capacities.close()
+
+
+def test_source_reference_connection_is_rejected_before_mutation(system):
+    from fabshuffle.bcdr.contracts import ConnectionIdentity
+    from fabshuffle.bcdr.service import ConnectionRoute
+
+    synced = system.service.synchronize(system.request)
+    source = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    target = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    original_get = system.c.destination.get
+    system.c.destination.get = lambda path, **kwargs: (
+        {
+            "id": target.connection_id,
+            "connectionDetails": {"path": system.captured.workspaces[0].identity.workspace_id},
+        }
+        if path.startswith("connections/")
+        else original_get(path, **kwargs)
+    )
+    with pytest.raises(RecoveryBlocked, match="still names the source"):
+        system.service.plan(
+            PlanRequest(
+                generation_id=synced.generation_id,
+                capacity_routes=system.request.capacity_routes,
+                connection_mappings=(
+                    ConnectionRoute(source=source, target=target, evidence="operator-approval"),
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize("new_workspace", [False, True])
+def test_production_setup_wires_real_provisioners_and_sql_catalog(
+    system,
+    tmp_path,
+    monkeypatch,
+    new_workspace,
+):
+    from functools import partial
+
+    from fabshuffle.bcdr import production
+    from fabshuffle.bcdr.bootstrap import BootstrapStore
+    from fabshuffle.bcdr.service import SetupCapacity, SetupRequest, setup
+
+    capacities, descriptor_store, _ = production_capacities(system, tmp_path, monkeypatch)
+    descriptor = descriptor_store.load()
+    system.c.tokens.object_id.return_value = system.config.access_policy.recovery_spn.object_id
+    control_id = system.config.control_workspace.workspace_id
+    system.estate.workspaces[control_id] = {
+        "id": control_id,
+        "type": "Workspace",
+        "capacityId": system.config.target_capacity_ids[0],
+        "capacityAssignmentProgress": "Completed",
+    }
+    warehouse_id = guid()
+
+    def fabric_handler(request):
+        path = request.url.path.removeprefix("/v1/")
+        if path.endswith("/warehouses") or "/warehouses/" in path:
+            return httpx.Response(
+                201 if request.method == "POST" else 200,
+                json={
+                    "id": warehouse_id,
+                    "type": "Warehouse",
+                    "workspaceId": path.split("/")[1],
+                    "properties": {"connectionString": "example.datawarehouse.fabric.microsoft.com"},
+                },
+            )
+        return system.estate.handler(request)
+
+    transport = httpx.MockTransport(fabric_handler)
+    monkeypatch.setattr(production, "FabricClient", partial(FabricClient, transport=transport))
+    monkeypatch.setattr(
+        production,
+        "ControlWorkspaceProvisioner",
+        partial(production.ControlWorkspaceProvisioner, transport=transport),
+    )
+    monkeypatch.setattr(
+        production,
+        "ControlWarehouseProvisioner",
+        partial(production.ControlWarehouseProvisioner, transport=transport),
+    )
+    monkeypatch.setattr(production, "ArmCapacityClient", lambda tokens: capacities.arm)
+    created = []
+
+    def new_catalog(server, database, tokens, config):
+        harness = SqlHarness(tmp_path / "setup-catalog.db")
+        catalog = WarehouseCatalog(harness.connect, config, sleep=Mock())
+        created.append(catalog)
+        return catalog
+
+    monkeypatch.setattr(WarehouseCatalog, "from_endpoint", new_catalog)
+    path = tmp_path / "new-deployment.json"
+    request = SetupRequest(
+        control_workspace_name="Recovery control" if new_workspace else None,
+        control_workspace_id=None if new_workspace else control_id,
+        source_capacity_ids=system.config.source_capacity_ids,
+        recovery_capacities=tuple(
+            SetupCapacity(
+                arm_resource_id=row.arm_resource_id,
+                fabric_capacity_id=row.fabric_capacity_id,
+                dedicated_recovery=True,
+                authorized_for_suspend=True,
+            )
+            for row in descriptor.capacities
+        ),
+        catalog_capacity_id=descriptor.catalog_capacity_id,
+        access_policy=system.config.access_policy,
+    )
+    result = setup(request, path, target_tokens=system.c.tokens)
+    stored = BootstrapStore(path).load()
+    assert stored.control_warehouse_id == warehouse_id
+    assert result.details["control_warehouse_id"] == warehouse_id
+    assert created[0].state().mode == RecoveryMode.STANDBY
+    assert created[0].recovery_set.control_workspace.workspace_id == stored.control_workspace_id
+    assert "not-a-real-secret" not in path.read_text()
