@@ -83,6 +83,7 @@ class PlanRequest(Record):
     capacity_routes: tuple[CapacityRoute, ...]
     suffix: Nonempty = " - recovery"
     connection_mappings: tuple[ConnectionRoute, ...] = ()
+    target_quiescence_evidence: Nonempty | None = None
 
 
 class SyncRequest(PlanRequest):
@@ -186,6 +187,15 @@ class RearmRequest(Record):
     park: StrictBool = True
 
 
+class ReconcileOperationRequest(Record):
+    operation_id: Guid
+    expected_controller_id: Guid
+    expected_epoch: int = Field(ge=1)
+    previous_controller_stopped: StrictBool
+    fencing_evidence: Nonempty
+    target_quiescence_evidence: Nonempty
+
+
 class GroupStatus(Record):
     group_id: Nonempty
     items: tuple[ItemIdentity, ...]
@@ -261,6 +271,9 @@ class BcdrService:
 
     def rearm(self, request: RearmRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.failback.rearm(request))
+
+    def reconcile_operation(self, request: ReconcileOperationRequest) -> ServiceResult:
+        return self._call(lambda: self.coordinator.reconcile_operation(request))
 
     def close(self) -> None:
         self.coordinator.close()

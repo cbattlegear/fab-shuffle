@@ -35,7 +35,7 @@ class FailbackController:
         self.coordinator = coordinator
         self.runtime = coordinator.runtime
 
-    def _return_coordinator(self) -> RecoveryCoordinator:
+    def _return_coordinator(self, plan_id: str) -> RecoveryCoordinator:
         from fabshuffle.bcdr.coordinator import RecoveryCoordinator
 
         original = self.coordinator
@@ -58,7 +58,7 @@ class FailbackController:
             apply=original.apply,
             observe=original.observe,
             capabilities=original.capabilities,
-            workspace_namespace="return-workspaces",
+            workspace_namespace=f"return-{plan_id}",
         )
         coordinator.runtime = original.runtime
         coordinator.destination.runtime = original.runtime
@@ -87,7 +87,8 @@ class FailbackController:
             applied = c.item_mappings()
             targets = tuple(applied[item.key].target for group in groups for item in group.items)
             self.runtime.transition(RecoveryMode.FAILING_BACK)
-            return_coordinator = self._return_coordinator()
+            plan_id = str(uuid4())
+            return_coordinator = self._return_coordinator(plan_id)
             captured = c.capture(
                 c.destination,
                 return_coordinator.recovery_set,
@@ -107,7 +108,6 @@ class FailbackController:
                 captured.snapshot.generation_id,
                 failover_generation_id=request.generation_id,
             )
-            plan_id = str(uuid4())
             stored_request = self.runtime.get("plans", request.generation_id)
             if stored_request is None:
                 raise RecoveryBlocked("The failover generation has no persisted capacity placement plan")
@@ -199,7 +199,7 @@ class FailbackController:
                 },
             )
             generation = c.catalog.load_generation(record["dr_generation_id"])
-            returned = self._return_coordinator()
+            returned = self._return_coordinator(request.plan_id)
             plan_request = PlanRequest.model_validate(record["request"])
             plan = returned._plan(generation, plan_request)
             groups, warnings = returned._apply_plan(generation, plan, plan_request.suffix)
@@ -340,7 +340,7 @@ class FailbackController:
             # Fresh return identities are authoritative; don't resume capturing obsolete original item IDs.
             return_generation = c.catalog.load_generation(record["dr_generation_id"])
             return_sources = {row.identity.key for row in return_generation.snapshot.items}
-            for row in c.catalog.list_records("return-workspaces"):
+            for row in c.catalog.list_records(f"return-{request.plan_id}"):
                 fresh = WorkspaceIdentity.model_validate(row.document["target"])
                 dr_tenant, dr_workspace = row.key.split("/")
                 self.runtime.put(
@@ -362,7 +362,13 @@ class FailbackController:
                 if returned.source.key not in return_sources:
                     continue
                 original = next(
-                    (row for row in mappings.values() if row.target == returned.source),
+                    (
+                        row
+                        for row in mappings.values()
+                        if row.target == returned.source
+                        and row.source.key in items
+                        and not items[row.source.key].tombstone
+                    ),
                     None,
                 )
                 if original is None:
@@ -388,7 +394,7 @@ class FailbackController:
                     "source": "fresh_return_targets",
                     "workspaces": [
                         row.model_dump(mode="json")
-                        for row in self._return_coordinator().workspace_mappings().values()
+                        for row in self._return_coordinator(request.plan_id).workspace_mappings().values()
                     ],
                     "evidence": request.evidence,
                 },

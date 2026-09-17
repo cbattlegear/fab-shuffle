@@ -151,3 +151,78 @@ def test_service_words_survive_credential_redaction():
     assert "Grant User on connection" in message
     assert request_id == "evidence-request"
     assert "do-not-leak" not in message
+
+
+def test_reenable_after_rearm_creates_new_owned_grant(system):
+    system.service.synchronize(system.request)
+    target = next(iter(system.c.workspace_mappings().values()))
+    desired = acl(system.config, AclScope.WORKSPACE, target=target)
+    runtime = system.c.runtime
+    with runtime.controller({RecoveryMode.STANDBY}):
+        runtime.transition(RecoveryMode.ENABLING_RECOVERY)
+        system.c.access.apply(desired, approved=True)
+        first_id = next(
+            row["id"]
+            for row in system.estate.roles[target.workspace_id]
+            if row["principal"]["id"] == desired.principal.object_id
+        )
+        runtime.transition(RecoveryMode.ACTIVE_RECOVERY)
+        runtime.transition(RecoveryMode.FAILING_BACK)
+        runtime.transition(RecoveryMode.REARMING)
+        system.c.access.rearm()
+        runtime.transition(RecoveryMode.STANDBY)
+    with runtime.controller({RecoveryMode.STANDBY}):
+        runtime.transition(RecoveryMode.ENABLING_RECOVERY)
+        system.c.access.apply(desired, approved=True)
+    new_id = next(
+        row["id"]
+        for row in system.estate.roles[target.workspace_id]
+        if row["principal"]["id"] == desired.principal.object_id
+    )
+    assert new_id != first_id
+
+
+def test_permission_denial_rolls_back_only_current_group_grants_and_can_retry(system):
+    from fabshuffle.bcdr.catalog import CapturedGeneration
+    from fabshuffle.bcdr.service import EnableRecoveryRequest
+    from tests.test_bcdr_coordinator import proofs
+
+    source_workspace = system.captured.workspaces[0].identity
+    grants = tuple(acl(system.config, AclScope.WORKSPACE, target=source_workspace) for _ in range(2))
+    captured = system.captured.model_copy(update={"desired_acls": grants})
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(captured, ())
+    synced = system.service.synchronize(system.request)
+    original = system.c.access.fabric.grant
+
+    def denied(assignment):
+        if assignment.principal == grants[1].principal:
+            raise FabricApiError(
+                "POST",
+                "https://api.fabric.microsoft.com/v1/roleAssignments",
+                403,
+                (
+                    '{"errorCode":"PermissionDenied","message":"Grant assignment denied",'
+                    '"requestId":"request-42"}'
+                ),
+            )
+        return original(assignment)
+
+    system.c.access.fabric.grant = denied
+    request = EnableRecoveryRequest(
+        generation_id=synced.generation_id,
+        group_ids=(synced.groups[0].group_id,),
+        approved_acl_ids=tuple(row.acl_id for row in grants),
+        readiness=proofs(system, synced.generation_id),
+    )
+    first = system.service.enable_recovery(request)
+    assert not first.groups[0].access_enabled
+    assert "PermissionDenied" in first.groups[0].blockers[0]
+    assert not system.catalog.pending_operations()
+    target = next(iter(system.c.workspace_mappings().values()))
+    assert not any(
+        row["principal"]["id"] in {acl.principal.object_id for acl in grants}
+        for row in system.estate.roles[target.workspace_id]
+    )
+    system.c.access.fabric.grant = original
+    retried = system.service.enable_recovery(request)
+    assert retried.groups[0].access_enabled

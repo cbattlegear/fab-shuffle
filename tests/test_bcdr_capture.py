@@ -23,7 +23,7 @@ from fabshuffle.bcdr.contracts import (
     WorkspaceIdentity,
 )
 from fabshuffle.bcdr.registry import TYPE_REGISTRY
-from fabshuffle.fabric.client import FabricApiError, FabricError
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.fabric.definitions import part
 
 TENANT = "10000000-0000-0000-0000-000000000001"
@@ -132,8 +132,16 @@ class SourceClient:
         return {"definition": {"parts": self.parts, **({"format": params["format"]} if params else {})}}
 
     def request(self, method, path, params=None):
-        assert method == "GET" and params == {"beta": "true"}
-        return httpx.Response(200, content=self.files[path.split("/files/")[1]])
+        assert method == "GET"
+        if "/files/" in path:
+            assert params == {"beta": "true"}
+            return httpx.Response(200, content=self.files[path.split("/files/")[1]])
+        if path == f"workspaces/{SOURCE}" or path.endswith(("/spark/settings", "/sparkcompute")):
+            return httpx.Response(200, json=self.get(path))
+        if "/environment" in path and "apacheAirflowJobs" in path:
+            return httpx.Response(200, json={"status": "Stopped"})
+        key = "libraries" if path.endswith("/libraries") else "value"
+        return httpx.Response(200, json={key: self.list_all(path, params=params)})
 
 
 def recovery_set():
@@ -403,3 +411,38 @@ def test_every_registry_type_has_an_explicit_capture_route(item_type):
     assert captured.record.item_type == item_type
     if not TYPE_REGISTRY[item_type].migration_rebuild:
         assert captured.record.properties["bcdr"]["unsupported_reason"]
+
+
+@pytest.mark.parametrize("body", [b"{}", b"not json", b'{"value":null}', b"[]"])
+def test_real_client_malformed_inventory_never_publishes_empty(body):
+    class Tokens:
+        def tenant_id(self):
+            return TENANT
+
+        def fabric_token(self):
+            return "test-token"
+
+    with FabricClient(
+        Tokens(), transport=httpx.MockTransport(lambda _: httpx.Response(200, content=body))
+    ) as client:
+        with pytest.raises(FabricError, match="capture is incomplete"):
+            capture_workspaces(client, recovery_set(), tokens=Tokens(), readers=Readers())
+
+
+def test_schedule_parts_are_retained_as_deferred_configuration():
+    client = SourceClient("Notebook", [part("definition.json", {}), part(".schedules", {"enabled": True})])
+    result = capture_item(client, IDENTITY, "Notebook", readers=Readers())
+    schedule = next(payload for payload in result.payloads if payload.descriptor.path == ".schedules")
+    assert schedule.descriptor.purpose == PayloadPurpose.CONFIGURATION
+    assert all(entry["path"] != ".schedules" for entry in definition_parts(result.record, result.payloads))
+
+
+def test_strict_capture_paging_preserves_rows_and_rejects_repeated_tokens():
+    from fabshuffle.bcdr.capture import capture_list
+
+    class Client:
+        def request(self, method, path, params=None):
+            return httpx.Response(200, json={"value": [{"id": ITEM}], "continuationToken": "again"})
+
+    with pytest.raises(FabricError, match="repeated"):
+        capture_list(Client(), "workspaces")

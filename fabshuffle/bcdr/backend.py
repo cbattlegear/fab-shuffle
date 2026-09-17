@@ -164,6 +164,27 @@ class DurableRuntime:
             ownership_evidence=f"controller={self.controller_id};epoch={self.require_lease().epoch};key={key}",
         )
         self.catalog.begin_operation(self.require_lease(), intent)
+        return self._perform(intent, action)
+
+    def resume_effect(
+        self,
+        operation: OperationRecord,
+        action: Callable[[], dict[str, JsonValue]],
+    ) -> dict[str, JsonValue]:
+        """Continue a journaled effect only after its exact service receipt was reconciled."""
+        self.fence()
+        pending = {row.operation_id: row for row in self.catalog.pending_operations()}
+        if pending.get(operation.operation_id) != operation or operation.target is None:
+            raise RecoveryBlocked(
+                "Reconcile an exact pending operation and returned target before continuing"
+            )
+        return self._perform(operation, action)
+
+    def _perform(
+        self,
+        intent: OperationRecord,
+        action: Callable[[], dict[str, JsonValue]],
+    ) -> dict[str, JsonValue]:
         self.current_operation = intent
         try:
             result = action()
@@ -200,6 +221,19 @@ class DurableRuntime:
             self.current_operation = None
         encoded = canonical_json(result)
         reject_embedded_secrets(encoded)
+        refused = "applied" in result and result["applied"] is None
+        if refused and observed.state != OperationState.INTENT:
+            self.catalog.record_operation(
+                self.require_lease(),
+                observed.model_copy(
+                    update={
+                        "state": OperationState.AMBIGUOUS,
+                        "recorded_at": now(),
+                        "message": "Adapter incomplete after a service effect; reconcile owned resources",
+                    }
+                ),
+            )
+            raise RecoveryBlocked("Reconcile the partial adapter operation before another attempt")
         if isinstance(result.get("applied"), dict):
             applied_target = ItemIdentity.model_validate(result["applied"]["target"])
             if observed.target is not None and observed.target != applied_target:
@@ -209,7 +243,7 @@ class DurableRuntime:
             self.require_lease(),
             observed.model_copy(
                 update={
-                    "state": OperationState.SUCCEEDED,
+                    "state": OperationState.FAILED if refused else OperationState.SUCCEEDED,
                     "recorded_at": now(),
                     "message": encoded.decode("utf-8"),
                 }

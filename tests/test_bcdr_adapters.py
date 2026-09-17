@@ -6,6 +6,7 @@ import zipfile
 from datetime import UTC, datetime
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from fabshuffle.bcdr import adapters
@@ -111,6 +112,24 @@ class Destination:
         self._target_only(path)
         return []
 
+    def request(self, method, path, params=None, **kwargs):
+        self._target_only(path)
+        if method == "GET":
+            if path.startswith("connections/"):
+                return httpx.Response(200, json=self.get(path))
+            if path.endswith("/sparkcompute"):
+                return httpx.Response(200, json={})
+            if path.endswith("/libraries"):
+                return httpx.Response(200, json={"libraries": []})
+            return httpx.Response(200, json={"value": self.list_all(path)})
+        self.mutations.append((path, kwargs.get("content")))
+        return httpx.Response(200)
+
+    def patch(self, path, **kwargs):
+        self._target_only(path)
+        self.mutations.append((path, kwargs.get("json")))
+        return {}
+
 
 def apply(item, payloads, client=None, **kwargs):
     client = client or Destination()
@@ -144,7 +163,7 @@ def test_source_independent_apply_returns_real_target_and_hashes():
 def test_update_reuses_explicit_id_and_never_adopts_by_name():
     item, payloads = captured()
     client = Destination()
-    result = apply(item, payloads, client, target_id=CREATED)
+    result = apply(item, payloads, client, target_id=CREATED, destination_quiescence="test-owned-stopped")
     assert result.applied.target.item_id == CREATED
     assert len(client.mutations) == 1
     assert client.mutations[0][0].endswith(f"/{CREATED}/updateDefinition")
@@ -564,3 +583,150 @@ def test_dacpac_export_timestamp_does_not_masquerade_as_schema_drift():
         "schema.dacpac",
         payloads[1],
     )
+
+
+def test_json_unicode_escaped_source_workspace_is_rewritten_without_source_reads():
+    item, _ = captured()
+    escaped_workspace = OTHER_SOURCE.replace("-", r"\u002d")
+    payload = make_payload(
+        IDENTITY,
+        "definition.json",
+        ('{"workspaceId":"' + escaped_workspace + '"}').encode(),
+        PayloadPurpose.DEFINITION,
+    )
+    item = item.model_copy(update={"payload_ids": (payload.descriptor.payload_id,)})
+    other = item.model_copy(
+        update={
+            "identity": ItemIdentity(
+                tenant_id=TENANT,
+                workspace_id=OTHER_SOURCE,
+                item_id=DEPENDENCY,
+            )
+        }
+    )
+    client = Destination()
+    result = apply(
+        item,
+        (payload,),
+        client,
+        source_items=[item, other],
+        workspace_mappings={
+            (TENANT, SOURCE): TARGET_WORKSPACE,
+            (TENANT, OTHER_SOURCE): WorkspaceIdentity(tenant_id=TENANT, workspace_id=OTHER_TARGET),
+        },
+    )
+    assert result.metadata_applied
+    assert decode_json_part(client.definition[0]["payload"])["workspaceId"] == OTHER_TARGET
+    assert not any(OTHER_SOURCE in path for path in client.reads)
+
+
+def test_definition_schedule_is_never_imported_and_is_exposed_for_later_enablement():
+    item, payloads = captured()
+    schedule = make_payload(IDENTITY, ".schedules", b'{"enabled":true}', PayloadPurpose.DEFINITION)
+    item = item.model_copy(update={"payload_ids": (*item.payload_ids, schedule.descriptor.payload_id)})
+    client = Destination()
+    result = apply(item, (*payloads, schedule), client)
+    assert result.metadata_applied
+    assert any(grant["scope"] == "schedule" for grant in result.deferred_grants)
+    assert all(entry["path"] != ".schedules" for entry in client.definition)
+
+
+def test_existing_actor_update_requires_quiescence_evidence_before_read_or_mutation():
+    item, payloads = captured("Notebook")
+    client = Destination()
+    result = apply(item, payloads, client, target_id=CREATED)
+    assert result.outcome == RecoveryOutcome.BLOCKED
+    assert client.reads == [] and client.mutations == []
+
+
+def test_reuse_of_explicitly_verified_external_connection_is_allowed():
+    item, payloads = captured(content={"connectionId": CONNECTION})
+    connection = ConnectionIdentity(tenant_id=TENANT, connection_id=CONNECTION)
+    client = Destination()
+    result = apply(
+        item,
+        payloads,
+        client,
+        connection_mappings=((connection, connection),),
+        verified_external_connections=(connection,),
+    )
+    assert result.metadata_applied
+    assert decode_json_part(client.definition[0]["payload"])["connectionId"] == CONNECTION
+
+
+def test_unverified_connection_reuse_is_still_blocked():
+    item, payloads = captured(content={"connectionId": CONNECTION})
+    connection = ConnectionIdentity(tenant_id=TENANT, connection_id=CONNECTION)
+    client = Destination()
+    result = apply(item, payloads, client, connection_mappings=((connection, connection),))
+    assert result.outcome == RecoveryOutcome.BLOCKED and not client.mutations
+
+
+def test_nondefault_captured_definition_format_survives_offline_apply():
+    item, payloads = captured("VariableLibrary")
+    item = item.model_copy(update={"definition_format": "JSON"})
+    client = Destination()
+    result = apply(item, payloads, client)
+    assert result.metadata_applied
+    assert client.mutations[0][1]["definition"]["format"] == "JSON"
+
+
+def test_environment_uses_only_staging_endpoints_never_generic_definition_or_publish():
+    item, payloads = captured(
+        "Environment",
+        None,
+        "Setting/Sparkcompute.yml",
+        properties={
+            "bcdr": {"environment": {"staging_compute": {"driverCores": 4, "sparkProperties": []}}},
+        },
+    )
+    client = Destination()
+    result = apply(item, payloads, client)
+    assert result.metadata_applied
+    assert any(path.endswith("/staging/sparkcompute") for path, _ in client.mutations)
+    assert all(
+        "publish" not in path.lower() and "updateDefinition" not in path for path, _ in client.mutations
+    )
+
+
+def test_lakehouse_shortcut_zero_ids_remain_destination_local(monkeypatch):
+    item, payloads = schema_capture("Lakehouse")
+    shortcuts = [
+        {
+            "name": "local",
+            "path": "Files",
+            "target": {
+                "type": "OneLake",
+                "oneLake": {
+                    "workspaceId": adapters.EMPTY_GUID,
+                    "itemId": adapters.EMPTY_GUID,
+                    "path": "Files/data",
+                },
+            },
+        }
+    ]
+    metadata = make_payload(
+        IDENTITY, "lakehouse.metadata.json", b'{"defaultSchema":"dbo"}', PayloadPurpose.DEFINITION
+    )
+    shortcut_payload = make_payload(
+        IDENTITY, "shortcuts.metadata.json", json.dumps(shortcuts).encode(), PayloadPurpose.DEFINITION
+    )
+    item = item.model_copy(
+        update={
+            "payload_ids": (
+                *item.payload_ids,
+                metadata.descriptor.payload_id,
+                shortcut_payload.descriptor.payload_id,
+            ),
+            "properties": {
+                "bcdr": {"sql": {"sql_dependencies": []}, "schema_enabled": True, "shortcuts": shortcuts}
+            },
+        }
+    )
+    client = Destination()
+    monkeypatch.setattr(adapters, "_apply_sql_schema", lambda *args, **kwargs: None)
+    result = apply(item, (*payloads, metadata, shortcut_payload), client, tokens=object())
+    assert result.metadata_applied
+    payload = next(entry for entry in client.definition if entry["path"] == "shortcuts.metadata.json")
+    target = decode_json_part(payload["payload"])[0]["target"]["oneLake"]
+    assert target["workspaceId"] == TARGET and target["itemId"] == adapters.EMPTY_GUID
