@@ -96,9 +96,11 @@ the recorded provisioning operation; the backend must not adopt an unrelated War
 | --- | --- |
 | Set up the control Warehouse | Create or choose the restricted control workspace, create its single new metadata Warehouse, and persist the ownership/bootstrap descriptor. |
 | Read recovery status | Read the recorded mode, generations, groups, writer state and pending operations without source metadata reads. It can resume the control Warehouse capacity; opening the panel itself does not. |
+| Reconcile interrupted operation | Fence the previous controller and reconcile an exact recorded service receipt or saved completed result; never repeat an uncertain create or adopt by name. |
 | Preview standby selection | Preview exact include/exclude workspace IDs, positive name keywords, capacity routes and required dependency additions against captured metadata. |
 | Sync standby | Resume dedicated recovery capacity, optionally capture healthy-source metadata, update actual inactive standby items, commit results and pause only when the backend determines it is safe and parking was requested. |
-| Configure optional data protection | Register a typed, approved SQL/Cosmos export or KQL standby descriptor for the next capture, not a historical generation or automatic business-data copy. |
+| Configure optional data protection | Register a typed, approved SQL/Cosmos export, KQL standby or independent Lakehouse snapshot for the next capture, not a historical generation or automatic business-data copy. |
+| Configure qualified temporary attachments | Record exact retained-source OneLake paths and independently verified incident/access evidence. Enable recovery performs the actual attachments; configuration alone does not make data ready. |
 | Enable recovery | Explicitly leave standby mode, stop scheduled synchronization/automatic pause, reconcile selected groups and apply only explicitly approved, eligible deferred ACLs. This is not cutover. |
 | Approve cutover | Submit current readiness observations and primary-writer fencing evidence for the selected groups. The backend decides whether cutover is permitted. |
 | Plan failback | Establish primary availability with evidence and create a linked return/reconciliation plan, not a reversed migration retry. |
@@ -120,6 +122,8 @@ Use **Approved connection routes** when a captured connection needs a validated 
 replacement or explicitly approved external connection reuse. Supply exact connection identities
 and evidence; the backend reads the destination connection and rejects retained source-compute
 references. This is not a credential field or a general source-reference bypass.
+For failback, use the separate **Approved return connection routes**. A forward recovery
+connection is not automatically a valid primary-return connection.
 
 ### Access remains restricted until enablement
 
@@ -151,6 +155,22 @@ settling the synchronous service call and closes its clients. Do not terminate t
 or deploy a new revision during an operation. After a crash or ambiguous service failure,
 read status and reconcile recorded operations before retrying; never adopt resources by name.
 
+### Reconcile an interrupted operation
+
+Read recovery status first. **Reconcile interrupted operation** lists recorded pending operations
+and pins the observed controller ID and **controller epoch**, which is separate from the writer
+epoch used for cutover. Choose the exact operation. If a completed service result exists but its
+catalog mapping was interrupted, the advanced exact-ID field accepts that existing operation ID.
+It is not a field for inventing an operation or entering an item name.
+
+Stop and fence the previous controller, then provide independently established controller-fencing
+and destination-quiescence evidence. The explicit confirmation authorizes the backend to take
+over that recorded epoch and finish only work justified by the exact owned receipt. It does not
+authorize a second create, enable recovery, admit a business group, or approve cutover.
+Read status again after each reconciliation. Stale epochs, running previous controllers and
+missing/ambiguous receipts remain actionable blockers requiring inspection; this is not a
+general reset or a way to clear errors without evidence.
+
 ## Data protection and qualification
 
 All current supported migration types remain in the recovery assessment. This does not
@@ -170,6 +190,27 @@ browser request path. SQL/Cosmos portable artifacts require matching off-region 
 approvals; a prepared KQL descriptor does not use a portable-file storage configuration.
 Configuration applies to the **next capture** and cannot patch a historical generation in place.
 
+### Independent Lakehouse materialization
+
+Choose the `lakehouse` provider in **Configure optional data protection**, then the typed
+`LakehouseProtection` descriptor. Supply the source identity; the independently qualified
+off-region snapshot/access references; capture/completion timestamps and consistency window;
+and exact `Tables`/`Files` directory and file pins (length, hash and ETag). Confirm that captured
+paths were independently verified as local source data. The form does not manufacture this
+qualification or a file inventory. Use the provider's healthy-source capture output.
+The provider's `capture_lakehouse` helper can produce the exact pins during an approved
+healthy-source preparation step. It is not an automatically scheduled data-capture command:
+the product's metadata synchronization does not invoke it or export business data implicitly.
+An external preparation workflow must capture and retain the approved snapshot and descriptor
+before supplying that descriptor through the configuration form or CLI.
+
+This descriptor uses no portable-file `storage` record and no KQL materialized inputs.
+The real provider streams the approved pinned global-OneLake bytes into a fresh owned
+destination Lakehouse and records byte-copy results. Copied bytes are **not** proof of Delta
+consistency, endpoint availability, consumer bindings or readiness. Metadata and fresh target
+data/engine/access evidence are still required before cutover. It is distinct from a retained-source
+shortcut: consumers must ultimately use the owned materialized destination, not the original.
+
 **Fabric SQL native backups restore within the same workspace only, and have no
 geo-replicated backup copy.** They are not cross-region recovery inputs. See the
 [SQL database backup limitations](https://learn.microsoft.com/en-us/fabric/database/sql/backup#limitations).
@@ -187,6 +228,28 @@ Retain the original source identities and backing data for as long as those bind
 works against a healthy primary is not evidence of native replica routing during a real
 regional outage. Independent writable recovery must use validated destination-owned data
 or an approved independent standby and self-contained compute bindings.
+
+### Qualified temporary Lakehouse attachments
+
+**Configure qualified temporary attachments** requires a pinned captured generation, exact
+source Lakehouse and paths, existing target consumer identity, destination shortcut path/name,
+and an independent incident qualification with a validity window. Each attachment also needs
+the exact binding hash and independently verified caller access evidence. The enforcement
+reference must agree with the binding evidence; neither a checked attestation nor an
+automatically computed hash proves read-only access.
+
+The backend supports the qualified caller access mode here, not an inferred owner/delegated
+SQL or Direct Lake access mode. It checks exact path coverage and known source-write access.
+Loose root files and unqualified paths must use independent copying or remain missing;
+do not replace them with an invented `Files/recovered` attachment.
+
+Configure first, then explicitly **Enable recovery** for the selected groups. The backend
+creates the exact qualified attachments and reports `temporary_attached`, not ready.
+Capture fresh post-attachment engine, data, reference and effective-access observations.
+Keep original data and identities until all consumers have independent replacements.
+To renew expired evidence, supply the existing configuration hash; renewal cannot change
+the approved source/target/path/principal scope. This remains incident-qualified temporary
+continuity, never a general claim that native replica outage behavior has been demonstrated.
 
 ## Noninteractive operations
 
@@ -210,7 +273,8 @@ Alternatively inject `FAB_SHUFFLE_BCDR_CLIENT_SECRET_FILE` pointing to an extern
 secret file instead of `FAB_SHUFFLE_BCDR_CLIENT_SECRET`. Supplying both is rejected.
 There are no secret command-line options and no stored password configuration.
 
-Commands are `setup`, `status`, `plan`, `synchronize`, `configure-protection`, `enable-recovery`,
+Commands are `setup`, `status`, `reconcile-operation`, `plan`, `synchronize`,
+`configure-protection`, `configure-replica`, `enable-recovery`,
 `cutover`, `plan-failback`, `execute-failback`, `cutback`, and `rearm`. Supply typed JSON through standard input or
 `--request /controller/request.json`. Generate the actual request schema without
 credentials using, for example:
@@ -239,6 +303,12 @@ Every consequential command requires `--confirm` followed by that exact action n
 `--confirm synchronize` cannot confirm `enable-recovery`. Backend mode checks still refuse
 normal synchronization during enabled recovery; a scheduler cannot override them.
 
+Use `reconcile-operation --confirm reconcile-operation` with the recorded operation/controller
+IDs and fencing evidence. Use `configure-replica --confirm configure-replica` for independently
+qualified temporary attachments. Both accept `--request` or standard input, use the same real
+service as the wizard, and do not supply a source metadata provider. Neither command starts
+production or grants readiness.
+
 Results are JSON on standard output. The service's aggregate `exit_code` is returned:
 `0` for success and `2` for partial/blocked results. Validation also exits `2`; credential,
 filesystem and service failures exit nonzero with an actionable error on standard error.
@@ -257,7 +327,8 @@ above as `/api/bcdr/<command>`, for example `/api/bcdr/enable-recovery`.
 of status or any recovery action.
 
 The POST paths are `/api/bcdr/setup`, `/api/bcdr/plan`, `/api/bcdr/synchronize`,
-`/api/bcdr/configure-protection`, `/api/bcdr/enable-recovery`, `/api/bcdr/cutover`,
+`/api/bcdr/reconcile-operation`, `/api/bcdr/configure-protection`, `/api/bcdr/configure-replica`,
+`/api/bcdr/enable-recovery`, `/api/bcdr/cutover`,
 `/api/bcdr/plan-failback`, `/api/bcdr/execute-failback`, `/api/bcdr/cutback`, and
 `/api/bcdr/rearm`.
 
@@ -275,6 +346,13 @@ Fence every external writer and event producer on the appropriate side. A Fabric
 an application lock or a checked box is not proof that a writer has stopped. Record who
 confirmed fencing, the current writer epoch, the evidence and its validity interval.
 Keep readiness observations distinct from operator attestations.
+Readiness records bind the generation, current writer epoch, target content hash, authenticated
+recovery-principal issuer and the actual intended runtime principal set. The UI pins the issuer,
+generation and observed writer epoch from the backend **readiness context**; it never fills in
+effective-access checks on their behalf. During failback this evidence generation can differ from
+the original failover generation shown for lineage. Missing context blocks the form instead of
+falling back to the original generation or guessing an epoch.
+Evidence from another generation, writer epoch, issuer or stale target must be collected again.
 
 Prefer newly created return targets and review DR-side data, schema, security, expiration
 and ingestion changes. Conflicting writes on both sides require explicit reconciliation,

@@ -16,6 +16,10 @@ import pytest
     "signout_ignores_late_errors",
     "capacity_state_is_not_inferred_from_mode",
     "returning_to_migration_cannot_discover_for_a_new_session",
+    "reconciliation_pins_controller_not_writer_epoch", "reconciliation_confirmation_uses_exact_action",
+    "readiness_pins_issuer_generation_and_writer", "qualification_is_not_generated_by_defaults",
+    "missing_readiness_context_never_uses_lineage_generation",
+    "temporary_attachment_retains_source_and_is_not_ready",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")
