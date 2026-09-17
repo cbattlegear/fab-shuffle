@@ -387,7 +387,7 @@ class WarehouseCatalog(RecoveryCatalog):
             self._require_drained(cursor)
             cursor.execute("UPDATE bcdr.control SET controller_id = NULL WHERE singleton = 1")
 
-        self._transaction(lease, release, allowed_modes={RecoveryMode.STANDBY})
+        self._transaction(lease, release, allowed_modes=set(RecoveryMode) - {RecoveryMode.PARKING})
 
     def transition_mode(
         self, lease: ControllerLease, expected: RecoveryMode, desired: RecoveryMode, operation_id: str,

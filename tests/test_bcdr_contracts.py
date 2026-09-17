@@ -221,6 +221,9 @@ def test_retained_source_reference_requires_scoped_verified_read_only_contract()
         RecoveryDataBinding(**fields)
     fields["qualification"] = Qualification.VERIFIED
     assert RecoveryDataBinding(**fields).source == source
+    fields["consumer"] = source.model_copy(update={"item_id": guid()})
+    with pytest.raises(ValidationError, match="distinct same-tenant"):
+        RecoveryDataBinding(**fields)
 
 
 @pytest.mark.parametrize("value", [
