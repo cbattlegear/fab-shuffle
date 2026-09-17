@@ -17,6 +17,7 @@ from fabshuffle.bcdr.bootstrap import (
     WorkspacePrincipal,
 )
 from fabshuffle.bcdr.capacity import ArmCapacityClient, CapacityCoordinator, PauseProof
+from fabshuffle.bcdr.capture import capture_list, item_document
 from fabshuffle.bcdr.contracts import (
     ControllerLease,
     ItemIdentity,
@@ -220,12 +221,13 @@ class CatalogPauseGuard:
         active_groups = self.runtime.catalog.list_records("groups")
         if any(row.document["group"]["active"] for row in active_groups):
             raise RecoveryBlocked("Recovery still serves an active group; do not pause its capacity")
-        expected_items = {row.target.item_id for row in self.runtime.catalog.applied_items()}
-        expected_items.add(config.control_warehouse.item_id)
+        owned = {row.target.key for row in self.runtime.catalog.applied_items()}
+        owned.add(config.control_warehouse.key)
         for capacity in descriptor.capacities:
             # The accessible-workspace list is insufficient to prove a capacity hosts no unrelated resources.
             # Learn admin/workspaces/list-workspaces documents this capacity filter and response key.
-            workspaces = self.capacities.client.list_all(
+            workspaces = capture_list(
+                self.capacities.client,
                 "admin/workspaces",
                 params={"capacityId": capacity.fabric_capacity_id, "state": "Active"},
                 value_key="workspaces",
@@ -239,8 +241,39 @@ class CatalogPauseGuard:
                         f"Capacity {capacity.fabric_capacity_id} hosts unowned workspace "
                         f"{workspace.get('id')}; move it off the dedicated recovery capacity before parking"
                     )
-                for item in self.capacities.client.list_all(f"workspaces/{workspace['id']}/items"):
-                    if item.get("id") not in expected_items:
+                inventory = capture_list(self.capacities.client, f"workspaces/{workspace['id']}/items")
+                derived = set()
+                for parent in inventory:
+                    identity = ItemIdentity(
+                        tenant_id=config.tenant_id,
+                        workspace_id=workspace["id"],
+                        item_id=parent["id"],
+                    )
+                    if identity.key not in owned or parent.get("type") not in {
+                        "Lakehouse",
+                        "Warehouse",
+                        "SQLDatabase",
+                        "MirroredDatabase",
+                    }:
+                        continue
+                    current = item_document(self.capacities.client, identity, parent["type"])
+                    if current.get("workspaceId", workspace["id"]) != workspace["id"]:
+                        raise RecoveryBlocked(
+                            "Owned parent metadata returned a different workspace before parking"
+                        )
+                    endpoint = (current.get("properties") or {}).get("sqlEndpointProperties") or {}
+                    if endpoint.get("id"):
+                        derived.add(str(UUID(endpoint["id"])))
+                for item in inventory:
+                    identity = ItemIdentity(
+                        tenant_id=config.tenant_id,
+                        workspace_id=workspace["id"],
+                        item_id=item["id"],
+                    )
+                    if identity.key not in owned and not (
+                        item.get("type") in {"SQLEndpoint", "SqlAnalyticsEndpoint"}
+                        and identity.item_id in derived
+                    ):
                         raise RecoveryBlocked(
                             f"Workspace {workspace['id']} contains untracked item {item.get('id')}; "
                             "reconcile its ownership and activity before parking"

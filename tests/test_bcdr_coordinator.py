@@ -33,6 +33,7 @@ from fabshuffle.bcdr.service import (
 )
 from fabshuffle.bcdr.warehouse_catalog import WarehouseCatalog
 from fabshuffle.fabric.client import FabricClient
+from tests import test_bcdr_protection_lakehouse as lakehouse_cases
 from tests.test_bcdr_contracts import guid, recovery_set, snapshot
 from tests.test_bcdr_warehouse_catalog import SqlHarness
 
@@ -73,6 +74,7 @@ class Estate:
         self.lost_create = False
         self.unexpected_item_grant = None
         self.operation_results = {}
+        self.shortcuts = {}
 
     def handler(self, request):
         path = request.url.path.removeprefix("/v1/")
@@ -80,6 +82,41 @@ class Estate:
         import json
 
         body = json.loads(request.content) if request.content else {}
+        if "/shortcuts" in path:
+            parts = path.split("/")
+            identifier = parts[3]
+            shortcuts = self.shortcuts.setdefault(identifier, [])
+            if request.method == "POST":
+                assert request.url.params["shortcutConflictPolicy"] == "Abort"
+                shortcuts.append(body)
+                return httpx.Response(201, json=body)
+            if path.endswith("/shortcuts"):
+                return httpx.Response(200, json={"value": shortcuts})
+            key = "/".join(parts[5:])
+            match = next(row for row in shortcuts if f"{row['path']}/{row['name']}" == key)
+            return httpx.Response(200, json=match)
+        if "/lakehouses/" in path and request.method == "GET":
+            return httpx.Response(200, json=self.items[path.split("/")[-1]])
+        if path.startswith("connections/") and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": path.split("/")[1],
+                    "connectionDetails": {"type": "Web", "path": "https://external.example"},
+                },
+            )
+        if path.endswith("/jobs/instances") and request.method == "GET":
+            return httpx.Response(200, json={"value": []})
+        if path.endswith("/getDefinition"):
+            return httpx.Response(
+                200,
+                json={
+                    "definition": self.items[path.split("/")[3]].get("definition", {"parts": []}),
+                },
+            )
+        if path.endswith("/updateDefinition"):
+            self.items[path.split("/")[3]]["definition"] = body["definition"]
+            return httpx.Response(200, json={})
         if path.startswith("operations/"):
             identifier = path.split("/")[1]
             return httpx.Response(
@@ -173,8 +210,10 @@ class Estate:
 
 
 @pytest.fixture
-def system(tmp_path, monkeypatch):
+def system(tmp_path, monkeypatch, request):
     config = recovery_set()
+    if getattr(request, "param", {}).get("catalog_separate"):
+        config = config.model_copy(update={"target_capacity_ids": (*config.target_capacity_ids, guid())})
     harness = SqlHarness(tmp_path / "catalog.db")
     catalog = WarehouseCatalog(harness.connect, config, sleep=Mock())
     catalog.initialize()
@@ -182,6 +221,7 @@ def system(tmp_path, monkeypatch):
     tokens = Mock()
     tokens.token.return_value = "unit-test"
     tokens.tenant_id.return_value = config.tenant_id
+    tokens.object_id.return_value = config.access_policy.recovery_spn.object_id
     tokens.principal.client_id = guid()
     client = FabricClient(tokens, transport=httpx.MockTransport(estate.handler))
     captured = snapshot(config)
@@ -256,7 +296,7 @@ def system(tmp_path, monkeypatch):
         capacity_routes=(
             CapacityRoute(
                 source_capacity_id=config.source_capacity_ids[0],
-                target_capacity_id=config.target_capacity_ids[0],
+                target_capacity_id=config.target_capacity_ids[-1],
             ),
         ),
         park=False,
@@ -278,15 +318,24 @@ def system(tmp_path, monkeypatch):
 
 
 def proofs(system, generation_id):
+    generation = system.catalog.load_generation(generation_id)
+    groups = system.c._groups(generation_id)
+    writer = system.c.runtime.get("lifecycle", "writer") or {"epoch": 0}
     return tuple(
         ItemReadiness(
             source=row.source,
             target=row.target,
+            generation_id=generation_id,
+            writer_epoch=writer["epoch"],
+            issuer=system.config.access_policy.recovery_spn,
             target_observed_sha256=system.observed[row.target.key],
             data_verified=True,
             references_verified=True,
             security_verified=True,
-            effective_principals=(system.config.access_policy.recovery_spn,),
+            effective_principals=system.c.intended_runtime_principals(
+                generation,
+                next(group for group in groups if row.source in group.items),
+            ),
             evidence="operator-query-run-42",
             observed_at=now() - timedelta(seconds=1),
             valid_until=now() + timedelta(hours=1),
@@ -627,6 +676,53 @@ def test_production_pause_refuses_untracked_item(system, tmp_path, monkeypatch):
         with pytest.raises(RecoveryBlocked, match="untracked item"):
             capacities.park(system.c.runtime, (workspace,))
     assert not any(method == "POST" for method, _ in state["calls"])
+    capacities.close()
+
+
+@pytest.mark.parametrize("owned_endpoint", [False, True])
+def test_parking_accepts_only_exact_owned_lakehouse_derived_endpoint(
+    system,
+    tmp_path,
+    monkeypatch,
+    owned_endpoint,
+):
+    source = system.captured.items[0].model_copy(update={"item_type": "Lakehouse"})
+    model = source.model_copy(
+        update={
+            "identity": source.identity.model_copy(update={"item_id": guid()}),
+            "item_type": "SemanticModel",
+            "display_name": "Independent former-default model",
+        }
+    )
+    captured = system.captured.model_copy(update={"items": (source, model)})
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(captured, ())
+    result = system.service.synchronize(system.request)
+    assert all(group.metadata_applied for group in result.groups)
+    mappings = system.c.item_mappings()
+    parent = mappings[source.identity.key].target
+    endpoint = guid()
+    system.estate.items[parent.item_id]["properties"] = {
+        "sqlEndpointProperties": {
+            "id": endpoint,
+            "connectionString": "owned.sql",
+            "provisioningStatus": "Success",
+        },
+    }
+    raw_id = endpoint if owned_endpoint else guid()
+    system.estate.items[raw_id] = {
+        "id": raw_id,
+        "workspaceId": parent.workspace_id,
+        "type": "SQLEndpoint",
+    }
+    capacities, _, state = production_capacities(system, tmp_path, monkeypatch)
+    with system.c.runtime.controller({RecoveryMode.STANDBY}):
+        if owned_endpoint:
+            capacities.park(system.c.runtime, tuple(system.c.workspace_mappings().values()))
+            assert state["value"] == "Suspended"
+        else:
+            with pytest.raises(RecoveryBlocked, match="untracked item"):
+                capacities.park(system.c.runtime, tuple(system.c.workspace_mappings().values()))
+            assert state["value"] == "Active"
     capacities.close()
 
 
@@ -1042,3 +1138,486 @@ def test_deferred_schedule_stays_stopped_without_blocking_acl_admission(system):
     result = enable(system)
     assert result.groups[0].access_enabled
     assert not any("jobs" in path for _, path in system.estate.calls)
+
+
+def test_blocked_group_can_enable_after_another_group_cutover(system):
+    second = snapshot(system.config)
+    capture = system.captured.model_copy(
+        update={
+            "workspaces": (*system.captured.workspaces, *second.workspaces),
+            "items": (*system.captured.items, *second.items),
+        }
+    )
+    system.c.capture = Mock(return_value=CapturedGeneration(capture, ()))
+    synced = system.service.synchronize(system.request)
+    evidence = proofs(system, synced.generation_id)
+    enabled = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=tuple(row.group_id for row in synced.groups),
+            readiness=(evidence[0],),
+        )
+    )
+    first = next(row for row in enabled.groups if row.access_enabled)
+    blocked = next(row for row in enabled.groups if not row.access_enabled)
+    system.service.cutover(
+        CutoverRequest(
+            generation_id=synced.generation_id,
+            group_ids=(first.group_id,),
+            readiness=proofs(system, synced.generation_id),
+            writer_fence=fence(),
+        )
+    )
+    writes = [row for row in system.estate.calls if row[0] != "GET"]
+    result = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(blocked.group_id,),
+            readiness=proofs(system, synced.generation_id),
+        )
+    )
+    assert result.mode == RecoveryMode.ACTIVE_RECOVERY
+    assert result.groups[0].access_enabled
+    assert next(
+        row for row in system.c._groups(synced.generation_id) if row.group_id == first.group_id
+    ).active
+    assert writes == [row for row in system.estate.calls if row[0] != "GET"]
+    assert system.c.capture.call_count == 1
+
+
+@pytest.mark.parametrize("invalid_field", ["generation_id", "writer_epoch", "issuer", "effective_principals"])
+def test_readiness_is_generation_epoch_issuer_and_runtime_bound(system, invalid_field):
+    first = system.service.synchronize(system.request)
+    old = proofs(system, first.generation_id)[0]
+    second = system.service.synchronize(system.request)
+    good = proofs(system, second.generation_id)[0]
+    stranger = system.config.access_policy.recovery_spn.model_copy(update={"object_id": guid()})
+    replacements = {
+        "generation_id": old.generation_id,
+        "writer_epoch": good.writer_epoch + 1,
+        "issuer": stranger,
+        "effective_principals": (stranger,),
+    }
+    result = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=second.generation_id,
+            group_ids=(second.groups[0].group_id,),
+            readiness=(good.model_copy(update={invalid_field: replacements[invalid_field]}),),
+        )
+    )
+    assert not result.groups[0].access_enabled
+    assert result.groups[0].blockers
+
+
+@pytest.mark.parametrize("reuse_external", [False, True])
+def test_exact_lro_reconciliation_replays_pinned_routes_with_real_adapter(system, reuse_external):
+    from fabshuffle.bcdr.adapters import apply_captured_item, observe_target
+    from fabshuffle.bcdr.capture import make_payload
+    from fabshuffle.bcdr.contracts import ConnectionIdentity, PayloadPurpose
+    from fabshuffle.bcdr.service import ConnectionRoute, ReconcileOperationRequest
+    from fabshuffle.fabric.client import OperationTimeout
+    from fabshuffle.fabric.definitions import decode_json_part
+
+    source = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    target = source if reuse_external else source.model_copy(update={"connection_id": guid()})
+    item = system.captured.items[0]
+    payload = make_payload(
+        item.identity,
+        "definition.json",
+        canonical_json({"connectionId": source.connection_id}),
+        PayloadPurpose.DEFINITION,
+    )
+    item = item.model_copy(
+        update={
+            "payload_ids": (payload.descriptor.payload_id,),
+            "properties": {"bcdr": {"connections": [{"id": source.connection_id}]}},
+        }
+    )
+    generation = system.captured.model_copy(
+        update={
+            "items": (item,),
+            "payloads": (payload.descriptor,),
+            "dependencies": (
+                DependencyEdge(
+                    edge_id=guid(),
+                    consumer=item.identity,
+                    prerequisite=source,
+                    phase="bind",
+                    provenance="definition",
+                    detail="Use an independently approved connection",
+                ),
+            ),
+        }
+    )
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(generation, (payload,))
+    service_id = guid()
+    original_request = system.c.destination.client.request
+
+    def accepted(method, path, **kwargs):
+        response = original_request(method, path, **kwargs)
+        if method == "POST" and path.endswith("/items"):
+            system.estate.operation_results[service_id] = response.json()
+            return httpx.Response(202, headers={"x-ms-operation-id": service_id}, request=response.request)
+        return response
+
+    system.c.destination.client.request = accepted
+
+    def interrupted(client, item, payloads, **kwargs):
+        client.request(
+            "POST",
+            f"workspaces/{kwargs['target_workspace'].workspace_id}/items",
+            json={"type": "Notebook", "displayName": item.display_name},
+        )
+        raise OperationTimeout("interrupted before target metadata binding")
+
+    system.c.apply = interrupted
+    with pytest.raises(RecoveryBlocked, match="reconcile"):
+        system.service.synchronize(
+            system.request.model_copy(
+                update={
+                    "connection_mappings": (
+                        ConnectionRoute(source=source, target=target, evidence="approved"),
+                    ),
+                }
+            )
+        )
+    operation = system.catalog.pending_operations()[0]
+    state = system.catalog.state()
+    system.c.destination.client.request = original_request
+    system.c.apply = apply_captured_item
+    system.c.observe = observe_target
+    system.c.source = None
+    result = system.service.reconcile_operation(
+        ReconcileOperationRequest(
+            operation_id=operation.operation_id,
+            expected_controller_id=state.controller_id,
+            expected_epoch=state.epoch,
+            previous_controller_stopped=True,
+            fencing_evidence="previous worker stopped",
+            target_quiescence_evidence="target scheduler fenced",
+        )
+    )
+    definition = next(iter(system.estate.items.values()))["definition"]["parts"][0]
+    assert decode_json_part(definition["payload"])["connectionId"] == target.connection_id
+    assert len(system.estate.items) == 1
+    assert result.details["applied"]["target"]["item_id"] == next(iter(system.estate.items))
+
+
+def configured_replica(system):
+    from fabshuffle.bcdr.contracts import AclScope, DesiredAcl, Principal, RecoveryDataBinding
+    from fabshuffle.bcdr.replica import ReplicaAccessEvidence, binding_digest
+    from fabshuffle.bcdr.service import ConfigureReplicaRequest, ReplicaAttachment
+
+    source = system.captured.items[0]
+    metadata = {
+        "schema_enabled": False,
+        "schemas": [{"name": "dbo"}],
+        "files_inventory": [],
+        "shortcuts": [],
+        "tables": [
+            {
+                "name": "orders",
+                "schema_name": "dbo",
+                "data_source_format": "DELTA",
+                "storage_location": (
+                    f"https://onelake.dfs.fabric.microsoft.com/{source.identity.workspace_id}/"
+                    f"{source.identity.item_id}/Tables/orders"
+                ),
+            }
+        ],
+    }
+    runtime_principal = Principal(tenant_id=source.identity.tenant_id, object_id=guid(), kind="User")
+    grant = DesiredAcl(
+        acl_id=guid(),
+        scope=AclScope.WORKSPACE,
+        workspace=system.captured.workspaces[0].identity,
+        principal=runtime_principal,
+        permission="Viewer",
+        provenance="captured reader",
+    )
+    item = source.model_copy(update={"item_type": "Lakehouse", "properties": {"bcdr": metadata}})
+    captured = system.captured.model_copy(update={"items": (item,), "desired_acls": (grant,)})
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(captured, ())
+    result = system.service.synchronize(system.request)
+    applied = system.c.item_mappings()[item.identity.key]
+    old_observe = system.c.observe
+
+    def observed(client, target, item_type):
+        shortcuts = system.estate.shortcuts.get(target.item_id, [])
+        return (
+            digest(canonical_json({"shortcuts": shortcuts}))
+            if shortcuts
+            else old_observe(client, target, item_type)
+        )
+
+    system.c.observe = observed
+    system.c.replica.observe = observed
+    binding = RecoveryDataBinding(
+        generation_id=result.generation_id,
+        source=item.identity,
+        source_path="Tables/orders",
+        consumer=applied.target,
+        strategy="temporary_continuity",
+        qualification="verified",
+        read_only_verified=True,
+        retention_acknowledged=True,
+        evidence="external-read-only-enforcement",
+    )
+    request = ConfigureReplicaRequest(
+        generation_id=result.generation_id,
+        source=item.identity,
+        attachments=(
+            ReplicaAttachment(
+                binding=binding,
+                shortcut_path="Tables",
+                shortcut_name="orders",
+                access_evidence=ReplicaAccessEvidence(
+                    qualification_id=guid(),
+                    binding_sha256=binding_digest(binding),
+                    principal=runtime_principal,
+                    verified_at=now(),
+                    valid_until=now() + timedelta(hours=1),
+                    enforcement_reference=binding.evidence,
+                ),
+            ),
+        ),
+        qualified_at=now(),
+        valid_until=now() + timedelta(hours=1),
+        qualification_evidence="incident caller-only qualification",
+    )
+    return result, request, grant
+
+
+def current_replica_proofs(system, generation_id):
+    return tuple(
+        row.model_copy(
+            update={
+                "target_observed_sha256": system.c.observe(system.c.destination, row.target, "Lakehouse"),
+                "observed_at": now(),
+            }
+        )
+        for row in proofs(system, generation_id)
+    )
+
+
+def test_configure_and_enable_real_replica_attachment_requires_fresh_runtime_proof(system):
+    synced, configured, grant = configured_replica(system)
+    before = list(system.estate.calls)
+    config_result = system.service.configure_replica(configured)
+    assert not config_result.details["data_ready"]
+    assert before == system.estate.calls
+    system.c.source = None
+    first = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(synced.groups[0].group_id,),
+            approved_acl_ids=(grant.acl_id,),
+            readiness=proofs(system, synced.generation_id),
+        )
+    )
+    assert not first.groups[0].access_enabled
+    attachments = first.details["temporary_attachments"][0]
+    assert not attachments["data_ready"] and not attachments["endpoint_ready"]
+    assert sum(len(rows) for rows in system.estate.shortcuts.values()) == 1
+    proof = current_replica_proofs(system, synced.generation_id)
+    enabled = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(synced.groups[0].group_id,),
+            approved_acl_ids=(grant.acl_id,),
+            readiness=proof,
+        )
+    )
+    assert enabled.groups[0].access_enabled
+    assert (
+        len(
+            [path for method, path in system.estate.calls if method == "POST" and path.endswith("/shortcuts")]
+        )
+        == 1
+    )
+    cutover = system.service.cutover(
+        CutoverRequest(
+            generation_id=synced.generation_id,
+            group_ids=(synced.groups[0].group_id,),
+            readiness=current_replica_proofs(system, synced.generation_id),
+            writer_fence=fence(),
+        )
+    )
+    assert cutover.groups[0].active
+    assert system.c.runtime.get("lifecycle", "writer")["access_mode"] == "read_only"
+    assert not any(configured.source.workspace_id in path for _, path in system.estate.calls)
+
+
+@pytest.mark.parametrize("invalid", ["target", "expired", "binding-hash", "path-alias", "wrong-principal"])
+def test_replica_configuration_rejects_unqualified_scope_without_mutations(system, invalid):
+    from fabshuffle.bcdr.replica import ReplicaAttachmentError
+
+    _, request, _ = configured_replica(system)
+    entry = request.attachments[0]
+    if invalid == "target":
+        entry = entry.model_copy(
+            update={
+                "binding": entry.binding.model_copy(
+                    update={
+                        "consumer": entry.binding.consumer.model_copy(update={"item_id": guid()}),
+                    }
+                )
+            }
+        )
+    elif invalid == "expired":
+        request = request.model_copy(update={"valid_until": now() - timedelta(seconds=1)})
+    elif invalid == "binding-hash":
+        entry = entry.model_copy(
+            update={
+                "access_evidence": entry.access_evidence.model_copy(
+                    update={
+                        "binding_sha256": digest(b"wrong binding"),
+                    }
+                )
+            }
+        )
+    elif invalid == "path-alias":
+        entry = entry.model_copy(update={"shortcut_name": "not-orders"})
+    else:
+        entry = entry.model_copy(
+            update={
+                "access_evidence": entry.access_evidence.model_copy(
+                    update={
+                        "principal": system.config.access_policy.recovery_spn,
+                    }
+                )
+            }
+        )
+        # No captured read-only enforcement for a source workspace administrator.
+        request = request.model_copy(update={"qualified_at": now()})
+    request = request.model_copy(update={"attachments": (entry,)})
+    before = list(system.estate.calls)
+    if invalid == "wrong-principal":
+        # Admission still needs the intended business readers, not merely a qualified operator.
+        system.service.configure_replica(request)
+        synced = system.c._groups(request.generation_id)[0]
+        result = system.service.enable_recovery(
+            EnableRecoveryRequest(
+                generation_id=request.generation_id,
+                group_ids=(synced.group_id,),
+                readiness=proofs(system, request.generation_id),
+            )
+        )
+        assert not result.groups[0].access_enabled
+    else:
+        with pytest.raises((RecoveryBlocked, ReplicaAttachmentError)):
+            system.service.configure_replica(request)
+        assert before == system.estate.calls
+        assert not system.catalog.pending_operations()
+
+
+@pytest.fixture
+def lakehouse_setup(monkeypatch):
+    return lakehouse_cases.setup.__wrapped__(monkeypatch)
+
+
+def test_independent_lakehouse_real_copy_finalizes_metadata_then_requires_new_proof(
+    system,
+    lakehouse_setup,
+    tmp_path,
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    from fabshuffle.bcdr.protection import DataIdentity
+    from fabshuffle.bcdr.protection_binding import (
+        ConfigureProtectionRequest,
+        ProtectionConfiguration,
+        build_data_recovery,
+    )
+    from tests import test_bcdr_protection_lakehouse as lake_tests
+
+    lake, template = lakehouse_setup
+    source = system.captured.items[0].model_copy(
+        update={
+            "item_type": "Lakehouse",
+            "properties": {"defaultSchema": "dbo"},
+        }
+    )
+    captured = system.captured.model_copy(update={"items": (source,)})
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(captured, ())
+    point = captured.captured_at - timedelta(minutes=1)
+    descriptor = template.model_copy(
+        update={
+            "source": DataIdentity(
+                source.identity.tenant_id, source.identity.workspace_id, source.identity.item_id
+            ),
+            "captured_at": point,
+            "completed_at": point,
+            "consistency": replace(
+                template.consistency,
+                verified_at=point - timedelta(minutes=1),
+                valid_until=now() + timedelta(hours=1),
+            ),
+        }
+    )
+    system.service.configure_protection(
+        ConfigureProtectionRequest(
+            source=source.identity,
+            configuration=ProtectionConfiguration(
+                provider="lakehouse",
+                descriptor=descriptor,
+                max_age_seconds=86400,
+                target_approval_ref="fresh-owned",
+            ),
+        )
+    )
+    original_apply = system.c.apply
+    modes = []
+
+    def applying(client, item, payloads, **kwargs):
+        modes.append(kwargs.get("shell_only", False))
+        result = original_apply(client, item, payloads, **kwargs)
+        system.estate.items[result.applied.target.item_id]["properties"] = {"defaultSchema": "dbo"}
+        return replace(result, metadata_applied=not kwargs.get("shell_only", False))
+
+    system.c.apply = applying
+    synced = system.service.synchronize(system.request)
+    assert not synced.groups[0].metadata_applied and modes == [True]
+    target = system.c.item_mappings()[source.identity.key].target
+    system.estate.workspaces[target.workspace_id]["capacityRegion"] = "West US"
+    monkeypatch.setattr(lake_tests, "SOURCE", source.identity)
+    monkeypatch.setattr(lake_tests, "TARGET", target)
+    system.c.data_recovery = build_data_recovery(
+        client=system.c.destination,
+        tokens=system.c.tokens,
+        protected_root=None,
+        scratch=tmp_path,
+        limits=lake_tests.LIMITS,
+    )
+    system.c.source = None
+    first = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(synced.groups[0].group_id,),
+            readiness=proofs(system, synced.generation_id),
+        )
+    )
+    assert not first.groups[0].access_enabled
+    assert {key: bytes(value) for key, value in lake.target.items()} == lake_tests.CONTENT
+    assert modes == [True, False]
+    prepared = system.c.runtime.get("data-prepared", f"{synced.generation_id}/{source.identity.key}")
+    assert prepared["byte_copy_complete"] and not prepared["data_ready"] and not prepared["endpoint_ready"]
+    writes = len(lake.writes)
+    postcopy = tuple(
+        proof.model_copy(update={"observed_at": now()}) for proof in proofs(system, synced.generation_id)
+    )
+    second = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(synced.groups[0].group_id,),
+            readiness=postcopy,
+        )
+    )
+    assert second.groups[0].access_enabled
+    assert len(lake.writes) == writes
+    assert all(
+        request.method in ("GET", "HEAD")
+        for request in lake.calls
+        if source.identity.workspace_id in request.url.path
+    )
