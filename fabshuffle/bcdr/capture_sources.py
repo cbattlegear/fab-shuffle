@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
@@ -14,12 +16,33 @@ import httpx
 from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
 
 from fabshuffle.auth import TokenProvider
-from fabshuffle.bcdr.contracts import ItemIdentity, logical_path
+from fabshuffle.bcdr.contracts import ItemIdentity, logical_path, reject_embedded_secrets
 from fabshuffle.fabric.client import FabricApiError, FabricError
 from fabshuffle.transfer import sqlschema
 
 MAX_METADATA_BYTES = 64 * 1024 * 1024
 MAX_METADATA_ROWS = 100_000
+
+
+def inspect_schema_archive(data: bytes) -> dict[str, bytes]:
+    """Bound decompression and inspect credentials before cataloging an opaque DACPAC."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        entries = archive.infolist()
+        names = [entry.filename for entry in entries]
+        if len(names) != len(set(names)) or "model.xml" not in names:
+            raise FabricError("Captured DACPAC needs one model.xml and unique archive members")
+        if len(entries) > 10_000 or sum(entry.file_size for entry in entries) > MAX_METADATA_BYTES:
+            raise FabricError("Expanded DACPAC exceeds the metadata inspection budget")
+        inspected: dict[str, bytes] = {}
+        for entry in entries:
+            content = archive.read(entry)
+            reject_embedded_secrets(content)
+            if entry.filename.lower().endswith((".xml", ".sql")):
+                if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+                    content = content.decode("utf-16").encode("utf-8")
+                reject_embedded_secrets(content)
+                inspected[entry.filename] = content
+        return inspected
 
 
 class MetadataReaders:
