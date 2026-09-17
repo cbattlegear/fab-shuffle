@@ -35,16 +35,23 @@ class FailbackController:
         self.coordinator = coordinator
         self.runtime = coordinator.runtime
 
-    def _return_coordinator(self, plan_id: str) -> RecoveryCoordinator:
+    def _return_coordinator(
+        self,
+        plan_id: str,
+        routes: tuple[CapacityRoute, ...] | None = None,
+    ) -> RecoveryCoordinator:
         from fabshuffle.bcdr.coordinator import RecoveryCoordinator
 
         original = self.coordinator
         config = original.recovery_set
+        if routes is None:
+            record = self._record(plan_id)
+            routes = PlanRequest.model_validate(record["request"]).capacity_routes
         reverse_config = RecoverySet.model_validate(
             {
                 **config.model_dump(),
-                "source_capacity_ids": config.target_capacity_ids,
-                "target_capacity_ids": config.source_capacity_ids,
+                "source_capacity_ids": tuple(sorted({route.source_capacity_id for route in routes})),
+                "target_capacity_ids": tuple(sorted({route.target_capacity_id for route in routes})),
             }
         )
         coordinator = RecoveryCoordinator(
@@ -63,6 +70,7 @@ class FailbackController:
         coordinator.runtime = original.runtime
         coordinator.destination.runtime = original.runtime
         coordinator.access.runtime = original.runtime
+        coordinator.replica.runtime = original.runtime
         return coordinator
 
     def plan(self, request: FailbackRequest) -> ServiceResult:
@@ -76,19 +84,55 @@ class FailbackController:
                 raise RecoveryBlocked(
                     "Confirm primary availability with evidence and provide primary credentials"
                 )
+            applied = c.item_mappings()
+            targets = tuple(applied[item.key].target for group in groups for item in group.items)
+            failover = c.catalog.load_generation(request.generation_id)
+            selected_workspaces = {
+                "/".join(item.key.split("/")[:2]) for group in groups for item in group.items
+            }
+            selected_primary_capacities = {
+                row.capacity_id
+                for row in failover.snapshot.workspaces
+                if row.identity.key in selected_workspaces
+            }
             observations = []
-            for identifier in c.recovery_set.source_capacity_ids:
+            for identifier in sorted(selected_primary_capacities):
                 capacity = get_capacity(c.source, identifier)
                 if capacity.get("state") != "Active":
                     raise RecoveryBlocked(
                         f"Resume and verify original capacity {identifier} before planning failback"
                     )
                 observations.append({"capacity_id": identifier, "state": capacity["state"]})
-            applied = c.item_mappings()
-            targets = tuple(applied[item.key].target for group in groups for item in group.items)
-            self.runtime.transition(RecoveryMode.FAILING_BACK)
+            stored_request = self.runtime.get("plans", request.generation_id)
+            if stored_request is None:
+                raise RecoveryBlocked("The failover generation has no persisted capacity placement plan")
+            forward = PlanRequest.model_validate(
+                {key: value for key, value in stored_request.items() if key not in {"capture", "park"}}
+            )
+            capacity_destinations = {}
+            for route in forward.capacity_routes:
+                if route.source_capacity_id not in selected_primary_capacities:
+                    continue
+                if (
+                    route.target_capacity_id in capacity_destinations
+                    and capacity_destinations[route.target_capacity_id] != route.source_capacity_id
+                ):
+                    raise RecoveryBlocked(
+                        "Selected original capacities share recovery compute; approve an explicit "
+                        "per-workspace return plan rather than guessing a reverse capacity map"
+                    )
+                capacity_destinations[route.target_capacity_id] = route.source_capacity_id
+            routes = tuple(
+                CapacityRoute(
+                    source_capacity_id=source,
+                    target_capacity_id=target,
+                )
+                for source, target in capacity_destinations.items()
+            )
+            if not routes:
+                raise RecoveryBlocked("The selected groups have no durable business capacity placement")
             plan_id = str(uuid4())
-            return_coordinator = self._return_coordinator(plan_id)
+            return_coordinator = self._return_coordinator(plan_id, routes)
             captured = c.capture(
                 c.destination,
                 return_coordinator.recovery_set,
@@ -99,7 +143,16 @@ class FailbackController:
             captured = type(captured)(
                 captured.snapshot.model_copy(update={"capture_kind": "recovery"}), captured.payloads
             )
-            # The linked snapshot is complete but never replaces the primary capture pointer.
+            return_request = PlanRequest(
+                generation_id=captured.snapshot.generation_id,
+                capacity_routes=routes,
+                suffix=f" - return {plan_id[:8]}",
+                connection_mappings=request.return_connection_mappings,
+                target_quiescence_evidence=request.target_quiescence_evidence,
+            )
+            plan = return_coordinator._plan(captured, return_request)
+            self.runtime.transition(RecoveryMode.FAILING_BACK)
+            # Validate placement before the mode transition; publish DR separately from source authority.
             c.catalog.stage_failback_generation(
                 self.runtime.require_lease(), captured.snapshot, captured.payloads
             )
@@ -108,35 +161,17 @@ class FailbackController:
                 captured.snapshot.generation_id,
                 failover_generation_id=request.generation_id,
             )
-            stored_request = self.runtime.get("plans", request.generation_id)
-            if stored_request is None:
-                raise RecoveryBlocked("The failover generation has no persisted capacity placement plan")
-            forward = PlanRequest.model_validate(
-                {key: value for key, value in stored_request.items() if key not in {"capture", "park"}}
-            )
-            capacity_destinations = {}
-            for route in forward.capacity_routes:
-                if (
-                    route.target_capacity_id in capacity_destinations
-                    and capacity_destinations[route.target_capacity_id] != route.source_capacity_id
-                ):
-                    raise RecoveryBlocked(
-                        "Multiple original capacities share a recovery capacity; approve an explicit "
-                        "return placement before reconciling, rather than guessing a reverse map"
-                    )
-                capacity_destinations[route.target_capacity_id] = route.source_capacity_id
-            return_request = PlanRequest(
-                generation_id=captured.snapshot.generation_id,
-                capacity_routes=tuple(
-                    CapacityRoute(
-                        source_capacity_id=source,
-                        target_capacity_id=target,
-                    )
-                    for source, target in capacity_destinations.items()
-                ),
-                suffix=f" - return {plan_id[:8]}",
-            )
-            plan = return_coordinator._plan(captured, return_request)
+            self.runtime.put("plans", captured.snapshot.generation_id, return_request.model_dump(mode="json"))
+            for route in request.return_connection_mappings:
+                self.runtime.put(
+                    "connections",
+                    route.source.key,
+                    {
+                        "generation_id": captured.snapshot.generation_id,
+                        "target": route.target.model_dump(mode="json"),
+                        "evidence": route.evidence,
+                    },
+                )
             self.runtime.put(
                 "failback",
                 plan_id,
@@ -248,6 +283,9 @@ class FailbackController:
                 outcome="succeeded" if ready else "blocked",
                 warnings=(*warnings, *blockers),
                 details={
+                    "return_generation_id": record["dr_generation_id"],
+                    "readiness_context": c.readiness_context(record["dr_generation_id"]),
+                    "writer": self.runtime.get("lifecycle", "writer"),
                     "return_targets": [
                         row.model_dump(mode="json")
                         for key, row in mappings.items()
@@ -340,8 +378,27 @@ class FailbackController:
             # Fresh return identities are authoritative; don't resume capturing obsolete original item IDs.
             return_generation = c.catalog.load_generation(record["dr_generation_id"])
             return_sources = {row.identity.key for row in return_generation.snapshot.items}
+            previous_authority = self.runtime.get("lifecycle", "authority")
+            authority = {
+                row.key: row
+                for row in (
+                    tuple(
+                        WorkspaceIdentity.model_validate(value) for value in previous_authority["workspaces"]
+                    )
+                    if previous_authority
+                    else tuple(row.identity for row in generation.snapshot.workspaces)
+                )
+            }
+            selected_source_workspaces = {
+                "/".join(identity.key.split("/")[:2])
+                for group in c._selected_groups(record["failover_generation_id"], record["groups"])
+                for identity in group.items
+            }
+            for source_workspace in selected_source_workspaces:
+                authority.pop(source_workspace, None)
             for row in c.catalog.list_records(f"return-{request.plan_id}"):
                 fresh = WorkspaceIdentity.model_validate(row.document["target"])
+                authority[fresh.key] = fresh
                 dr_tenant, dr_workspace = row.key.split("/")
                 self.runtime.put(
                     "workspaces",
@@ -392,10 +449,7 @@ class FailbackController:
                 {
                     "plan_id": request.plan_id,
                     "source": "fresh_return_targets",
-                    "workspaces": [
-                        row.model_dump(mode="json")
-                        for row in self._return_coordinator(request.plan_id).workspace_mappings().values()
-                    ],
+                    "workspaces": [row.model_dump(mode="json") for row in authority.values()],
                     "evidence": request.evidence,
                 },
             )

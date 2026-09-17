@@ -23,10 +23,12 @@ from fabshuffle.bcdr.contracts import (
     Nonempty,
     Principal,
     Record,
+    RecoveryDataBinding,
     RecoveryMode,
     StandbyAccessPolicy,
 )
 from fabshuffle.bcdr.protection import ProtectionError
+from fabshuffle.bcdr.replica import ReplicaAccessEvidence
 from fabshuffle.lifecycle import safe_text
 
 if TYPE_CHECKING:
@@ -103,6 +105,9 @@ class ItemReadiness(Record):
 
     source: ItemIdentity
     target: ItemIdentity
+    generation_id: Guid
+    writer_epoch: int = Field(ge=0)
+    issuer: Principal
     target_observed_sha256: Digest
     data_verified: StrictBool
     references_verified: StrictBool
@@ -155,6 +160,8 @@ class FailbackRequest(Record):
     group_ids: tuple[Nonempty, ...]
     primary_available: StrictBool
     primary_evidence: Nonempty
+    return_connection_mappings: tuple[ConnectionRoute, ...] = ()
+    target_quiescence_evidence: Nonempty | None = None
 
 
 class ReconciliationEvidence(Record):
@@ -194,6 +201,40 @@ class ReconcileOperationRequest(Record):
     previous_controller_stopped: StrictBool
     fencing_evidence: Nonempty
     target_quiescence_evidence: Nonempty
+
+
+class ReplicaAttachment(Record):
+    binding: RecoveryDataBinding
+    shortcut_path: Nonempty
+    shortcut_name: Nonempty
+    access_evidence: ReplicaAccessEvidence
+
+
+class ConfigureReplicaRequest(Record):
+    """Incident-qualified exact retained-source attachments, never a generic reference bypass."""
+
+    generation_id: Guid
+    source: ItemIdentity
+    attachments: tuple[ReplicaAttachment, ...] = Field(min_length=1)
+    qualified_at: AwareDatetime
+    valid_until: AwareDatetime
+    qualification_evidence: Nonempty
+    expected_configuration_sha256: Digest | None = None
+
+    @model_validator(mode="after")
+    def consistent_qualification(self) -> ConfigureReplicaRequest:
+        if self.valid_until <= self.qualified_at:
+            raise ValueError("Temporary attachment qualification must have a positive validity window")
+        if any(
+            row.binding.generation_id != self.generation_id or row.binding.source != self.source
+            for row in self.attachments
+        ):
+            raise ValueError("Every attachment must name this exact captured generation and source")
+        destinations = [(row.shortcut_path, row.shortcut_name) for row in self.attachments]
+        sources = [row.binding.source_path for row in self.attachments]
+        if len(destinations) != len(set(destinations)) or len(sources) != len(set(sources)):
+            raise ValueError("Temporary attachment paths and destinations must not be duplicated")
+        return self
 
 
 class GroupStatus(Record):
@@ -253,6 +294,9 @@ class BcdrService:
 
     def configure_protection(self, request: ConfigureProtectionRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.configure_protection(request))
+
+    def configure_replica(self, request: ConfigureReplicaRequest) -> ServiceResult:
+        return self._call(lambda: self.coordinator.configure_replica(request))
 
     def enable_recovery(self, request: EnableRecoveryRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.enable_recovery(request))

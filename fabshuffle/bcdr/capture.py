@@ -29,6 +29,7 @@ from fabshuffle.bcdr.contracts import (
     ConnectionIdentity,
     DependencyEdge,
     DesiredAcl,
+    EndpointIdentity,
     ItemIdentity,
     ItemRecord,
     PayloadDescriptor,
@@ -52,7 +53,8 @@ from fabshuffle.bcdr.registry import TYPE_REGISTRY
 from fabshuffle.fabric import analytics, special_items
 from fabshuffle.fabric.client import FabricClient, FabricError
 from fabshuffle.fabric.definitions import decode_json_part, find_part, is_text_part, part
-from fabshuffle.fabric.items import get_item_definition
+from fabshuffle.fabric.items import get_item_definition, is_system_item
+from fabshuffle.fabric.support import is_derived_type
 
 TYPED_COLLECTIONS = {
     "Lakehouse": "lakehouses",
@@ -81,6 +83,13 @@ EXECUTION_ITEMS = frozenset(
         "GraphModel",
     }
 )
+SYSTEM_ITEM_TYPES = {
+    "dataflowsstaginglakehouse": "Lakehouse",
+    "dataflowsstagingwarehouse": "Warehouse",
+    "monitoring eventhouse": "Eventhouse",
+    "monitoring kql database": "KQLDatabase",
+    "monitoring_eventstream": "Eventstream",
+}
 
 
 def capture_json(
@@ -540,10 +549,171 @@ def _role_assignments(
     return acls, unknowns
 
 
-def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]:
+def _endpoint_aliases(item: ItemRecord) -> tuple[EndpointIdentity, ...]:
+    endpoint = item.properties.get("sqlEndpointProperties")
+    if not isinstance(endpoint, dict):
+        return ()
+    return tuple(
+        EndpointIdentity(
+            item=item.identity,
+            endpoint_kind="sql_endpoint_id" if key == "id" else "sql_endpoint_server",
+            endpoint_id=value,
+        )
+        for key in ("id", "connectionString")
+        if isinstance(value := endpoint.get(key), str) and value
+    )
+
+
+def _managed_action(item: Mapping[str, Any]) -> str:
+    name = item["displayName"]
+    if str(name).casefold().startswith("dataflowsstaging"):
+        return (
+            f"'{name}' is managed Dataflow Gen2 staging, not a user store to reconstruct. "
+            "Qualify destination Dataflow staging and map explicit dependencies before binding consumers."
+        )
+    return (
+        f"'{name}' belongs to workspace monitoring. Configure monitoring separately in the destination "
+        "only when approved; provide an independent replacement for consumers of historical monitoring data."
+    )
+
+
+def _workspace_inventory(
+    client: FabricClient,
+    workspace: WorkspaceIdentity,
+    inventory: Sequence[dict[str, Any]],
+    readers: MetadataReaders,
+) -> tuple[list[ItemCapture], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Separate endpoint/system evidence from independently reconstructed business items."""
+    keys = [canonical_id(row["id"]) for row in inventory]
+    if len(keys) != len(set(keys)):
+        raise FabricError("The source item inventory contains duplicate item identities")
+    derived = [row for row in inventory if is_derived_type(row["type"])]
+    managed: list[dict[str, Any]] = []
+    for row in inventory:
+        if (
+            is_system_item(row)
+            and SYSTEM_ITEM_TYPES.get(str(row.get("displayName", "")).casefold()) == row["type"]
+        ):
+            identity = ItemIdentity(
+                tenant_id=workspace.tenant_id,
+                workspace_id=workspace.workspace_id,
+                item_id=row["id"],
+            )
+            raw = item_document(client, identity, row["type"])
+            if (
+                not is_system_item(raw)
+                or SYSTEM_ITEM_TYPES.get(
+                    str(raw.get("displayName", "")).casefold(),
+                )
+                != row["type"]
+            ):
+                raise FabricError("System-item classification changed during capture; recapture its identity")
+            managed.append(
+                {
+                    "identity": identity.model_dump(mode="json"),
+                    "raw_item": raw,
+                    "classification": "service_managed",
+                    "action": _managed_action(raw),
+                }
+            )
+    managed_ids = {entry["identity"]["item_id"] for entry in managed}
+    captures = []
+    for row in inventory:
+        if is_derived_type(row["type"]) or canonical_id(row["id"]) in managed_ids:
+            continue
+        captures.append(
+            capture_item(
+                client,
+                ItemIdentity(
+                    tenant_id=workspace.tenant_id,
+                    workspace_id=workspace.workspace_id,
+                    item_id=row["id"],
+                ),
+                row["type"],
+                readers=readers,
+            )
+        )
+    owners = [(capture.record.identity, capture.record.properties, False, "") for capture in captures] + [
+        (
+            ItemIdentity.model_validate(entry["identity"]),
+            entry["raw_item"].get("properties") or {},
+            True,
+            entry["action"],
+        )
+        for entry in managed
+    ]
+    evidence: list[dict[str, Any]] = []
+    gaps: list[str] = []
+    for row in derived:
+        endpoint_id = canonical_id(row["id"])
+        matches = [
+            (identity, properties, system, action)
+            for identity, properties, system, action in owners
+            if isinstance(properties.get("sqlEndpointProperties"), dict)
+            and isinstance(properties["sqlEndpointProperties"].get("id"), str)
+            and canonical_id(properties["sqlEndpointProperties"]["id"]) == endpoint_id
+        ]
+        # A type label is not owner evidence. Even derived types stay unresolved until
+        # the typed owner endpoint returns the exact identity; never match display names.
+        if len(matches) != 1 or row["type"].casefold() not in {"sqlendpoint", "sqlanalyticsendpoint"}:
+            action = (
+                f"Resolve the exact typed owner of derived item '{row.get('displayName') or endpoint_id}' "
+                f"({endpoint_id}), then recapture; it must not be independently reconstructed."
+            )
+            evidence.append({"raw_item": row, "qualification": "unverified", "action": action})
+            gaps.append(action)
+            continue
+        owner, _, system, action = matches[0]
+        endpoint = EndpointIdentity(
+            item=owner,
+            endpoint_kind="sql_endpoint_id",
+            endpoint_id=endpoint_id,
+        )
+        entry = {
+            "raw_item": row,
+            "owner": owner.model_dump(mode="json"),
+            "endpoint": endpoint.model_dump(mode="json"),
+            "qualification": "documented",
+            "action": action
+            if system
+            else (
+                "Map this SQL endpoint from the recovery owner's returned sqlEndpointProperties; "
+                "do not create a separate endpoint item."
+            ),
+        }
+        evidence.append(entry)
+        if system:
+            managed.append(
+                {
+                    "identity": ItemIdentity(
+                        tenant_id=workspace.tenant_id,
+                        workspace_id=workspace.workspace_id,
+                        item_id=endpoint_id,
+                    ).model_dump(mode="json"),
+                    "raw_item": row,
+                    "classification": "service_managed_endpoint",
+                    "action": action,
+                }
+            )
+    return captures, managed, evidence, gaps
+
+
+def _dependencies(
+    captures: Sequence[ItemCapture],
+    managed_items: Sequence[dict[str, Any]] = (),
+) -> tuple[DependencyEdge, ...]:
     """Known literal evidence, never a claim that arbitrary executable code was analyzed."""
     edges: list[DependencyEdge] = []
     known_ids = {capture.record.identity.item_id for capture in captures}
+    aliases = tuple(alias for capture in captures for alias in _endpoint_aliases(capture.record))
+    known_ids.update(
+        alias.endpoint_id.lower()
+        for alias in aliases
+        if analytics.GUID_PATTERN.fullmatch(
+            alias.endpoint_id,
+        )
+    )
+    managed_ids = {entry["identity"]["item_id"] for entry in managed_items}
     workspace_ids = {capture.record.identity.workspace_id for capture in captures}
     for capture in captures:
         item = capture.record
@@ -551,11 +721,15 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
         dependency_metadata = {
             key: value for key, value in item.properties.get("bcdr", {}).items() if key != "raw_item"
         }
-        text = "\n".join(
-            payload.data.decode("utf-8")
-            for payload in capture.payloads
-            if payload.descriptor.encoding == "utf-8"
-        ) + canonical_json(dependency_metadata).decode("utf-8")
+        texts = []
+        for payload in capture.payloads:
+            if payload.descriptor.encoding != "utf-8":
+                continue
+            text = payload.data.decode("utf-8")
+            if payload.descriptor.path.endswith((".json", ".bim", ".pbir", ".pbism", ".ipynb")):
+                text = json.dumps(json.loads(text), ensure_ascii=False)
+            texts.append(text)
+        text = ("\n".join(texts) + canonical_json(dependency_metadata).decode("utf-8")).casefold()
         for other in captures:
             if other.record.identity == item.identity:
                 continue
@@ -567,7 +741,7 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
                     },
                 }
             )
-            if any(identifier.casefold() in text.casefold() for identifier in identifiers):
+            if any(identifier.casefold() in text for identifier in identifiers):
                 edges.append(
                     DependencyEdge(
                         edge_id=str(uuid4()),
@@ -577,6 +751,34 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
                         provenance="captured literal definition/metadata",
                         qualification=Qualification.DOCUMENTED,
                         detail=f"Map '{other.record.display_name}' before binding '{item.display_name}'.",
+                    )
+                )
+        for alias in aliases:
+            if alias.item != item.identity and alias.endpoint_id.casefold() in text:
+                edges.append(
+                    DependencyEdge(
+                        edge_id=str(uuid4()),
+                        consumer=item.identity,
+                        prerequisite=alias,
+                        phase="bind",
+                        qualification=Qualification.DOCUMENTED,
+                        provenance="typed owner sqlEndpointProperties",
+                        detail=f"Map the recovery endpoint for owner '{alias.item.item_id}' before binding.",
+                    )
+                )
+        for managed in managed_items:
+            raw = managed["raw_item"]
+            identifiers = analytics.reference_identifiers({raw["id"]: raw})
+            if any(identifier.casefold() in text for identifier in identifiers):
+                edges.append(
+                    DependencyEdge(
+                        edge_id=str(uuid4()),
+                        consumer=item.identity,
+                        external_reference=f"service-managed:{ItemIdentity.model_validate(managed['identity']).key}",
+                        phase="bind",
+                        qualification=Qualification.UNVERIFIED,
+                        provenance="captured service-managed inventory/reference",
+                        detail=managed["action"],
                     )
                 )
         connection_ids = set(analytics.with_connection_references(parts))
@@ -607,7 +809,10 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
             )
         }
         for item_id in sorted(
-            explicit_ids - known_ids - ({EMPTY_GUID} if item.item_type == "Lakehouse" else set())
+            explicit_ids
+            - known_ids
+            - managed_ids
+            - ({EMPTY_GUID} if item.item_type == "Lakehouse" else set())
         ):
             edges.append(
                 DependencyEdge(
@@ -673,6 +878,7 @@ def capture_workspaces(
     desired: list[DesiredAcl] = []
     unresolved: list[str] = []
     connections: dict[str, ConnectionIdentity] = {}
+    managed_items: list[dict[str, Any]] = []
     for candidate in candidates:
         identity = WorkspaceIdentity(tenant_id=recovery_set.tenant_id, workspace_id=candidate["id"])
         root = f"workspaces/{identity.workspace_id}"
@@ -702,18 +908,18 @@ def capture_workspaces(
                 "role_assignments": roles,
             },
         }
+        workspace_captures, managed, derived, gaps = _workspace_inventory(
+            client,
+            identity,
+            capture_list(client, f"{root}/items"),
+            readers,
+        )
+        properties["bcdr"]["system_items"] = managed
+        properties["bcdr"]["derived_items"] = derived
+        properties["bcdr"]["inventory_actions"] = list(dict.fromkeys(entry["action"] for entry in managed))
         reject_embedded_secrets(canonical_json(properties))
-        for raw in capture_list(client, f"{root}/items"):
-            capture = capture_item(
-                client,
-                ItemIdentity(
-                    tenant_id=identity.tenant_id,
-                    workspace_id=identity.workspace_id,
-                    item_id=raw["id"],
-                ),
-                raw["type"],
-                readers=readers,
-            )
+        managed_items.extend(managed)
+        for capture in workspace_captures:
             captures.append(capture)
             for row in capture.record.properties.get("bcdr", {}).get("connections", []):
                 if row.get("id"):
@@ -727,6 +933,7 @@ def capture_workspaces(
                 captured_at=captured_at,
                 properties=properties,
                 inventory_complete=True,
+                unresolved=tuple(gaps),
             )
         )
     for connection in connections.values():
@@ -756,7 +963,7 @@ def capture_workspaces(
         workspaces=tuple(workspaces),
         items=tuple(capture.record for capture in captures),
         payloads=tuple(p.descriptor for p in payloads),
-        dependencies=_dependencies(captures),
+        dependencies=_dependencies(captures, managed_items),
         desired_acls=tuple(desired),
         protections=protections,
         inventory_complete=True,
