@@ -806,3 +806,10 @@ def test_old_config_without_additive_binding_field_keeps_its_pinned_digest(confi
     )
     record = configured.record.model_copy(update={"artifact_reference": reference, "sha256": reference})
     assert binding._load_config(record, configured.runtime.catalog).kql_materialized_inputs == ()
+
+
+def test_kql_new_clone_mismatch_is_named_manual_not_estate_failure(materialized):
+    case = materialized
+    ready, warnings = case.recovery.restore(case.generation, case.item, SOURCE, case.runtime)
+    assert not ready and "Orders" in warnings[0] and "manual prepared-target mapping" in warnings[0]
+    assert not case.fabric.calls and not case.sdk.queries
