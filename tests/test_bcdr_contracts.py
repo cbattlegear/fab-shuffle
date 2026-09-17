@@ -7,7 +7,10 @@ from pydantic import ValidationError
 from fabshuffle.bcdr.contracts import (
     AclScope,
     CaptureSnapshot,
+    ConnectionIdentity,
+    DependencyEdge,
     DesiredAcl,
+    EndpointIdentity,
     ItemIdentity,
     ItemRecord,
     Principal,
@@ -79,6 +82,8 @@ def test_registry_covers_every_current_type_without_claiming_outage_rebuild():
         contract.failback_qualification == Qualification.UNVERIFIED for contract in TYPE_REGISTRY.values()
     )
     assert "geo-replicated" in TYPE_REGISTRY["SQLDatabase"].restrictions[0]
+    assert {"definition", "data_access_roles"} <= set(TYPE_REGISTRY["Lakehouse"].capture_requirements)
+    assert "definition" in TYPE_REGISTRY["Eventhouse"].capture_requirements
 
 
 def test_identity_is_qualified_normalized_and_frozen():
@@ -163,6 +168,44 @@ def test_unprotected_never_means_protected_and_warning_is_actionable():
         action="Supply an off-region export or wait for the original database to recover",
     )
     assert record.qualification == Qualification.UNVERIFIED
+
+
+def test_optional_missing_data_does_not_make_metadata_unpublishable():
+    config = recovery_set()
+    capture = snapshot(config)
+    missing = ProtectionRecord(
+        protection_id=guid(), item=capture.items[0].identity, kind=ProtectionKind.UNPROTECTED,
+        outcome=RecoveryOutcome.PROTECTION_MISSING, provenance="capture",
+        action="Supply a protected off-region export before restoring this dependency group",
+    )
+    capture.model_copy(update={"protections": (missing,)}).require_publishable(config)
+
+
+@pytest.mark.parametrize("target_kind", ["item", "connection", "endpoint", "acl"])
+def test_foreign_tenant_qualified_references_cannot_be_published(target_kind):
+    config = recovery_set()
+    capture = snapshot(config)
+    foreign = ItemIdentity(tenant_id=guid(), workspace_id=guid(), item_id=guid())
+    if target_kind == "acl":
+        acl = DesiredAcl(
+            acl_id=guid(), scope=AclScope.ITEM, item=foreign,
+            principal=Principal(tenant_id=foreign.tenant_id, object_id=guid(), kind="User"),
+            permission="Read", provenance="captured share",
+        )
+        capture = capture.model_copy(update={"desired_acls": (acl,)})
+    else:
+        prerequisite = foreign
+        if target_kind == "connection":
+            prerequisite = ConnectionIdentity(tenant_id=foreign.tenant_id, connection_id=guid())
+        elif target_kind == "endpoint":
+            prerequisite = EndpointIdentity(item=foreign, endpoint_kind="sql", endpoint_id="alias")
+        edge = DependencyEdge(
+            edge_id=guid(), consumer=capture.items[0].identity, prerequisite=prerequisite,
+            phase="bind", provenance="captured reference", detail="Required target",
+        )
+        capture = capture.model_copy(update={"dependencies": (edge,)})
+    with pytest.raises(ValueError, match="recovery tenant"):
+        capture.require_publishable(config)
 
 
 def test_retained_source_reference_requires_scoped_verified_read_only_contract():
