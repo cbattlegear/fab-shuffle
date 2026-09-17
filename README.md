@@ -157,6 +157,23 @@ The single-principal bcp path does write a SQL access token to an owner-only tem
 and removes it afterward. Protect the container filesystem; an abrupt process termination
 can bypass normal cleanup.
 
+### Standby and recovery
+
+Choose **Operate standby & recovery (same tenant)** at sign-in, or **Standby & recovery**
+from an existing same-tenant session, for the separate multi-workspace BCDR workflow.
+It uses one central metadata Warehouse and a durable non-secret bootstrap descriptor;
+it does not use Git integration or a metadata lakehouse/Spark session.
+
+**Sync standby is not Enable recovery.** Standby synchronization updates inactive items
+with SPN/owner-only access and parks dedicated recovery capacity only when safe. Recovery
+enablement, deferred ACL replay, writer-fenced cutover, failback and rearm are explicit
+operations. Captured metadata and restored definitions are not proof of application
+readiness; inspect partial group outcomes and optional-data protection warnings.
+
+See [the BCDR operator guide](docs/bcdr.md) for controller setup, capacity/metadata costs,
+source-retention obligations, qualification limits, API routes and the Linux-container
+`python -m fabshuffle.bcdr` scheduler entrypoint. Existing migration modes remain unchanged.
+
 ## Migration modes
 
 Fab Shuffle is a Linux-container application with a web wizard. It either reassigns a

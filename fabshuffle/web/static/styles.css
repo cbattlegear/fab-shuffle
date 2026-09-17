@@ -50,6 +50,55 @@ body {
 .masthead h1 { margin: 0; font-size: 1.15rem; letter-spacing: 0.01em; }
 .masthead p { margin: 0; color: var(--text-dim); font-size: 0.85rem; }
 
+.masthead-actions { display: flex; align-items: center; gap: 1rem; }
+.bcdr[hidden], .bcdr [hidden] { display: none; }
+.bcdr { overflow-wrap: anywhere; }
+.bcdr-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+.bcdr h3 { margin: 1.5rem 0 0.5rem; font-size: 1rem; }
+.bcdr h4 { margin: 1rem 0 0.5rem; font-size: 0.95rem; }
+.bcdr p { max-width: 75ch; }
+.bcdr .callout strong { display: inline; margin: 0; font-size: inherit; }
+.bcdr details { border-top: 1px solid var(--border); padding: 1rem 0; }
+.bcdr summary { cursor: pointer; font-weight: 600; }
+.bcdr form, .bcdr fieldset { min-width: 0; }
+.bcdr fieldset { margin: 1rem 0; padding: 0; border: 0; }
+.bcdr legend { font-weight: 600; margin-bottom: 0.5rem; }
+.bcdr-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; }
+.bcdr .bcdr-wide { grid-column: 1 / -1; }
+.bcdr label { min-width: 0; }
+.bcdr input, .bcdr select, .bcdr textarea {
+  min-width: 0; width: 100%; padding: 0.65rem; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-size: 1rem;
+}
+.bcdr textarea { resize: vertical; min-height: 5rem; }
+.bcdr input::placeholder, .bcdr textarea::placeholder { color: var(--text-dim); opacity: 1; }
+.bcdr [aria-invalid="true"] { border-color: var(--danger); }
+.bcdr input[type="checkbox"] { width: auto; flex: 0 0 auto; margin-top: 0.2rem; }
+.bcdr-check { display: flex; align-items: flex-start; gap: 0.6rem; color: var(--text); }
+.bcdr button { min-height: 2.75rem; }
+.bcdr :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.bcdr-results { margin: 1rem 0; padding-left: 1.25rem; }
+.bcdr-results li + li { margin-top: 0.75rem; }
+.bcdr-status { font-weight: 600; }
+.bcdr-status[data-outcome="ready_for_cutover"] { color: var(--success); }
+.bcdr-status[data-outcome="partial"], .bcdr-status[data-outcome="unverified"],
+.bcdr-status[data-outcome="protection_missing"] { color: var(--warning); }
+.bcdr-status[data-outcome="blocked"], .bcdr-status[data-outcome="restore_failed"] { color: var(--danger); }
+.bcdr pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow-y: auto; }
+.bcdr-confirm {
+  max-width: min(36rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem);
+  overflow-y: auto; padding: 1.5rem; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.bcdr-confirm::backdrop { background: rgba(0, 0, 0, 0.7); }
+@media (max-width: 40rem) {
+  .masthead { flex-wrap: wrap; padding: 1rem; }
+  .masthead-actions { flex-wrap: wrap; }
+  .bcdr-heading { flex-direction: column; }
+  .bcdr-fields { grid-template-columns: minmax(0, 1fr); }
+  main { padding-right: 1rem; padding-left: 1rem; }
+}
+
 .wizard-nav { padding: 1rem 2rem 0; }
 
 .wizard-nav ol {
@@ -128,7 +177,7 @@ main { max-width: 62rem; margin: 0 auto; padding: 1.5rem 2rem 4rem; }
 
 label { display: grid; gap: 0.35rem; font-size: 0.85rem; color: var(--text-dim); }
 
-input[type="text"], input[type="password"], input[type="search"], .form input, .field input {
+input[type="text"], input[type="password"], input[type="search"], .form input, .form select, .field input {
   padding: 0.6rem 0.7rem;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -138,7 +187,7 @@ input[type="text"], input[type="password"], input[type="search"], .form input, .
   font-size: 0.9rem;
 }
 
-input:focus-visible, button:focus-visible, .choice:focus-visible {
+input:focus-visible, select:focus-visible, button:focus-visible, .choice:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }

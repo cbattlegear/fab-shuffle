@@ -46,7 +46,9 @@ async function api(path, { method = "GET", body, signal, download = false } = {}
     const message = typeof detail === "string" ? detail
       : Array.isArray(detail) ? detail.map((entry) => `${(entry.loc || []).join(".")}: ${entry.msg}`).join("; ")
       : detail?.message;
-    throw new Error(message || `Request failed with HTTP ${response.status}`);
+    const error = new Error(message || `Request failed with HTTP ${response.status}`);
+    error.details = Array.isArray(detail) ? detail : [];
+    throw error;
   }
   return payload;
 }
@@ -59,6 +61,7 @@ function showError(message) {
 }
 
 function goTo(stage) {
+  $(".wizard-nav").hidden = stage === "bcdr";
   $$(".panel").forEach((panel) => {
     panel.hidden = panel.dataset.stage !== stage;
   });
@@ -138,6 +141,7 @@ $("#login-form").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   const button = form.querySelector("button");
   const data = loginBody(form);
+  const workflow = $("#login-workflow").value;
 
   busy(button, true, "Signing in…");
   try {
@@ -164,6 +168,15 @@ $("#login-form").addEventListener("submit", async (event) => {
     updateLoginMode();
     renderIdentity();
     $("#sign-out").hidden = false;
+    if (workflow === "bcdr") {
+      if (state.crossTenant) {
+        goTo("capacity");
+        showError("Standby & recovery requires credentials in the same tenant. Sign out to change credentials.");
+      } else {
+        $("#bcdr-open").click();
+      }
+      return;
+    }
     await loadCapacities();
     if (!state.paired) loadLeftovers();
     loadResumable();
@@ -194,12 +207,14 @@ $("#sign-out").addEventListener("click", async () => {
     resumeRunId: null, forceRebuild: false,
   });
   $("#sign-out").hidden = true;
+  $("#bcdr-open").hidden = true;
   $("#opt-start-mirrors").checked = false;
   goTo("login");
 });
 
 function renderIdentity() {
   const identity = state.identity;
+  $("#bcdr-open").hidden = !state.sessionId || state.crossTenant;
   $("#restore-access-tool").hidden = state.paired;
   $("#leftovers").hidden = true;
   $("#destination-context").hidden = !state.paired;

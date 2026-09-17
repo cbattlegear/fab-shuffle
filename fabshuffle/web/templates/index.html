@@ -15,7 +15,10 @@
         <p>Move a Microsoft Fabric workspace to another region or tenant</p>
       </div>
     </div>
-    <button id="sign-out" class="link-button" hidden>Sign out</button>
+    <div class="masthead-actions">
+      <button id="bcdr-open" class="secondary" type="button" hidden>Standby &amp; recovery</button>
+      <button id="sign-out" class="link-button" hidden>Sign out</button>
+    </div>
   </header>
 
   <nav class="wizard-nav" aria-label="Migration steps">
@@ -31,6 +34,22 @@
   <main>
     <div id="alert" class="alert" role="alert" hidden></div>
 
+    <section id="bcdr-panel" class="panel bcdr" data-stage="bcdr" hidden aria-labelledby="bcdr-title">
+      <div class="bcdr-heading">
+        <div>
+          <h2 id="bcdr-title" tabindex="-1">Standby &amp; recovery</h2>
+          <p class="hint">Same-tenant recovery across workspaces. Migration remains a separate workflow.</p>
+        </div>
+        <button id="bcdr-back" class="secondary" type="button">Back to migration</button>
+      </div>
+      <p class="callout">Sync standby resumes dedicated capacity for updates only. It does <strong>not</strong>
+        enable recovery. Jobs stay stopped and access stays restricted to the recovery principal and owners.
+        The control workspace remains restricted after enablement.</p>
+      <p id="bcdr-error" class="alert" role="alert" hidden></p>
+      <p id="bcdr-progress" class="hint" role="status" aria-live="polite"></p>
+      <div id="bcdr-content"></div>
+    </section>
+
     <!-- 1. Sign in -->
     <section class="panel" data-stage="login">
       <h2>Sign in with a service principal</h2>
@@ -39,6 +58,12 @@
         Use a source principal with workspace access and a destination principal with access to the target capacity.
       </p>
       <form id="login-form" class="form">
+        <label>Workflow
+          <select id="login-workflow">
+            <option value="migration">Move a workspace</option>
+            <option value="bcdr">Operate standby &amp; recovery (same tenant)</option>
+          </select>
+        </label>
         <fieldset class="options login-mode">
           <legend>Destination</legend>
           <label><input type="checkbox" id="another-tenant" /> Another tenant</label>
@@ -365,5 +390,6 @@
   </main>
 
   <script src="/static/app.js"></script>
+  <script src="/static/bcdr.js"></script>
 </body>
 </html>

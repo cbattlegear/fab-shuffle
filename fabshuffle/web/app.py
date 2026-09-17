@@ -358,8 +358,11 @@ class ResumeRunRequest(BaseModel):
 
 
 def create_app() -> FastAPI:
+    from fabshuffle.web.bcdr import create_router
+
     app = FastAPI(title="Fab Shuffle", version=__version__, docs_url="/api/docs")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(create_router(require_session, _run_fabric))
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
