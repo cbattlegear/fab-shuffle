@@ -73,6 +73,16 @@ const scenarios = {
       !["/api/workspaces", "/api/capacities", "/api/scratch-workspaces"].includes(request.url)));
     await f.reply(1, { commands: [command] });
   },
+  async returning_to_migration_cannot_discover_for_a_new_session(f) {
+    f.product.bcdr.returnStage = "login";
+    const back = f.get("bcdr-back").click();
+    assert.equal(f.requests[0].url, "/api/capacities");
+    f.ui.state.sessionId = "new-recovery-session";
+    f.product.bcdr.sessionId = "new-recovery-session";
+    await f.reply(0, { capacities: [] });
+    await back;
+    assert.equal(f.requests.length, 1, "An old navigation must not discover source workspaces in a new session");
+  },
   async controls_pin_backend_ids(f) {
     f.product.bcdrRenderForms([command]);
     f.product.bcdrRenderResult(result);
@@ -109,6 +119,18 @@ const scenarios = {
     assert.match(output, /Orders is unprotected/);
     assert.doesNotMatch(output, /all recovered/i);
   },
+  async capacity_state_is_not_inferred_from_mode(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrRenderResult({
+      ...result, mode: "standby", details: { capacities: [{
+        capacity_id: "capacity-1", arm_resource_id: "/subscriptions/demo/providers/Microsoft.Fabric/capacities/dr",
+        state: "Active", provisioning_state: "Succeeded", observed_at: "2026-09-17T18:00:00Z",
+      }] },
+    });
+    assert.match(f.get("bcdr-result").textContent, /Active - capacity-1/);
+    assert.doesNotMatch(f.get("bcdr-result").textContent, /Paused - capacity-1/);
+    assert.match(f.get("bcdr-result").textContent, /not an inference from standby mode/);
+  },
   async service_errors_and_pending_controls(f) {
     f.product.bcdrRenderForms([command]);
     const button = f.get("bcdr-content").querySelector("button");
@@ -143,6 +165,19 @@ const scenarios = {
     await signout;
     assert.equal(f.ui.state.sessionId, null);
     assert.equal(f.get("bcdr-open").hidden, true);
+  },
+  async signout_ignores_late_errors(f) {
+    f.product.bcdrRenderForms([command]);
+    const button = f.get("bcdr-content").querySelector("button");
+    const pending = f.product.bcdrSubmit(command, {}, button);
+    const signout = f.get("sign-out").click();
+    assert.equal(f.product.bcdr.sessionId, null);
+    await f.reply(0, { detail: "Old session catalog details" }, 409);
+    await pending;
+    assert.equal(f.get("bcdr-error").hidden, true);
+    assert.equal(f.get("bcdr-progress").textContent, "");
+    await f.reply(1, { ok: true });
+    await signout;
   },
   async optional_object_is_omitted_unless_selected(f) {
     const field = f.product.bcdrField("storage", {

@@ -13,6 +13,9 @@ import pytest
     "partial_is_not_ready", "service_errors_and_pending_controls",
     "stale_session_never_renders_old_results", "schema_controls_are_native_not_json",
     "signout_clears_sensitive_results", "optional_object_is_omitted_unless_selected",
+    "signout_ignores_late_errors",
+    "capacity_state_is_not_inferred_from_mode",
+    "returning_to_migration_cannot_discover_for_a_new_session",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

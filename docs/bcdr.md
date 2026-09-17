@@ -116,6 +116,11 @@ by dependency closure. Review the named prerequisites and approve additions expl
 or leave their dependent groups blocked. The control workspace is excluded from business
 selection and recovery access replay.
 
+Use **Approved connection routes** when a captured connection needs a validated destination
+replacement or explicitly approved external connection reuse. Supply exact connection identities
+and evidence; the backend reads the destination connection and rejects retained source-compute
+references. This is not a credential field or a general source-reference bypass.
+
 ### Access remains restricted until enablement
 
 Before explicit recovery enablement, only the recovery service principal and designated
@@ -134,6 +139,8 @@ Capture generation and applied standby generation measure different things. A su
 capture does not mean every destination definition was applied; applied metadata does not
 mean data, bindings or effective access are ready. Review each dependency group's separate
 metadata, data, access, readiness and active states, plus its blockers and warnings.
+Capacity state is shown from actual ARM observations with timestamps and exact resource IDs.
+`standby` mode alone does not mean capacity is paused; reading catalog status can resume its capacity.
 
 `restored_stopped`, `unverified`, `partial`, and `ready_for_cutover` are not interchangeable.
 Creation of a report, model or store does not justify an "all recovered" claim. Independent

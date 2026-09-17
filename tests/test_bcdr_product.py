@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.bcdr import __main__ as cli
 from fabshuffle.bcdr.backend import RecoveryBlocked
+from fabshuffle.bcdr.bootstrap import BootstrapDescriptor, BootstrapStore, CapacityAuthorization
 from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.contracts import RecoveryMode
 from fabshuffle.bcdr.service import ServiceResult, SetupRequest, SyncRequest
@@ -31,7 +32,7 @@ SPN = "00000000-0000-0000-0000-000000000006"
 CONTROL = "00000000-0000-0000-0000-000000000007"
 ARM = (
     "/subscriptions/00000000-0000-0000-0000-000000000008"
-    "/resourceGroups/dr/providers/Microsoft.Fabric/capacities/dr"
+    "/resourceGroups/dr/providers/Microsoft.Fabric/capacities/recovery"
 )
 SETUP = {
     "control_workspace_id": CONTROL,
@@ -489,3 +490,41 @@ def test_every_lifecycle_cli_command_calls_its_exact_public_service_method(
     assert service.closed
     assert (factories[0][1]["source_tokens"] is not None) == (command == "plan-failback")
     assert "runtime-secret" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("descriptor_exists", [False, True])
+def test_real_factory_rejects_missing_or_wrong_tenant_bootstrap_before_source_reads(
+    tmp_path, monkeypatch, descriptor_exists,
+):
+    path = tmp_path / "controller" / "bootstrap.json"
+    monkeypatch.setenv("FAB_SHUFFLE_BCDR_BOOTSTRAP", str(path))
+    if descriptor_exists:
+        BootstrapStore(path).save(BootstrapDescriptor(
+            recovery_set_id=GENERATION, tenant_id="00000000-0000-0000-0000-000000000099",
+            application_id=CLIENT, controller_id=SPN,
+            capacities=(CapacityAuthorization(
+                arm_resource_id=ARM, fabric_capacity_id=TARGET_CAPACITY,
+                dedicated_recovery=True, authorized_for_suspend=True,
+            ),),
+            catalog_capacity_id=ARM, control_workspace_id=CONTROL,
+        ), expected_revision=None)
+    tokens = Tokens()
+    session = web.SESSIONS.create(tokens.principal, tokens)
+    try:
+        with TestClient(web.create_app()) as client:
+            response = client.get("/api/bcdr/status", headers={web.SESSION_HEADER: session.id})
+        assert response.status_code == 409
+        assert response.json()["detail"]
+        assert "never-persist-this" not in response.text
+    finally:
+        web.SESSIONS.drop(session.id)
+
+
+def test_real_cli_factory_reports_missing_bootstrap_without_source_reads(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "credential_provider", lambda environ: Tokens())
+    code = cli.main(["status", "--bootstrap", str(tmp_path / "missing.json")])
+    assert code == 1
+    output = capsys.readouterr()
+    assert "bootstrap" in output.err.lower()
+    assert not output.out
+    assert "never-persist-this" not in output.err

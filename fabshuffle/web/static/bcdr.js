@@ -19,6 +19,10 @@ function bcdrElement(tag, text, className) {
   return element;
 }
 
+function bcdrCurrentSession(sessionId) {
+  return !!sessionId && sessionId === state.sessionId && sessionId === bcdr.sessionId;
+}
+
 function bcdrLabel(name) {
   const labels = {
     recovery_set_id: "Recovery set ID",
@@ -29,6 +33,8 @@ function bcdrLabel(name) {
     source_capacity_id: "Source capacity ID",
     target_capacity_ids: "Dedicated recovery capacity IDs",
     target_capacity_id: "Dedicated recovery capacity ID",
+    connection_mappings: "Approved connection routes",
+    connection_id: "Connection ID",
     recovery_capacities: "Dedicated recovery capacities",
     fabric_capacity_id: "Fabric capacity ID",
     catalog_capacity_id: "Control Warehouse capacity ARM resource ID",
@@ -52,6 +58,15 @@ function bcdrLabel(name) {
     generation_id: "Captured generation ID",
     writer_fence: "Writer-fence evidence",
     readiness: "Readiness evidence",
+    target_observed_sha256: "Observed target content hash (SHA-256)",
+    writers_stopped: "I attest the named side's external writers are stopped",
+    conflicting_writes: "Conflicting writes were observed",
+    data_verified: "Data checks passed for this target",
+    references_verified: "Reference checks passed for this target",
+    security_verified: "Effective-access checks passed for this target",
+    effective_principals: "Principals used for effective-access checks",
+    evidence: "Evidence reference (operator or runtime record)",
+    confirmed_by: "Operator confirming the writer fence",
   };
   return labels[name] || name.replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase());
 }
@@ -473,6 +488,25 @@ function bcdrRenderResult(result) {
     facts.appendChild(bcdrElement("dd", value, "v"));
   }
   output.appendChild(facts);
+  if (result.details?.capacities?.length) {
+    output.appendChild(bcdrElement("h4", "Observed recovery capacity state"));
+    output.appendChild(bcdrElement("p",
+      "These are service observations, not an inference from standby mode. Reading status resumes the catalog capacity.",
+      "hint"));
+    const capacities = bcdrElement("ul", undefined, "bcdr-results");
+    for (const capacity of result.details.capacities) {
+      const entry = bcdrElement("li");
+      entry.appendChild(bcdrElement("strong", `${capacity.state || "Unreported"} - ${capacity.capacity_id}`));
+      entry.appendChild(bcdrElement("p",
+        `Provisioning: ${capacity.provisioning_state || "Unreported"}. Observed: ${capacity.observed_at}.`));
+      const resource = bcdrElement("details");
+      resource.appendChild(bcdrElement("summary", "Exact ARM resource"));
+      resource.appendChild(bcdrElement("p", capacity.arm_resource_id));
+      entry.appendChild(resource);
+      capacities.appendChild(entry);
+    }
+    output.appendChild(capacities);
+  }
   if (result.warnings?.length) {
     const warnings = bcdrElement("div", undefined, "warnings");
     warnings.appendChild(bcdrElement("h4", "Actions and protection warnings"));
@@ -561,11 +595,11 @@ async function bcdrSubmit(command, body, button) {
   try {
     const payload = command.confirmation ? { confirmation: command.name, request: body } : body;
     const result = await api(command.path, { method: command.method, body: payload });
-    if (sessionId !== state.sessionId || sessionId !== bcdr.sessionId) return;
+    if (!bcdrCurrentSession(sessionId)) return;
     bcdrRenderResult(result);
     $("#bcdr-progress").textContent = `${command.label}: result received. Review all group outcomes below.`;
   } catch (error) {
-    if (sessionId === state.sessionId) {
+    if (bcdrCurrentSession(sessionId)) {
       for (const entry of error.details || []) {
         const name = entry.loc?.at(-1);
         controls.filter((control) => control.name === name).forEach((control) => {
@@ -580,8 +614,8 @@ async function bcdrSubmit(command, body, button) {
     bcdr.pending = false;
     panel.setAttribute("aria-busy", "false");
     controls.forEach((control, index) => { control.disabled = disabled[index]; });
-    if (sessionId === state.sessionId && !$("#bcdr-error").hidden) $("#bcdr-error").focus();
-    else if (sessionId === state.sessionId) button.focus();
+    if (bcdrCurrentSession(sessionId) && !$("#bcdr-error").hidden) $("#bcdr-error").focus();
+    else if (bcdrCurrentSession(sessionId)) button.focus();
   }
 }
 
@@ -614,7 +648,7 @@ function bcdrConfirm(command, body, trigger) {
   cancel.addEventListener("click", () => dialog.close());
   confirm.addEventListener("click", () => {
     dialog.close();
-    if (sessionId !== state.sessionId) {
+    if (!bcdrCurrentSession(sessionId)) {
       bcdrError("The sign-in changed. Review this operation again in the current session.");
       return;
     }
@@ -642,12 +676,12 @@ function bcdrRenderForms(commands) {
     bcdrError("");
     try {
       const inventory = await api("/api/bcdr/discovery");
-      if (sessionId !== state.sessionId || sessionId !== bcdr.sessionId) return;
+      if (!bcdrCurrentSession(sessionId)) return;
       bcdr.discovered = inventory;
       bcdr.bindings.forEach((refresh) => refresh());
       $("#bcdr-progress").textContent = "Named setup choices loaded. Review exact IDs; no configuration has been saved.";
     } catch (error) {
-      if (sessionId === state.sessionId) bcdrError(error.message);
+      if (bcdrCurrentSession(sessionId)) bcdrError(error.message);
     } finally {
       busy(discover, false);
     }
@@ -707,13 +741,13 @@ $("#bcdr-open").addEventListener("click", async () => {
   const sessionId = state.sessionId;
   try {
     const response = await api("/api/bcdr/forms");
-    if (sessionId !== state.sessionId || sessionId !== bcdr.sessionId) return;
+    if (!bcdrCurrentSession(sessionId)) return;
     bcdr.identity = response.identity || {};
     bcdrRenderForms(response.commands);
     bcdr.forms = response.commands;
     $("#bcdr-progress").textContent = "Choose setup or read the saved recovery status. No operation has started.";
   } catch (error) {
-    if (sessionId === state.sessionId) {
+    if (bcdrCurrentSession(sessionId)) {
       bcdrError(error.message);
       $("#bcdr-progress").textContent = "The recovery forms could not be loaded.";
     }
@@ -734,6 +768,7 @@ $("#sign-out").addEventListener("click", () => {
 });
 
 $("#bcdr-back").addEventListener("click", async () => {
+  const sessionId = state.sessionId;
   $(".wizard-nav").hidden = false;
   const fromRecoverySignIn = bcdr.returnStage === "login";
   goTo(fromRecoverySignIn ? "capacity" : bcdr.returnStage);
@@ -741,13 +776,18 @@ $("#bcdr-back").addEventListener("click", async () => {
   if (fromRecoverySignIn) {
     try {
       await loadCapacities();
+      if (!bcdrCurrentSession(sessionId)) return;
       loadResumable();
       if (!state.paired) {
         loadLeftovers();
-        loadWorkspaces().then(fillWorkspaceSelects).catch((error) => showError(error.message));
+        loadWorkspaces().then(() => {
+          if (bcdrCurrentSession(sessionId)) fillWorkspaceSelects();
+        }).catch((error) => {
+          if (bcdrCurrentSession(sessionId)) showError(error.message);
+        });
       }
     } catch (error) {
-      showError(error.message);
+      if (bcdrCurrentSession(sessionId)) showError(error.message);
     }
   }
 });
