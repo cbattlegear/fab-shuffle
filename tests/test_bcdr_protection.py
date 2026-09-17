@@ -607,6 +607,10 @@ def test_kql_restores_prepared_target_without_primary_reads_or_ingestion(prepare
             queries.append((database, query))
             return SimpleNamespace(primary_results=[[[12]]])
 
+        def execute_mgmt(self, database, query, **kwargs):
+            assert query == '.show table ["events"] details | project TableName'
+            return SimpleNamespace(primary_results=[[{"TableName": "events"}]])
+
     def target_only(endpoint, _):
         assert endpoint == DST.endpoint
         return Client()

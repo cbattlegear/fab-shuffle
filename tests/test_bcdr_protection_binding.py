@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
@@ -12,6 +13,7 @@ from pydantic import ValidationError
 
 from fabshuffle.bcdr import protection_binding as binding
 from fabshuffle.bcdr import protection_cosmos as cosmos
+from fabshuffle.bcdr import protection_kql as kql
 from fabshuffle.bcdr.catalog import CapturedGeneration, CatalogConflict, CatalogError
 from fabshuffle.bcdr.contracts import (
     CaptureSnapshot,
@@ -534,3 +536,273 @@ def test_default_kql_binding_defers_unresolved_opaque_inputs(prepared, tmp_path)
     ready, warnings = recovery.restore(captured, item, TARGET, runtime)
     assert not ready and "eventhub-2" in warnings[-1] and "Orders" in warnings[-1]
     assert not client.calls and not runtime.effects
+
+
+class KqlFabric:
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.calls = []
+        self.region = "West US"
+        self.database_type = "ReadWrite"
+        self.shortcut_values = []
+        self.query_uri = DST.endpoint
+        self.name = DST.database
+        self.identity = TARGET
+        self.failure = None
+
+    def tenant_id(self):
+        return TARGET.tenant_id
+
+    def get(self, path):
+        self.runtime.fence()
+        assert self.runtime.current_operation is not None
+        assert SOURCE.workspace_id not in path, "No source control-plane read at outage."
+        self.calls.append(path)
+        if self.failure:
+            raise self.failure
+        if "/kqlDatabases/" not in path:
+            return {
+                "id": TARGET.workspace_id,
+                "capacityRegion": self.region,
+                "capacityAssignmentProgress": "Completed",
+            }
+        return {
+            "id": self.identity.item_id,
+            "workspaceId": self.identity.workspace_id,
+            "type": "KQLDatabase",
+            "displayName": self.name,
+            "properties": {
+                "queryServiceUri": self.query_uri,
+                "databaseType": self.database_type,
+            },
+        }
+
+    def list_all(self, path):
+        self.runtime.fence()
+        assert path == f"workspaces/{TARGET.workspace_id}/items/{TARGET.item_id}/shortcuts"
+        self.calls.append(path)
+        return self.shortcut_values
+
+
+class KqlClient:
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.rows = 12
+        self.physical = True
+        self.queries = []
+        self.closed = 0
+        self.after_query = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.closed += 1
+
+    def execute_mgmt(self, database, command, *, properties):
+        assert self.runtime.current_operation is not None
+        assert database == DST.database
+        assert command == '.show table ["events"] details | project TableName'
+        assert properties.get_option("request_readonly_hardline", None) is True
+        return SimpleNamespace(primary_results=[[{"TableName": "events"}] if self.physical else []])
+
+    def execute_query(self, database, command, *, properties):
+        assert database == DST.database and command == '["events"] | count'
+        for option in (
+            "request_readonly_hardline",
+            "request_remote_entities_disabled",
+            "request_external_data_disabled",
+            "request_external_table_disabled",
+            "request_callout_disabled",
+            "request_sandboxed_execution_disabled",
+            "request_block_row_level_security",
+            "request_impersonation_disabled",
+        ):
+            assert properties.get_option(option, None) is True
+        self.queries.append(command)
+        if self.after_query:
+            self.after_query()
+        return SimpleNamespace(primary_results=[[[self.rows]]])
+
+
+@pytest.fixture
+def materialized(prepared, tmp_path, monkeypatch):
+    runtime = Runtime()
+    descriptor = replace(prepared, inputs=(kql.KqlInput("materialized-events", "input-access-check"),))
+    configuration = binding.ProtectionConfiguration(
+        provider="kql",
+        descriptor=descriptor,
+        max_age_seconds=86400,
+        target_approval_ref=descriptor.target_approval_ref,
+        kql_materialized_inputs=(
+            binding.KqlMaterializedInput(
+                resource_ref="materialized-events",
+                item=TARGET,
+                tables=descriptor.tables,
+            ),
+        ),
+    )
+    request = binding.ConfigureProtectionRequest(source=SOURCE, configuration=configuration)
+    record = binding.configure_protection(runtime, request, protected_root=None)
+    captured, item = generation(record, item_type="KQLDatabase")
+    fabric = KqlFabric(runtime)
+    sdk = KqlClient(runtime)
+
+    def client(endpoint, _principal):
+        assert endpoint == DST.endpoint, "Never query a primary-supplied or user-arbitrary endpoint."
+        runtime.fence()
+        return sdk
+
+    monkeypatch.setattr(kql, "kql_client", client)
+    recovery = binding.build_data_recovery(
+        client=fabric,
+        tokens=TOKENS,
+        protected_root=None,
+        scratch=tmp_path,
+        limits=LIMITS,
+    )
+    return SimpleNamespace(
+        runtime=runtime,
+        request=request,
+        record=record,
+        generation=captured,
+        item=item,
+        fabric=fabric,
+        sdk=sdk,
+        recovery=recovery,
+    )
+
+
+def test_materialized_kql_executes_authenticated_destination_only_data_checks(materialized):
+    case = materialized
+    assert binding.prepared_target(case.generation, case.item, case.runtime.catalog) == TARGET
+    assert case.record.qualification.value == "unverified", "Nomination is not metadata qualification."
+    ready, warnings = case.recovery.restore(case.generation, case.item, TARGET, case.runtime)
+    assert ready and len(case.sdk.queries) == 2
+    assert all(op.kind == "data-validate" for op in case.runtime.catalog.journal.values())
+    assert all(
+        json.loads(op.message)["ready_for_cutover"] is False for op in case.runtime.catalog.journal.values()
+    )
+    assert any("does not certify" in warning for warning in warnings)
+    assert not case.runtime.catalog.pending_operations()
+
+
+def test_materialized_kql_rechecks_data_instead_of_replaying_old_ready_result(materialized):
+    case = materialized
+    assert case.recovery.restore(case.generation, case.item, TARGET, case.runtime)[0]
+    case.sdk.rows = 0
+    ready, warnings = case.recovery.restore(case.generation, case.item, TARGET, case.runtime)
+    assert not ready and any("row-count" in warning for warning in warnings)
+    assert case.runtime.effects == 2
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("region", "East US"),
+        ("region", ""),
+        ("database_type", "Shortcut"),
+        ("shortcut_values", [{"name": "events"}]),
+        ("identity", SOURCE),
+        ("query_uri", SRC.endpoint),
+        ("query_uri", "https://different.example.test"),
+        ("name", "different-db"),
+    ],
+)
+def test_materialized_kql_refuses_wrong_region_identity_shortcuts_or_endpoint(materialized, field, value):
+    case = materialized
+    setattr(case.fabric, field, value)
+    ready, warnings = case.recovery.restore(case.generation, case.item, TARGET, case.runtime)
+    assert not ready and warnings and not case.sdk.queries
+    assert not case.runtime.catalog.pending_operations(), (
+        "Read-only rejection must not block unrelated groups."
+    )
+
+
+def test_materialized_kql_refuses_functions_and_empty_cloned_schema(materialized):
+    case = materialized
+    case.sdk.physical = False
+    ready, warnings = case.recovery.restore(case.generation, case.item, TARGET, case.runtime)
+    assert not ready and any("physical table" in warning for warning in warnings)
+    assert not case.sdk.queries
+
+
+@pytest.mark.parametrize("failure", ["catalog", "cancel"])
+def test_materialized_kql_fences_between_authenticated_input_and_target_reads(materialized, failure):
+    case = materialized
+
+    def interrupt():
+        if failure == "catalog":
+            case.runtime.catalog.available = False
+        else:
+            case.runtime.cancelled = True
+
+    case.sdk.after_query = interrupt
+    with pytest.raises(CatalogError if failure == "catalog" else CancelledError):
+        case.recovery.restore(case.generation, case.item, TARGET, case.runtime)
+    assert len(case.sdk.queries) == 1
+
+
+def test_materialized_kql_preserves_service_error_and_redacts_credentials(materialized):
+    from fabshuffle.fabric.client import FabricApiError
+
+    case = materialized
+    case.fabric.failure = FabricApiError(
+        "GET",
+        "target",
+        403,
+        '{"errorCode":"KqlAccessDenied","message":"token=DO_NOT_LOG"}',
+    )
+    ready, warnings = case.recovery.restore(case.generation, case.item, TARGET, case.runtime)
+    assert not ready and "KqlAccessDenied" in warnings[0] and "DO_NOT_LOG" not in warnings[0]
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "source", "wrong-tenant", "url"])
+def test_materialized_kql_bindings_are_exact_typed_and_non_source(materialized, change):
+    body = materialized.request.configuration.model_dump(mode="json")
+    row = body["kql_materialized_inputs"][0]
+    if change == "missing":
+        row["resource_ref"] = "not-the-declared-input"
+    elif change == "duplicate":
+        body["kql_materialized_inputs"].append(dict(row))
+    elif change == "source":
+        row["item"] = SOURCE.model_dump(mode="json")
+    elif change == "wrong-tenant":
+        row["item"]["tenant_id"] = str(uuid4())
+    else:
+        row["endpoint"] = "https://arbitrary.example.test"
+    with pytest.raises(ValidationError):
+        binding.ProtectionConfiguration.model_validate(body)
+
+
+def test_materialized_kql_does_not_claim_live_ingestion_from_table_access(materialized):
+    case = materialized
+    descriptor = replace(
+        case.request.configuration.descriptor, continuous=True, independent_active_compute=True
+    )
+    configuration = case.request.configuration.model_copy(update={"descriptor": descriptor})
+    request = binding.ConfigureProtectionRequest(
+        source=SOURCE, configuration=configuration, expected_revision=1
+    )
+    record = binding.configure_protection(case.runtime, request, protected_root=None)
+    captured, item = generation(record, item_type="KQLDatabase")
+    assert binding.prepared_target(captured, item, case.runtime.catalog) is None
+    ready, warnings = case.recovery.restore(captured, item, TARGET, case.runtime)
+    assert not ready and any("no executable default binding" in warning for warning in warnings)
+    assert not case.fabric.calls and not case.sdk.queries
+
+
+def test_old_config_without_additive_binding_field_keeps_its_pinned_digest(configured):
+    row = configured.runtime.catalog.get_record("protection-config", configured.record.artifact_reference)
+    old = dict(row.document)
+    old.pop("kql_materialized_inputs")
+    reference = digest(canonical_json(old))
+    configured.runtime.catalog.put_record(
+        configured.runtime.lease,
+        "protection-config",
+        reference,
+        old,
+        expected_revision=None,
+    )
+    record = configured.record.model_copy(update={"artifact_reference": reference, "sha256": reference})
+    assert binding._load_config(record, configured.runtime.catalog).kql_materialized_inputs == ()

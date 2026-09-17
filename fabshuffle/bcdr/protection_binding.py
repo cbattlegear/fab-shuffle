@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
@@ -49,6 +49,11 @@ from fabshuffle.bcdr.protection import (
 )
 from fabshuffle.bcdr.protection_cosmos import CosmosProtection, restore_cosmos
 from fabshuffle.bcdr.protection_kql import KqlProtection, validate_kql
+from fabshuffle.bcdr.protection_kql_binding import (
+    KqlMaterializedInput,
+    restore_materialized_kql,
+    validate_materialized_bindings,
+)
 from fabshuffle.bcdr.protection_sql import SqlProtection, restore_sql
 from fabshuffle.fabric import cosmosdb, sqldatabases
 from fabshuffle.fabric.client import FabricApiError, FabricClient
@@ -94,6 +99,7 @@ class ProtectionConfiguration(Record):
     storage: ProtectionStorage | None = None
     max_age_seconds: Annotated[int, Field(strict=True, gt=0, le=86399999913600)]
     target_approval_ref: EvidenceRef
+    kql_materialized_inputs: tuple[KqlMaterializedInput, ...] = ()
 
     @model_validator(mode="after")
     def provider_matches(self) -> Self:
@@ -105,7 +111,11 @@ class ProtectionConfiguration(Record):
                 raise ValueError("Prepared KQL data does not use a portable-file storage configuration.")
             if self.target_approval_ref != self.descriptor.target_approval_ref:
                 raise ValueError("KQL target approval must match the prepared mapping.")
+            if self.kql_materialized_inputs:
+                validate_materialized_bindings(self.descriptor, self.kql_materialized_inputs)
         else:
+            if self.kql_materialized_inputs:
+                raise ValueError("Materialized KQL inputs are only valid for the KQL provider.")
             manifest = self.descriptor.manifest
             if self.storage is None or (
                 self.storage.storage_region != manifest.storage_region
@@ -227,6 +237,35 @@ def owns_schema(generation: CapturedGeneration, item: ItemRecord, catalog: Recov
     )
 
 
+def prepared_target(
+    generation: CapturedGeneration,
+    item: ItemRecord,
+    catalog: RecoveryCatalog,
+) -> ItemIdentity | None:
+    """Nominate an explicit prepared mapping, never certify metadata or adopt by name.
+
+    The coordinator must independently qualify the prepared target's metadata,
+    ownership, placement and restricted ACLs before registering this mapping.
+    """
+    record = _selected_record(generation, item)
+    if item.item_type != "KQLDatabase" or record is None or not record.artifact_reference:
+        return None
+    configuration = _load_config(record, catalog)
+    descriptor = configuration.descriptor
+    if (
+        not isinstance(descriptor, KqlProtection)
+        or not configuration.kql_materialized_inputs
+        or descriptor.continuous
+    ):
+        return None
+    identity = descriptor.target.identity
+    return ItemIdentity(
+        tenant_id=identity.tenant_id,
+        workspace_id=identity.workspace_id,
+        item_id=identity.item_id,
+    )
+
+
 def _location(configuration: ProtectionConfiguration, protected_root: Path | None) -> ProtectedLocation:
     if protected_root is None:
         raise ProtectionError(
@@ -272,10 +311,18 @@ def configure_protection(
             limits=limits,
         )
         outcome = RecoveryOutcome.MANUAL
-        qualification = Qualification.NEEDS_PROVIDER
+        concrete = bool(configuration.kql_materialized_inputs) and not configuration.descriptor.continuous
+        qualification = Qualification.UNVERIFIED if concrete else Qualification.NEEDS_PROVIDER
         limitations = (
             *status.warnings,
-            "Resolve and independently verify the named KQL data inputs before declaring data ready.",
+            (
+                "Materialized KQL data bindings are configured but unverified; qualify the exact prepared "
+                "target metadata and run authenticated local-table probes before data readiness."
+                if concrete
+                else "Manual KQL protection only: opaque or continuous ingestion inputs have no executable "
+                "default binding. Supply typed materialized KQL inputs "
+                "or a qualified workload-specific provider."
+            ),
         )
     else:
 
@@ -407,6 +454,87 @@ class ProviderDataRecovery:
             endpoint = cosmosdb.endpoint_url(response)
         return DataEndpoint(_data_identity(target), endpoint, database)
 
+    def _materialized_kql(
+        self,
+        generation: CapturedGeneration,
+        item: ItemRecord,
+        target: ItemIdentity,
+        runtime: DurableRuntime,
+        record: ProtectionRecord,
+        configuration: ProtectionConfiguration,
+    ) -> tuple[bool, tuple[str, ...]]:
+        descriptor = configuration.descriptor
+        if not isinstance(descriptor, KqlProtection):
+            raise ProtectionError("Materialized KQL validation needs a KQL protection descriptor.")
+        if runtime.catalog.pending_operations():
+            raise CatalogConflict("Reconcile pending operations before validating prepared KQL data.")
+
+        def fence() -> bool:
+            runtime.fence()
+            return False
+
+        def action() -> dict[str, JsonValue]:
+            try:
+                assessment = restore_materialized_kql(
+                    client=self.client,
+                    tokens=self.tokens,
+                    protection=descriptor,
+                    bindings=configuration.kql_materialized_inputs,
+                    target=_data_identity(target),
+                    max_age=timedelta(seconds=configuration.max_age_seconds),
+                    limits=self.limits,
+                    cancel=fence,
+                )
+                runtime.fence()
+                return _RestoreResult(
+                    configuration_digest=record.sha256,
+                    source=item.identity,
+                    target=target,
+                    state=assessment.state,
+                    data_ready=assessment.data_ready,
+                    warnings=tuple(safe_text(warning) for warning in assessment.warnings),
+                ).model_dump(mode="json")
+            except _PROVIDER_ERRORS as error:
+                # Every service operation in this branch is read-only. Record the
+                # failed observation without making an unrelated group ambiguous.
+                runtime.fence()
+                return _RestoreResult(
+                    configuration_digest=record.sha256,
+                    source=item.identity,
+                    target=target,
+                    state="deferred",
+                    data_ready=False,
+                    warnings=(
+                        f"{item.display_name}: {safe_text(str(error))}. "
+                        "Repair the independent prepared KQL input and repeat its authenticated checks.",
+                    ),
+                ).model_dump(mode="json")
+
+        # Readiness probes are observations, not imports. Requery every time; never
+        # infer current availability from yesterday's successful validation journal.
+        key = (
+            f"{generation.snapshot.generation_id}:{item.identity.key}:{target.key}:"
+            f"{record.artifact_reference}:{uuid4()}"
+        )
+        result = _RestoreResult.model_validate(
+            runtime.effect(
+                "data-validate",
+                key,
+                action,
+                generation_id=generation.snapshot.generation_id,
+                source=item.identity,
+                target=target,
+            )
+        )
+        runtime.fence()
+        if (
+            result.configuration_digest != record.sha256
+            or result.source != item.identity
+            or result.target != target
+        ):
+            raise ProtectionError("KQL validation result does not match the pinned recovery mapping.")
+        return result.data_ready and result.state == "restored_stopped", result.warnings
+
     def restore(
         self,
         generation: CapturedGeneration,
@@ -433,11 +561,17 @@ class ProviderDataRecovery:
             )
             if configuration.descriptor.target.identity != _data_identity(target):
                 raise ProtectionError("The KQL prepared data belongs to a different target mapping.")
+            if status.state != "protected":
+                return False, status.warnings
+            if configuration.kql_materialized_inputs and not configuration.descriptor.continuous:
+                return self._materialized_kql(generation, item, target, runtime, record, configuration)
             unresolved = ", ".join(value.resource_ref for value in configuration.descriptor.inputs)
             return False, (
                 *status.warnings,
-                f"{item.display_name}: independently resolve and verify KQL "
-                f"data inputs [{unresolved}]; the default binder cannot certify opaque input evidence.",
+                f"{item.display_name}: manual KQL protection only for data inputs [{unresolved}]. "
+                "Opaque or continuous ingestion inputs have no executable default binding. "
+                "Supply typed independent materialized KQL data inputs "
+                "or qualify a workload-specific provider.",
             )
         if self.protected_root is None:
             return False, (
