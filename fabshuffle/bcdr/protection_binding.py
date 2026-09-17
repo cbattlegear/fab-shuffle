@@ -720,6 +720,7 @@ class ProviderDataRecovery:
                         scratch=self.scratch,
                         max_age=timedelta(seconds=configuration.max_age_seconds),
                         target_approval_ref=configuration.target_approval_ref,
+                        target_client=self.client,
                         limits=self.limits,
                         cancel=fence,
                     )

@@ -295,6 +295,7 @@ def copy_tree_streaming(
     on_complete: Callable[[CopyOutcome], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     transport_client: httpx.Client | None = None,
+    existing_target_directories: Collection[str] = (),
 ) -> CopyOutcome:
     """Relay a frozen OneLake tree through bounded RAM and bounded checkpoint disk.
 
@@ -317,6 +318,9 @@ def copy_tree_streaming(
     A successful byte copy does not establish destination SQL catalog readiness.
     ``transport_client`` lets a recovery caller enforce pinned input/no-overwrite policies;
     its lifetime belongs to that caller. Ordinary transfers retain the default client.
+    ``existing_target_directories`` contains exact root-relative directories whose
+    empty, local destination scaffolding the caller already verified. Only their
+    directory PUT is skipped; files are never skipped or treated as successful copies.
     The destination must be fresh, or a retry of the same operator-frozen source snapshot.
     On retry each file is recreated before appending; no uncertain append is retried alone.
 
@@ -342,6 +346,14 @@ def copy_tree_streaming(
     excluded = {value.strip("/") for value in exclude_paths}
     count = 0
     copied_metadata: set[str] = set()
+    existing_directories = set(existing_target_directories)
+    for value in existing_directories:
+        if (
+            not value or "\\" in value or "%" in value or ":" in value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise FileTransferError("Existing target directories must be exact root-relative paths.")
 
     def is_excluded(name: str) -> bool:
         local = name[len(source_root) + 1:]
@@ -359,18 +371,22 @@ def copy_tree_streaming(
                 continue
             target = f"{target_fs}/{quote(target_root + '/' + local, safe='/')}"
             if str(entry.get("isDirectory", False)).lower() == "true":
-                response = client.put(
-                    target, params={"resource": "directory"}, headers=_headers(target_tokens), content=b"",
-                )
-                if not response.is_success:
-                    try:
-                        code = response.json().get("error", {}).get("code")
-                    except ValueError:
-                        code = None
-                    if response.status_code != 409 or code != "PathAlreadyExists":
-                        raise _error(response)
+                if local not in existing_directories:
+                    response = client.put(
+                        target, params={"resource": "directory"},
+                        headers=_headers(target_tokens), content=b"",
+                    )
+                    if not response.is_success:
+                        try:
+                            code = response.json().get("error", {}).get("code")
+                        except ValueError:
+                            code = None
+                        if response.status_code != 409 or code != "PathAlreadyExists":
+                            raise _error(response)
                 visit(client, local)
             else:
+                if local in existing_directories:
+                    raise FileTransferError("A verified destination directory conflicts with a source file.")
                 entry = snapshot.pin(entry)
                 if on_progress:
                     on_progress(f"Copying OneLake {local}")
