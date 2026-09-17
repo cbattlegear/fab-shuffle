@@ -10,6 +10,7 @@ import logging
 import shutil
 import subprocess
 from collections.abc import Callable, Collection, Iterator
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -293,6 +294,7 @@ def copy_tree_streaming(
     on_progress: Callable[[str], None] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    transport_client: httpx.Client | None = None,
 ) -> CopyOutcome:
     """Relay a frozen OneLake tree through bounded RAM and bounded checkpoint disk.
 
@@ -313,6 +315,8 @@ def copy_tree_streaming(
     Source writes must remain frozen.
     ``scratch_dir`` defaults to the working directory; private checkpoint staging is always removed.
     A successful byte copy does not establish destination SQL catalog readiness.
+    ``transport_client`` lets a recovery caller enforce pinned input/no-overwrite policies;
+    its lifetime belongs to that caller. Ordinary transfers retain the default client.
     The destination must be fresh, or a retry of the same operator-frozen source snapshot.
     On retry each file is recreated before appending; no uncertain append is retried alone.
 
@@ -378,7 +382,11 @@ def copy_tree_streaming(
                 if name in snapshot.files:
                     copied_metadata.add(name)
 
-    with httpx.Client(timeout=120, follow_redirects=False) as client:
+    transport = (
+        nullcontext(transport_client) if transport_client is not None
+        else httpx.Client(timeout=120, follow_redirects=False)
+    )
+    with transport as client:
         from fabshuffle.transfer.delta import preflight
 
         snapshot = preflight(
