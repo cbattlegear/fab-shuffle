@@ -17,6 +17,7 @@ from fabshuffle.bcdr.catalog import CatalogError
 from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
 from fabshuffle.bcdr.service import (
     BcdrService,
+    ConfigureReplicaRequest,
     CutbackRequest,
     CutoverRequest,
     EnableRecoveryRequest,
@@ -24,6 +25,7 @@ from fabshuffle.bcdr.service import (
     FailbackRequest,
     PlanRequest,
     RearmRequest,
+    ReconcileOperationRequest,
     ServiceResult,
     SetupRequest,
     SyncRequest,
@@ -35,6 +37,8 @@ from fabshuffle.bcdr.service import (
 from fabshuffle.fabric.client import FabricApiError, FabricError
 
 REQUESTS = {
+    "reconcile-operation": ReconcileOperationRequest,
+    "configure-replica": ConfigureReplicaRequest,
     "setup": SetupRequest,
     "configure-protection": ConfigureProtectionRequest,
     "plan": PlanRequest,
@@ -48,7 +52,7 @@ REQUESTS = {
 }
 CONSEQUENTIAL = frozenset({
     "setup", "configure-protection", "synchronize", "enable-recovery",
-    "cutover", "execute-failback", "cutback", "rearm",
+    "cutover", "execute-failback", "cutback", "rearm", "reconcile-operation", "configure-replica",
 })
 
 
@@ -84,6 +88,10 @@ def dispatch(service: BcdrService, command: str, text: str) -> ServiceResult:
     """Explicit typed calls; unsupported commands cannot reach a dynamic service member."""
     if command == "status":
         return service.status()
+    if command == "reconcile-operation":
+        return service.reconcile_operation(ReconcileOperationRequest.model_validate_json(text))
+    if command == "configure-replica":
+        return service.configure_replica(ConfigureReplicaRequest.model_validate_json(text))
     if command == "configure-protection":
         return service.configure_protection(ConfigureProtectionRequest.model_validate_json(text))
     if command == "plan":

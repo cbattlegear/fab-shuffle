@@ -18,7 +18,13 @@ from fabshuffle.bcdr.backend import RecoveryBlocked
 from fabshuffle.bcdr.bootstrap import BootstrapDescriptor, BootstrapStore, CapacityAuthorization
 from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.contracts import RecoveryMode
-from fabshuffle.bcdr.service import ServiceResult, SetupRequest, SyncRequest
+from fabshuffle.bcdr.service import (
+    ConfigureReplicaRequest,
+    ReconcileOperationRequest,
+    ServiceResult,
+    SetupRequest,
+    SyncRequest,
+)
 from fabshuffle.fabric.client import FabricApiError
 from fabshuffle.web import app as web
 from fabshuffle.web import bcdr
@@ -55,7 +61,59 @@ FENCE = {
     "evidence": "Operator evidence reference", "confirmed_by": "Recovery operator",
     "observed_at": "2026-09-17T10:00:00Z", "valid_until": "2026-09-17T11:00:00Z",
 }
+RECONCILE = {
+    "operation_id": GENERATION, "expected_controller_id": CONTROL, "expected_epoch": 4,
+    "previous_controller_stopped": True, "fencing_evidence": "Stopped and fenced controller worker.",
+    "target_quiescence_evidence": "Destination jobs and writers stopped.",
+}
+REPLICA = {
+    "generation_id": GENERATION,
+    "source": {"tenant_id": TENANT, "workspace_id": CONTROL, "item_id": SPN},
+    "attachments": [{
+        "binding": {
+            "generation_id": GENERATION,
+            "source": {"tenant_id": TENANT, "workspace_id": CONTROL, "item_id": SPN},
+            "source_path": "Tables/dbo/orders",
+            "consumer": {"tenant_id": TENANT, "workspace_id": SOURCE_CAPACITY, "item_id": TARGET_CAPACITY},
+            "strategy": "temporary_continuity", "qualification": "verified",
+            "read_only_verified": True, "retention_acknowledged": True,
+            "evidence": "Independent caller access qualification",
+        },
+        "shortcut_path": "Tables/dbo", "shortcut_name": "orders",
+        "access_evidence": {
+            "qualification_id": GENERATION, "binding_sha256": "a" * 64,
+            "principal": {"tenant_id": TENANT, "object_id": SPN, "kind": "ServicePrincipal"},
+            "verified_at": "2026-09-17T10:00:00Z", "valid_until": "2026-09-17T11:00:00Z",
+            "enforcement_reference": "Independent caller access qualification", "access_mode": "caller",
+        },
+    }],
+    "qualified_at": "2026-09-17T10:00:00Z", "valid_until": "2026-09-17T11:00:00Z",
+    "qualification_evidence": "Independently qualified incident reference",
+}
+LAKEHOUSE = {
+    "source": {"tenant_id": TENANT, "workspace_id": CONTROL, "item_id": SPN},
+    "configuration": {
+        "provider": "lakehouse",
+        "descriptor": {
+            "source": {"tenant_id": TENANT, "workspace_id": CONTROL, "item_id": SPN},
+            "captured_at": "2026-09-17T10:00:00Z", "completed_at": "2026-09-17T10:01:00Z",
+            "consistency": {
+                "reference": "snapshot_freeze",
+                "verified_at": "2026-09-17T09:00:00Z", "valid_until": "2026-09-17T11:00:00Z",
+                "writes_quiesced": True,
+            },
+            "storage_read_approval_ref": "approved_snapshot_access",
+            "snapshot_qualification_ref": "qualified_snapshot",
+            "source_region": "eastus", "recovery_region": "westus",
+            "files": [], "directories": ["Tables", "Files"], "source_paths_verified_local": True,
+        },
+        "max_age_seconds": 3600, "target_approval_ref": "approved_target",
+    },
+}
 LIFECYCLE_REQUESTS = [
+    ("reconcile-operation", RECONCILE),
+    ("configure-replica", REPLICA),
+    ("configure-protection", LAKEHOUSE),
     ("cutover", {
         "generation_id": GENERATION, "group_ids": ["sales"], "readiness": [], "writer_fence": FENCE,
     }),
@@ -135,6 +193,18 @@ class Service:
         self.calls.append(("rearm", request))
         return self.result
 
+    def reconcile_operation(self, request):
+        self.calls.append(("reconcile-operation", request))
+        return self.result
+
+    def configure_replica(self, request):
+        self.calls.append(("configure-replica", request))
+        return self.result
+
+    def configure_protection(self, request):
+        self.calls.append(("configure-protection", request))
+        return self.result
+
     def close(self):
         self.closed = True
 
@@ -163,7 +233,7 @@ def test_all_product_routes_require_authentication(product):
         assert client.get(f"/api/bcdr/{path}").status_code == 401
     for path in (
         "setup", "configure-protection", "plan", "synchronize", "enable-recovery", "cutover",
-        "plan-failback", "execute-failback", "cutback", "rearm",
+        "plan-failback", "execute-failback", "cutback", "rearm", "reconcile-operation", "configure-replica",
     ):
         assert client.post(f"/api/bcdr/{path}", json={}).status_code == 401
     assert not service.calls
@@ -176,10 +246,30 @@ def test_forms_do_not_resume_capacity_or_read_catalog(product):
     commands = {entry["name"]: entry for entry in response.json()["commands"]}
     assert commands["synchronize"]["schema"] == SyncRequest.model_json_schema()
     assert commands["setup"]["schema"] == SetupRequest.model_json_schema()
+    assert commands["reconcile-operation"]["schema"] == ReconcileOperationRequest.model_json_schema()
+    assert commands["configure-replica"]["schema"] == ConfigureReplicaRequest.model_json_schema()
     assert response.json()["identity"] == {"tenant_id": TENANT, "client_id": CLIENT, "object_id": SPN}
     assert "NOT Enable" in commands["synchronize"]["confirmation"]
     assert "control workspace" in commands["enable-recovery"]["confirmation"]
     assert created == []
+
+@pytest.mark.parametrize(("command", "payload"), [
+    ("reconcile-operation", RECONCILE),
+    ("configure-replica", REPLICA),
+])
+def test_new_actions_require_exact_confirmation_and_complete_evidence(product, command, payload):
+    client, headers, service, created, _ = product
+    assert client.post(f"/api/bcdr/{command}", headers=headers, json=payload).status_code == 422
+    assert client.post(f"/api/bcdr/{command}", headers=headers, json={
+        "confirmation": "enable-recovery", "request": payload,
+    }).status_code == 409
+    incomplete = {key: value for key, value in payload.items() if key not in {
+        "fencing_evidence", "attachments",
+    }}
+    assert client.post(f"/api/bcdr/{command}", headers=headers, json={
+        "confirmation": command, "request": incomplete,
+    }).status_code == 422
+    assert not service.calls and not created
 
 
 def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch):

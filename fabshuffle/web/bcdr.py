@@ -24,6 +24,7 @@ from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
 from fabshuffle.bcdr.service import (
     BcdrService,
+    ConfigureReplicaRequest,
     CutbackRequest,
     CutoverRequest,
     EnableRecoveryRequest,
@@ -31,6 +32,7 @@ from fabshuffle.bcdr.service import (
     FailbackRequest,
     PlanRequest,
     RearmRequest,
+    ReconcileOperationRequest,
     ServiceResult,
     SetupRequest,
     SyncRequest,
@@ -93,6 +95,13 @@ COMMANDS = (
     ("status", "Read recovery status", None,
      "Read the saved recovery state without source metadata reads. This resumes the metadata "
      "Warehouse capacity if paused; storage is still billed while paused.", ""),
+    ("reconcile-operation", "Reconcile interrupted operation", ReconcileOperationRequest,
+     "Read status, select the exact recorded operation, stop the previous controller and provide "
+     "controller-fencing and destination-quiescence evidence. The backend verifies the service receipt; "
+     "an uncertain create is never repeated or adopted by name.",
+     "Take over the recorded controller epoch after fencing its previous worker and reconcile only "
+     "the exact owned receipt. This may finish interrupted metadata application, but does not "
+     "enable recovery, admit a dependency group or approve cutover. Receipt-free ambiguity remains blocked."),
     ("plan", "Preview standby selection", PlanRequest,
      "Preview exact workspace selection, dependency additions and capacity routes against a captured "
      "generation. Empty includes mean the configured source-capacity scope, not the whole tenant.", ""),
@@ -103,11 +112,18 @@ COMMANDS = (
      "Keep access restricted to the recovery principal and designated owners. This is NOT Enable "
      "recovery. The service pauses dedicated capacities only when safe and requested."),
     ("configure-protection", "Configure optional data protection", ConfigureProtectionRequest,
-     "Configure an approved SQL, Cosmos or KQL protection input for the next capture. "
+     "Configure an approved SQL, Cosmos, KQL or independent Lakehouse protection input for the next capture. "
      "Metadata synchronization itself does not copy business data. Keep credentials in the runtime provider.",
      "Record this optional protection configuration for the next capture. Review the off-region "
      "storage approval, integrity and consistency evidence. "
      "This is not a native backup or readiness approval."),
+    ("configure-replica", "Configure qualified temporary attachments", ConfigureReplicaRequest,
+     "Record independently qualified, exact retained-source OneLake paths and access evidence. "
+     "Enable recovery performs the attachment; configuration alone does not attach data or prove readiness. "
+     "Do not delete the retained source or treat a healthy-primary drill as outage qualification.",
+     "Record these exact temporary attachment identities and their independently verified access evidence. "
+     "Retain the original data for the full lifetime of the attachments. This is not independent recovery, "
+     "does not enable recovery, and does not establish read-only enforcement or approve cutover."),
     ("enable-recovery", "Enable recovery", EnableRecoveryRequest,
      "Use a captured generation without source metadata reads. Approve only the displayed deferred "
      "ACL IDs. Enabling recovery stops scheduled source-to-standby sync and automatic pause.",
@@ -259,6 +275,15 @@ def create_router(
     async def status(session=Depends(require_session)):
         return await execute(session, lambda: _service_call(session, lambda service: service.status()))
 
+    @router.post("/reconcile-operation", response_model=ServiceResult)
+    async def reconcile_operation(
+        body: ConfirmedRequest[ReconcileOperationRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "reconcile-operation")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.reconcile_operation(request))
+        )
+
     @router.post("/plan", response_model=ServiceResult)
     async def plan(body: PlanRequest, session=Depends(require_session)):
         return await execute(session, lambda: _service_call(session, lambda service: service.plan(body)))
@@ -288,6 +313,15 @@ def create_router(
         request = confirmed(body, "configure-protection")
         return await execute(
             session, lambda: _service_call(session, lambda service: service.configure_protection(request))
+        )
+
+    @router.post("/configure-replica", response_model=ServiceResult)
+    async def configure_replica(
+        body: ConfirmedRequest[ConfigureReplicaRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "configure-replica")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.configure_replica(request))
         )
 
     @router.post("/cutover", response_model=ServiceResult)

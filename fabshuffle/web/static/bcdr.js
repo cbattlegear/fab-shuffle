@@ -34,6 +34,7 @@ function bcdrLabel(name) {
     target_capacity_ids: "Dedicated recovery capacity IDs",
     target_capacity_id: "Dedicated recovery capacity ID",
     connection_mappings: "Approved connection routes",
+    return_connection_mappings: "Approved return connection routes",
     connection_id: "Connection ID",
     recovery_capacities: "Dedicated recovery capacities",
     fabric_capacity_id: "Fabric capacity ID",
@@ -67,6 +68,24 @@ function bcdrLabel(name) {
     effective_principals: "Principals used for effective-access checks",
     evidence: "Evidence reference (operator or runtime record)",
     confirmed_by: "Operator confirming the writer fence",
+    expected_controller_id: "Recorded controller ID",
+    operation_id: "Recorded operation",
+    previous_controller_stopped: "I have stopped and fenced the previous controller",
+    fencing_evidence: "Evidence that the previous controller is fenced",
+    target_quiescence_evidence: "Evidence that destination activity is stopped",
+    issuer: "Authenticated readiness evidence issuer",
+    writer_epoch: "Observed writer epoch",
+    qualification_evidence: "Independent incident qualification reference",
+    access_evidence: "Independently verified access enforcement",
+    enforcement_reference: "Read-only enforcement evidence reference",
+    qualification_id: "Independent qualification ID",
+    binding_sha256: "Independently verified binding hash (SHA-256)",
+    expected_configuration_sha256: "Existing configuration hash (for same-scope renewal only)",
+    source_paths_verified_local: "Snapshot paths independently verified as local source data",
+    snapshot_qualification_ref: "Independent snapshot qualification reference",
+    storage_read_approval_ref: "Approved OneLake snapshot access reference",
+    read_only_verified: "Independent checks verified read-only access (attestation, not enforcement)",
+    retention_acknowledged: "I will retain the original source identities and data while attachments exist",
   };
   return labels[name] || name.replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase());
 }
@@ -80,7 +99,7 @@ function bcdrResolve(schema, root) {
   return { ...resolved, ...schema, $ref: undefined };
 }
 
-function bcdrField(name, source, root, required = false) {
+function bcdrField(name, source, root, required = false, context = []) {
   let schema = bcdrResolve(source, root);
   if (schema.anyOf || schema.oneOf) {
     const alternatives = schema.anyOf || schema.oneOf;
@@ -98,7 +117,7 @@ function bcdrField(name, source, root, required = false) {
       const fields = bcdrElement("fieldset");
       fields.disabled = true;
       fields.hidden = true;
-      const field = bcdrField(name, choices[0], root, true);
+      const field = bcdrField(name, choices[0], root, true, context);
       fields.appendChild(field.element);
       group.appendChild(fields);
       enabled.addEventListener("change", () => {
@@ -129,7 +148,7 @@ function bcdrField(name, source, root, required = false) {
       let field;
       select.addEventListener("change", () => {
         holder.replaceChildren();
-        field = select.value === "" ? undefined : bcdrField(name, choices[Number(select.value)], root, true);
+        field = select.value === "" ? undefined : bcdrField(name, choices[Number(select.value)], root, true, context);
         if (field) holder.appendChild(field.element);
       });
       return {
@@ -143,8 +162,9 @@ function bcdrField(name, source, root, required = false) {
     schema = { ...schema, ...bcdrResolve(choices[0], root) };
   }
   const id = `bcdr-field-${++bcdr.sequence}`;
-  const title = bcdrLabel(name);
-  if (name === "recovery_spn") {
+  const controllerEpoch = name === "expected_epoch" && !!root.properties?.expected_controller_id;
+  const title = controllerEpoch ? "Recorded controller epoch (not writer epoch)" : bcdrLabel(name);
+  if (name === "recovery_spn" || name === "issuer") {
     const group = bcdrElement("div", undefined, "bcdr-wide");
     group.appendChild(bcdrElement("p",
       `${title}: ${bcdr.identity.object_id || "Identity unavailable; sign in again"}. ` +
@@ -159,7 +179,57 @@ function bcdrField(name, source, root, required = false) {
       },
     };
   }
-  if (["generation_id", "plan_id", "expected_epoch", "tenant_id"].includes(name)) {
+  if (name === "operation_id" && root.properties?.expected_controller_id) {
+    const group = bcdrElement("div", undefined, "bcdr-wide");
+    const label = bcdrElement("label", title);
+    const select = bcdrElement("select");
+    select.id = id;
+    select.name = name;
+    label.htmlFor = id;
+    label.appendChild(select);
+    group.appendChild(label);
+    const advanced = bcdrElement("details");
+    advanced.appendChild(bcdrElement("summary", "Use an exact recorded ID instead"));
+    const exactLabel = bcdrElement("label", "Exact operation ID from the catalog or saved result");
+    const exact = bcdrElement("input");
+    exact.type = "text";
+    exact.id = `${id}-exact`;
+    exactLabel.htmlFor = exact.id;
+    exactLabel.appendChild(exact);
+    advanced.appendChild(exactLabel);
+    advanced.appendChild(bcdrElement("p",
+      "Use this for a completed receipt whose catalog mapping was interrupted. Never use a target name or create a new ID.",
+      "hint"));
+    group.appendChild(advanced);
+    select.addEventListener("change", () => { exact.value = ""; });
+    exact.addEventListener("input", () => { select.value = ""; });
+    const refresh = () => {
+      select.replaceChildren();
+      const empty = bcdrElement("option", "Read status, then select an operation");
+      empty.value = "";
+      select.appendChild(empty);
+      for (const operation of bcdr.latest.details?.pending_operations || []) {
+        const option = bcdrElement("option",
+          `${operation.kind}: ${operation.source?.item_id || operation.target?.item_id || operation.operation_id}` +
+          ` - ${operation.state} - ${operation.operation_id}`);
+        option.value = operation.operation_id;
+        select.appendChild(option);
+      }
+      select.value = "";
+      exact.value = "";
+    };
+    bcdr.bindings.push(refresh);
+    refresh();
+    return {
+      element: group,
+      read: () => {
+        const value = exact.value.trim() || select.value;
+        if (!value) throw new Error("Select the exact recorded operation after reading recovery status.");
+        return value;
+      },
+    };
+  }
+  if (["generation_id", "plan_id", "expected_epoch", "writer_epoch", "tenant_id", "expected_controller_id"].includes(name)) {
     const label = bcdrElement("label", title);
     const input = bcdrElement("input");
     input.type = "text";
@@ -169,7 +239,12 @@ function bcdrField(name, source, root, required = false) {
     input.placeholder = name === "plan_id" ? "Create a failback plan first" : "Read status or preview first";
     label.appendChild(input);
     const refresh = () => {
-      input.value = String(name === "expected_epoch" ? bcdr.latest.details?.writer?.epoch ?? "" :
+      input.value = String(name === "expected_controller_id" ? bcdr.latest.details?.controller_id || "" :
+        controllerEpoch ? bcdr.latest.details?.controller_epoch ?? "" :
+        name === "writer_epoch" ? bcdr.latest.details?.readiness_context?.writer_epoch ?? "" :
+        name === "generation_id" && context.includes("readiness") ?
+          bcdr.latest.details?.readiness_context?.generation_id || "" :
+        name === "expected_epoch" ? bcdr.latest.details?.writer?.epoch ?? "" :
         name === "tenant_id" ? bcdr.identity.tenant_id || "" : bcdr.latest[name] || "");
     };
     bcdr.bindings.push(refresh);
@@ -178,7 +253,8 @@ function bcdrField(name, source, root, required = false) {
       element: label,
       read: () => {
         if (!input.value && required) throw new Error(`${input.placeholder} to pin the ${title.toLowerCase()}.`);
-        return input.value === "" ? undefined : name === "expected_epoch" ? Number(input.value) : input.value;
+        return input.value === "" ? undefined :
+          ["expected_epoch", "writer_epoch"].includes(name) ? Number(input.value) : input.value;
       },
     };
   }
@@ -318,6 +394,24 @@ function bcdrField(name, source, root, required = false) {
     return { element: fieldset, read: () => controls.filter((input) => input.checked).map((input) => input.value) };
   }
   if (schema.const !== undefined) {
+    if (typeof schema.const === "boolean") {
+      const label = bcdrElement("label", title, "bcdr-check");
+      const input = bcdrElement("input");
+      input.type = "checkbox";
+      input.name = name;
+      input.id = id;
+      input.checked = false;
+      input.required = true;
+      label.htmlFor = id;
+      label.appendChild(input);
+      return {
+        element: label,
+        read: () => {
+          if (!input.checked) throw new Error(`Confirm: ${title}.`);
+          return schema.const;
+        },
+      };
+    }
     return { element: document.createDocumentFragment(), read: () => schema.const };
   }
   if (schema.type === "object") {
@@ -360,7 +454,7 @@ function bcdrField(name, source, root, required = false) {
     }
     for (const [key, value] of Object.entries(schema.properties || {})) {
       if (workspace && ["control_workspace_name", "control_workspace_id"].includes(key)) continue;
-      const field = bcdrField(key, value, root, (schema.required || []).includes(key));
+      const field = bcdrField(key, value, root, (schema.required || []).includes(key), [...context, name]);
       fields.appendChild(field.element);
       readers.push([key, field.read]);
     }
@@ -383,7 +477,7 @@ function bcdrField(name, source, root, required = false) {
     add.type = "button";
     add.addEventListener("click", () => {
       const row = bcdrElement("div");
-      const field = bcdrField(name, schema.items, root, true);
+      const field = bcdrField(name, schema.items, root, true, context);
       row.appendChild(field.element);
       const remove = bcdrElement("button", "Remove entry", "secondary");
       remove.type = "button";
@@ -488,6 +582,80 @@ function bcdrRenderResult(result) {
     facts.appendChild(bcdrElement("dd", value, "v"));
   }
   output.appendChild(facts);
+  if (result.details?.readiness_context) {
+    const context = result.details.readiness_context;
+    output.appendChild(bcdrElement("h4", "Backend readiness context"));
+    output.appendChild(bcdrElement("p",
+      `Evidence generation ${context.generation_id}; writer epoch ${context.writer_epoch}. ` +
+      "This may differ from the original failover generation during failback. " +
+      "Collect current target and intended-principal evidence; these identifiers do not prove readiness.", "hint"));
+    const evidence = bcdrElement("details");
+    evidence.appendChild(bcdrElement("summary", "Issuer and intended runtime principals"));
+    evidence.appendChild(bcdrElement("pre", JSON.stringify(context, null, 2)));
+    output.appendChild(evidence);
+  }
+  if (result.details?.configuration_sha256) {
+    output.appendChild(bcdrElement("p", `Configuration hash: ${result.details.configuration_sha256}`, "hint"));
+  }
+  if (result.details?.temporary_configurations?.length) {
+    const section = bcdrElement("details");
+    section.appendChild(bcdrElement("summary", "Recorded temporary configurations for same-scope renewal"));
+    const list = bcdrElement("ul", undefined, "bcdr-results");
+    for (const configuration of result.details.temporary_configurations) {
+      const source = configuration.request.source;
+      list.appendChild(bcdrElement("li",
+        `${source.workspace_id}/${source.item_id}: ${configuration.sha256}. ` +
+        `Qualification valid until ${configuration.request.valid_until}.`));
+    }
+    section.appendChild(list);
+    output.appendChild(section);
+  }
+  if (result.details?.temporary_attachments?.length) {
+    const section = bcdrElement("section", undefined, "warnings");
+    section.appendChild(bcdrElement("h4", "Temporary attachments: retain the source"));
+    section.appendChild(bcdrElement("p",
+      "Attached data is not independent recovery. Do not delete the original identities or backing data. " +
+      "Collect fresh post-attachment engine, data, reference and effective-access evidence."));
+    const list = bcdrElement("ul", undefined, "bcdr-results");
+    for (const item of result.details.temporary_attachments) {
+      for (const attachment of item.attachments) {
+        const binding = attachment.binding;
+        const entry = bcdrElement("li",
+          `${binding.source.workspace_id}/${binding.source.item_id}/${binding.source_path} -> ` +
+          `${binding.consumer.workspace_id}/${binding.consumer.item_id}. ` +
+          `Attachment verified: ${attachment.attachment_verified ? "yes" : "no"}; ` +
+          `data ready: ${attachment.data_ready ? "yes" : "no"}.`);
+        list.appendChild(entry);
+      }
+    }
+    section.appendChild(list);
+    output.appendChild(section);
+  }
+  if (result.details?.pending_operations?.length) {
+    output.appendChild(bcdrElement("h4", "Interrupted operations to inspect"));
+    output.appendChild(bcdrElement("p",
+      "Read the exact service receipt before reconciling. Stop and fence the previous controller; " +
+      "an interrupted operation is not permission to repeat a create.", "hint"));
+    const list = bcdrElement("ul", undefined, "bcdr-results");
+    for (const operation of result.details.pending_operations) {
+      const entry = bcdrElement("li");
+      entry.appendChild(bcdrElement("strong", `${operation.kind} - ${operation.state}`));
+      entry.appendChild(bcdrElement("p", `Operation ${operation.operation_id}`));
+      if (operation.source) entry.appendChild(bcdrElement("p",
+        `Source item ${operation.source.workspace_id}/${operation.source.item_id}`));
+      if (operation.service_operation_id) entry.appendChild(bcdrElement("p",
+        `Service receipt ${operation.service_operation_id}`));
+      if (operation.error_code || operation.message) entry.appendChild(bcdrElement("p",
+        [operation.error_code, operation.message].filter(Boolean).join(": ")));
+      list.appendChild(entry);
+    }
+    output.appendChild(list);
+  }
+  if (result.details?.reconciled_operation) {
+    output.appendChild(bcdrElement("p",
+      `Reconciled operation ${result.details.reconciled_operation}. This does not enable recovery or approve cutover. ` +
+      "Read status again before selecting another operation.", "hint"));
+  }
   if (result.details?.capacities?.length) {
     output.appendChild(bcdrElement("h4", "Observed recovery capacity state"));
     output.appendChild(bcdrElement("p",
