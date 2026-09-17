@@ -9,6 +9,8 @@ https://learn.microsoft.com/fabric/onelake/onelake-disaster-recovery
 from __future__ import annotations
 
 import hashlib
+import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
@@ -28,6 +30,8 @@ from fabshuffle.bcdr.protection import (
     evidence_ref,
     operation_cancel,
 )
+from fabshuffle.fabric.client import FabricClient
+from fabshuffle.fabric.data_stores import get_lakehouse
 from fabshuffle.transfer import delta, files
 from fabshuffle.transfer.common import StagingBudgetError, check_cancelled
 
@@ -201,6 +205,7 @@ class _PinnedClient(httpx.Client):
         self.owned_files: set[str] = set()
         self.owned_directories: set[str] = set()
         self.writes_allowed = False
+        self.before_first_write: Callable[[], None] | None = None
 
     def send(self, request: httpx.Request, *, stream=False, **kwargs) -> httpx.Response:
         check_cancelled(self.cancel)
@@ -246,6 +251,9 @@ class _PinnedClient(httpx.Client):
         elif request.method not in ("GET", "HEAD"):
             if not self.writes_allowed:
                 raise ProtectionError("Complete every source/target preflight before writing OneLake data.")
+            if self.before_first_write is not None:
+                self.before_first_write()
+                self.before_first_write = None
             if request.method == "PUT":
                 if local in ("Tables", "Files"):
                     raise ProtectionError("Do not replace managed Lakehouse root directories.")
@@ -380,6 +388,53 @@ def capture_lakehouse(
     return result
 
 
+def _target_schema_mode(client: FabricClient, target: DataIdentity, cancel: Cancel) -> str | None:
+    """Use the exact live target; a schema shortcut can look like an empty directory."""
+    check_cancelled(cancel)
+    item = get_lakehouse(client, target.workspace_id, target.item_id)
+    if (
+        str(item.get("id", "")).casefold() != target.item_id
+        or str(item.get("workspaceId", "")).casefold() != target.workspace_id
+        or item.get("type") != "Lakehouse"
+    ):
+        raise ProtectionError("The schema scaffold belongs to a different live Lakehouse identity/type.")
+    properties = item.get("properties")
+    if not isinstance(properties, dict):
+        raise ProtectionError("The target Lakehouse returned incomplete schema-mode properties.")
+    default = properties.get("defaultSchema")
+    if default is not None and (not isinstance(default, str) or not re.fullmatch(r"[A-Za-z0-9_]+", default)):
+        raise ProtectionError("The target Lakehouse returned an invalid default schema.")
+    check_cancelled(cancel)
+    # Do not use the legacy wrapper that translates a 404 into an empty inventory.
+    shortcuts = client.list_all(f"workspaces/{target.workspace_id}/items/{target.item_id}/shortcuts")
+    if shortcuts:
+        raise ProtectionError(
+            "The target Lakehouse has shortcuts; use a local empty schema scaffold, not an external binding."
+        )
+    check_cancelled(cancel)
+    return default
+
+
+def _scaffold_versions(
+    client: httpx.Client,
+    target: DataIdentity,
+    directories: set[str],
+    tokens: TokenProvider,
+    cancel: Cancel,
+) -> dict[str, str]:
+    versions = {}
+    for path in sorted(directories - {"Tables", "Files"}):
+        check_cancelled(cancel)
+        response = files._request(client, "HEAD", f"{_root(target)}/{quote(path, safe='/')}", tokens)
+        etag = response.headers.get("ETag")
+        if not etag or response.headers.get("x-ms-resource-type") != "directory":
+            raise ProtectionError(
+                "Target schema scaffolding needs verifiable directory identity/ETag metadata."
+            )
+        versions[path] = etag
+    return versions
+
+
 def restore_lakehouse(
     protection: LakehouseProtection,
     *,
@@ -389,6 +444,7 @@ def restore_lakehouse(
     scratch: Path,
     max_age: timedelta,
     target_approval_ref: str,
+    target_client: FabricClient,
     limits: ProtectionLimits = ProtectionLimits(),
     cancel: Cancel = None,
 ) -> LakehouseCopyReceipt:
@@ -405,6 +461,7 @@ def restore_lakehouse(
         )
     cancel = operation_cancel(limits, cancel)
     check_cancelled(cancel)
+    schema_mode = _target_schema_mode(target_client, target, cancel)
     with _PinnedClient(protection, target, limits, cancel) as client:
         source_files, source_dirs = _inventory(client, source, tokens, limits, cancel)
         if set(source_files) != {f.path for f in protection.files} or source_dirs != set(
@@ -418,11 +475,32 @@ def restore_lakehouse(
                     "Pinned OneLake source checksum/size/ETag does not match; no data was written."
                 )
         target_files, target_dirs = _inventory(client, target, tokens, limits, cancel)
-        if target_files or target_dirs != {"Tables", "Files"}:
+        schema_scaffold = target_dirs - {"Tables", "Files"}
+        allowed_scaffold = (
+            {path for path in protection.directories if re.fullmatch(r"Tables/[A-Za-z0-9_]+", path)}
+            if schema_mode is not None
+            else set()
+        )
+        if target_files or not schema_scaffold <= allowed_scaffold:
             raise ProtectionError(
-                "Use a fresh owned Lakehouse with empty Tables/Files roots; remove precreated user/schema "
-                "directories under an approved destination-only preparation before copying."
+                "Use a fresh owned Lakehouse with no files or unrelated directories. Only empty captured "
+                "schema directories under Tables may already exist on a schema-enabled target."
             )
+        # Schema-enabled targets include an immutable dbo scaffold. Never PUT/delete it.
+        # https://learn.microsoft.com/fabric/data-engineering/lakehouse-schemas
+        scaffold_versions = _scaffold_versions(client, target, target_dirs, tokens, cancel)
+
+        def verify_scaffold() -> None:
+            if _target_schema_mode(target_client, target, cancel) != schema_mode:
+                raise ProtectionError("Target schema mode changed during Lakehouse preflight.")
+            current_files, current_dirs = _inventory(client, target, tokens, limits, cancel)
+            if (
+                current_files
+                or current_dirs != target_dirs
+                or _scaffold_versions(client, target, target_dirs, tokens, cancel) != scaffold_versions
+            ):
+                raise ProtectionError("Target schema scaffold drifted during preflight; no copy may start.")
+
         client.owned_directories = target_dirs
         for root in ("Tables", "Files"):
             delta.preflight(
@@ -438,6 +516,8 @@ def restore_lakehouse(
                 cancel_requested=cancel,
                 strict=root == "Tables",
             )
+        verify_scaffold()
+        client.before_first_write = verify_scaffold
         client.writes_allowed = True
         for root in ("Tables", "Files"):
             files.copy_tree_streaming(
@@ -451,10 +531,15 @@ def restore_lakehouse(
                 kind="lakehouse" if root == "Tables" else "files",
                 cancel_requested=cancel,
                 transport_client=client,
+                existing_target_directories=tuple(
+                    path[len(root) + 1 :] for path in schema_scaffold if path.startswith(root + "/")
+                ),
             )
         restored, restored_dirs = _inventory(client, target, tokens, limits, cancel)
         if set(restored) != set(source_files) or restored_dirs != source_dirs:
             raise ProtectionError("Destination file inventory differs after copying; keep recovery disabled.")
+        if _target_schema_mode(target_client, target, cancel) != schema_mode:
+            raise ProtectionError("Target schema mode changed during copy; keep recovery disabled.")
         for expected in protection.files:
             checksum, size, _etag = _hash_file(
                 client, target, restored[expected.path], tokens, limits, cancel
