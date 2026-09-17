@@ -361,6 +361,7 @@ class CaptureSnapshot(Record):
     generation_id: Guid
     captured_at: AwareDatetime
     parent_generation_id: Guid | None = None
+    capture_kind: Literal["source", "recovery"] = "source"
     workspaces: tuple[WorkspaceRecord, ...] = ()
     items: tuple[ItemRecord, ...] = ()
     dependencies: tuple[DependencyEdge, ...] = ()
@@ -411,10 +412,14 @@ class CaptureSnapshot(Record):
             raise ValueError("Capture belongs to a different recovery set")
         if not self.inventory_complete or self.unresolved:
             raise ValueError("Complete the source inventory and resolve capture gaps before publication")
+        capacity_scope = (
+            recovery_set.source_capacity_ids
+            if self.capture_kind == "source" else recovery_set.target_capacity_ids
+        )
         for workspace in self.workspaces:
             if (
                 workspace.identity.tenant_id != recovery_set.tenant_id
-                or workspace.capacity_id not in recovery_set.source_capacity_ids
+                or workspace.capacity_id not in capacity_scope
                 or workspace.identity == recovery_set.control_workspace
             ):
                 raise ValueError("Capture includes an out-of-scope or control workspace")
@@ -423,6 +428,24 @@ class CaptureSnapshot(Record):
         for item in self.items:
             if not item.capture_complete or item.unresolved:
                 raise ValueError(f"Complete metadata for '{item.display_name}' before publication")
+        for edge in self.dependencies:
+            target = edge.prerequisite
+            if isinstance(target, EndpointIdentity):
+                target = target.item
+            if target is not None and target.tenant_id != recovery_set.tenant_id:
+                raise ValueError("Qualified dependency targets must belong to the recovery tenant")
+        workspace_keys = {workspace.identity.key for workspace in self.workspaces}
+        item_keys = {item.identity.key for item in self.items}
+        for acl in self.desired_acls:
+            target = acl.item or acl.workspace or acl.connection
+            if target is None or target.tenant_id != recovery_set.tenant_id:
+                raise ValueError("Desired ACL targets must belong to the recovery tenant")
+            if acl.principal.tenant_id != recovery_set.tenant_id:
+                raise ValueError("Desired ACL principals must belong to the recovery tenant")
+            if acl.item is not None and acl.item.key not in item_keys:
+                raise ValueError("Desired item/data ACLs must name captured business items")
+            if acl.workspace is not None and acl.workspace.key not in workspace_keys:
+                raise ValueError("Desired workspace ACLs must name captured business workspaces")
 
 
 class AppliedItem(Record):
@@ -492,6 +515,13 @@ class CatalogDocument(Record):
     key: Nonempty
     revision: Annotated[int, Field(ge=1)]
     document: dict[str, JsonValue]
+
+
+class GenerationInfo(Record):
+    generation_id: Guid
+    status: Literal["staging", "sealed", "complete"]
+    manifest_sha256: Digest
+    payload_count: Annotated[int, Field(ge=1)]
 
 
 def canonical_json(value: BaseModel | dict[str, JsonValue]) -> bytes:
