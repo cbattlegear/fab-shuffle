@@ -206,8 +206,38 @@ class AccessController:
                 "acl": acl.model_dump(mode="json"),
                 "assignment_id": result["id"],
                 "revoked": False,
+                "grant_epoch": self.runtime.require_lease().epoch,
             },
         )
+
+    def rollback_grants(self, grants: Sequence[DesiredAcl]) -> None:
+        """Undo only this admission attempt's positively owned grants after a definite denial."""
+        for acl in reversed(grants):
+            key = f"{acl.acl_id}/{target_key(acl)}"
+            receipt = self.runtime.get("owned-acls", key)
+            if (
+                receipt is None
+                or receipt["revoked"]
+                or receipt.get("grant_epoch") != self.runtime.require_lease().epoch
+                or self.recovery_set.access_policy.permits(
+                    acl,
+                    mode=RecoveryMode.STANDBY,
+                    control_workspace=self.recovery_set.control_workspace,
+                )
+            ):
+                continue
+            matches = [row for row in self.fabric.assignments(acl) if row["id"] == receipt["assignment_id"]]
+            if len(matches) != 1 or (
+                matches[0]["role"] != acl.permission
+                or _principal(matches[0]["principal"], acl.principal.tenant_id) != acl.principal
+            ):
+                raise RecoveryBlocked(f"Grant {acl.acl_id} changed during admission; review before rollback")
+            self.runtime.effect(
+                "rollback-grant",
+                f"{key}/{receipt['assignment_id']}",
+                lambda a=acl, identifier=receipt["assignment_id"]: self.fabric.revoke(a, identifier),
+            )
+            self.runtime.put("owned-acls", key, {**receipt, "revoked": True})
 
     def rearm(self) -> None:
         if self.runtime.mode != RecoveryMode.REARMING:

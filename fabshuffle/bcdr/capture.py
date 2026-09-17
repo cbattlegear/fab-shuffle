@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from fabshuffle.auth import TokenProvider
@@ -62,12 +63,89 @@ TYPED_COLLECTIONS = {
     "KQLDatabase": "kqlDatabases",
     "MirroredDatabase": "mirroredDatabases",
     "SnowflakeDatabase": "snowflakeDatabases",
+    "Environment": "environments",
 }
 NO_DEFINITION = frozenset({"Warehouse", "Dashboard", "PaginatedReport"})
 SECURITY_UNKNOWNS = (
     "Item sharing, OneLake effective access and inherited permissions are not fully enumerated. "
     "Review those scopes before enabling recovery; no such grants are applied by standby adapters.",
 )
+EMPTY_GUID = "00000000-0000-0000-0000-000000000000"
+EXECUTION_ITEMS = frozenset(
+    {
+        "Notebook",
+        "SparkJobDefinition",
+        "DataPipeline",
+        "CopyJob",
+        "Dataflow",
+        "GraphModel",
+    }
+)
+
+
+def capture_json(
+    client: FabricClient,
+    path: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    response = client.request("GET", path, params=params)
+    try:
+        document = response.json()
+    except ValueError as error:
+        raise FabricError(f"'{path}' returned invalid JSON; metadata capture is incomplete") from error
+    if not isinstance(document, dict):
+        raise FabricError(f"'{path}' did not return a metadata object")
+    return document
+
+
+def capture_list(
+    client: FabricClient,
+    path: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+    value_key: str = "value",
+) -> list[dict[str, Any]]:
+    """Strict Fabric pagination: malformed pages are never successful empty inventories."""
+    query = dict(params or {})
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    while True:
+        response = client.request("GET", path, params=query)
+        try:
+            document = response.json()
+        except ValueError as error:
+            raise FabricError(f"'{path}' returned invalid JSON; metadata capture is incomplete") from error
+        if (
+            not isinstance(document, dict)
+            or not isinstance(document.get(value_key), list)
+            or any(not isinstance(row, dict) for row in document[value_key])
+        ):
+            raise FabricError(f"'{path}' omitted a valid value collection; capture is incomplete")
+        rows.extend(document[value_key])
+        if len(rows) > 100_000:
+            raise FabricError(f"'{path}' exceeds the metadata inventory limit")
+        token = document.get("continuationToken")
+        uri = document.get("continuationUri")
+        if not token and uri:
+            parsed = urlsplit(uri)
+            requested = urlsplit(str(response.request.url))
+            if (parsed.scheme, parsed.netloc, parsed.path) != (
+                requested.scheme,
+                requested.netloc,
+                requested.path,
+            ):
+                raise FabricError("Capture continuation URI left the requested source endpoint")
+            values = parse_qs(parsed.query).get("continuationToken", [])
+            if len(values) != 1:
+                raise FabricError("Capture continuation URI omitted its token")
+            token = values[0]
+        if not token:
+            return rows
+        if not isinstance(token, str) or token in seen:
+            raise FabricError(f"'{path}' returned a repeated/invalid token; capture is incomplete")
+        seen.add(token)
+        query = dict(params or {}) | {"continuationToken": token}
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +235,8 @@ def _definition_payloads(
                 else PayloadPurpose.DEFINITION
             )
         )
+        if path.rsplit("/", 1)[-1] == ".schedules":
+            purpose = PayloadPurpose.CONFIGURATION
         result.append(
             make_payload(
                 identity,
@@ -263,7 +343,8 @@ def capture_item(
 
     if contract and contract.migration_rebuild:
         # Use the strict REST endpoint, not preview helpers that replace read failures with [].
-        metadata["connections"] = client.list_all(
+        metadata["connections"] = capture_list(
+            client,
             f"workspaces/{identity.workspace_id}/items/{identity.item_id}/connections",
         )
     if item_type in {"Lakehouse", "Warehouse"}:
@@ -271,10 +352,12 @@ def capture_item(
         if item_type == "Lakehouse":
             metadata["schema_enabled"] = "defaultSchema" in properties
             metadata["files_inventory"] = readers.files_inventory(identity)
-            metadata["shortcuts"] = client.list_all(
+            metadata["shortcuts"] = capture_list(
+                client,
                 f"workspaces/{identity.workspace_id}/items/{identity.item_id}/shortcuts",
             )
-            metadata["data_access_roles"] = client.list_all(
+            metadata["data_access_roles"] = capture_list(
+                client,
                 f"workspaces/{identity.workspace_id}/items/{identity.item_id}/dataAccessRoles",
             )
     if item_type in {"Lakehouse", "Warehouse", "SQLDatabase"}:
@@ -308,13 +391,26 @@ def capture_item(
             identity.item_id,
             follower=properties.get("databaseType") == "Shortcut",
         )
-        metadata["table_shortcuts"] = client.list_all(
+        metadata["table_shortcuts"] = capture_list(
+            client,
             f"workspaces/{identity.workspace_id}/kqlDatabases/{identity.item_id}/shortcuts",
         )
     if item_type == "ApacheAirflowJob":
         root = f"workspaces/{identity.workspace_id}/apacheAirflowJobs/{identity.item_id}/files"
-        files = client.list_all(root, params={"beta": "true"})
+        files = capture_list(client, root, params={"beta": "true"})
         metadata["runtime_files"] = files
+        environment_root = (
+            f"workspaces/{identity.workspace_id}/apacheAirflowJobs/{identity.item_id}/environment"
+        )
+        metadata["airflow_environment"] = {
+            key: capture_json(client, f"{environment_root}{suffix}", params={"beta": "true"})
+            for key, suffix in (
+                ("state", ""),
+                ("compute", "/compute"),
+                ("settings", "/settings"),
+                ("libraries", "/libraries"),
+            )
+        }
         for entry in files:
             path = logical_path(entry["filePath"])
             if entry.get("sizeInBytes", 0) > MAX_METADATA_BYTES:
@@ -329,6 +425,46 @@ def capture_item(
                     encoding="utf-8" if is_text_part(path) else "binary",
                 )
             )
+    if item_type == "Environment":
+        root = f"workspaces/{identity.workspace_id}/environments/{identity.item_id}"
+        metadata["environment"] = {
+            "staging_compute": capture_json(client, f"{root}/staging/sparkcompute", params={"beta": "false"}),
+            "published_compute": capture_json(client, f"{root}/sparkcompute", params={"beta": "false"}),
+            "staging_libraries": capture_list(
+                client,
+                f"{root}/staging/libraries",
+                params={"beta": "false"},
+                value_key="libraries",
+            ),
+            "published_libraries": capture_list(
+                client,
+                f"{root}/libraries",
+                params={"beta": "false"},
+                value_key="libraries",
+            ),
+        }
+        library_paths = {payload.descriptor.path for payload in payloads}
+        for library in metadata["environment"]["staging_libraries"]:
+            if library.get("libraryType") == "Custom" and (
+                f"Libraries/CustomLibraries/{library['name']}" not in library_paths
+            ):
+                unresolved.append(
+                    f"Capture custom Environment library '{library['name']}' before publication."
+                )
+    if item_type in EXECUTION_ITEMS:
+        root = f"workspaces/{identity.workspace_id}/items/{identity.item_id}"
+        metadata["job_instances"] = capture_list(client, f"{root}/jobs/instances")
+        metadata["schedule_qualification"] = (
+            "Captured .schedules parts are deferred. Absent parts or job history do not prove no schedules; "
+            "qualify schedule selectors before restoring scheduling policy."
+        )
+        if item_type == "DataPipeline":
+            metadata["schedule_selectors"] = {
+                "DefaultJob": capture_list(
+                    client,
+                    f"{root}/jobs/DefaultJob/schedules",
+                )
+            }
     if item_type == "Eventhouse" and not isinstance(properties.get("databasesItemIds"), list):
         unresolved.append(f"'{name}' needs the Eventhouse child database IDs captured.")
     activation = "unknown"
@@ -412,11 +548,14 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
     for capture in captures:
         item = capture.record
         parts = definition_parts(item, capture.payloads)
+        dependency_metadata = {
+            key: value for key, value in item.properties.get("bcdr", {}).items() if key != "raw_item"
+        }
         text = "\n".join(
             payload.data.decode("utf-8")
             for payload in capture.payloads
             if payload.descriptor.encoding == "utf-8"
-        ) + canonical_json(item.properties.get("bcdr", {})).decode("utf-8")
+        ) + canonical_json(dependency_metadata).decode("utf-8")
         for other in captures:
             if other.record.identity == item.identity:
                 continue
@@ -467,7 +606,9 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
                 rewritten_workspaces=workspace_ids,
             )
         }
-        for item_id in sorted(explicit_ids - known_ids):
+        for item_id in sorted(
+            explicit_ids - known_ids - ({EMPTY_GUID} if item.item_type == "Lakehouse" else set())
+        ):
             edges.append(
                 DependencyEdge(
                     edge_id=str(uuid4()),
@@ -510,7 +651,7 @@ def capture_workspaces(
     selected = {canonical_id(value) for value in workspace_ids} if workspace_ids is not None else None
     if selected is not None and recovery_set.control_workspace.workspace_id in selected:
         raise FabricError("The control workspace cannot be captured as a business workspace")
-    listed = client.list_all("workspaces")
+    listed = capture_list(client, "workspaces")
     candidates = [
         workspace
         for workspace in listed
@@ -535,7 +676,7 @@ def capture_workspaces(
     for candidate in candidates:
         identity = WorkspaceIdentity(tenant_id=recovery_set.tenant_id, workspace_id=candidate["id"])
         root = f"workspaces/{identity.workspace_id}"
-        workspace = client.get(root)
+        workspace = capture_json(client, root)
         if canonical_id(workspace["id"]) != identity.workspace_id:
             raise FabricError("Workspace metadata returned a different source identity")
         if not workspace.get("capacityId") and selected is None:
@@ -547,7 +688,7 @@ def capture_workspaces(
             raise FabricError(f"'{workspace['displayName']}' is outside the explicit source capacity scope")
         if workspace.get("capacityAssignmentProgress") not in {None, "Completed"}:
             raise FabricError(f"'{workspace['displayName']}' has an unsettled source capacity assignment")
-        roles = client.list_all(f"{root}/roleAssignments")
+        roles = capture_list(client, f"{root}/roleAssignments")
         acls, gaps = _role_assignments(roles, workspace=identity)
         desired.extend(acls)
         unresolved.extend(gaps)
@@ -555,14 +696,14 @@ def capture_workspaces(
             **workspace,
             "bcdr": {
                 "control_workspace": recovery_set.control_workspace.model_dump(mode="json"),
-                "folders": client.list_all(f"{root}/folders"),
-                "spark_pools": client.list_all(f"{root}/spark/pools"),
-                "spark_settings": client.get(f"{root}/spark/settings"),
+                "folders": capture_list(client, f"{root}/folders"),
+                "spark_pools": capture_list(client, f"{root}/spark/pools"),
+                "spark_settings": capture_json(client, f"{root}/spark/settings"),
                 "role_assignments": roles,
             },
         }
         reject_embedded_secrets(canonical_json(properties))
-        for raw in client.list_all(f"{root}/items"):
+        for raw in capture_list(client, f"{root}/items"):
             capture = capture_item(
                 client,
                 ItemIdentity(
@@ -589,7 +730,7 @@ def capture_workspaces(
             )
         )
     for connection in connections.values():
-        rows = client.list_all(f"connections/{connection.connection_id}/roleAssignments")
+        rows = capture_list(client, f"connections/{connection.connection_id}/roleAssignments")
         acls, gaps = _role_assignments(rows, connection=connection)
         desired.extend(acls)
         unresolved.extend(gaps)

@@ -7,6 +7,7 @@ from fabshuffle.bcdr.failback import required_reconciliation
 from fabshuffle.bcdr.service import (
     CutbackRequest,
     CutoverRequest,
+    EnableRecoveryRequest,
     FailbackExecuteRequest,
     FailbackRequest,
     RearmRequest,
@@ -179,6 +180,39 @@ def test_metadata_return_creates_fresh_targets_then_requires_cutback_and_rearm(s
     retained = next(row for row in system.catalog.applied_items() if row.source == fresh)
     assert retained.target != fresh
     assert retained.target in targets
+    enabled_again = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=resynced.generation_id,
+            group_ids=tuple(row.group_id for row in resynced.groups),
+            readiness=proofs(system, resynced.generation_id),
+        )
+    )
+    active_again = system.service.cutover(
+        CutoverRequest(
+            generation_id=resynced.generation_id,
+            group_ids=tuple(row.group_id for row in enabled_again.groups),
+            readiness=proofs(system, resynced.generation_id),
+            writer_fence=fence(epoch=2),
+        )
+    )
+    capture_dr(system)
+    second_plan = system.service.plan_failback(
+        FailbackRequest(
+            generation_id=active_again.generation_id,
+            group_ids=tuple(row.group_id for row in active_again.groups),
+            primary_available=True,
+            primary_evidence="primary available again",
+        )
+    )
+    second_return = system.service.execute_failback(
+        FailbackExecuteRequest(
+            plan_id=second_plan.plan_id,
+            writer_fence=fence("recovery", 3),
+        )
+    )
+    assert second_return.exit_code == 0
+    assert len(system.estate.items) == 3
+    assert all(row["target"]["item_id"] != fresh.item_id for row in second_return.details["return_targets"])
 
 
 def test_failed_primary_availability_does_not_enter_failback(system):

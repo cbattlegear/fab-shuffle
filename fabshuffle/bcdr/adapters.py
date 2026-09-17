@@ -6,6 +6,7 @@ Every adapter validates captured bytes and bindings before its first destination
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,13 +17,17 @@ from typing import Any
 
 from fabshuffle.auth import TokenProvider
 from fabshuffle.bcdr.capture import (
+    EMPTY_GUID,
+    EXECUTION_ITEMS,
     NO_DEFINITION,
     SECURITY_UNKNOWNS,
+    capture_json,
+    capture_list,
     definition_format,
     definition_parts,
     item_document,
 )
-from fabshuffle.bcdr.capture_sources import MAX_METADATA_BYTES, inspect_schema_archive
+from fabshuffle.bcdr.capture_sources import MAX_METADATA_BYTES, file_api_path, inspect_schema_archive
 from fabshuffle.bcdr.contracts import (
     AppliedItem,
     ConnectionIdentity,
@@ -49,7 +54,7 @@ from fabshuffle.fabric.definitions import (
     rewrite_parts,
     strip_part,
 )
-from fabshuffle.fabric.items import get_item_definition, update_item_definition
+from fabshuffle.fabric.items import create_item, get_item_definition, update_item_definition
 from fabshuffle.transfer import sqlschema
 
 ItemKey = tuple[str, str, str]
@@ -68,6 +73,10 @@ STORES = frozenset(
     }
 )
 BLOCKED_TYPES = {
+    "MirroredDatabase": (
+        "A non-starting create/update contract is not established for every mirrored source type. "
+        "Qualify an independently stopped mirror; separate Start/Stop APIs are not proof of safe create."
+    ),
     "Eventstream": (
         "Eventstream inactive creation is not established for every source/destination node. "
         "Prepare a qualified stopped topology; do not create a live ingestion path during standby sync."
@@ -168,6 +177,7 @@ def _mapping(
     endpoint_mappings: Sequence[tuple[EndpointIdentity, str]],
     connection_mappings: Sequence[tuple[ConnectionIdentity, ConnectionIdentity]],
     target_id: str | None,
+    verified_external_connections: Sequence[ConnectionIdentity] = (),
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
     if item.identity.tenant_id != target_workspace.tenant_id:
         raise FabricError("BCDR adapters require same-tenant recovery identities")
@@ -228,7 +238,9 @@ def _mapping(
     if target_id:
         add(item.identity.item_id, canonical_id(target_id))
     for source, target in endpoint_mappings:
-        if _key(source.item) not in sources or source.item.item_id not in replacements:
+        if _key(source.item) not in sources or (
+            source.item.item_id not in replacements and source.endpoint_kind != "spark_pool_id"
+        ):
             raise FabricError("Map the owning item before mapping its endpoint")
         if source.endpoint_kind == "sql_database_name":
             # A bare display/catalog name is not a globally unique replacement key.
@@ -243,12 +255,31 @@ def _mapping(
     for source, target in connection_mappings:
         if source.tenant_id != item.identity.tenant_id or target.tenant_id != source.tenant_id:
             raise FabricError("Connection mappings must identify the recovery tenant")
-        add(source.connection_id, target.connection_id)
+        if source == target and source in verified_external_connections:
+            if source.connection_id in references:
+                raise FabricError("An unchanged connection ID collides with a captured item/workspace ID")
+            replacements[source.connection_id] = target.connection_id
+        else:
+            add(source.connection_id, target.connection_id)
+    if {value.key for value in verified_external_connections} != {
+        source.key for source, target in connection_mappings if source == target
+    }:
+        raise FabricError("Qualify exactly the unchanged external connections in this apply operation")
     return replacements, references
 
 
 def _defer_grants(parts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     deferred: list[dict[str, Any]] = []
+    for candidate in parts:
+        if candidate["path"].rsplit("/", 1)[-1] == ".schedules":
+            deferred.append(
+                {
+                    "scope": "schedule",
+                    "path": candidate["path"],
+                    "definition": decode_payload(candidate["payload"]).decode("utf-8"),
+                }
+            )
+    parts = [candidate for candidate in parts if candidate["path"].rsplit("/", 1)[-1] != ".schedules"]
     access = find_part(parts, "data-access-roles.json")
     if access:
         roles = decode_json_part(access["payload"])
@@ -320,6 +351,57 @@ def _defer_grants(parts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], li
     return parts, deferred
 
 
+def _normalise_parts(parts: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Make JSON escapes visible to the legacy literal-ID rewriter without executing code."""
+    normalised = []
+    for entry in parts:
+        path = entry["path"]
+        if path.endswith((".json", ".bim", ".pbir", ".pbism", ".ipynb")):
+            document = decode_json_part(entry["payload"])
+            normalised.append(part(path, json.dumps(document, ensure_ascii=False, allow_nan=False)))
+        else:
+            normalised.append(entry)
+    return normalised
+
+
+def _lakehouse_local_targets(
+    item: ItemRecord,
+    parts: Sequence[dict[str, Any]],
+    workspace: WorkspaceIdentity,
+    replacements: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    result = list(parts)
+    if item.item_type != "Lakehouse":
+        return result
+    candidate = find_part(parts, "shortcuts.metadata.json")
+    if not candidate:
+        return result
+    shortcuts = decode_json_part(candidate["payload"])
+    if not isinstance(shortcuts, list):
+        raise FabricError("Capture an inspectable Lakehouse shortcut array")
+    for shortcut in shortcuts:
+        target = (shortcut.get("target") or {}).get("oneLake")
+        if not isinstance(target, dict):
+            continue
+        source_workspace = canonical_id(target["workspaceId"])
+        source_item = canonical_id(target["itemId"])
+        if source_workspace == EMPTY_GUID:
+            source_workspace = item.identity.workspace_id
+        if source_workspace == item.identity.workspace_id and source_item in {
+            EMPTY_GUID,
+            item.identity.item_id,
+        }:
+            # These sentinels are documented only within a Lakehouse shortcut OneLake target.
+            # The actual target item is assigned by Fabric during create/update.
+            target["workspaceId"] = workspace.workspace_id
+            target["itemId"] = EMPTY_GUID
+        elif source_workspace == item.identity.workspace_id:
+            if source_item not in replacements:
+                raise FabricError(f"Map shortcut prerequisite '{source_item}' before creating the Lakehouse")
+            target["workspaceId"] = item.identity.workspace_id
+    return replace_part(result, "shortcuts.metadata.json", shortcuts)
+
+
 def _inactive_parts(item: ItemRecord, parts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     diagnostics: list[str] = []
     if item.item_type == "Reflex":
@@ -357,12 +439,15 @@ def _inactive_parts(item: ItemRecord, parts: list[dict[str, Any]]) -> tuple[list
                 )
         parts = replace_part(parts, "definition.json", document)
     elif item.item_type == "KQLDatabase":
-        if item.properties.get("databaseType") == "Shortcut":
+        if item.properties.get("databaseType") != "ReadWrite":
             raise FabricError(
-                "KQL follower auto-sync has no qualified stopped-create contract; prepare an independent DB."
+                "Capture a ReadWrite KQL database for this adapter; follower or unknown modes "
+                "need a qualified independent database."
             )
         candidate = find_part(parts, eventhouses.DATABASE_SCHEMA_PART)
-        script = decode_payload(candidate["payload"]).decode("utf-8") if candidate else ""
+        if candidate is None:
+            raise FabricError("Capture DatabaseSchema.kql before declaring KQL metadata synchronized")
+        script = decode_payload(candidate["payload"]).decode("utf-8")
         # Only table declarations are accepted by this deliberately narrow inactive schema path.
         # Other commands can ingest, grant, enable policies or execute arbitrary queries.
         commands = [line.strip() for line in script.splitlines() if line.strip()]
@@ -381,6 +466,7 @@ def _strict_references(
     parts: list[dict[str, Any]],
     replacements: Mapping[str, str],
     references: Mapping[str, Mapping[str, Any]],
+    verified_external_connections: Sequence[ConnectionIdentity] = (),
 ) -> None:
     # Unlike legacy migration, operational self-references are not ignored before creation.
     inspected = strip_part(parts, ".platform")
@@ -396,6 +482,7 @@ def _strict_references(
         inspected,
         replacements,
         analytics.with_connection_references(inspected, references),
+        ignore=tuple(value.connection_id for value in verified_external_connections),
     )
     if missing:
         raise analytics.StrandedReference(missing)
@@ -405,9 +492,21 @@ def _strict_references(
         for key, value in replacements.items()
         if key.casefold() == value.casefold() and not analytics.GUID_PATTERN.fullmatch(key)
     }
-    remaining = analytics.dangling_references(rewritten, retained_names, references)
+    remaining = analytics.dangling_references(
+        rewritten,
+        retained_names,
+        references,
+        ignore=tuple(value.connection_id for value in verified_external_connections),
+    )
     if remaining:
         raise analytics.StrandedReference(remaining)
+    target_workspaces = {
+        replacements[key].casefold()
+        for key, value in references.items()
+        if value.get("type") == "source workspace" and key in replacements
+    }
+    if any(value.casefold() not in target_workspaces for value in analytics.referenced_workspaces(rewritten)):
+        raise FabricError("The rewritten definition retains a source or unqualified workspace reference")
 
 
 def _archive_schema(data: bytes) -> None:
@@ -559,7 +658,16 @@ def observe_target(client: FabricClient, target: ItemIdentity, item_type: str) -
                 for base in [decode_payload(entry["payload"])]
             ],
         }
-    return digest(canonical_json({"item": document, "definition": definition}))
+    observed = {"item": document, "definition": definition}
+    if item_type == "Environment":
+        root = f"workspaces/{target.workspace_id}/environments/{target.item_id}/staging"
+        observed["environment_staging"] = {
+            "compute": capture_json(client, f"{root}/sparkcompute", params={"beta": "false"}),
+            "libraries": capture_list(
+                client, f"{root}/libraries", params={"beta": "false"}, value_key="libraries"
+            ),
+        }
+    return digest(canonical_json(observed))
 
 
 def _create_store(client: FabricClient, item: ItemRecord, workspace_id: str) -> dict[str, Any]:
@@ -592,6 +700,103 @@ def _create_store(client: FabricClient, item: ItemRecord, workspace_id: str) -> 
     raise FabricError(f"'{item.item_type}' has no qualified definition-free shell adapter")
 
 
+def _environment_preflight(
+    client: FabricClient,
+    item: ItemRecord,
+    parts: Sequence[dict[str, Any]],
+    workspace: WorkspaceIdentity,
+    replacements: Mapping[str, str],
+) -> dict[str, Any]:
+    configuration = item.properties.get("bcdr", {}).get("environment")
+    if not isinstance(configuration, dict) or not isinstance(configuration.get("staging_compute"), dict):
+        raise FabricError(
+            "Capture the Environment staging compute and library inventories before restoration"
+        )
+    compute = json.loads(json.dumps(configuration["staging_compute"]))
+    allowed = {
+        "instancePool",
+        "driverCores",
+        "driverMemory",
+        "executorCores",
+        "executorMemory",
+        "dynamicExecutorAllocation",
+        "sparkProperties",
+        "runtimeVersion",
+        "customLivePoolSupport",
+        "customLivePoolSettings",
+    }
+    if set(compute) - allowed:
+        raise FabricError("Review new Environment compute fields before including them in a standby request")
+    compute["customLivePoolSupport"] = "Disabled"
+    pool = compute.get("instancePool")
+    if isinstance(pool, dict) and pool.get("id"):
+        target_pool = replacements.get(str(pool["id"]).casefold())
+        if not target_pool:
+            raise FabricError("Map the Environment's captured custom Spark pool before staging its settings")
+        matches = [
+            row
+            for row in capture_list(client, f"workspaces/{workspace.workspace_id}/spark/pools")
+            if str(row.get("id", "")).casefold() == target_pool.casefold()
+        ]
+        if len(matches) != 1:
+            raise FabricError("The mapped destination Spark pool is not present uniquely in its workspace")
+        compute["instancePool"] = {"name": matches[0]["name"], "type": matches[0]["type"]}
+    elif isinstance(pool, dict):
+        compute["instancePool"] = {key: pool[key] for key in ("name", "type") if key in pool}
+    for entry in compute.get("sparkProperties", []):
+        if not isinstance(entry, dict) or re.search(
+            r"acl|credential|identity|principal|token|secret|spark\.hadoop",
+            str(entry.get("key", "")),
+            re.I,
+        ):
+            raise FabricError("Defer Environment Spark security/identity properties before staging compute")
+    for entry in parts:
+        path = entry["path"]
+        if path == "Libraries/PublicLibraries/environment.yml":
+            raise FabricError(
+                "Capture retained the Environment external-library YAML. The stable import endpoint's upload "
+                "media contract is not established here. Qualify that staged upload before restoration."
+            )
+        if path.startswith("Libraries/CustomLibraries/"):
+            name = path.removeprefix("Libraries/CustomLibraries/")
+            file_api_path(name)
+            if "/" in name or not name.endswith((".jar", ".py", ".whl", ".tar.gz")):
+                raise FabricError("Environment custom library has an unsupported upload path or type")
+        elif path not in {".platform", "Setting/Sparkcompute.yml"}:
+            raise FabricError(f"Qualify Environment part '{path}' for staging-only restoration")
+    return compute
+
+
+def _stage_environment(
+    client: FabricClient,
+    item: ItemRecord,
+    parts: Sequence[dict[str, Any]],
+    workspace_id: str,
+    compute: dict[str, Any],
+    target_id: str | None,
+) -> str:
+    if target_id is None:
+        target_id = canonical_id(
+            client.post(
+                f"workspaces/{workspace_id}/environments",
+                json={"displayName": item.display_name},
+            )["id"]
+        )
+    root = f"workspaces/{workspace_id}/environments/{target_id}/staging"
+    client.patch(f"{root}/sparkcompute", params={"beta": "false"}, json=compute)
+    for entry in parts:
+        if entry["path"].startswith("Libraries/CustomLibraries/"):
+            name = entry["path"].removeprefix("Libraries/CustomLibraries/")
+            client.request(
+                "POST",
+                f"{root}/libraries/{file_api_path(name)}",
+                content=decode_payload(entry["payload"]),
+                headers={"Content-Type": "application/octet-stream"},
+                expected=(200,),
+            )
+    return target_id
+
+
 def apply_captured_item(
     client: FabricClient,
     item: ItemRecord,
@@ -609,6 +814,8 @@ def apply_captured_item(
     tokens: TokenProvider | None = None,
     shell_only: bool = False,
     mutation_guard: Callable[[], None] | None = None,
+    destination_quiescence: str | None = None,
+    verified_external_connections: Sequence[ConnectionIdentity] = (),
 ) -> AdapterResult:
     """Create/update only from captured bytes; returned success never implies data readiness.
 
@@ -626,6 +833,20 @@ def apply_captured_item(
         )
     if not capabilities.inactive_create:
         return AdapterResult(RecoveryOutcome.BLOCKED, diagnostics=(capabilities.reason,))
+    if target_id and item.item_type == "GraphModel":
+        return AdapterResult(
+            RecoveryOutcome.BLOCKED,
+            diagnostics=(
+                "GraphModel updates have no qualified no-ingestion contract. Use a fresh REST-created model.",
+            ),
+        )
+    if target_id and item.item_type in EXECUTION_ITEMS | {"Environment"} and not destination_quiescence:
+        return AdapterResult(
+            RecoveryOutcome.BLOCKED,
+            diagnostics=(
+                "Supply item-specific destination quiescence evidence before updating this standby.",
+            ),
+        )
     if shell_only and not capabilities.safe_shell:
         return AdapterResult(
             RecoveryOutcome.BLOCKED,
@@ -646,6 +867,7 @@ def apply_captured_item(
             endpoint_mappings,
             connection_mappings,
             target_id,
+            verified_external_connections,
         )
         target = ItemIdentity(
             tenant_id=target_workspace.tenant_id,
@@ -677,9 +899,10 @@ def apply_captured_item(
                 *SECURITY_UNKNOWNS,
             ),
         )
-    parts = definition_parts(item, payloads)
+    parts = _normalise_parts(definition_parts(item, payloads))
     deferred: list[dict[str, Any]] = []
     diagnostics = list(SECURITY_UNKNOWNS)
+    environment_compute: dict[str, Any] | None = None
     try:
         replacements, references = _mapping(
             item,
@@ -690,12 +913,54 @@ def apply_captured_item(
             endpoint_mappings,
             connection_mappings,
             target_id,
+            verified_external_connections,
         )
+        for connection in verified_external_connections:
+            observed_connection = capture_json(client, f"connections/{connection.connection_id}")
+            if canonical_id(observed_connection.get("id", "")) != connection.connection_id:
+                raise FabricError("Destination connection verification returned a different connection ID")
+            remaining = analytics.dangling_references(
+                [part("connection.json", observed_connection)],
+                {},
+                references,
+            )
+            if remaining:
+                raise FabricError(
+                    "The reused connection still references captured source resources: "
+                    + ", ".join(remaining)
+                )
+        parts = _lakehouse_local_targets(item, parts, target_workspace, replacements)
         parts, deferred = _defer_grants(parts)
+        deferred.extend(
+            {"scope": "schedule", "path": payload.descriptor.path, "definition": payload.data.decode("utf-8")}
+            for payload in payloads
+            if payload.descriptor.payload_id in item.payload_ids
+            and payload.descriptor.path.rsplit("/", 1)[-1] == ".schedules"
+            and payload.descriptor.purpose == PayloadPurpose.CONFIGURATION
+        )
         parts, inactivity = _inactive_parts(item, parts)
         diagnostics.extend(inactivity)
-        _strict_references(item, parts, replacements, references)
+        _strict_references(item, parts, replacements, references, verified_external_connections)
         _report_binding(client, item, parts, source_items, item_mappings)
+        if target_id and item.item_type in EXECUTION_ITEMS:
+            jobs = capture_list(
+                client, f"workspaces/{target_workspace.workspace_id}/items/{target_id}/jobs/instances"
+            )
+            if any(job.get("status") not in {"Completed", "Failed", "Cancelled", "Deduped"} for job in jobs):
+                raise FabricError(
+                    "Stop all active/pending destination job instances before changing their definition"
+                )
+            current = get_item_definition(
+                client, target_workspace.workspace_id, target_id, fmt=definition_format(item.item_type)
+            )
+            if any(
+                entry.get("path", "").rsplit("/", 1)[-1] == ".schedules" for entry in current.get("parts", [])
+            ):
+                raise FabricError(
+                    "Remove destination scheduling definitions before updating this inactive standby"
+                )
+        if item.item_type == "Environment":
+            environment_compute = _environment_preflight(client, item, parts, target_workspace, replacements)
         diagnostics.extend(
             analytics.validate_cross_tenant_references(
                 parts,
@@ -705,6 +970,7 @@ def apply_captured_item(
                 target_client=client,
                 source_items=references,
                 item_type=item.item_type,
+                ignore=tuple(value.connection_id for value in verified_external_connections),
             )
         )
         if item.item_type in {"Lakehouse", "Warehouse", "SQLDatabase"}:
@@ -737,8 +1003,15 @@ def apply_captured_item(
                 shortcuts = item.properties.get("bcdr", {}).get("shortcuts")
                 if not isinstance(shortcuts, list):
                     raise FabricError("Capture the lakehouse shortcut inventory before restoring metadata")
-                shortcut_parts = [part("shortcuts.metadata.json", shortcuts)]
-                _strict_references(item, shortcut_parts, replacements, references)
+                shortcut_parts = _lakehouse_local_targets(
+                    item,
+                    [part("shortcuts.metadata.json", shortcuts)],
+                    target_workspace,
+                    replacements,
+                )
+                _strict_references(
+                    item, shortcut_parts, replacements, references, verified_external_connections
+                )
         if item.item_type not in NO_DEFINITION and not parts and item.item_type != "SQLDatabase":
             raise FabricError("The captured item has no restorable definition parts")
     except FabricError as error:
@@ -762,7 +1035,12 @@ def apply_captured_item(
             ),
             item.item_type,
         )
-    if item.item_type in {"Lakehouse", "Warehouse", "SQLDatabase"}:
+    if item.item_type == "Environment":
+        if environment_compute is None:
+            raise FabricError("Environment staging preflight did not produce a compute request")
+        target_id = _stage_environment(client, item, parts, workspace_id, environment_compute, target_id)
+        diagnostics.append("Environment is staged only. Publish after explicit recovery approval.")
+    elif item.item_type in {"Lakehouse", "Warehouse", "SQLDatabase"}:
         if not target_id:
             created = _create_store(client, item, workspace_id)
             target_id = canonical_id(created["id"])
@@ -774,6 +1052,30 @@ def apply_captured_item(
                 target_id,
                 rebound,
                 definition_format=item.definition_format,
+            )
+    elif verified_external_connections or item.definition_format not in {
+        None,
+        definition_format(item.item_type),
+    }:
+        rebound, _ = rewrite_parts(strip_part(parts, ".platform"), replacements)
+        if target_id:
+            update_item_definition(
+                client,
+                workspace_id,
+                target_id,
+                rebound,
+                definition_format=item.definition_format,
+            )
+        else:
+            target_id = canonical_id(
+                create_item(
+                    client,
+                    workspace_id,
+                    item.display_name,
+                    item.item_type,
+                    parts=rebound,
+                    definition_format=item.definition_format,
+                )["id"]
             )
     else:
         migrated = analytics.migrate_definition_item(

@@ -247,16 +247,35 @@ class MetadataReaders:
             self.tokens.principal.client_secret,
             self.tokens.principal.tenant_id,
         )
-        commands = {
-            "schema": ".show database schema as csl script with (IncludePolicies=true)",
-            "principals": ".show database principals",
-        }
-        if follower:
-            commands["follower"] = f".show follower database [{json.dumps(database)}]"
         result: dict[str, Any] = {}
         with KustoClient(builder) as client:
+            identity = client.execute_mgmt(database, ".show database identity")
+            identity_rows = list(identity.primary_results[0])
+            if len(identity_rows) != 1 or not identity_rows[0]["DatabaseName"]:
+                raise FabricError("KQL did not return an unambiguous actual database identity")
+            actual_database = str(identity_rows[0]["DatabaseName"])
+            name = f"[{json.dumps(actual_database)}]"
+            result["database_name"] = actual_database
+            # These are the documented CSL options, not the nonexistent IncludePolicies switch.
+            # https://learn.microsoft.com/kusto/management/show-schema-database
+            commands = {
+                "schema": f".show database {name} schema as csl script with "
+                "(IncludeEncodingPolicies=true, IncludeSecuritySettings=false, "
+                "IncludeIngestionMappings=true, ShowObfuscatedStrings=false)",
+                "schema_json": f".show database {name} schema as json",
+                "security_schema": f".show database {name} schema as csl script with "
+                "(IncludeSecuritySettings=true, ShowObfuscatedStrings=false)",
+                "policies": ".show database policies",
+                "principals": f".show database {name} principals",
+            }
+            if follower:
+                commands["follower"] = f".show follower database {name}"
+                result["follower_source_qualification"] = (
+                    "Unverified: Fabric support and recreatable source identity are not established by "
+                    "the ADX follower override command. Preserve rows; never infer a source URI."
+                )
             for key, command in commands.items():
-                response = client.execute_mgmt(database, command)
+                response = client.execute_mgmt(actual_database, command)
                 rows = list(response.primary_results[0])
                 if len(rows) > self.max_rows:
                     raise FabricError(f"KQL metadata '{key}' exceeds the configured row limit")

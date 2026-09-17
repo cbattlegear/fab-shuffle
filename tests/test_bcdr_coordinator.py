@@ -72,6 +72,7 @@ class Estate:
         self.items = {}
         self.lost_create = False
         self.unexpected_item_grant = None
+        self.operation_results = {}
 
     def handler(self, request):
         path = request.url.path.removeprefix("/v1/")
@@ -79,6 +80,16 @@ class Estate:
         import json
 
         body = json.loads(request.content) if request.content else {}
+        if path.startswith("operations/"):
+            identifier = path.split("/")[1]
+            return httpx.Response(
+                200,
+                json=(
+                    self.operation_results[identifier]
+                    if path.endswith("/result")
+                    else {"status": "Succeeded"}
+                ),
+            )
         if path.startswith("capacities/"):
             return httpx.Response(200, json={"id": path.split("/")[1], "state": "Active"})
         if path == "admin/workspaces":
@@ -146,6 +157,8 @@ class Estate:
             identifier = path.split("/")[-1]
             self.items[identifier].update(body)
             return httpx.Response(200, json=self.items[identifier])
+        if "/items/" in path and request.method == "GET":
+            return httpx.Response(200, json=self.items[path.split("/")[-1]])
         if path.endswith("/items") and request.method == "GET":
             return httpx.Response(
                 200,
@@ -656,10 +669,23 @@ def test_production_factory_opens_sql_only_after_arm_resume(system, tmp_path, mo
     capacities.close()
 
 
-def test_source_reference_connection_is_rejected_before_mutation(system):
+@pytest.mark.parametrize("reference_kind", ["workspace", "sql-host"])
+def test_source_reference_connection_is_rejected_before_mutation(system, reference_kind):
     from fabshuffle.bcdr.contracts import ConnectionIdentity
     from fabshuffle.bcdr.service import ConnectionRoute
 
+    captured = system.captured
+    if reference_kind == "sql-host":
+        captured = captured.model_copy(
+            update={
+                "items": (
+                    captured.items[0].model_copy(
+                        update={"properties": {"serverFqdn": "source.database.fabric.microsoft.com,1433"}}
+                    ),
+                )
+            }
+        )
+        system.c.capture = lambda *args, **kwargs: CapturedGeneration(captured, ())
     synced = system.service.synchronize(system.request)
     source = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
     target = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
@@ -667,7 +693,13 @@ def test_source_reference_connection_is_rejected_before_mutation(system):
     system.c.destination.get = lambda path, **kwargs: (
         {
             "id": target.connection_id,
-            "connectionDetails": {"path": system.captured.workspaces[0].identity.workspace_id},
+            "connectionDetails": {
+                "path": (
+                    system.captured.workspaces[0].identity.workspace_id
+                    if reference_kind == "workspace"
+                    else "source.database.fabric.microsoft.com;source_database"
+                )
+            },
         }
         if path.startswith("connections/")
         else original_get(path, **kwargs)
@@ -769,3 +801,244 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
     assert created[0].state().mode == RecoveryMode.STANDBY
     assert created[0].recovery_set.control_workspace.workspace_id == stored.control_workspace_id
     assert "not-a-real-secret" not in path.read_text()
+
+
+def test_reconcile_uses_exact_lro_receipt_without_recreating_item(system):
+    from fabshuffle.bcdr.service import ReconcileOperationRequest
+    from fabshuffle.fabric.client import OperationTimeout
+
+    original_apply = system.c.apply
+    original_request = system.c.destination.client.request
+    service_id = guid()
+
+    def accepted(method, path, **kwargs):
+        response = original_request(method, path, **kwargs)
+        if method == "POST" and path.endswith("/items"):
+            document = response.json()
+            system.estate.operation_results[service_id] = document
+            return httpx.Response(202, headers={"x-ms-operation-id": service_id}, request=response.request)
+        return response
+
+    system.c.destination.client.request = accepted
+
+    def timeout(client, item, payloads, **kwargs):
+        client.request(
+            "POST",
+            f"workspaces/{kwargs['target_workspace'].workspace_id}/items",
+            json={"displayName": item.display_name, "type": item.item_type},
+        )
+        raise OperationTimeout("poll interrupted while the service continues")
+
+    system.c.apply = timeout
+    with pytest.raises(RecoveryBlocked, match="reconcile"):
+        system.service.synchronize(system.request)
+    pending = system.catalog.pending_operations()[0]
+    before = system.catalog.state()
+    assert len(system.estate.items) == 1
+    system.c.apply = original_apply
+    system.c.destination.client.request = original_request
+    system.c.source = None
+    result = system.service.reconcile_operation(
+        ReconcileOperationRequest(
+            operation_id=pending.operation_id,
+            expected_controller_id=before.controller_id,
+            expected_epoch=before.epoch,
+            previous_controller_stopped=True,
+            fencing_evidence="worker-process-terminated",
+            target_quiescence_evidence="target-writers-fenced",
+        )
+    )
+    assert result.details["reconciled_operation"] == pending.operation_id
+    assert len(system.estate.items) == 1
+    assert not system.catalog.pending_operations()
+    assert len(system.catalog.applied_items()) == 1
+
+
+def test_reconcile_refuses_name_only_unknown_create(system):
+    from fabshuffle.bcdr.service import ReconcileOperationRequest
+
+    system.estate.lost_create = True
+    with pytest.raises(RecoveryBlocked):
+        system.service.synchronize(system.request)
+    state = system.catalog.state()
+    pending = system.catalog.pending_operations()[0]
+    with pytest.raises(RecoveryBlocked, match="same-name"):
+        system.service.reconcile_operation(
+            ReconcileOperationRequest(
+                operation_id=pending.operation_id,
+                expected_controller_id=state.controller_id,
+                expected_epoch=state.epoch,
+                previous_controller_stopped=True,
+                fencing_evidence="worker-terminated",
+                target_quiescence_evidence="target-stopped",
+            )
+        )
+    assert len(system.estate.items) == 1
+    assert system.catalog.pending_operations()
+
+
+def test_reconcile_saved_success_after_catalog_loss_does_not_write_fabric(system, monkeypatch):
+    import pyodbc
+
+    from fabshuffle.bcdr.catalog import CatalogError
+    from fabshuffle.bcdr.service import ReconcileOperationRequest
+
+    original_pending = system.catalog.pending_operations
+    unavailable = False
+
+    def lost(*args, **kwargs):
+        nonlocal unavailable
+        unavailable = True
+        raise pyodbc.OperationalError("08S01", "catalog connection lost")
+
+    def pending():
+        if unavailable:
+            raise pyodbc.OperationalError("08S01", "catalog connection lost")
+        return original_pending()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(system.catalog, "record_applied", lost)
+        patch.setattr(system.catalog, "pending_operations", pending)
+        with pytest.raises(CatalogError, match="catalog connection lost"):
+            system.service.synchronize(system.request)
+    state = system.catalog.state()
+    operation = next(row for row in system.catalog.operations() if row.kind == "item-apply")
+    assert operation.state == OperationState.SUCCEEDED
+    writes = [call for call in system.estate.calls if call[0] != "GET"]
+    system.service.reconcile_operation(
+        ReconcileOperationRequest(
+            operation_id=operation.operation_id,
+            expected_controller_id=state.controller_id,
+            expected_epoch=state.epoch,
+            previous_controller_stopped=True,
+            fencing_evidence="worker-stopped",
+            target_quiescence_evidence="target-stopped",
+        )
+    )
+    assert system.catalog.applied_items()[0].operation_id == operation.operation_id
+    assert writes == [call for call in system.estate.calls if call[0] != "GET"]
+
+
+def test_changed_connection_rebinds_unchanged_item(system):
+    from fabshuffle.bcdr.contracts import ConnectionIdentity
+    from fabshuffle.bcdr.service import ConnectionRoute
+
+    source = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    first = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    second = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    captured = system.captured.model_copy(
+        update={
+            "dependencies": (
+                DependencyEdge(
+                    edge_id=guid(),
+                    consumer=system.captured.items[0].identity,
+                    prerequisite=source,
+                    phase="bind",
+                    provenance="captured connection",
+                    detail="Use a verified external connection",
+                ),
+            )
+        }
+    )
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(
+        captured.model_copy(
+            update={
+                "generation_id": guid(),
+                "parent_generation_id": kwargs.get("parent_generation_id"),
+            }
+        ),
+        (),
+    )
+    original_get = system.c.destination.get
+    system.c.destination.get = lambda path, **kwargs: (
+        {
+            "id": path.split("/")[-1],
+            "connectionDetails": {"type": "Web", "path": "https://independent.example"},
+        }
+        if path.startswith("connections/")
+        else original_get(path, **kwargs)
+    )
+    system.c.apply = Mock(wraps=system.c.apply)
+    for target in (first, second):
+        result = system.service.synchronize(
+            system.request.model_copy(
+                update={
+                    "connection_mappings": (
+                        ConnectionRoute(source=source, target=target, evidence="approved"),
+                    ),
+                }
+            )
+        )
+        assert result.groups[0].metadata_applied
+    assert system.c.apply.call_count == 2
+    assert system.c.apply.call_args.kwargs["connection_mappings"] == ((source, second),)
+
+
+def test_corrected_preflight_refusal_retries_pinned_generation(system):
+    original = system.c.apply
+    system.c.apply = lambda *args, **kwargs: AdapterResult(
+        RecoveryOutcome.BLOCKED,
+        diagnostics=("Supply target quiescence",),
+    )
+    first = system.service.synchronize(system.request)
+    assert not first.groups[0].metadata_applied
+    assert (
+        next(row for row in system.catalog.operations() if row.kind == "item-apply").state
+        == OperationState.FAILED
+    )
+    system.c.apply = original
+    second = system.service.synchronize(
+        system.request.model_copy(
+            update={
+                "capture": False,
+                "generation_id": first.generation_id,
+                "target_quiescence_evidence": "writers-fenced",
+            }
+        )
+    )
+    assert second.groups[0].metadata_applied
+    assert len(system.estate.items) == 1
+
+
+def test_partial_enable_rechecks_corrected_group_evidence(system):
+    second = snapshot(system.config)
+    capture = system.captured.model_copy(
+        update={
+            "workspaces": (*system.captured.workspaces, *second.workspaces),
+            "items": (*system.captured.items, *second.items),
+        }
+    )
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(capture, ())
+    synced = system.service.synchronize(system.request)
+    all_proofs = proofs(system, synced.generation_id)
+    first = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=tuple(row.group_id for row in synced.groups),
+            readiness=(all_proofs[0],),
+        )
+    )
+    failed = next(row for row in first.groups if not row.access_enabled)
+    assert sum(row.access_enabled for row in first.groups) == 1
+    retried = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(failed.group_id,),
+            readiness=all_proofs,
+        )
+    )
+    assert retried.groups[0].access_enabled
+    assert retried.groups[0].blockers == ()
+
+
+def test_deferred_schedule_stays_stopped_without_blocking_acl_admission(system):
+    from dataclasses import replace
+
+    original = system.c.apply
+    system.c.apply = lambda *args, **kwargs: replace(
+        original(*args, **kwargs),
+        deferred_grants=({"scope": "schedule", "path": ".schedules"},),
+    )
+    result = enable(system)
+    assert result.groups[0].access_enabled
+    assert not any("jobs" in path for _, path in system.estate.calls)
