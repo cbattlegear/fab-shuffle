@@ -6,10 +6,8 @@ Every adapter validates captured bytes and bindings before its first destination
 
 from __future__ import annotations
 
-import io
 import re
-import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +22,7 @@ from fabshuffle.bcdr.capture import (
     definition_parts,
     item_document,
 )
-from fabshuffle.bcdr.capture_sources import MAX_METADATA_BYTES
+from fabshuffle.bcdr.capture_sources import MAX_METADATA_BYTES, inspect_schema_archive
 from fabshuffle.bcdr.contracts import (
     AppliedItem,
     ConnectionIdentity,
@@ -37,7 +35,6 @@ from fabshuffle.bcdr.contracts import (
     canonical_id,
     canonical_json,
     digest,
-    reject_embedded_secrets,
 )
 from fabshuffle.bcdr.payloads import CapturedPayload
 from fabshuffle.bcdr.registry import TYPE_REGISTRY
@@ -111,6 +108,7 @@ class AdapterResult:
     target_properties: dict[str, Any] = field(default_factory=dict)
     deferred_grants: tuple[dict[str, Any], ...] = ()
     diagnostics: tuple[str, ...] = ()
+    metadata_applied: bool = False
 
 
 def adapter_capabilities(item: ItemRecord) -> AdapterCapabilities:
@@ -129,6 +127,24 @@ def _key(identity: ItemIdentity) -> ItemKey:
     return identity.tenant_id, identity.workspace_id, identity.item_id
 
 
+def _definition_digest(path: str, data: bytes) -> str:
+    if not path.lower().endswith(".dacpac"):
+        return digest(data)
+    # ZIP timestamps and Origin.xml are export metadata, not destination schema drift.
+    members = inspect_schema_archive(data)
+    return digest(
+        canonical_json(
+            {
+                "members": [
+                    {"path": name, "sha256": digest(content)}
+                    for name, content in sorted(members.items())
+                    if name == "model.xml" or name.lower().endswith(".sql")
+                ],
+            }
+        )
+    )
+
+
 def captured_hashes(item: ItemRecord, payloads: Sequence[CapturedPayload]) -> tuple[str, str]:
     definition_parts(item, payloads)
     by_id = {payload.descriptor.payload_id: payload for payload in payloads}
@@ -136,7 +152,7 @@ def captured_hashes(item: ItemRecord, payloads: Sequence[CapturedPayload]) -> tu
         {
             "path": by_id[value].descriptor.path,
             "purpose": by_id[value].descriptor.purpose,
-            "sha256": by_id[value].descriptor.sha256,
+            "sha256": _definition_digest(by_id[value].descriptor.path, by_id[value].data),
         }
         for value in item.payload_ids
     ]
@@ -216,6 +232,12 @@ def _mapping(
             raise FabricError("Map the owning item before mapping its endpoint")
         if source.endpoint_kind == "sql_database_name":
             # A bare display/catalog name is not a globally unique replacement key.
+            if target != source.endpoint_id:
+                raise FabricError(
+                    "SQL catalog renames require a qualified SQL/model binding adapter, "
+                    "not global text replacement"
+                )
+            replacements[source.endpoint_id.casefold()] = target
             continue
         add(source.endpoint_id, target)
     for source, target in connection_mappings:
@@ -378,31 +400,69 @@ def _strict_references(
     if missing:
         raise analytics.StrandedReference(missing)
     rewritten, _ = rewrite_parts(inspected, replacements)
-    remaining = analytics.dangling_references(rewritten, {}, references)
+    retained_names = {
+        key: value
+        for key, value in replacements.items()
+        if key.casefold() == value.casefold() and not analytics.GUID_PATTERN.fullmatch(key)
+    }
+    remaining = analytics.dangling_references(rewritten, retained_names, references)
     if remaining:
         raise analytics.StrandedReference(remaining)
 
 
 def _archive_schema(data: bytes) -> None:
     """Inspect bounded DACPAC members without extracting or executing scripts."""
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        entries = archive.infolist()
-        if sum(entry.file_size for entry in entries) > MAX_METADATA_BYTES:
-            raise FabricError("Expanded DACPAC exceeds the metadata inspection budget")
-        if "model.xml" not in archive.namelist():
-            raise FabricError("The captured DACPAC has no inspectable model.xml")
-        for entry in entries:
-            if entry.filename.endswith((".xml", ".sql")):
-                content = archive.read(entry)
-                reject_embedded_secrets(content)
-                if entry.filename == "model.xml" and re.search(
-                    rb"Sql(?:DmlTrigger|DatabaseDdlTrigger|ServerDdlTrigger|Assembly|ExternalDataSource)",
-                    content,
-                ):
-                    raise FabricError(
-                        "The DACPAC contains triggers, assemblies or external sources. Prepare a "
-                        "self-contained schema without active/opaque objects before standby apply."
-                    )
+    content = inspect_schema_archive(data)["model.xml"]
+    if re.search(
+        rb"Sql(?:DmlTrigger|DatabaseDdlTrigger|ServerDdlTrigger|Assembly|ExternalDataSource)",
+        content,
+        re.IGNORECASE,
+    ):
+        raise FabricError(
+            "The DACPAC contains triggers, assemblies or external sources. Prepare a "
+            "self-contained schema without active/opaque objects before standby apply."
+        )
+
+
+def _report_binding(
+    client: FabricClient,
+    item: ItemRecord,
+    parts: Sequence[dict[str, Any]],
+    source_items: Sequence[ItemRecord],
+    mappings: Mapping[ItemKey, ItemIdentity],
+) -> None:
+    if item.item_type != "Report":
+        return
+    candidate = find_part(parts, "definition.pbir")
+    if not candidate:
+        raise FabricError("Capture definition.pbir before restoring a report/model binding")
+    document = decode_json_part(candidate["payload"])
+    reference = document.get("datasetReference") if isinstance(document, dict) else None
+    if not isinstance(reference, dict):
+        raise FabricError("Capture an inspectable report datasetReference")
+    if reference.get("byPath"):
+        path = reference["byPath"].get("path", "")
+        match = re.fullmatch(r"\.\./([^/\\]+)\.SemanticModel", path)
+        if not match:
+            raise FabricError("Resolve the report's nonstandard byPath model reference before restoring it")
+        models = [
+            row
+            for row in source_items
+            if row.item_type == "SemanticModel"
+            and row.display_name == match[1]
+            and row.identity.workspace_id == item.identity.workspace_id
+        ]
+        normalized = {tuple(canonical_id(value) for value in key): target for key, target in mappings.items()}
+        if len(models) != 1 or _key(models[0].identity) not in normalized:
+            raise FabricError(
+                f"Map the exact captured semantic model '{match[1]}' before restoring this report"
+            )
+        target = normalized[_key(models[0].identity)]
+        current = item_document(client, target, "SemanticModel")
+        if current.get("displayName") != match[1]:
+            raise FabricError("The mapped report model was renamed; supply an explicit byConnection binding")
+    elif not reference.get("byConnection"):
+        raise FabricError("Resolve the report's missing model binding before restoring it")
 
 
 def _apply_sql_schema(
@@ -412,6 +472,7 @@ def _apply_sql_schema(
     tokens: TokenProvider,
     replacements: Mapping[str, str],
     references: Mapping[str, Mapping[str, Any]],
+    mutation_guard: Callable[[], None] | None = None,
 ) -> None:
     schemas = [
         payload
@@ -457,12 +518,19 @@ def _apply_sql_schema(
             max_memory_bytes=MAX_METADATA_BYTES,
         )
         output.write_text(script, encoding="utf-8")
+
+        def guarded_batch() -> bool:
+            if mutation_guard is not None:
+                mutation_guard()
+            return False
+
         failures = sqlschema.apply_script(
             output,
             server=server,
             database=database,
             tokens=tokens,
             max_memory_bytes=MAX_METADATA_BYTES,
+            cancel_requested=guarded_batch,
         )
         if failures:
             raise FabricError("Destination schema application failed: " + "; ".join(failures))
@@ -486,8 +554,8 @@ def observe_target(client: FabricClient, target: ItemIdentity, item_type: str) -
         definition = {
             "format": definition.get("format"),
             "parts": [
-                {"path": entry["path"], "sha256": digest(base)}
-                for entry in definition["parts"]
+                {"path": entry["path"], "sha256": _definition_digest(entry["path"], base)}
+                for entry in sorted(definition["parts"], key=lambda value: value["path"])
                 for base in [decode_payload(entry["payload"])]
             ],
         }
@@ -540,6 +608,7 @@ def apply_captured_item(
     target_id: str | None = None,
     tokens: TokenProvider | None = None,
     shell_only: bool = False,
+    mutation_guard: Callable[[], None] | None = None,
 ) -> AdapterResult:
     """Create/update only from captured bytes; returned success never implies data readiness.
 
@@ -626,6 +695,7 @@ def apply_captured_item(
         parts, inactivity = _inactive_parts(item, parts)
         diagnostics.extend(inactivity)
         _strict_references(item, parts, replacements, references)
+        _report_binding(client, item, parts, source_items, item_mappings)
         diagnostics.extend(
             analytics.validate_cross_tenant_references(
                 parts,
@@ -731,7 +801,7 @@ def apply_captured_item(
     if item.item_type in {"Lakehouse", "Warehouse", "SQLDatabase"}:
         if tokens is None:
             raise FabricError("Destination SQL tokens disappeared after schema preflight")
-        _apply_sql_schema(item, payloads, target, tokens, replacements, references)
+        _apply_sql_schema(item, payloads, target, tokens, replacements, references, mutation_guard)
         deferred.append({"scope": "sql", "captured": item.properties.get("bcdr", {}).get("sql", {})})
         diagnostics.append(
             "SQL grants, role memberships and pre/post-deployment scripts were excluded. "
@@ -760,4 +830,5 @@ def apply_captured_item(
         target_properties=target,
         deferred_grants=tuple(deferred),
         diagnostics=tuple(diagnostics),
+        metadata_applied=True,
     )

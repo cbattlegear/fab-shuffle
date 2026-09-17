@@ -298,6 +298,32 @@ def test_embedded_secrets_are_not_published():
         make_payload(IDENTITY, "definition.json", b'{"password":"do-not-save"}', PayloadPurpose.DEFINITION)
 
 
+def test_compressed_dacpac_credentials_are_inspected_before_cataloging():
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model.xml", "<DataSchemaModel/>")
+        archive.writestr("postdeploy.sql", "password=do-not-save")
+    with pytest.raises(ValueError, match="credential"):
+        make_payload(IDENTITY, "source.dacpac", data.getvalue(), PayloadPurpose.SQL_SCHEMA, encoding="binary")
+
+
+def test_full_onelake_roles_are_captured_separately_from_definition(monkeypatch):
+    client = SourceClient(
+        "Lakehouse",
+        [part("lakehouse.metadata.json", {"defaultSchema": "dbo"})],
+        {"defaultSchema": "dbo", "sqlEndpointProperties": {"connectionString": "source.sql"}},
+    )
+    original = client.list_all
+    role = {"name": "Readers", "members": {"microsoftEntraMembers": [{"tenantId": TENANT, "objectId": SPN}]}}
+
+    def list_roles(path, **kwargs):
+        return [role] if path.endswith("/dataAccessRoles") else original(path, **kwargs)
+
+    monkeypatch.setattr(client, "list_all", list_roles)
+    result = capture_item(client, IDENTITY, "Lakehouse", readers=Readers())
+    assert result.record.properties["bcdr"]["data_access_roles"] == [role]
+
+
 def test_source_sql_failure_is_not_replaced_by_empty_schema():
     class FailedReader(Readers):
         def sql_metadata(self, server, database):

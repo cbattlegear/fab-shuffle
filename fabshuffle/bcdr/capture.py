@@ -15,7 +15,12 @@ from typing import Any
 from uuid import uuid4
 
 from fabshuffle.auth import TokenProvider
-from fabshuffle.bcdr.capture_sources import MAX_METADATA_BYTES, MetadataReaders, file_api_path
+from fabshuffle.bcdr.capture_sources import (
+    MAX_METADATA_BYTES,
+    MetadataReaders,
+    file_api_path,
+    inspect_schema_archive,
+)
 from fabshuffle.bcdr.catalog import CapturedGeneration
 from fabshuffle.bcdr.contracts import (
     AclScope,
@@ -82,6 +87,8 @@ def make_payload(
 ) -> CapturedPayload:
     if len(data) > MAX_METADATA_BYTES:
         raise FabricError(f"Metadata part '{path}' exceeds the {MAX_METADATA_BYTES}-byte limit")
+    if purpose == PayloadPurpose.SQL_SCHEMA and path.lower().endswith(".dacpac"):
+        inspect_schema_archive(data)
     descriptor = PayloadDescriptor(
         payload_id=str(uuid4()),
         owner=owner,
@@ -400,6 +407,8 @@ def _role_assignments(
 def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]:
     """Known literal evidence, never a claim that arbitrary executable code was analyzed."""
     edges: list[DependencyEdge] = []
+    known_ids = {capture.record.identity.item_id for capture in captures}
+    workspace_ids = {capture.record.identity.workspace_id for capture in captures}
     for capture in captures:
         item = capture.record
         parts = definition_parts(item, capture.payloads)
@@ -435,7 +444,7 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
         for connection in item.properties.get("bcdr", {}).get("connections", []):
             if connection.get("id"):
                 connection_ids.add(connection["id"])
-        for connection_id in sorted(connection_ids):
+        for connection_id in sorted({canonical_id(value) for value in connection_ids}):
             edges.append(
                 DependencyEdge(
                     edge_id=str(uuid4()),
@@ -448,6 +457,26 @@ def _dependencies(captures: Sequence[ItemCapture]) -> tuple[DependencyEdge, ...]
                     provenance="Fabric definition/item connections",
                     qualification=Qualification.DOCUMENTED,
                     detail=f"Provision and map connection '{connection_id}' without exporting credentials.",
+                )
+            )
+        explicit_ids = {
+            canonical_id(value)
+            for value in analytics._source_item_references(
+                parts,
+                item.identity.workspace_id,
+                rewritten_workspaces=workspace_ids,
+            )
+        }
+        for item_id in sorted(explicit_ids - known_ids):
+            edges.append(
+                DependencyEdge(
+                    edge_id=str(uuid4()),
+                    consumer=item.identity,
+                    external_reference=f"uncaptured-item:{item_id}",
+                    phase="bind",
+                    qualification=Qualification.UNVERIFIED,
+                    provenance="explicit captured item binding absent from estate inventory",
+                    detail=f"Capture and qualify item '{item_id}' before binding '{item.display_name}'.",
                 )
             )
         edges.append(
@@ -487,7 +516,11 @@ def capture_workspaces(
         for workspace in listed
         if canonical_id(workspace["id"]) != recovery_set.control_workspace.workspace_id
         and (selected is None or canonical_id(workspace["id"]) in selected)
-        and (selected is not None or workspace.get("capacityId") in recovery_set.source_capacity_ids)
+        and (
+            selected is not None
+            or not workspace.get("capacityId")
+            or canonical_id(workspace["capacityId"]) in recovery_set.source_capacity_ids
+        )
     ]
     if selected is not None and {canonical_id(workspace["id"]) for workspace in candidates} != selected:
         raise FabricError(
@@ -505,8 +538,12 @@ def capture_workspaces(
         workspace = client.get(root)
         if canonical_id(workspace["id"]) != identity.workspace_id:
             raise FabricError("Workspace metadata returned a different source identity")
+        if not workspace.get("capacityId") and selected is None:
+            continue
         capacity = canonical_id(workspace["capacityId"])
         if capacity not in recovery_set.source_capacity_ids:
+            if selected is None:
+                continue
             raise FabricError(f"'{workspace['displayName']}' is outside the explicit source capacity scope")
         if workspace.get("capacityAssignmentProgress") not in {None, "Completed"}:
             raise FabricError(f"'{workspace['displayName']}' has an unsettled source capacity assignment")

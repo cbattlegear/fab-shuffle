@@ -132,6 +132,7 @@ def test_source_independent_apply_returns_real_target_and_hashes():
     client = Destination()
     result = apply(item, payloads, client)
     assert result.outcome == RecoveryOutcome.RESTORED_STOPPED
+    assert result.metadata_applied
     assert result.applied.target.item_id == CREATED
     assert (result.applied.definition_sha256, result.applied.properties_sha256) == captured_hashes(
         item, payloads
@@ -420,6 +421,7 @@ def test_sql_schema_uses_captured_dacpac_and_only_destination_credentials(monkey
     client = Destination()
     tokens = object()
     calls = []
+    guard = Mock()
 
     def script(source, output, **kwargs):
         assert source.read_bytes() == payloads[0].data
@@ -433,8 +435,14 @@ def test_sql_schema_uses_captured_dacpac_and_only_destination_credentials(monkey
     monkeypatch.setattr(
         adapters.sqlschema, "extract_dacpac", Mock(side_effect=AssertionError("source unavailable"))
     )
-    monkeypatch.setattr(adapters.sqlschema, "apply_script", lambda path, **kwargs: [])
-    result = apply(item, payloads, client, tokens=tokens)
+
+    def apply_script(path, **kwargs):
+        assert kwargs["cancel_requested"]() is False
+        return []
+
+    monkeypatch.setattr(adapters.sqlschema, "apply_script", apply_script)
+    result = apply(item, payloads, client, tokens=tokens, mutation_guard=guard)
+    guard.assert_called_once_with()
     assert result.outcome == RecoveryOutcome.PARTIAL and calls
     assert result.target_properties["properties"]["connectionString"] == "target.sql"
     assert result.deferred_grants[0]["scope"] == "sql"
@@ -482,6 +490,7 @@ def test_sql_protection_shell_does_not_apply_schema_first(monkeypatch):
     assert result.outcome == RecoveryOutcome.PARTIAL
     assert result.applied.target.item_id == CREATED
     assert "NOT synchronized" in result.diagnostics[0]
+    assert result.metadata_applied is False
     assert len(client.mutations) == 1 and client.mutations[0][0].endswith("/sqlDatabases")
 
 
@@ -507,3 +516,51 @@ def test_unknown_workspace_is_blocked_without_probing_it():
     result = apply(item, payloads, client)
     assert result.outcome == RecoveryOutcome.BLOCKED
     assert client.reads == [] and client.mutations == []
+
+
+def test_report_by_path_requires_exact_captured_model_mapping():
+    item, payloads = captured(
+        "Report",
+        {"datasetReference": {"byPath": {"path": "../Orders.SemanticModel"}}},
+        "definition.pbir",
+    )
+    client = Destination()
+    result = apply(item, payloads, client)
+    assert result.outcome == RecoveryOutcome.BLOCKED
+    assert "exact captured semantic model" in result.diagnostics[0]
+    assert not client.mutations
+
+
+def test_reflex_rules_remain_stopped_on_repeat_definition_update():
+    item, payloads = captured(
+        "Reflex",
+        [
+            {
+                "type": "timeSeriesView-v1",
+                "payload": {"definition": {"type": "Rule", "settings": {"shouldRun": True}}},
+            }
+        ],
+        "ReflexEntities.json",
+    )
+    client = Destination()
+    result = apply(item, payloads, client, target_id=CREATED)
+    assert result.applied.target.item_id == CREATED
+    assert decode_json_part(client.definition[0]["payload"])[0]["payload"]["definition"]["settings"] == {
+        "shouldRun": False,
+        "shouldApplyRuleOnUpdate": False,
+    }
+
+
+def test_dacpac_export_timestamp_does_not_masquerade_as_schema_drift():
+    payloads = []
+    for stamp in ("first-export", "second-export"):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as archive:
+            archive.writestr("model.xml", "<Model>same schema</Model>")
+            archive.writestr("Origin.xml", f"<export>{stamp}</export>")
+        payloads.append(data.getvalue())
+    assert payloads[0] != payloads[1]
+    assert adapters._definition_digest("schema.dacpac", payloads[0]) == adapters._definition_digest(
+        "schema.dacpac",
+        payloads[1],
+    )
