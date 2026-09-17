@@ -15,6 +15,7 @@ from fabshuffle.bcdr.capture import (
 )
 from fabshuffle.bcdr.capture_sources import MetadataReaders
 from fabshuffle.bcdr.contracts import (
+    EndpointIdentity,
     ItemIdentity,
     PayloadPurpose,
     Principal,
@@ -446,3 +447,262 @@ def test_strict_capture_paging_preserves_rows_and_rejects_repeated_tokens():
 
     with pytest.raises(FabricError, match="repeated"):
         capture_list(Client(), "workspaces")
+
+
+MODEL_ID = "30000000-0000-0000-0000-000000000011"
+ENDPOINT_ID = "30000000-0000-0000-0000-000000000012"
+SYSTEM_ID = "30000000-0000-0000-0000-000000000013"
+UNKNOWN_ID = "30000000-0000-0000-0000-000000000014"
+
+
+class InventoryClient(SourceClient):
+    """Raw List Items includes derived/system rows in front of their owners."""
+
+    def __init__(self, endpoint_type="SQLEndpoint", extra=()):
+        super().__init__()
+        self.documents = {
+            ENDPOINT_ID: {"id": ENDPOINT_ID, "type": endpoint_type, "displayName": "Orders SQL"},
+            MODEL_ID: {
+                "id": MODEL_ID,
+                "type": "SemanticModel",
+                "displayName": "Orders",
+                "properties": {"isDefaultModel": True},
+            },
+            ITEM: {
+                "id": ITEM,
+                "type": "Lakehouse",
+                "displayName": "Orders",
+                "properties": {
+                    "defaultSchema": "dbo",
+                    "sqlEndpointProperties": {
+                        "id": ENDPOINT_ID,
+                        "connectionString": "source.sql",
+                    },
+                },
+            },
+            **{row["id"]: row for row in extra},
+        }
+        self.definitions = {
+            MODEL_ID: [
+                part(
+                    "model.bim",
+                    {
+                        "model": {
+                            "dataSources": [
+                                {
+                                    "name": "lakehouse",
+                                    "connectionString": f"server=source.sql;database={ENDPOINT_ID}",
+                                }
+                            ],
+                            "roles": [],
+                            "tables": [],
+                        }
+                    },
+                )
+            ],
+            ITEM: [part("lakehouse.metadata.json", {"defaultSchema": "dbo"})],
+        }
+        self.item_reads = []
+        self.definition_reads = []
+
+    def list_all(self, path, params=None, value_key="value"):
+        if path.endswith("/items"):
+            return list(self.documents.values())
+        return super().list_all(path, params=params, value_key=value_key)
+
+    def get(self, path):
+        item_id = path.rsplit("/", 1)[-1]
+        if item_id in self.documents:
+            self.item_reads.append(item_id)
+            assert self.documents[item_id]["type"].casefold() not in {"sqlendpoint", "sqlanalyticsendpoint"}
+            return self.documents[item_id]
+        return super().get(path)
+
+    def post(self, path, params=None):
+        item_id = path.split("/")[-2]
+        self.definition_reads.append(item_id)
+        assert item_id not in {ENDPOINT_ID, SYSTEM_ID}
+        return {"definition": {"parts": self.definitions.get(item_id, [part("definition.json", {})])}}
+
+
+@pytest.mark.parametrize("endpoint_type", ["SQLEndpoint", "SqlAnalyticsEndpoint", "sqlendpoint"])
+def test_standard_lakehouse_endpoint_and_former_default_model_capture_has_only_rebuildable_items(
+    endpoint_type,
+):
+    client = InventoryClient(endpoint_type)
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    result.snapshot.require_publishable(recovery_set())
+    assert {item.item_type for item in result.snapshot.items} == {"Lakehouse", "SemanticModel"}
+    model = next(row for row in result.snapshot.items if row.item_type == "SemanticModel")
+    lakehouse = next(row for row in result.snapshot.items if row.item_type == "Lakehouse")
+    assert model.identity.item_id == MODEL_ID and model.definition_format == "TMSL"
+    assert MODEL_ID in client.definition_reads
+    assert ENDPOINT_ID not in client.definition_reads and ENDPOINT_ID not in client.item_reads
+    workspace = result.snapshot.workspaces[0]
+    derived = workspace.properties["bcdr"]["derived_items"]
+    assert len(derived) == 1 and derived[0]["raw_item"]["id"] == ENDPOINT_ID
+    assert derived[0]["owner"]["item_id"] == ITEM
+    assert EndpointIdentity.model_validate(derived[0]["endpoint"]).item == lakehouse.identity
+    dependencies = [edge for edge in result.snapshot.dependencies if edge.consumer == model.identity]
+    assert any(edge.prerequisite == lakehouse.identity for edge in dependencies)
+    endpoint_refs = [
+        edge.prerequisite for edge in dependencies if isinstance(edge.prerequisite, EndpointIdentity)
+    ]
+    assert {(ref.endpoint_kind, ref.endpoint_id) for ref in endpoint_refs} == {
+        ("sql_endpoint_id", ENDPOINT_ID),
+        ("sql_endpoint_server", "source.sql"),
+    }
+    assert not any(edge.phase == "bind" and edge.external_reference for edge in dependencies)
+
+
+def test_explicit_endpoint_item_id_binding_resolves_through_owner_not_uncaptured_item():
+    client = InventoryClient()
+    client.definitions[MODEL_ID] = [
+        part(
+            "model.bim",
+            {
+                "model": {
+                    "binding": {
+                        "workspaceId": SOURCE,
+                        "itemId": ENDPOINT_ID,
+                    }
+                }
+            },
+        )
+    ]
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    references = [edge for edge in result.snapshot.dependencies if edge.consumer.item_id == MODEL_ID]
+    assert any(isinstance(edge.prerequisite, EndpointIdentity) for edge in references)
+    assert not any(edge.external_reference == f"uncaptured-item:{ENDPOINT_ID}" for edge in references)
+
+
+def test_unowned_endpoint_is_visible_and_blocks_publication_not_a_fake_rebuild_type():
+    client = InventoryClient()
+    client.documents[ITEM]["properties"]["sqlEndpointProperties"]["id"] = UNKNOWN_ID
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    assert all(row.item_type != "SQLEndpoint" for row in result.snapshot.items)
+    evidence = result.snapshot.workspaces[0].properties["bcdr"]["derived_items"][0]
+    assert evidence["qualification"] == "unverified" and ENDPOINT_ID in evidence["action"]
+    with pytest.raises(ValueError, match="inventory"):
+        result.snapshot.require_publishable(recovery_set())
+
+
+@pytest.mark.parametrize(
+    "name,item_type",
+    [
+        ("DataflowsStagingLakehouse", "Lakehouse"),
+        ("DataflowsStagingWarehouse", "Warehouse"),
+        ("Monitoring Eventhouse", "Eventhouse"),
+        ("Monitoring KQL database", "KQLDatabase"),
+        ("monitoring_eventstream", "Eventstream"),
+    ],
+)
+def test_unreferenced_known_system_items_do_not_poison_normal_workspace_group(name, item_type):
+    client = InventoryClient(extra=({"id": SYSTEM_ID, "type": item_type, "displayName": name},))
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    result.snapshot.require_publishable(recovery_set())
+    assert {row.identity.item_id for row in result.snapshot.items} == {ITEM, MODEL_ID}
+    system = result.snapshot.workspaces[0].properties["bcdr"]["system_items"]
+    assert system[0]["raw_item"]["id"] == SYSTEM_ID and system[0]["action"]
+    assert SYSTEM_ID in client.item_reads and SYSTEM_ID not in client.definition_reads
+    assert not any(edge.phase == "bind" and edge.external_reference for edge in result.snapshot.dependencies)
+
+
+def test_explicit_consumer_of_system_staging_gets_named_required_dependency_not_silent_drop():
+    client = InventoryClient(
+        extra=(
+            {
+                "id": SYSTEM_ID,
+                "type": "Warehouse",
+                "displayName": "DataflowsStagingWarehouse",
+                "properties": {"connectionString": "staging.sql"},
+            },
+        )
+    )
+    client.definitions[MODEL_ID] = [
+        part(
+            "model.bim",
+            {
+                "model": {
+                    "binding": {
+                        "workspaceId": SOURCE,
+                        "itemId": SYSTEM_ID,
+                        "server": "staging.sql",
+                    }
+                }
+            },
+        )
+    ]
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    dependencies = [
+        edge
+        for edge in result.snapshot.dependencies
+        if edge.consumer.item_id == MODEL_ID and edge.phase == "bind" and edge.external_reference
+    ]
+    assert len(dependencies) == 1
+    assert dependencies[0].external_reference.endswith(SYSTEM_ID)
+    assert dependencies[0].required and "DataflowsStagingWarehouse" in dependencies[0].detail
+
+
+def test_system_like_name_is_not_enough_to_filter_legitimate_semantic_models_or_unknown_types():
+    client = InventoryClient(
+        extra=(
+            {
+                "id": SYSTEM_ID,
+                "type": "SemanticModel",
+                "displayName": "DataflowsStagingLakehouse",
+            },
+            {
+                "id": UNKNOWN_ID,
+                "type": "FutureWorkload",
+                "displayName": "Monitoring Eventhouse",
+            },
+        )
+    )
+    client.definitions[SYSTEM_ID] = [part("model.bim", {"model": {"roles": []}})]
+
+    def definitions(path, params=None):
+        item_id = path.split("/")[-2]
+        client.definition_reads.append(item_id)
+        return {"definition": {"parts": client.definitions[item_id]}}
+
+    client.post = definitions
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    assert {row.identity.item_id for row in result.snapshot.items} == {ITEM, MODEL_ID, SYSTEM_ID, UNKNOWN_ID}
+    assert SYSTEM_ID in client.definition_reads
+    assert result.snapshot.workspaces[0].properties["bcdr"]["system_items"] == []
+    unknown = next(row for row in result.snapshot.items if row.identity.item_id == UNKNOWN_ID)
+    assert unknown.properties["bcdr"]["unsupported_reason"]
+
+
+def test_malformed_items_page_still_fails_instead_of_filtering_everything():
+    client = InventoryClient()
+    original = client.request
+
+    def malformed(method, path, **kwargs):
+        return httpx.Response(200, json={}) if path.endswith("/items") else original(method, path, **kwargs)
+
+    client.request = malformed
+    with pytest.raises(FabricError, match="collection"):
+        capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+
+
+def test_system_staging_endpoint_uses_system_owner_evidence_and_blocks_only_referencing_consumers():
+    client = InventoryClient(
+        extra=(
+            {
+                "id": SYSTEM_ID,
+                "type": "Lakehouse",
+                "displayName": "DataflowsStagingLakehouse",
+                "properties": {
+                    "sqlEndpointProperties": {"id": UNKNOWN_ID, "connectionString": "staging.sql"}
+                },
+            },
+            {"id": UNKNOWN_ID, "type": "SQLEndpoint", "displayName": "Staging SQL"},
+        )
+    )
+    result = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    result.snapshot.require_publishable(recovery_set())
+    assert {row.identity.item_id for row in result.snapshot.items} == {ITEM, MODEL_ID}
+    derived = result.snapshot.workspaces[0].properties["bcdr"]["derived_items"]
+    assert {entry["owner"]["item_id"] for entry in derived} == {ITEM, SYSTEM_ID}
