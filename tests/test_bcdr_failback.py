@@ -427,6 +427,18 @@ def test_failback_pins_explicit_return_connections_without_inverting_forward_rou
         ),
         (),
     )
+    with pytest.raises(RecoveryBlocked, match="Resolve return metadata prerequisites"):
+        system.service.plan_failback(
+            FailbackRequest(
+                generation_id=running.generation_id,
+                group_ids=(running.groups[0].group_id,),
+                primary_available=True,
+                primary_evidence="primary available",
+            )
+        )
+    assert system.catalog.state().mode == RecoveryMode.ACTIVE_RECOVERY
+    assert system.catalog.state().current_generation_id == running.generation_id
+    assert not system.catalog.list_records("failback")
     planned = system.service.plan_failback(
         FailbackRequest(
             generation_id=running.generation_id,

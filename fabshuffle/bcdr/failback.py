@@ -151,6 +151,18 @@ class FailbackController:
                 target_quiescence_evidence=request.target_quiescence_evidence,
             )
             plan = return_coordinator._plan(captured, return_request)
+            metadata_blockers = tuple(
+                dict.fromkeys(
+                    blocker.message
+                    for consumer in plan.consumers
+                    for blocker in consumer.metadata_blockers
+                )
+            )
+            if metadata_blockers:
+                raise RecoveryBlocked(
+                    "Resolve return metadata prerequisites before starting failback: "
+                    + "; ".join(metadata_blockers)
+                )
             self.runtime.transition(RecoveryMode.FAILING_BACK)
             # Validate placement before the mode transition; publish DR separately from source authority.
             c.catalog.stage_failback_generation(
