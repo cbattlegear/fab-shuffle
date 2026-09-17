@@ -12,7 +12,7 @@ from fabshuffle.bcdr.service import (
     FailbackRequest,
     RearmRequest,
 )
-from tests.test_bcdr_contracts import guid
+from tests.test_bcdr_contracts import guid, snapshot
 from tests.test_bcdr_coordinator import enable, fence, proofs
 from tests.test_bcdr_coordinator import system as system
 
@@ -37,7 +37,7 @@ def capture_dr(system):
             "identity": WorkspaceIdentity(
                 tenant_id=row.target.tenant_id, workspace_id=row.target.workspace_id
             ),
-            "capacity_id": system.config.target_capacity_ids[0],
+            "capacity_id": system.config.target_capacity_ids[-1],
         }
     )
     item = original.items[0].model_copy(update={"identity": row.target})
@@ -227,6 +227,230 @@ def test_failed_primary_availability_does_not_enter_failback(system):
             )
         )
     assert system.catalog.state().mode == RecoveryMode.ACTIVE_RECOVERY
+
+
+@pytest.mark.parametrize("system", [{"catalog_separate": True}], indirect=True)
+def test_failback_does_not_treat_catalog_only_capacity_as_business_source(system):
+    running = active(system)
+    capture_dr(system)
+    result = system.service.plan_failback(
+        FailbackRequest(
+            generation_id=running.generation_id,
+            group_ids=(running.groups[0].group_id,),
+            primary_available=True,
+            primary_evidence="primary observed",
+        )
+    )
+    assert result.plan_id
+    record = system.c.runtime.get("failback", result.plan_id)
+    routes = record["request"]["capacity_routes"]
+    assert [row["source_capacity_id"] for row in routes] == [system.config.target_capacity_ids[-1]]
+    assert system.config.target_capacity_ids[0] not in str(result.details["return_placements"])
+
+
+@pytest.mark.parametrize("system", [{"catalog_separate": True}], indirect=True)
+def test_invalid_return_plan_keeps_active_mode_and_can_retry(system):
+    from fabshuffle.bcdr.contracts import ConnectionIdentity
+    from fabshuffle.bcdr.planner import PlanConfigurationError
+    from fabshuffle.bcdr.service import ConnectionRoute
+
+    running = active(system)
+    capture_dr(system)
+    connection = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    request = FailbackRequest(
+        generation_id=running.generation_id,
+        group_ids=(running.groups[0].group_id,),
+        primary_available=True,
+        primary_evidence="primary available",
+        return_connection_mappings=(
+            ConnectionRoute(source=connection, target=connection, evidence="stale approval"),
+        ),
+    )
+    with pytest.raises(PlanConfigurationError, match="Unknown mapping source"):
+        system.service.plan_failback(request)
+    assert system.catalog.state().mode == RecoveryMode.ACTIVE_RECOVERY
+    assert not system.catalog.list_records("failback")
+    assert system.service.plan_failback(request.model_copy(update={"return_connection_mappings": ()})).plan_id
+
+
+def test_partial_failback_preserves_unaffected_source_authority(system):
+    second = snapshot(system.config)
+    original = system.captured
+    combined = original.model_copy(
+        update={
+            "workspaces": (*original.workspaces, *second.workspaces),
+            "items": (*original.items, *second.items),
+        }
+    )
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(combined, ())
+    synced = system.service.synchronize(system.request)
+    selected = next(group for group in synced.groups if original.items[0].identity in group.items)
+    enabled = system.service.enable_recovery(
+        EnableRecoveryRequest(
+            generation_id=synced.generation_id,
+            group_ids=(selected.group_id,),
+            readiness=proofs(system, synced.generation_id),
+        )
+    )
+    system.service.cutover(
+        CutoverRequest(
+            generation_id=synced.generation_id,
+            group_ids=(selected.group_id,),
+            readiness=proofs(system, synced.generation_id),
+            writer_fence=fence(),
+        )
+    )
+    dr = system.c.item_mappings()[original.items[0].identity.key].target
+    dr_workspace = original.workspaces[0].model_copy(
+        update={
+            "identity": WorkspaceIdentity(tenant_id=dr.tenant_id, workspace_id=dr.workspace_id),
+            "capacity_id": system.request.capacity_routes[0].target_capacity_id,
+        }
+    )
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(
+        original.model_copy(
+            update={
+                "generation_id": guid(),
+                "parent_generation_id": kwargs.get("parent_generation_id"),
+                "workspaces": (dr_workspace,),
+                "items": (original.items[0].model_copy(update={"identity": dr}),),
+            }
+        ),
+        (),
+    )
+    planned = system.service.plan_failback(
+        FailbackRequest(
+            generation_id=synced.generation_id,
+            group_ids=(selected.group_id,),
+            primary_available=True,
+            primary_evidence="primary available",
+        )
+    )
+    system.service.execute_failback(
+        FailbackExecuteRequest(
+            plan_id=planned.plan_id,
+            writer_fence=fence("recovery", 1),
+        )
+    )
+    return_id = planned.details["return_generation_id"]
+    system.service.cutback(
+        CutbackRequest(
+            plan_id=planned.plan_id,
+            readiness=proofs(system, return_id),
+            writer_fence=fence("recovery", 1),
+        )
+    )
+    system.service.rearm(
+        RearmRequest(
+            plan_id=planned.plan_id,
+            approve=True,
+            recovery_no_longer_serving=True,
+            evidence="cutback done",
+            park=False,
+        )
+    )
+    fresh = system.c.item_mappings()[dr.key].target
+    authority = system.c.runtime.get("lifecycle", "authority")
+    assert {row["workspace_id"] for row in authority["workspaces"]} == {
+        fresh.workspace_id,
+        second.workspaces[0].identity.workspace_id,
+    }
+    returned_item = original.items[0].model_copy(update={"identity": fresh})
+    returned_workspace = original.workspaces[0].model_copy(
+        update={
+            "identity": WorkspaceIdentity(tenant_id=fresh.tenant_id, workspace_id=fresh.workspace_id),
+        }
+    )
+    expected_ids = {fresh.workspace_id, second.workspaces[0].identity.workspace_id}
+
+    def recapture(*args, **kwargs):
+        assert set(kwargs["workspace_ids"]) == expected_ids
+        return CapturedGeneration(
+            combined.model_copy(
+                update={
+                    "generation_id": guid(),
+                    "parent_generation_id": kwargs["parent_generation_id"],
+                    "workspaces": (returned_workspace, *second.workspaces),
+                    "items": (returned_item, *second.items),
+                }
+            ),
+            (),
+        )
+
+    system.c.capture = recapture
+    result = system.service.synchronize(
+        system.request.model_copy(
+            update={
+                "include_workspace_ids": (second.workspaces[0].identity.workspace_id,),
+            }
+        )
+    )
+    current = system.catalog.load_generation(result.generation_id).snapshot
+    assert not next(row for row in current.items if row.identity == second.items[0].identity).tombstone
+    assert not next(row for row in current.items if row.identity == fresh).tombstone
+    assert enabled.groups[0].access_enabled
+
+
+def test_failback_pins_explicit_return_connections_without_inverting_forward_routes(system):
+    from fabshuffle.bcdr.contracts import ConnectionIdentity, DependencyEdge
+    from fabshuffle.bcdr.service import ConnectionRoute
+
+    running = active(system)
+    dr = system.c.item_mappings()[system.captured.items[0].identity.key].target
+    source_connection = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    return_connection = ConnectionIdentity(tenant_id=system.config.tenant_id, connection_id=guid())
+    row = system.captured.workspaces[0].model_copy(
+        update={
+            "identity": WorkspaceIdentity(tenant_id=dr.tenant_id, workspace_id=dr.workspace_id),
+            "capacity_id": system.request.capacity_routes[0].target_capacity_id,
+        }
+    )
+    item = system.captured.items[0].model_copy(update={"identity": dr})
+    system.c.capture = lambda *args, **kwargs: CapturedGeneration(
+        system.captured.model_copy(
+            update={
+                "generation_id": guid(),
+                "parent_generation_id": kwargs.get("parent_generation_id"),
+                "workspaces": (row,),
+                "items": (item,),
+                "dependencies": (
+                    DependencyEdge(
+                        edge_id=guid(),
+                        consumer=dr,
+                        prerequisite=source_connection,
+                        phase="bind",
+                        provenance="DR definition",
+                        detail="Explicit approved return connection required",
+                    ),
+                ),
+            }
+        ),
+        (),
+    )
+    planned = system.service.plan_failback(
+        FailbackRequest(
+            generation_id=running.generation_id,
+            group_ids=(running.groups[0].group_id,),
+            primary_available=True,
+            primary_evidence="primary available",
+            return_connection_mappings=(
+                ConnectionRoute(
+                    source=source_connection,
+                    target=return_connection,
+                    evidence="return connection approved",
+                ),
+            ),
+        )
+    )
+    result = system.service.execute_failback(
+        FailbackExecuteRequest(
+            plan_id=planned.plan_id,
+            writer_fence=fence("recovery", 1),
+        )
+    )
+    assert result.groups[0].metadata_applied
+    saved = system.c.runtime.get("plans", planned.details["return_generation_id"])
+    assert saved["connection_mappings"][0]["target"]["connection_id"] == return_connection.connection_id
 
 
 @pytest.mark.parametrize(
