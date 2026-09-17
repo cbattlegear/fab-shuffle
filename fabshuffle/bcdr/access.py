@@ -193,7 +193,7 @@ class AccessController:
             )
         result = self.runtime.effect(
             "grant",
-            receipt_key,
+            f"{receipt_key}/{self.runtime.require_lease().epoch}",
             lambda: self.fabric.grant(acl),
             target=acl.item,
         )
@@ -232,7 +232,7 @@ class AccessController:
             if matching:
                 self.runtime.effect(
                     "revoke",
-                    row.key,
+                    f"{row.key}/{receipt['assignment_id']}",
                     lambda a=acl, identifier=receipt["assignment_id"]: self.fabric.revoke(a, identifier),
                 )
             self.runtime.put("owned-acls", row.key, {**receipt, "revoked": True})

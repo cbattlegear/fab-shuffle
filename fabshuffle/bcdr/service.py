@@ -11,8 +11,12 @@ import pyodbc
 from pydantic import AwareDatetime, Field, JsonValue, StrictBool, model_validator
 
 from fabshuffle.auth import TokenProvider
+from fabshuffle.bcdr.backend import RecoveryBlocked
+from fabshuffle.bcdr.bootstrap import BootstrapError
+from fabshuffle.bcdr.capacity import CapacityError
 from fabshuffle.bcdr.catalog import CatalogError
 from fabshuffle.bcdr.contracts import (
+    ConnectionIdentity,
     Digest,
     Guid,
     ItemIdentity,
@@ -22,6 +26,7 @@ from fabshuffle.bcdr.contracts import (
     RecoveryMode,
     StandbyAccessPolicy,
 )
+from fabshuffle.bcdr.protection import ProtectionError
 from fabshuffle.lifecycle import safe_text
 
 if TYPE_CHECKING:
@@ -32,6 +37,12 @@ if TYPE_CHECKING:
 class CapacityRoute(Record):
     source_capacity_id: Guid
     target_capacity_id: Guid
+
+
+class ConnectionRoute(Record):
+    source: ConnectionIdentity
+    target: ConnectionIdentity
+    evidence: Nonempty
 
 
 class SetupCapacity(Record):
@@ -54,6 +65,12 @@ class SetupRequest(Record):
     def one_control_workspace(self) -> SetupRequest:
         if (self.control_workspace_id is None) == (self.control_workspace_name is None):
             raise ValueError("Choose an existing control workspace ID or a name for a new one, not both")
+        if not self.source_capacity_ids or len(self.source_capacity_ids) != len(
+            set(self.source_capacity_ids)
+        ):
+            raise ValueError("Specify distinct source capacities before provisioning")
+        if set(self.source_capacity_ids) & {row.fabric_capacity_id for row in self.recovery_capacities}:
+            raise ValueError("Source and dedicated recovery capacities must not overlap")
         return self
 
 
@@ -65,6 +82,7 @@ class PlanRequest(Record):
     approved_addition_ids: tuple[Guid, ...] = ()
     capacity_routes: tuple[CapacityRoute, ...]
     suffix: Nonempty = " - recovery"
+    connection_mappings: tuple[ConnectionRoute, ...] = ()
 
 
 class SyncRequest(PlanRequest):
@@ -211,6 +229,8 @@ class BcdrService:
             return action()
         except pyodbc.Error as error:
             raise CatalogError(safe_text(str(error))) from error
+        except (BootstrapError, CapacityError, ProtectionError) as error:
+            raise RecoveryBlocked(safe_text(str(error))) from error
 
     def status(self) -> ServiceResult:
         return self._call(self.coordinator.status)
@@ -267,6 +287,8 @@ def create_service(
         )
     except pyodbc.Error as error:
         raise CatalogError(safe_text(str(error))) from error
+    except (BootstrapError, CapacityError, ProtectionError) as error:
+        raise RecoveryBlocked(safe_text(str(error))) from error
 
 
 def setup(

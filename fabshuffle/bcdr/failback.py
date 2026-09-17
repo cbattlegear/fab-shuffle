@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from fabshuffle.bcdr.backend import RecoveryBlocked, now
-from fabshuffle.bcdr.contracts import RecoveryMode, RecoverySet
+from fabshuffle.bcdr.contracts import RecoveryMode, RecoverySet, WorkspaceIdentity
 from fabshuffle.bcdr.service import (
     CapacityRoute,
     CutbackRequest,
@@ -338,6 +338,48 @@ class FailbackController:
                     ),
                 )
             # Fresh return identities are authoritative; don't resume capturing obsolete original item IDs.
+            return_generation = c.catalog.load_generation(record["dr_generation_id"])
+            return_sources = {row.identity.key for row in return_generation.snapshot.items}
+            for row in c.catalog.list_records("return-workspaces"):
+                fresh = WorkspaceIdentity.model_validate(row.document["target"])
+                dr_tenant, dr_workspace = row.key.split("/")
+                self.runtime.put(
+                    "workspaces",
+                    fresh.key,
+                    {
+                        "target": WorkspaceIdentity(
+                            tenant_id=dr_tenant,
+                            workspace_id=dr_workspace,
+                        ).model_dump(mode="json"),
+                        "capacity_id": next(
+                            workspace.capacity_id
+                            for workspace in return_generation.snapshot.workspaces
+                            if workspace.identity.key == row.key
+                        ),
+                    },
+                )
+            for returned in mappings.values():
+                if returned.source.key not in return_sources:
+                    continue
+                original = next(
+                    (row for row in mappings.values() if row.target == returned.source),
+                    None,
+                )
+                if original is None:
+                    raise RecoveryBlocked("A return target has no original DR ownership chain; reconcile it")
+                self.runtime.put(
+                    "rearmed-items",
+                    returned.target.key,
+                    {
+                        "target": returned.source.model_dump(mode="json"),
+                        "ownership_operation": original.operation_id,
+                        "observed_sha256": c.observe(
+                            c.destination,
+                            returned.source,
+                            items[original.source.key].item_type,
+                        ),
+                    },
+                )
             self.runtime.put(
                 "lifecycle",
                 "authority",
@@ -351,6 +393,8 @@ class FailbackController:
                     "evidence": request.evidence,
                 },
             )
+            writer = self.runtime.get("lifecycle", "writer")
+            self.runtime.put("lifecycle", "writer", {**writer, "side": "primary"})
             self.runtime.put("failback", request.plan_id, {**record, "state": "rearmed"})
             self.runtime.transition(RecoveryMode.STANDBY)
             if request.park:
