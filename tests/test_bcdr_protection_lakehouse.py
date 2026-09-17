@@ -39,6 +39,7 @@ class OneLake:
         self.source = dict(CONTENT)
         self.target = {}
         self.target_dirs = {"Tables", "Files"}
+        self.source_dirs = set()
         self.calls = []
         self.reject_read = False
         self.race = False
@@ -46,6 +47,7 @@ class OneLake:
         self.versions = {}
         self.after_write = None
         self.redirect = False
+        self.directory_versions = {}
 
     def handle(self, request):
         self.calls.append(request)
@@ -62,7 +64,7 @@ class OneLake:
         if not parts:
             directory = request.url.params["directory"].removeprefix(identity.item_id + "/")
             entries = {}
-            paths = set(data) | (set() if source else self.target_dirs)
+            paths = set(data) | (self.source_dirs if source else self.target_dirs)
             for path in paths:
                 if not path.startswith(directory + "/"):
                     continue
@@ -82,6 +84,14 @@ class OneLake:
         path = "/".join(parts[1:])
         etag = f'"v{self.versions.get(path, 0)}"'
         if request.method in ("GET", "HEAD"):
+            if not source and path in self.target_dirs and request.method == "HEAD":
+                return httpx.Response(
+                    200,
+                    headers={
+                        "ETag": f'"dir{self.directory_versions.get(path, 0)}"',
+                        "x-ms-resource-type": "directory",
+                    },
+                )
             if source and self.reject_read:
                 return httpx.Response(
                     403, json={"error": {"code": "ReplicaUnavailable", "message": "Not routed"}}
@@ -162,6 +172,34 @@ def setup(monkeypatch):
     return lake, protection
 
 
+class TargetFabric:
+    def __init__(self):
+        self.default_schema = "dbo"
+        self.shortcuts = []
+        self.calls = []
+        self.hook = None
+        self.shortcut_error = None
+
+    def get(self, path):
+        assert path == f"workspaces/{TARGET.workspace_id}/lakehouses/{TARGET.item_id}"
+        self.calls.append(path)
+        if self.hook:
+            self.hook()
+        return {
+            "id": TARGET.item_id,
+            "workspaceId": TARGET.workspace_id,
+            "type": "Lakehouse",
+            "properties": {"defaultSchema": self.default_schema} if self.default_schema else {},
+        }
+
+    def list_all(self, path):
+        assert path == f"workspaces/{TARGET.workspace_id}/items/{TARGET.item_id}/shortcuts"
+        self.calls.append(path)
+        if self.shortcut_error:
+            raise self.shortcut_error
+        return self.shortcuts
+
+
 def restore(protection, tmp_path, **extra):
     return lh.restore_lakehouse(
         protection,
@@ -171,6 +209,7 @@ def restore(protection, tmp_path, **extra):
         scratch=tmp_path,
         max_age=timedelta(days=1),
         target_approval_ref="fresh-owned-target",
+        target_client=extra.pop("target_client", TargetFabric()),
         limits=LIMITS,
         **extra,
     )
@@ -350,6 +389,7 @@ def test_inventory_budget_checked_before_service_reads(setup, tmp_path):
             scratch=tmp_path,
             max_age=timedelta(days=1),
             target_approval_ref="approved",
+            target_client=TargetFabric(),
             limits=LIMITS.__class__(max_manifest_entries=1),
         )
     assert not lake.calls
@@ -374,12 +414,22 @@ def test_binder_publishes_preparation_only_after_success_and_preserves_copy_time
             assert SOURCE.workspace_id not in path and runtime.current_operation is not None
             runtime.fence()
             if "/lakehouses/" in path:
-                return {"id": TARGET.item_id, "workspaceId": TARGET.workspace_id, "type": "Lakehouse"}
+                return {
+                    "id": TARGET.item_id,
+                    "workspaceId": TARGET.workspace_id,
+                    "type": "Lakehouse",
+                    "properties": {"defaultSchema": "dbo"},
+                }
             return {
                 "id": TARGET.workspace_id,
                 "capacityRegion": "West US",
                 "capacityAssignmentProgress": "Completed",
             }
+
+        def list_all(self, path):
+            assert path == f"workspaces/{TARGET.workspace_id}/items/{TARGET.item_id}/shortcuts"
+            runtime.fence()
+            return []
 
     configuration = binding.ProtectionConfiguration(
         provider="lakehouse",
@@ -393,6 +443,7 @@ def test_binder_publishes_preparation_only_after_success_and_preserves_copy_time
         protected_root=None,
     )
     captured, item = generation(record, item_type="Lakehouse")
+    lake.target_dirs.add("Tables/dbo")
     recovery = binding.build_data_recovery(
         client=Fabric(),
         tokens=TOKENS,
@@ -427,3 +478,122 @@ def test_catalog_loss_interrupts_actual_one_lake_copy_without_further_mutation(s
     with pytest.raises(CatalogError):
         restore(protection, tmp_path, cancel=fence)
     assert len([request for request in lake.writes if request.method == "PATCH"]) == 1
+
+
+@pytest.mark.parametrize("schemas", [("dbo",), ("dbo", "sales")])
+def test_empty_captured_schema_scaffolding_is_preserved_without_put_or_delete(setup, tmp_path, schemas):
+    lake, protection = setup
+    extra = {f"Tables/{schema}" for schema in schemas}
+    lake.target_dirs |= extra
+    lake.source_dirs |= extra
+    protection = protection.model_copy(
+        update={
+            "directories": tuple(sorted(set(protection.directories) | extra)),
+        }
+    )
+    fabric = TargetFabric()
+    receipt = restore(protection, tmp_path, target_client=fabric)
+    assert receipt.byte_copy_complete and not receipt.data_ready and not receipt.endpoint_ready
+    assert {name: bytes(content) for name, content in lake.target.items()} == CONTENT
+    assert lake.target_dirs == set(protection.directories)
+    assert not any(
+        request.url.path.removeprefix(f"/{TARGET.workspace_id}/{TARGET.item_id}/") in extra
+        for request in lake.writes
+    ), "Do not PUT, delete or overwrite existing immutable schema directories."
+    assert fabric.calls and all(SOURCE.workspace_id not in path for path in fabric.calls)
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "Tables/unrelated",
+        "Tables/dbo/Events",
+        "Files/empty",
+        "Tables/dbo/Events/_delta_log",
+    ],
+)
+def test_only_empty_captured_top_level_schema_scaffolds_may_preexist(setup, tmp_path, directory):
+    lake, protection = setup
+    lake.target_dirs.add("Tables/dbo")
+    lake.target_dirs.add(directory)
+    with pytest.raises(ProtectionError):
+        restore(protection, tmp_path)
+    assert not lake.writes
+
+
+def test_schema_scaffold_requires_live_schema_mode(setup, tmp_path):
+    lake, protection = setup
+    lake.target_dirs.add("Tables/dbo")
+    fabric = TargetFabric()
+    fabric.default_schema = None
+    with pytest.raises(ProtectionError, match="schema-enabled"):
+        restore(protection, tmp_path, target_client=fabric)
+    assert not lake.writes
+
+
+def test_empty_schema_shortcuts_are_not_accepted_as_local_scaffolding(setup, tmp_path):
+    lake, protection = setup
+    lake.target_dirs.add("Tables/dbo")
+    fabric = TargetFabric()
+    fabric.shortcuts = [{"path": "Tables", "name": "dbo", "target": {"oneLake": {}}}]
+    with pytest.raises(ProtectionError, match="shortcuts"):
+        restore(protection, tmp_path, target_client=fabric)
+    assert not lake.writes
+
+
+def test_failed_shortcut_inventory_is_not_empty_proof(setup, tmp_path):
+    from fabshuffle.fabric.client import FabricApiError
+
+    lake, protection = setup
+    fabric = TargetFabric()
+    fabric.shortcut_error = FabricApiError("GET", "target", 404, '{"errorCode":"ItemNotFound"}')
+    with pytest.raises(FabricApiError, match="ItemNotFound"):
+        restore(protection, tmp_path, target_client=fabric)
+    assert not lake.writes
+
+
+@pytest.mark.parametrize("drift", ["etag", "file", "directory", "shortcut", "mode"])
+def test_scaffold_drift_during_source_preflight_stops_before_copy(setup, tmp_path, drift):
+    lake, protection = setup
+    lake.target_dirs.add("Tables/dbo")
+    fabric = TargetFabric()
+    count = 0
+
+    def change():
+        nonlocal count
+        count += 1
+        if count != 2:
+            return
+        if drift == "etag":
+            lake.directory_versions["Tables/dbo"] = 1
+        elif drift == "file":
+            lake.target["Files/input.txt"] = bytearray(b"new")
+        elif drift == "directory":
+            lake.target_dirs.add("Tables/dbo/Events")
+        elif drift == "shortcut":
+            fabric.shortcuts = [{"name": "dbo"}]
+        else:
+            fabric.default_schema = None
+
+    fabric.hook = change
+    with pytest.raises(ProtectionError):
+        restore(protection, tmp_path, target_client=fabric)
+    assert not lake.writes
+
+
+def test_scaffold_is_checked_again_immediately_before_first_mutation(setup, tmp_path):
+    lake, protection = setup
+    lake.target_dirs.add("Tables/dbo")
+    fabric = TargetFabric()
+    count = 0
+
+    def change():
+        nonlocal count
+        count += 1
+        if count == 3:
+            lake.directory_versions["Tables/dbo"] = 1
+
+    fabric.hook = change
+    with pytest.raises(ProtectionError, match="drifted"):
+        restore(protection, tmp_path, target_client=fabric)
+    assert not lake.writes
