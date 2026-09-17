@@ -471,19 +471,21 @@ def test_unqualified_or_widened_bindings_never_reach_destination(field, value):
 
 
 @pytest.mark.parametrize(
-    "update",
+    "field,value",
     [
-        {"binding_sha256": "f" * 64},
-        {"valid_until": datetime.now(UTC) - timedelta(minutes=1)},
-        {"verified_at": datetime.now(UTC) + timedelta(minutes=1)},
-        {"verified_at": datetime.now(UTC) - timedelta(days=1)},
-        {"access_mode": "delegated_owner"},
-        {"enforcement_reference": "different proof"},
+        ("binding_sha256", "f" * 64),
+        ("valid_until", timedelta(minutes=-1)),
+        ("verified_at", timedelta(minutes=1)),
+        ("verified_at", timedelta(days=-1)),
+        ("access_mode", "delegated_owner"),
+        ("enforcement_reference", "different proof"),
     ],
 )
-def test_current_exact_caller_mode_access_evidence_is_mandatory(update):
+def test_current_exact_caller_mode_access_evidence_is_mandatory(field, value):
     case = make_case()
-    case.access_evidence = case.access_evidence.model_copy(update=update)
+    if isinstance(value, timedelta):
+        value = datetime.now(UTC) + value
+    case.access_evidence = case.access_evidence.model_copy(update={field: value})
     destination = Destination(case)
     with pytest.raises((ValueError, ReplicaAttachmentError)):
         destination.apply()
