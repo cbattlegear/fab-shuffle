@@ -36,6 +36,7 @@ from fabshuffle.bcdr.service import (
     setup as setup_recovery,
 )
 from fabshuffle.fabric.client import FabricApiError, FabricError
+from fabshuffle.lifecycle import safe_text
 
 REQUESTS = {
     "reconcile-operation": ReconcileOperationRequest,
@@ -210,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"error": "Invalid BCDR request", "details": details}), file=sys.stderr)
         return 2
     except FabricApiError as error:
-        print(json.dumps({"error": error.body or str(error)}), file=sys.stderr)
+        print(json.dumps({"error": safe_text(error.body or str(error))}), file=sys.stderr)
         return 1
     except (AuthError, FabricError, CatalogError, RecoveryBlocked, ValueError, OSError) as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)
