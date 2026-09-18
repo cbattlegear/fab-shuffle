@@ -648,8 +648,9 @@ def materialized(prepared, tmp_path, monkeypatch):
     fabric = KqlFabric(runtime)
     sdk = KqlClient(runtime)
 
-    def client(endpoint, _principal):
+    def client(endpoint, _principal, *, tokens):
         assert endpoint == DST.endpoint, "Never query a primary-supplied or user-arbitrary endpoint."
+        assert tokens is TOKENS
         runtime.fence()
         return sdk
 

@@ -208,15 +208,19 @@ class MetadataReaders:
         result: dict[str, Any] = {}
         with closing(sqlschema.connect(server, database, self.tokens)) as connection:
             cursor = connection.cursor()
+            self.tokens.assert_active()
             permission = cursor.execute(
                 "SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')"
             ).fetchone()
+            self.tokens.assert_active()
             if not permission or permission[0] != 1:
                 raise FabricError("Grant source database VIEW DEFINITION for complete SQL metadata capture")
             for key, query in queries.items():
+                self.tokens.assert_active()
                 cursor.execute(query)
                 columns = [column[0] for column in cursor.description]
                 rows = cursor.fetchmany(self.max_rows + 1)
+                self.tokens.assert_active()
                 if len(rows) > self.max_rows:
                     raise FabricError(f"SQL metadata '{key}' exceeds the configured row limit")
                 result[key] = [dict(zip(columns, row, strict=True)) for row in rows]
@@ -224,6 +228,7 @@ class MetadataReaders:
 
     def sql_schema(self, server: str, database: str) -> bytes:
         """Stage a schema-only DACPAC transiently; the Warehouse owns its durable bytes."""
+        self.tokens.assert_active()
         with TemporaryDirectory(prefix="fab-bcdr-schema-") as folder:
             root = Path(folder)
             path = sqlschema.extract_dacpac(
@@ -236,6 +241,7 @@ class MetadataReaders:
                 max_disk_staging_bytes=self.max_bytes,
                 cancel_requested=self.cancel_requested,
             )
+            self.tokens.assert_active()
             if path.stat().st_size > self.max_bytes:
                 raise FabricError("SQL schema payload exceeds the configured metadata byte limit")
             return path.read_bytes()
@@ -243,10 +249,13 @@ class MetadataReaders:
     def kql_metadata(self, cluster: str, database: str, *, follower: bool) -> dict[str, Any]:
         if not cluster or not database:
             raise FabricError("Capture needs the source KQL query endpoint and database ID")
-        builder = kusto_connection(cluster, self.tokens)
+        self.tokens.assert_active()
+        builder = kusto_connection(cluster, self.tokens, use_token_provider=True)
         result: dict[str, Any] = {}
         with KustoClient(builder) as client:
+            self.tokens.assert_active()
             identity = client.execute_mgmt(database, ".show database identity")
+            self.tokens.assert_active()
             identity_rows = list(identity.primary_results[0])
             if len(identity_rows) != 1 or not identity_rows[0]["DatabaseName"]:
                 raise FabricError("KQL did not return an unambiguous actual database identity")
@@ -272,7 +281,9 @@ class MetadataReaders:
                     "the ADX follower override command. Preserve rows; never infer a source URI."
                 )
             for key, command in commands.items():
+                self.tokens.assert_active()
                 response = client.execute_mgmt(actual_database, command)
+                self.tokens.assert_active()
                 rows = list(response.primary_results[0])
                 if len(rows) > self.max_rows:
                     raise FabricError(f"KQL metadata '{key}' exceeds the configured row limit")
