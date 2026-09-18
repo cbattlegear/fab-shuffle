@@ -97,7 +97,7 @@ def verify_health() -> None:
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.2)
-            for path in ("/", "/static/app.js", "/static/styles.css"):
+            for path in ("/", "/static/app.js", "/static/auth.js", "/static/styles.css"):
                 with opener.open(f"http://127.0.0.1:18080{path}", timeout=2) as response:
                     if response.status != 200 or not response.read():
                         raise RuntimeError(f"Packaged asset unavailable: {path}")

@@ -21,7 +21,7 @@ from urllib.parse import quote
 from azure.kusto.data import ClientRequestProperties, DataFormat, KustoClient, KustoConnectionStringBuilder
 from azure.kusto.data.exceptions import KustoServiceError
 
-from fabshuffle.auth import ServicePrincipal
+from fabshuffle.auth import AuthPrincipal, ManagedIdentity, TokenProvider
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer.common import (
     StagingBudgetError,
@@ -70,20 +70,39 @@ class FollowerSource:
         return _GUID.fullmatch(self.database_name) is not None
 
 
-def _client(cluster_uri: str, principal: ServicePrincipal) -> KustoClient:
-    connection = KustoConnectionStringBuilder.with_aad_application_key_authentication(
+def kusto_connection(
+    cluster_uri: str, tokens: TokenProvider, *, use_token_provider: bool = False,
+) -> KustoConnectionStringBuilder:
+    """Share explicit credentials with capture; a callback refreshes MI tokens per request.
+
+    https://learn.microsoft.com/kusto/api/get-started/app-authentication-methods
+    """
+    principal = tokens.principal
+    if use_token_provider or isinstance(principal, ManagedIdentity):
+        return KustoConnectionStringBuilder.with_token_provider(cluster_uri, tokens.kusto_token)
+    return KustoConnectionStringBuilder.with_aad_application_key_authentication(
         cluster_uri,
         principal.client_id,
         principal.client_secret,
         principal.tenant_id,
     )
-    return KustoClient(connection)
+
+
+def _client(
+    cluster_uri: str, principal: AuthPrincipal, *, tokens: TokenProvider | None = None,
+) -> KustoClient:
+    if tokens is not None:
+        if tokens.principal != principal:
+            raise KqlTransferError("KQL tokens must match the selected application identity.")
+        tokens.assert_active()
+        return KustoClient(kusto_connection(cluster_uri, tokens, use_token_provider=True))
+    return KustoClient(kusto_connection(cluster_uri, TokenProvider(principal)))
 
 
 def follower_source(
     cluster_uri: str,
     database: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
 ) -> FollowerSource | None:
     """Resolve what a shortcut (follower) KQL database actually follows.
 
@@ -122,7 +141,7 @@ def _ident(name: str) -> str:
 def list_tables(
     cluster_uri: str,
     database: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     *,
     exclude: Collection[str] = (),
 ) -> list[str]:
@@ -143,8 +162,8 @@ def copy_database(
     source_cluster_uri: str,
     target_cluster_uri: str,
     database: str,
-    principal: ServicePrincipal,
-    target_principal: ServicePrincipal | None = None,
+    principal: AuthPrincipal,
+    target_principal: AuthPrincipal | None = None,
     source_database: str | None = None,
     target_database: str | None = None,
     max_staging_bytes: int | None = None,
@@ -376,7 +395,7 @@ def _stop_target_policies(
 def stop_update_policies(
     cluster_uri: str,
     database: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     on_progress: Callable[[str], None] | None = None,
     *,
     cancel_requested: Callable[[], bool] | None = None,
@@ -416,7 +435,7 @@ def stop_database_update_policies(
     *,
     target_cluster_uri: str,
     target_database: str,
-    target_principal: ServicePrincipal,
+    target_principal: AuthPrincipal,
     on_warning: Callable[[str], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
@@ -541,8 +560,8 @@ def copy_database_streaming(
     source_cluster_uri: str,
     target_cluster_uri: str,
     database: str,
-    principal: ServicePrincipal,
-    target_principal: ServicePrincipal,
+    principal: AuthPrincipal,
+    target_principal: AuthPrincipal,
     source_database: str | None = None,
     target_database: str | None = None,
     max_staging_bytes: int | None = None,

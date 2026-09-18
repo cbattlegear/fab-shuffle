@@ -28,12 +28,14 @@ function fixture() {
       else this[name] = value;
     }
     matches(selector) {
+      if (selector.includes(",")) return selector.split(",").some((part) => this.matches(part.trim()));
       if (selector.startsWith("#")) return this.id === selector.slice(1);
       if (selector.startsWith(".")) return this.className.split(" ").includes(selector.slice(1));
       return this.tagName === selector;
     }
     closest(selector) { return this.matches(selector) ? this : this.parentElement?.closest(selector); }
     querySelectorAll(selector) {
+      if (selector.includes(",")) return [...new Set(selector.split(",").flatMap((part) => this.querySelectorAll(part.trim())))];
       const parts = selector.split(" "), results = [];
       const visit = (element) => element.children.forEach((child) => {
         if (child.matches(parts.at(-1)) && (parts.length === 1 || child.parentElement.closest(parts[0]))) results.push(child);
@@ -43,11 +45,18 @@ function fixture() {
       return results;
     }
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-    addEventListener(type, handler) { this.handlers[type] = handler; }
+    addEventListener(type, handler) {
+      const prior = this.handlers[type];
+      this.handlers[type] = prior ? (event) => {
+        const first = prior(event), second = handler(event);
+        return second === undefined ? first : second;
+      } : handler;
+    }
     focus() { document.activeElement = this; }
     showModal() { this.open = true; }
     close() { this.open = false; }
     scrollIntoView() {}
+    reportValidity() { return true; }
     remove() { this.parentElement.children = this.parentElement.children.filter((child) => child !== this); }
     click() { return this.handlers.click?.({ target: this, currentTarget: this }); }
     reset() {
@@ -69,6 +78,7 @@ function fixture() {
   }
   const document = new Element("document");
   document.createElement = (tag) => new Element(tag);
+  document.createDocumentFragment = () => new Element("fragment");
   const root = path.join(__dirname, "..", "fabshuffle", "web");
   parse(fs.readFileSync(path.join(root, "templates", "index.html"), "utf8"), document);
   document.body = document.querySelector("body");
@@ -114,7 +124,7 @@ function fixture() {
     ui.renderReview();
     ui.setStartEnabled(true);
   }
-  return { get, ui, document, requests, streams, reply, flush, paired };
+  return { get, ui, document, requests, streams, reply, flush, paired, context };
 }
 
 const scenarios = {

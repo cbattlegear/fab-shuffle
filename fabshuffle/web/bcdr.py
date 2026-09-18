@@ -1,0 +1,365 @@
+"""Authenticated transport for the Warehouse-backed BCDR service.
+
+The service owns mode, identity, readiness, ACL and capacity policy. HTTP only
+validates the request/explicit action confirmation and keeps a worker alive until
+the synchronous service has settled its operation and closed its clients.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict
+
+from fabshuffle.bcdr.backend import RecoveryBlocked
+from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
+from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
+from fabshuffle.bcdr.service import (
+    BcdrService,
+    ConfigureReplicaRequest,
+    CutbackRequest,
+    CutoverRequest,
+    EnableRecoveryRequest,
+    FailbackExecuteRequest,
+    FailbackRequest,
+    PlanRequest,
+    RearmRequest,
+    ReconcileOperationRequest,
+    ServiceResult,
+    SetupRequest,
+    SyncRequest,
+    create_service,
+)
+from fabshuffle.bcdr.service import (
+    setup as setup_recovery,
+)
+from fabshuffle.config import SETTINGS
+from fabshuffle.fabric import workspaces
+from fabshuffle.fabric.client import FabricClient
+
+if TYPE_CHECKING:
+    from fabshuffle.web.app import Session
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class ConfirmedRequest(BaseModel, Generic[T]):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    confirmation: str
+    request: T
+
+
+class BcdrRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handle(request):
+            try:
+                return await original(request)
+            except RequestValidationError as error:
+                # Invalid input may contain a mistakenly pasted secret. Never echo
+                # arbitrary request values through FastAPI's default 422 response.
+                return JSONResponse(status_code=422, content={"detail": [
+                    {"loc": entry["loc"], "msg": entry["msg"], "type": entry["type"]}
+                    for entry in error.errors()
+                ]})
+
+        return handle
+
+
+def bootstrap_path() -> Path:
+    """Only deployment configuration may select a server-side bootstrap file."""
+    return Path(os.environ.get(
+        "FAB_SHUFFLE_BCDR_BOOTSTRAP", str(SETTINGS.scratch_root / "bcdr" / "bootstrap.json")
+    )).resolve()
+
+
+COMMANDS = (
+    ("setup", "Set up the control Warehouse", SetupRequest,
+     "Create a restricted control workspace or choose an existing one whose access matches the recovery "
+     "principal and owner allowlist. New control workspace owners use the Admin role. "
+     "Create one new central metadata Warehouse and persist its "
+     "non-secret bootstrap in durable controller storage. No metadata lakehouse, Spark or Git is used.",
+     "Create the central metadata Warehouse and, if selected, its restricted control workspace. Confirm the "
+     "source-capacity scope, dedicated recovery capacities, suspend authorization and owner allowlist. "
+     "This does not enable recovery or grant general user access."),
+    ("status", "Read recovery status", None,
+     "Read the saved recovery state without source metadata reads. This resumes the metadata "
+     "Warehouse capacity if paused; storage is still billed while paused.", ""),
+    ("reconcile-operation", "Reconcile interrupted operation", ReconcileOperationRequest,
+     "Read status, select the exact recorded operation, stop the previous controller and provide "
+     "controller-fencing and destination-quiescence evidence. The backend verifies the service receipt; "
+     "an uncertain create is never repeated or adopted by name.",
+     "Take over the recorded controller epoch after fencing its previous worker and reconcile only "
+     "the exact owned receipt. This may finish interrupted metadata application, but does not "
+     "enable recovery, admit a dependency group or approve cutover. Receipt-free ambiguity remains blocked."),
+    ("plan", "Preview standby selection", PlanRequest,
+     "Preview exact workspace selection, dependency additions and capacity routes against a captured "
+     "generation. Empty includes mean the configured source-capacity scope, not the whole tenant.", ""),
+    ("synchronize", "Sync standby", SyncRequest,
+     "Capture source metadata and update actual inactive standby items. Optional protection gaps "
+     "affect the named items and dependents, not unrelated groups.",
+     "Resume dedicated recovery capacities, capture metadata and update inactive standby items. "
+     "Keep access restricted to the recovery principal and designated owners. This is NOT Enable "
+     "recovery. The service pauses dedicated capacities only when safe and requested."),
+    ("configure-protection", "Configure optional data protection", ConfigureProtectionRequest,
+     "Configure an approved SQL, Cosmos, KQL or independent Lakehouse protection input for the next capture. "
+     "Metadata synchronization itself does not copy business data. Keep credentials in the runtime provider.",
+     "Record this optional protection configuration for the next capture. Review the off-region "
+     "storage approval, integrity and consistency evidence. "
+     "This is not a native backup or readiness approval."),
+    ("configure-replica", "Configure qualified temporary attachments", ConfigureReplicaRequest,
+     "Record independently qualified, exact retained-source OneLake paths and access evidence. "
+     "Enable recovery performs the attachment; configuration alone does not attach data or prove readiness. "
+     "Do not delete the retained source or treat a healthy-primary drill as outage qualification.",
+     "Record these exact temporary attachment identities and their independently verified access evidence. "
+     "Retain the original data for the full lifetime of the attachments. This is not independent recovery, "
+     "does not enable recovery, and does not establish read-only enforcement or approve cutover."),
+    ("enable-recovery", "Enable recovery", EnableRecoveryRequest,
+     "Use a captured generation without source metadata reads. Approve only the displayed deferred "
+     "ACL IDs. Enabling recovery stops scheduled source-to-standby sync and automatic pause.",
+     "Enable recovery for the selected groups and replay only approved, backend-eligible ACLs. "
+     "Recovery capacities remain running. This does not fence external writers or approve cutover. "
+     "The control workspace remains restricted."),
+    ("cutover", "Approve cutover", CutoverRequest,
+     "Supply identity-bound, time-limited readiness observations and separate operator evidence "
+     "that primary writers are fenced. A controller lock is not a writer fence.",
+     "Approve the selected ready groups for production cutover. Confirm external primary writers "
+     "are fenced and review the exact readiness observations. Definition creation is not readiness."),
+    ("plan-failback", "Plan failback", FailbackRequest,
+     "Confirm primary availability with evidence, then plan return targets and reconciliation of "
+     "changes made in recovery. This is not a reversed migration.", ""),
+    ("execute-failback", "Reconcile failback", FailbackExecuteRequest,
+     "Fence recovery writers and supply reconciliation evidence, including deletes, expiration "
+     "and ingestion offsets where applicable. Keep the recovery estate for rollback.",
+     "Reconcile into the approved return targets after fencing recovery writers. Do not assume "
+     "conflicting primary and recovery writes can be merged automatically."),
+    ("cutback", "Approve cutback", CutbackRequest,
+     "Approve consumer return only after validating the return targets, current writer epoch "
+     "and time-limited data, binding and security evidence.",
+     "Approve consumer cutback to validated return targets. Retain recovery resources until "
+     "business sign-off; rollback after new writes is not a simple traffic switch."),
+    ("rearm", "Rearm standby", RearmRequest,
+     "Explicitly restore restricted standby access and source authority only after recovery "
+     "no longer serves production. Pause dedicated capacities only when safe.",
+     "Rearm source-to-standby synchronization, restore restricted standby access and, if requested, "
+     "pause dedicated recovery capacity after it no longer serves production."),
+)
+
+
+def _same_tenant(session: Session) -> str:
+    tenant = session.destination_tokens.tenant_id()
+    if session.tokens.tenant_id() != tenant:
+        raise ValueError("BCDR requires source and recovery credentials in the same tenant. "
+                         "Use the separate migration workflow for another tenant.")
+    return tenant
+
+
+def _service_call(
+    session: Session, invoke: Callable[[BcdrService], ServiceResult], *, source_access: bool = False,
+) -> ServiceResult:
+    _same_tenant(session)
+    service = create_service(
+        bootstrap_path(),
+        target_tokens=session.destination_tokens,
+        source_tokens=session.tokens if source_access else None,
+    )
+    try:
+        return invoke(service)
+    finally:
+        service.close()
+
+
+def _setup_call(session: Session, request: SetupRequest) -> ServiceResult:
+    _same_tenant(session)
+    return setup_recovery(request, bootstrap_path(), target_tokens=session.destination_tokens)
+
+
+def create_router(
+    require_session: Callable[..., Session],
+    run_fabric: Callable[[Callable], Awaitable[Any]],
+) -> APIRouter:
+    router = APIRouter(prefix="/api/bcdr", tags=["BCDR"], route_class=BcdrRoute)
+
+    async def execute(session, work):
+        # A disconnected request must not abandon a mutating worker or close its
+        # clients underneath it. Service operations settle before cancellation exits.
+        task = asyncio.create_task(run_fabric(work))
+        try:
+            return await asyncio.shield(task)
+        except (RecoveryBlocked, CatalogConflict) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except CatalogError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{error} Reconcile the recorded catalog operation before retrying.",
+            ) from error
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
+    def confirmed(body, action):
+        if body.confirmation != action:
+            raise HTTPException(
+                status_code=409, detail=f"Review the consequences and explicitly confirm '{action}'."
+            )
+        return body.request
+
+    @router.get("/forms")
+    async def forms(session=Depends(require_session)):
+        if session.cross_tenant:
+            raise HTTPException(status_code=409, detail="BCDR is same-tenant only.")
+        def identity():
+            tenant = _same_tenant(session)
+            return {
+                "tenant_id": tenant, "client_id": session.destination_tokens.principal.client_id,
+                "object_id": session.destination_tokens.object_id(),
+            }
+
+        principal = await execute(session, identity)
+        return {"identity": principal, "commands": [
+            {
+                "name": name, "label": label, "path": f"/api/bcdr/{name}",
+                "method": "GET" if model is None else "POST",
+                "schema": model.model_json_schema() if model else {"type": "object", "properties": {}},
+                "description": description, "confirmation": confirmation,
+                "primary": name == "synchronize",
+            }
+            for name, label, model, description, confirmation in COMMANDS
+        ]}
+
+    @router.post("/setup", response_model=ServiceResult)
+    async def setup(body: ConfirmedRequest[SetupRequest], session=Depends(require_session)):
+        request = confirmed(body, "setup")
+        return await execute(session, lambda: _setup_call(session, request))
+
+    @router.get("/discovery")
+    async def discovery(session=Depends(require_session)):
+        def work():
+            _same_tenant(session)
+
+            def inventory(tokens):
+                # These principal-scoped, paginated reads are explicit preparation,
+                # never an implicit dependency of recovery or catalog status.
+                # https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces
+                # https://learn.microsoft.com/rest/api/fabric/core/capacities/list-capacities
+                with FabricClient(tokens) as client:
+                    return {
+                        "capacities": [{
+                            key: entry.get(key) for key in ("id", "displayName", "region", "state")
+                        } for entry in workspaces.list_capacities(client)],
+                        "workspaces": [{
+                            key: entry.get(key) for key in ("id", "displayName", "capacityId")
+                        } for entry in workspaces.list_workspaces(client)
+                          if entry.get("type") == "Workspace"],
+                    }
+
+            source = inventory(session.tokens)
+            target = inventory(session.destination_tokens) if session.paired else source
+            return {"source": source, "recovery": target}
+
+        return await execute(session, work)
+
+    @router.get("/status", response_model=ServiceResult)
+    async def status(session=Depends(require_session)):
+        return await execute(session, lambda: _service_call(session, lambda service: service.status()))
+
+    @router.post("/reconcile-operation", response_model=ServiceResult)
+    async def reconcile_operation(
+        body: ConfirmedRequest[ReconcileOperationRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "reconcile-operation")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.reconcile_operation(request))
+        )
+
+    @router.post("/plan", response_model=ServiceResult)
+    async def plan(body: PlanRequest, session=Depends(require_session)):
+        return await execute(session, lambda: _service_call(session, lambda service: service.plan(body)))
+
+    @router.post("/synchronize", response_model=ServiceResult)
+    async def synchronize(body: ConfirmedRequest[SyncRequest], session=Depends(require_session)):
+        request = confirmed(body, "synchronize")
+        return await execute(
+            session, lambda: _service_call(
+                session, lambda service: service.synchronize(request), source_access=request.capture,
+            )
+        )
+
+    @router.post("/enable-recovery", response_model=ServiceResult)
+    async def enable_recovery(
+        body: ConfirmedRequest[EnableRecoveryRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "enable-recovery")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.enable_recovery(request))
+        )
+
+    @router.post("/configure-protection", response_model=ServiceResult)
+    async def configure_protection(
+        body: ConfirmedRequest[ConfigureProtectionRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "configure-protection")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.configure_protection(request))
+        )
+
+    @router.post("/configure-replica", response_model=ServiceResult)
+    async def configure_replica(
+        body: ConfirmedRequest[ConfigureReplicaRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "configure-replica")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.configure_replica(request))
+        )
+
+    @router.post("/cutover", response_model=ServiceResult)
+    async def cutover(body: ConfirmedRequest[CutoverRequest], session=Depends(require_session)):
+        request = confirmed(body, "cutover")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.cutover(request))
+        )
+
+    @router.post("/plan-failback", response_model=ServiceResult)
+    async def plan_failback(body: FailbackRequest, session=Depends(require_session)):
+        return await execute(
+            session, lambda: _service_call(
+                session, lambda service: service.plan_failback(body), source_access=True,
+            )
+        )
+
+    @router.post("/execute-failback", response_model=ServiceResult)
+    async def execute_failback(
+        body: ConfirmedRequest[FailbackExecuteRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "execute-failback")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.execute_failback(request))
+        )
+
+    @router.post("/cutback", response_model=ServiceResult)
+    async def cutback(body: ConfirmedRequest[CutbackRequest], session=Depends(require_session)):
+        request = confirmed(body, "cutback")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.cutback(request))
+        )
+
+    @router.post("/rearm", response_model=ServiceResult)
+    async def rearm(body: ConfirmedRequest[RearmRequest], session=Depends(require_session)):
+        request = confirmed(body, "rearm")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.rearm(request))
+        )
+
+    return router

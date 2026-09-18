@@ -1,0 +1,243 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Scheduled metadata synchronization for an EXISTING Fab Shuffle recovery controller. Reuses its Container Apps environment, Azure Files storage, bootstrap, approved request and user-assigned identity. Does not provision a second catalog, initialize recovery, enable recovery or perform cutover."
+  },
+  "parameters": {
+    "jobName": {
+      "type": "string",
+      "defaultValue": "",
+      "maxLength": 32,
+      "metadata": {
+        "description": "Optional. Leave blank for a stable job name derived from the resource group and existing environment. Deploy only one scheduled job per recovery controller."
+      }
+    },
+    "containerAppsEnvironmentName": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "EXISTING controller environment name from the web deployment output. Deploy in that environment's resource group. It must already contain the fab-shuffle-storage Azure Files storage configuration and the initialized shared controller files."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional. Leave blank to use the resource group's region. Must equal the existing controller environment's location; if the controller used an override, enter that same region code here."
+      }
+    },
+    "containerImage": {
+      "type": "string",
+      "defaultValue": "ghcr.io/cbattlegear/fab-shuffle:latest",
+      "metadata": {
+        "description": "The SAME released Linux production image/digest as the web controller, including the guarded scheduled-sync command. Do not point this job at an older release or a validation/test image."
+      }
+    },
+    "managedIdentityResourceId": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Full resource ID of the SAME existing user-assigned identity attached to the web controller and recorded in its bootstrap. Tenant/client/principal IDs are read from ARM, not inferred from this resource ID. Fabric, SQL, OneLake and Azure capacity permissions must already be granted."
+      }
+    },
+    "bcdrLeaseBlobUrl": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Required EXACT bcdrLeaseBlobUrl output from the existing web controller (https://<account>.blob.core.windows.net/fab-shuffle-locks/deployment.lock). No SAS, query, custom domain or alternate blob. Both web and job must use this one remote lease before any capacity effects; Azure Files advisory locks are not sufficient."
+      }
+    },
+    "scheduleUtc": {
+      "type": "string",
+      "defaultValue": "0 2 * * *",
+      "minLength": 9,
+      "maxLength": 256,
+      "metadata": {
+        "description": "Five-field cron in UTC; default daily at 02:00 UTC. Allow more time between executions than the worst-case sync duration. Parallelism=1 is per execution, not a global overlap lock. Review interrupted executions before retrying."
+      }
+    },
+    "replicaTimeoutSeconds": {
+      "type": "int",
+      "defaultValue": 14400,
+      "minValue": 60,
+      "maxValue": 86400,
+      "metadata": {
+        "description": "Finite execution timeout, default four hours. This template caps it at one day. A killed/timed-out operation can leave capacity running or an uncertain service receipt; inspect logs and reconcile manually. No automatic replica retries."
+      }
+    },
+    "cpuCores": {
+      "type": "string",
+      "defaultValue": "2",
+      "allowedValues": ["1", "2", "4"],
+      "metadata": {
+        "description": "vCPU allocation for the sync container."
+      }
+    },
+    "memoryGb": {
+      "type": "string",
+      "defaultValue": "4",
+      "allowedValues": ["2", "4", "8"],
+      "metadata": {
+        "description": "Memory in GiB. Must be exactly double cpuCores for this consumption sizing."
+      }
+    },
+    "maxDiskStagingGiB": {
+      "type": "int",
+      "defaultValue": 10,
+      "minValue": 1,
+      "maxValue": 102400,
+      "metadata": {
+        "description": "Per-operation disk staging budget. Does not reserve or resize the existing shared Azure Files quota."
+      }
+    },
+    "maxMemoryMiB": {
+      "type": "int",
+      "defaultValue": 1024,
+      "minValue": 1,
+      "maxValue": 8192,
+      "metadata": {
+        "description": "Per-operation in-memory metadata/transfer budget, not a hard process RAM cap. Leave room for Python and external tools."
+      }
+    }
+  },
+  "variables": {
+    "jobName": "[if(empty(parameters('jobName')), concat('fab-shuffle-sync-', uniqueString(resourceGroup().id, parameters('containerAppsEnvironmentName'))), parameters('jobName'))]",
+    "location": "[if(empty(parameters('location')), resourceGroup().location, parameters('location'))]",
+    "storageMountName": "fab-shuffle-storage",
+    "scratchVolumeName": "fab-shuffle-scratch",
+    "scratchMountPath": "/app/local",
+    "bootstrapPath": "/app/local/bcdr/bootstrap.json",
+    "requestPath": "/app/local/bcdr/scheduled-sync-request.json"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/jobs",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('jobName')]",
+      "location": "[variables('location')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[parameters('managedIdentityResourceId')]": {}
+        }
+      },
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('containerAppsEnvironmentName'))]",
+        "configuration": {
+          "triggerType": "Schedule",
+          "replicaTimeout": "[parameters('replicaTimeoutSeconds')]",
+          "replicaRetryLimit": 0,
+          "scheduleTriggerConfig": {
+            "cronExpression": "[parameters('scheduleUtc')]",
+            "replicaCompletionCount": 1,
+            "parallelism": 1
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "fab-shuffle-sync",
+              "image": "[parameters('containerImage')]",
+              "command": ["python"],
+              "args": [
+                "-m",
+                "fabshuffle.bcdr",
+                "scheduled-sync",
+                "--bootstrap",
+                "[variables('bootstrapPath')]",
+                "--request",
+                "[variables('requestPath')]",
+                "--confirm",
+                "scheduled-sync"
+              ],
+              "resources": {
+                "cpu": "[json(parameters('cpuCores'))]",
+                "memory": "[concat(parameters('memoryGb'), 'Gi')]"
+              },
+              "env": [
+                {
+                  "name": "FAB_SHUFFLE_BCDR_AUTH_MODE",
+                  "value": "managed_identity"
+                },
+                {
+                  "name": "FAB_SHUFFLE_MANAGED_IDENTITY_CLIENT_ID",
+                  "value": "[reference(parameters('managedIdentityResourceId'), '2023-01-31').clientId]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_MANAGED_IDENTITY_TENANT_ID",
+                  "value": "[reference(parameters('managedIdentityResourceId'), '2023-01-31').tenantId]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_SCRATCH",
+                  "value": "[variables('scratchMountPath')]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_BCDR_BOOTSTRAP",
+                  "value": "[variables('bootstrapPath')]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_BCDR_LEASE_BLOB_URL",
+                  "value": "[parameters('bcdrLeaseBlobUrl')]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES",
+                  "value": "[string(mul(parameters('maxDiskStagingGiB'), 1073741824))]"
+                },
+                {
+                  "name": "FAB_SHUFFLE_MAX_MEMORY_BYTES",
+                  "value": "[string(mul(parameters('maxMemoryMiB'), 1048576))]"
+                }
+              ],
+              "volumeMounts": [
+                {
+                  "volumeName": "[variables('scratchVolumeName')]",
+                  "mountPath": "[variables('scratchMountPath')]"
+                }
+              ]
+            }
+          ],
+          "volumes": [
+            {
+              "name": "[variables('scratchVolumeName')]",
+              "storageType": "AzureFile",
+              "storageName": "[variables('storageMountName')]"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "jobName": {
+      "type": "string",
+      "value": "[variables('jobName')]"
+    },
+    "scheduleUtc": {
+      "type": "string",
+      "value": "[parameters('scheduleUtc')]"
+    },
+    "controllerBootstrapPath": {
+      "type": "string",
+      "value": "[variables('bootstrapPath')]",
+      "metadata": { "description": "Existing shared bootstrap only. The job never sets up or replaces a catalog." }
+    },
+    "approvedRequestPath": {
+      "type": "string",
+      "value": "[variables('requestPath')]",
+      "metadata": { "description": "Persist an explicitly reviewed SyncRequest here before deploying the schedule. capture and park must both be true; no secrets or activation commands. This template never writes this file." }
+    },
+    "managedIdentityClientId": {
+      "type": "string",
+      "value": "[reference(parameters('managedIdentityResourceId'), '2023-01-31').clientId]"
+    },
+    "managedIdentityPrincipalId": {
+      "type": "string",
+      "value": "[reference(parameters('managedIdentityResourceId'), '2023-01-31').principalId]"
+    },
+    "managedIdentityTenantId": {
+      "type": "string",
+      "value": "[reference(parameters('managedIdentityResourceId'), '2023-01-31').tenantId]"
+    }
+  }
+}
