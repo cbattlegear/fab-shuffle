@@ -15,6 +15,7 @@ from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider, managed_
 from fabshuffle.bcdr.backend import RecoveryBlocked
 from fabshuffle.bcdr.catalog import CatalogError
 from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
+from fabshuffle.bcdr.scheduled import read_request, scheduled_sync
 from fabshuffle.bcdr.service import (
     BcdrService,
     ConfigureReplicaRequest,
@@ -43,6 +44,7 @@ REQUESTS = {
     "configure-protection": ConfigureProtectionRequest,
     "plan": PlanRequest,
     "synchronize": SyncRequest,
+    "scheduled-sync": SyncRequest,
     "enable-recovery": EnableRecoveryRequest,
     "cutover": CutoverRequest,
     "plan-failback": FailbackRequest,
@@ -53,6 +55,7 @@ REQUESTS = {
 CONSEQUENTIAL = frozenset({
     "setup", "configure-protection", "synchronize", "enable-recovery",
     "cutover", "execute-failback", "cutback", "rearm", "reconcile-operation", "configure-replica",
+    "scheduled-sync",
 })
 
 
@@ -169,11 +172,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError(
                     "status takes no request; it uses the bootstrap without source metadata reads."
                 )
+        elif args.command == "scheduled-sync":
+            if args.request is None:
+                raise ValueError(
+                    "scheduled-sync requires an approved --request JSON file, not standard input."
+                )
+            request = read_request(args.request)
         else:
             text = args.request.read_text(encoding="utf-8") if args.request else sys.stdin.read()
             request = REQUESTS[args.command].model_validate_json(text)
         tokens = credential_provider(os.environ)
-        if args.command == "setup":
+        if args.command == "scheduled-sync":
+            result = scheduled_sync(args.bootstrap, request, target_tokens=tokens)
+        elif args.command == "setup":
             result = setup_recovery(
                 SetupRequest.model_validate_json(text), args.bootstrap, target_tokens=tokens,
             )

@@ -128,6 +128,7 @@ class ArmCapacityClient:
         timeout_seconds: float = 900, max_attempts: int = 4,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        guard: Callable[[], None] | None = None,
     ) -> None:
         if timeout_seconds <= 0 or max_attempts < 1:
             raise ValueError("ARM polling timeout and retry count must be positive")
@@ -136,6 +137,7 @@ class ArmCapacityClient:
         self.max_attempts = max_attempts
         self.sleep = sleep
         self.clock = clock
+        self.guard = guard
         self.http = httpx.Client(transport=transport, timeout=60, follow_redirects=False)
 
     def close(self) -> None:
@@ -161,6 +163,8 @@ class ArmCapacityClient:
         ):
             raise BootstrapError("ARM request is outside the explicitly authorized capacity")
         for attempt in range(self.max_attempts):
+            if self.guard is not None:
+                self.guard()
             if authorize is not None:
                 authorize()
             try:
@@ -177,6 +181,8 @@ class ArmCapacityClient:
                     raise
                 self.sleep(min(2 ** attempt, 30))
                 continue
+            if self.guard is not None:
+                self.guard()
             if (
                 response.status_code == 429
                 or (method == "GET" and response.status_code in {500, 502, 503, 504})

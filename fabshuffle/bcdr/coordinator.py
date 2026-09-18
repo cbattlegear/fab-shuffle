@@ -677,9 +677,10 @@ class RecoveryCoordinator:
             expected_current=previous_id,
         )
 
-    def synchronize(self, request: SyncRequest) -> ServiceResult:
+    def synchronize(self, request: SyncRequest, *, standby_only: bool = False) -> ServiceResult:
         self._wake()
-        with self.runtime.controller({RecoveryMode.STANDBY, RecoveryMode.SYNCING}):
+        modes = {RecoveryMode.STANDBY} if standby_only else {RecoveryMode.STANDBY, RecoveryMode.SYNCING}
+        with self.runtime.controller(modes):
             if self.runtime.mode == RecoveryMode.STANDBY:
                 self.runtime.transition(RecoveryMode.SYNCING)
             self.capacities.resume_business(self.runtime)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -224,20 +225,33 @@ class BootstrapDescriptor(BootstrapRecord):
 
 
 class BootstrapStore:
-    """Atomic, revision-checked writes under a Linux interprocess deployment lock."""
+    """Atomic revision checks under a live deployment guard (or local-only flock)."""
 
     MAX_BYTES = 128 * 1024
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self, path: str | Path, *, guard: Callable[[], None] | None = None,
+        distributed: bool = False,
+    ) -> None:
         self.path = Path(path)
+        self.guard = guard
+        self.distributed = distributed
+        self._mutex = threading.RLock()
+
+    def _fence(self) -> None:
+        if self.guard is not None:
+            self.guard()
 
     def load(self) -> BootstrapDescriptor:
+        self._fence()
         try:
             with self.path.open("rb") as stream:
                 data = stream.read(self.MAX_BYTES + 1)
             if len(data) > self.MAX_BYTES:
                 raise BootstrapError("Bootstrap descriptor exceeds the supported size")
-            return BootstrapDescriptor.model_validate_json(data)
+            descriptor = BootstrapDescriptor.model_validate_json(data)
+            self._fence()
+            return descriptor
         except (ValueError, OSError) as error:
             raise BootstrapError(
                 "Cannot read a valid bootstrap descriptor; repair deployment state"
@@ -247,6 +261,14 @@ class BootstrapStore:
     def _lock(self) -> Iterator[None]:
         import fcntl
 
+        self._fence()
+        if self.distributed:
+            if self.guard is None:
+                raise BootstrapError("Distributed bootstrap access requires a live deployment guard")
+            with self._mutex:
+                self._fence()
+                yield
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path.with_suffix(self.path.suffix + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -270,6 +292,7 @@ class BootstrapStore:
             return self._write(change(current), current.revision + 1)
 
     def _write(self, descriptor: BootstrapDescriptor, revision: int) -> BootstrapDescriptor:
+        self._fence()
         # Revalidate model_copy/model_construct callers as well as ordinary constructors.
         document = descriptor.model_dump(mode="json")
         document["revision"] = revision
@@ -284,6 +307,7 @@ class BootstrapStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._fence()
             os.replace(staging, self.path)
             directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:

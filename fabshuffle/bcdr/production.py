@@ -28,6 +28,7 @@ from fabshuffle.bcdr.contracts import (
     RecoverySet,
     WorkspaceIdentity,
 )
+from fabshuffle.bcdr.deployment_lock import DeploymentLock, GuardedTokens
 from fabshuffle.bcdr.provisioning import ControlWarehouseProvisioner, ControlWorkspaceProvisioner
 from fabshuffle.bcdr.warehouse_catalog import WarehouseCatalog
 from fabshuffle.config import SETTINGS
@@ -39,26 +40,6 @@ if TYPE_CHECKING:
 
     from fabshuffle.bcdr.coordinator import RecoveryCoordinator
     from fabshuffle.bcdr.service import ServiceResult, SetupRequest
-
-
-class DeploymentLock:
-    """An explicit single deployment process, in addition to Warehouse epoch ownership."""
-
-    def __init__(self, path: Path) -> None:
-        import fcntl
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(path.with_suffix(path.suffix + ".controller.lock"), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            os.close(self.fd)
-            raise RecoveryBlocked(
-                "Another worker owns this deployment; wait for its durable result"
-            ) from error
-
-    def close(self) -> None:
-        os.close(self.fd)
 
 
 def _record_capacity(store, operation):
@@ -79,7 +60,7 @@ class ProductionCapacities:
         self.store = store
         self.tokens = tokens
         self.client = client
-        self.arm = ArmCapacityClient(tokens)
+        self.arm = ArmCapacityClient(tokens, guard=store.guard)
         self.driver = CapacityCoordinator(store, self.arm)
         self.catalog: WarehouseCatalog | None = None
         self.lock: DeploymentLock | None = None
@@ -92,6 +73,7 @@ class ProductionCapacities:
             descriptor.tds_catalog,
             self.tokens,
             expected_recovery_set_id=descriptor.recovery_set_id,
+            guard=self.store.guard,
         )
         self.catalog.state()
 
@@ -125,6 +107,13 @@ class ProductionCapacities:
             )
             if pending.kind != "suspend_capacity" or capacity is None:
                 raise RecoveryBlocked("A business operation remains pending; do not resume synchronization")
+            expected_id = str(uuid5(
+                UUID(descriptor.recovery_set_id), f"park:{parking.epoch}:{capacity.arm_resource_id}",
+            ))
+            if pending.operation_id != expected_id:
+                raise RecoveryBlocked(
+                    "Pending suspension is not the exact recorded parking epoch; reconcile it explicitly"
+                )
             evidence = [
                 row
                 for row in descriptor.capacity_operations
@@ -328,9 +317,13 @@ def open_coordinator(
     from fabshuffle.bcdr.protection_binding import build_data_recovery
 
     with ExitStack() as cleanup:
-        lock = DeploymentLock(bootstrap_path)
+        lock = DeploymentLock(bootstrap_path, tokens=target_tokens)
         cleanup.callback(lock.close)
-        store = BootstrapStore(bootstrap_path)
+        target_tokens = GuardedTokens(target_tokens, lock.assert_held)
+        source_tokens = GuardedTokens(source_tokens, lock.assert_held) if source_tokens else None
+        store = BootstrapStore(
+            bootstrap_path, guard=lock.assert_held, distributed=lock.remote is not None,
+        )
         descriptor = store.load()
         if controller_id is not None and controller_id != descriptor.controller_id:
             raise RecoveryBlocked("Controller identity must match the durable bootstrap deployment")
@@ -363,6 +356,7 @@ def open_coordinator(
             ),
             protected_root=Path(protected_root) if protected_root else None,
         )
+        coordinator.runtime.deployment_guard = lock.assert_held
         capacities.lock = lock
         cleanup.pop_all()
         return coordinator
@@ -386,8 +380,11 @@ def setup_recovery(
         CapacityAuthorization.model_validate(row.model_dump(exclude={"schema_version"}))
         for row in request.recovery_capacities
     )
-    lock = DeploymentLock(bootstrap_path)
-    store = BootstrapStore(bootstrap_path)
+    lock = DeploymentLock(bootstrap_path, tokens=target_tokens)
+    target_tokens = GuardedTokens(target_tokens, lock.assert_held)
+    store = BootstrapStore(
+        bootstrap_path, guard=lock.assert_held, distributed=lock.remote is not None,
+    )
     try:
         if bootstrap_path.exists():
             descriptor = store.load()
@@ -414,7 +411,7 @@ def setup_recovery(
                 control_workspace_id=request.control_workspace_id,
             )
             store.save(descriptor, expected_revision=None)
-        with ArmCapacityClient(target_tokens) as arm:
+        with ArmCapacityClient(target_tokens, guard=lock.assert_held) as arm:
             arm.resume(
                 descriptor.capacity(descriptor.catalog_capacity_id),
                 owner_id=descriptor.controller_id,
@@ -478,7 +475,8 @@ def setup_recovery(
             target_capacity_ids=tuple(row.fabric_capacity_id for row in capacities),
         )
         catalog = WarehouseCatalog.from_endpoint(
-            descriptor.tds_host, descriptor.tds_catalog, target_tokens, config
+            descriptor.tds_host, descriptor.tds_catalog, target_tokens, config,
+            guard=lock.assert_held,
         )
         catalog.initialize()
         return ServiceResult(

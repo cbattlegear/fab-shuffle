@@ -653,6 +653,21 @@ def test_production_parking_then_source_free_resume_reconciles_epoch(system, tmp
     capacities.close()
 
 
+def test_production_parking_refuses_a_different_pending_operation_epoch(system, tmp_path, monkeypatch):
+    system.service.synchronize(system.request)
+    capacities, store, _ = production_capacities(system, tmp_path, monkeypatch)
+    with system.c.runtime.controller({RecoveryMode.STANDBY}):
+        capacities.park(system.c.runtime, tuple(system.c.workspace_mappings().values()))
+    pending = system.catalog.pending_operations()[0]
+    different_epoch = pending.model_copy(update={"operation_id": guid()})
+    monkeypatch.setattr(system.catalog, "pending_operations", lambda: (different_epoch,))
+    with pytest.raises(RecoveryBlocked, match="exact recorded parking epoch"):
+        capacities._reconcile(store.load())
+    assert system.catalog.state().mode == RecoveryMode.PARKING
+    assert system.catalog.state().controller_id == system.c.runtime.controller_id
+    capacities.close()
+
+
 def test_production_pause_refuses_unrelated_workspace(system, tmp_path, monkeypatch):
     system.service.synchronize(system.request)
     capacities, _, state = production_capacities(system, tmp_path, monkeypatch)
@@ -748,7 +763,8 @@ def test_production_factory_opens_sql_only_after_arm_resume(system, tmp_path, mo
     state["value"] = "Suspended"
     actual_arm = ArmCapacityClient
     monkeypatch.setattr(
-        production, "ArmCapacityClient", lambda tokens: actual_arm(tokens, transport=transport)
+        production, "ArmCapacityClient",
+        lambda tokens, **kwargs: actual_arm(tokens, transport=transport, **kwargs),
     )
     monkeypatch.setattr(production, "FabricClient", lambda tokens: system.c.destination.client)
 
@@ -863,10 +879,10 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
         "ControlWarehouseProvisioner",
         partial(production.ControlWarehouseProvisioner, transport=transport),
     )
-    monkeypatch.setattr(production, "ArmCapacityClient", lambda tokens: capacities.arm)
+    monkeypatch.setattr(production, "ArmCapacityClient", lambda tokens, **kwargs: capacities.arm)
     created = []
 
-    def new_catalog(server, database, tokens, config):
+    def new_catalog(server, database, tokens, config, **kwargs):
         harness = SqlHarness(tmp_path / "setup-catalog.db")
         catalog = WarehouseCatalog(harness.connect, config, sleep=Mock())
         created.append(catalog)

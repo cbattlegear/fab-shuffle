@@ -156,6 +156,42 @@ def _validate_endpoint(server: str, database: str) -> None:
         raise ValueError("Specify a safe explicit control Warehouse catalog, not master")
 
 
+class _GuardedCursor:
+    def __init__(self, cursor: pyodbc.Cursor, guard: Callable[[], None]) -> None:
+        self.cursor = cursor
+        self.guard = guard
+
+    def execute(self, sql: str, *parameters: object) -> _GuardedCursor:
+        self.guard()
+        self.cursor.execute(sql, *parameters)
+        self.guard()
+        return self
+
+    def fetchall(self):
+        self.guard()
+        result = self.cursor.fetchall()
+        self.guard()
+        return result
+
+
+class _GuardedConnection:
+    def __init__(self, connection: pyodbc.Connection, guard: Callable[[], None]) -> None:
+        self.connection = connection
+        self.guard = guard
+
+    def cursor(self) -> _GuardedCursor:
+        self.guard()
+        return _GuardedCursor(self.connection.cursor(), self.guard)
+
+    def commit(self) -> None:
+        self.guard()
+        self.connection.commit()
+        self.guard()
+
+    def rollback(self) -> None:
+        self.connection.rollback()
+
+
 class WarehouseCatalog(RecoveryCatalog):
     """One catalog Warehouse and one explicitly authorized controller per recovery set.
 
@@ -167,6 +203,7 @@ class WarehouseCatalog(RecoveryCatalog):
     def __init__(
         self, connection_factory: Callable[[], pyodbc.Connection], recovery_set: RecoverySet,
         *, conflict_attempts: int = 3, sleep: Callable[[float], None] = time.sleep,
+        guard: Callable[[], None] | None = None,
     ) -> None:
         if not 1 <= conflict_attempts <= 5:
             raise ValueError("Use between one and five bounded SQL conflict attempts")
@@ -175,21 +212,28 @@ class WarehouseCatalog(RecoveryCatalog):
         self._attempts = conflict_attempts
         self._sleep = sleep
         self._mutex = threading.RLock()
+        self.guard = guard
+
+    def _fence(self) -> None:
+        if self.guard is not None:
+            self.guard()
 
     @classmethod
     def from_endpoint(
         cls, server: str, database: str, tokens: TokenProvider, recovery_set: RecoverySet,
+        *, guard: Callable[[], None] | None = None,
     ) -> WarehouseCatalog:
         # The legacy connector constructs an ODBC string. Validate its inputs here
         # rather than changing migration connection behavior.
         _validate_endpoint(server, database)
         if canonical_id(tokens.principal.tenant_id) != recovery_set.tenant_id:
             raise ValueError("The SQL token provider belongs to a different recovery tenant")
-        return cls(lambda: connect(server, database, tokens), recovery_set)
+        return cls(lambda: connect(server, database, tokens), recovery_set, guard=guard)
 
     @classmethod
     def open_from_endpoint(
         cls, server: str, database: str, tokens: TokenProvider, *, expected_recovery_set_id: str,
+        guard: Callable[[], None] | None = None,
     ) -> WarehouseCatalog:
         """Open existing authoritative configuration after bootstrap resumed capacity.
 
@@ -199,8 +243,12 @@ class WarehouseCatalog(RecoveryCatalog):
         _validate_endpoint(server, database)
         warehouse_id = canonical_id(database)
         expected_recovery_set_id = canonical_id(expected_recovery_set_id)
+        if guard is not None:
+            guard()
         connection = connect(server, warehouse_id, tokens)
         try:
+            if guard is not None:
+                guard()
             row = _one(connection.cursor().execute(
                 "SELECT config FROM bcdr.control",
             ).fetchall(), "catalog configuration")
@@ -212,17 +260,23 @@ class WarehouseCatalog(RecoveryCatalog):
             or config.control_warehouse.item_id != warehouse_id
         ):
             raise IntegrityError("Warehouse configuration does not match bootstrap recovery/control identity")
-        result = cls.from_endpoint(server, warehouse_id, tokens, config)
+        result = cls.from_endpoint(server, warehouse_id, tokens, config, guard=guard)
         result.state()
         return result
 
     @contextmanager
-    def _connection(self) -> Iterator[pyodbc.Connection]:
+    def _connection(self) -> Iterator[_GuardedConnection]:
+        self._fence()
         connection = self._connect()
         try:
+            self._fence()
             if connection.autocommit:
                 raise ValueError("Warehouse catalog requires autocommit=False")
-            yield connection
+            yield _GuardedConnection(connection, self._fence)
+            self._fence()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -256,8 +310,8 @@ class WarehouseCatalog(RecoveryCatalog):
                 raise
             self._commit(connection)
 
-    @staticmethod
-    def _commit(connection: pyodbc.Connection) -> None:
+    def _commit(self, connection: _GuardedConnection) -> None:
+        self._fence()
         try:
             connection.commit()
         except pyodbc.Error as error:
@@ -266,6 +320,7 @@ class WarehouseCatalog(RecoveryCatalog):
             raise AmbiguousCommit(
                 f"Warehouse commit acknowledgement failed: {error}. Re-read durable state before retrying."
             ) from error
+        self._fence()
 
     def _read_config(self, cursor) -> RecoverySet:
         row = _one(cursor.execute("SELECT config FROM bcdr.control").fetchall(), "catalog configuration")

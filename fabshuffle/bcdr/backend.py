@@ -59,6 +59,11 @@ class DurableRuntime:
         self.lease: ControllerLease | None = None
         self.mode: RecoveryMode | None = None
         self.current_operation: OperationRecord | None = None
+        self.deployment_guard: Callable[[], None] | None = None
+
+    def deployment_fence(self) -> None:
+        if self.deployment_guard is not None:
+            self.deployment_guard()
 
     def require_lease(self) -> ControllerLease:
         if self.lease is None:
@@ -66,6 +71,7 @@ class DurableRuntime:
         return self.lease
 
     def fence(self) -> None:
+        self.deployment_fence()
         lease = self.require_lease()
         state = self.catalog.state()
         if (
@@ -77,6 +83,7 @@ class DurableRuntime:
 
     @contextmanager
     def controller(self, modes: set[RecoveryMode]) -> Iterator[None]:
+        self.deployment_fence()
         self.lease = self.catalog.acquire_controller(self.controller_id)
         self.mode = self.catalog.state().mode
         try:
@@ -91,6 +98,7 @@ class DurableRuntime:
             yield
         finally:
             # On catalog loss or ambiguity ownership deliberately remains fenced. No timer steals it.
+            self.deployment_fence()
             if self.mode != RecoveryMode.PARKING and not self.catalog.pending_operations():
                 self.catalog.release_controller(self.require_lease())
                 self.lease = None
@@ -187,8 +195,11 @@ class DurableRuntime:
     ) -> dict[str, JsonValue]:
         self.current_operation = intent
         try:
+            self.fence()
             result = action()
+            self.fence()
         except FabricError as error:
+            self.fence()
             code, message, request_id = safe_error(error)
             # Even a definite rejection may follow earlier successful calls in a composite adapter.
             observed = self.current_operation or intent
