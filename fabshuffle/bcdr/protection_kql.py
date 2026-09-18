@@ -103,25 +103,30 @@ def _probe_tables(
     properties.set_option("query_results_cache_max_age", timedelta(0))
     properties.set_option("truncationmaxrecords", 2)
     properties.set_option("truncationmaxsize", limits.max_record_bytes)
-    with kql_client(protection.target.endpoint, tokens.principal) as client:
+    tokens.assert_active()
+    with kql_client(protection.target.endpoint, tokens.principal, tokens=tokens) as client:
         for table in protection.tables:
             check_cancelled(cancel)
+            tokens.assert_active()
             details = client.execute_mgmt(
                 protection.target.database,
                 f".show table {kql_identifier(table.name)} details | project TableName",
                 properties=properties,
             ).primary_results[0]
+            tokens.assert_active()
             if len(details) != 1 or details[0]["TableName"] != table.name:
                 raise ProtectionError(
                     f"Prepared KQL input '{table.name}' is not an exact physical table; "
                     "materialize its data independently before recovery."
                 )
             check_cancelled(cancel)
+            tokens.assert_active()
             response = client.execute_query(
                 protection.target.database,
                 f"{kql_identifier(table.name)} | count",
                 properties=properties,
             )
+            tokens.assert_active()
             rows = response.primary_results[0]
             if len(rows) != 1 or int(rows[0][0]) < table.minimum_rows:
                 raise ProtectionError(

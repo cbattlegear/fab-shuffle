@@ -43,7 +43,9 @@ SRC = DataEndpoint(SOURCE, "https://source.example.test", "original")
 DST = DataEndpoint(TARGET, "https://target.example.test", "standby")
 NOW = datetime.now(UTC)
 EVIDENCE = ConsistencyEvidence("freeze-123", NOW - timedelta(hours=1), NOW + timedelta(hours=1), True, True)
-TOKENS = SimpleNamespace(sql_token=lambda: "TEST_ACCESS_TOKEN", principal=object())
+TOKENS = SimpleNamespace(
+    sql_token=lambda: "TEST_ACCESS_TOKEN", principal=object(), assert_active=lambda: None,
+)
 LIMITS = ProtectionLimits(max_disk_bytes=1024**2, max_record_bytes=65536)
 
 
@@ -611,8 +613,9 @@ def test_kql_restores_prepared_target_without_primary_reads_or_ingestion(prepare
             assert query == '.show table ["events"] details | project TableName'
             return SimpleNamespace(primary_results=[[{"TableName": "events"}]])
 
-    def target_only(endpoint, _):
+    def target_only(endpoint, _, *, tokens):
         assert endpoint == DST.endpoint
+        assert tokens is TOKENS
         return Client()
 
     monkeypatch.setattr(kql, "kql_client", target_only)

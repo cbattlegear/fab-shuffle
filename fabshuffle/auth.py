@@ -158,16 +158,25 @@ class TokenProvider:
         return result.token
 
     def token(self, scope: str) -> str:
+        self.assert_active()
         with self._lock:
             if isinstance(self.principal, ManagedIdentity):
-                return self._managed_token(scope, self.principal)
-            result = self._app().acquire_token_for_client(scopes=[scope])
+                result = {"access_token": self._managed_token(scope, self.principal)}
+            else:
+                result = self._app().acquire_token_for_client(scopes=[scope])
+        self.assert_active()
         if not isinstance(result, dict) or "access_token" not in result:
             description = ""
             if isinstance(result, dict):
                 description = result.get("error_description") or result.get("error") or ""
             raise AuthError(f"Could not acquire a token for {scope}. {description}".strip())
         return str(result["access_token"])
+
+    def assert_active(self) -> None:
+        """Recovery wrappers override this to fence new calls after deployment lease loss.
+
+        This cannot cancel or roll back a request already accepted by a remote service.
+        """
 
     def invalidate(self) -> None:
         """Discard local resource caches after an explicit authentication rejection.
@@ -177,6 +186,7 @@ class TokenProvider:
         this is not a guarantee of revocation propagation or permission propagation.
         https://learn.microsoft.com/azure/container-apps/managed-identity
         """
+        self.assert_active()
         with self._lock:
             if self._managed_credential is not None:
                 self._managed_credential.close()

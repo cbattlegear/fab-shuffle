@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -10,7 +11,8 @@ from test_managed_identity import CLIENT, OBJECT, TENANT, provider
 from test_managed_identity import endpoint as endpoint
 
 from fabshuffle import auth
-from fabshuffle.bcdr import capture_sources
+from fabshuffle.bcdr import capture_sources, protection_kql
+from fabshuffle.bcdr.protection import ProtectionLimits
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer import bulkcopy, cosmos, files, kql, sqlschema
 
@@ -98,7 +100,7 @@ def test_metadata_capture_uses_shared_mi_kusto_connection(endpoint, monkeypatch)
     monkeypatch.setattr(capture_sources, "KustoClient", Mock(return_value=manager))
     with pytest.raises(RuntimeError, match="metadata query reached"):
         reader.kql_metadata("https://cluster", "database", follower=False)
-    connection.assert_called_once_with("https://cluster", tokens)
+    connection.assert_called_once_with("https://cluster", tokens, use_token_provider=True)
 
 
 def test_sql_extract_mi_uses_fresh_token_on_retry_not_secret(endpoint, monkeypatch, tmp_path):
@@ -183,3 +185,134 @@ def test_cosmos_adapter_uses_mi_audience_and_actual_expiry(endpoint):
     assert auth.token_claim(value.token, "aud") == "https://cosmos.azure.com"
     endpoint.now += 3601
     assert credential.get_token("https://cosmos.azure.com/.default").token != value.token
+
+
+class FencedTokens(auth.TokenProvider):
+    def __init__(self):
+        super().__init__(auth.ManagedIdentity(TENANT, CLIENT))
+        self.active = True
+
+    def assert_active(self):
+        if not self.active:
+            raise RuntimeError("deployment lease lost")
+
+
+def test_inactive_provider_cannot_get_cached_tokens_or_invalidate(endpoint):
+    tokens = FencedTokens()
+    tokens.fabric_token()
+    tokens.active = False
+    with pytest.raises(RuntimeError, match="lease lost"):
+        tokens.fabric_token()
+    with pytest.raises(RuntimeError, match="lease lost"):
+        tokens.invalidate()
+    assert len(endpoint.calls) == 1
+
+
+def test_provider_checks_lease_after_identity_endpoint_returns(endpoint, monkeypatch):
+    tokens = FencedTokens()
+    original = endpoint.send
+
+    def expired_during_request(*args, **kwargs):
+        response = original(*args, **kwargs)
+        tokens.active = False
+        return response
+
+    monkeypatch.setattr(endpoint, "send", expired_during_request)
+    with pytest.raises(RuntimeError, match="lease lost"):
+        tokens.fabric_token()
+    assert len(endpoint.calls) == 1
+
+
+def test_kql_supplied_provider_is_not_reconstructed_or_downgraded_to_secret(monkeypatch):
+    tokens = auth.TokenProvider(auth.ServicePrincipal("tenant", "client", "secret"))
+    callback = Mock(return_value=Mock())
+    monkeypatch.setattr(kql.KustoConnectionStringBuilder, "with_token_provider", callback)
+    monkeypatch.setattr(kql, "KustoClient", Mock())
+    kql._client("https://cluster", tokens.principal, tokens=tokens)
+    assert callback.call_args.args[1].__self__ is tokens
+    with pytest.raises(kql.KqlTransferError, match="must match"):
+        kql._client("https://cluster", auth.ManagedIdentity(TENANT, CLIENT), tokens=tokens)
+
+
+def test_metadata_sql_loss_stops_next_query_on_existing_connection(monkeypatch):
+    tokens = FencedTokens()
+    cursor = Mock()
+    cursor.execute.return_value = cursor
+    cursor.fetchone.return_value = [1]
+    cursor.description = [("name",)]
+
+    def fetched(_):
+        tokens.active = False
+        return [["orders"]]
+
+    cursor.fetchmany.side_effect = fetched
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(sqlschema, "connect", Mock(return_value=connection))
+    with pytest.raises(RuntimeError, match="lease lost"):
+        capture_sources.MetadataReaders(tokens).sql_metadata("server", "database")
+    assert cursor.execute.call_count == 2  # permission check, then first inventory query only
+    connection.close.assert_called_once()
+
+
+def test_metadata_kql_loss_stops_next_management_read(monkeypatch):
+    tokens = FencedTokens()
+    client = Mock()
+
+    def execute(*_):
+        tokens.active = False
+        return SimpleNamespace(primary_results=[[{"DatabaseName": "actual"}]])
+
+    client.execute_mgmt.side_effect = execute
+    manager = Mock(__enter__=Mock(return_value=client), __exit__=Mock(return_value=False))
+    monkeypatch.setattr(capture_sources, "KustoClient", Mock(return_value=manager))
+    with pytest.raises(RuntimeError, match="lease lost"):
+        capture_sources.MetadataReaders(tokens).kql_metadata("https://cluster", "database", follower=False)
+    client.execute_mgmt.assert_called_once_with("database", ".show database identity")
+
+
+def test_kql_prepared_probe_preserves_provider_and_stops_after_loss(monkeypatch):
+    tokens = FencedTokens()
+    client = Mock()
+
+    def execute(*args, **kwargs):
+        tokens.active = False
+        return SimpleNamespace(primary_results=[[{"TableName": "orders"}]])
+
+    client.execute_mgmt.side_effect = execute
+    manager = Mock(__enter__=Mock(return_value=client), __exit__=Mock(return_value=False))
+    factory = Mock(return_value=manager)
+    monkeypatch.setattr(protection_kql, "kql_client", factory)
+    prepared = SimpleNamespace(
+        target=SimpleNamespace(endpoint="https://standby", database="database"),
+        tables=(protection_kql.KqlTable("orders", 1),),
+    )
+    with pytest.raises(RuntimeError, match="lease lost"):
+        protection_kql._probe_tables(prepared, tokens, ProtectionLimits(), None)
+    factory.assert_called_once_with("https://standby", tokens.principal, tokens=tokens)
+    client.execute_query.assert_not_called()
+
+
+def test_sql_existing_batch_mutation_guard_stops_after_lost_lease(monkeypatch, tmp_path):
+    tokens = FencedTokens()
+    path = tmp_path / "schema.sql"
+    path.write_text(
+        "-- SqlPackage preamble\nGO\n"
+        "CREATE VIEW first AS SELECT 1 AS value;\nGO\nCREATE VIEW second AS SELECT 2 AS value;"
+    )
+    cursor = Mock()
+    cursor.execute.side_effect = lambda _: setattr(tokens, "active", False)
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    manager = Mock(__enter__=Mock(return_value=connection), __exit__=Mock(return_value=False))
+    monkeypatch.setattr(sqlschema, "connect", Mock(return_value=manager))
+
+    def batch_guard():
+        tokens.assert_active()
+        return False
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        sqlschema.apply_script(
+            path, server="server", database="database", tokens=tokens, cancel_requested=batch_guard,
+        )
+    cursor.execute.assert_called_once()

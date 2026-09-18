@@ -70,13 +70,15 @@ class FollowerSource:
         return _GUID.fullmatch(self.database_name) is not None
 
 
-def kusto_connection(cluster_uri: str, tokens: TokenProvider) -> KustoConnectionStringBuilder:
+def kusto_connection(
+    cluster_uri: str, tokens: TokenProvider, *, use_token_provider: bool = False,
+) -> KustoConnectionStringBuilder:
     """Share explicit credentials with capture; a callback refreshes MI tokens per request.
 
     https://learn.microsoft.com/kusto/api/get-started/app-authentication-methods
     """
     principal = tokens.principal
-    if isinstance(principal, ManagedIdentity):
+    if use_token_provider or isinstance(principal, ManagedIdentity):
         return KustoConnectionStringBuilder.with_token_provider(cluster_uri, tokens.kusto_token)
     return KustoConnectionStringBuilder.with_aad_application_key_authentication(
         cluster_uri,
@@ -86,7 +88,14 @@ def kusto_connection(cluster_uri: str, tokens: TokenProvider) -> KustoConnection
     )
 
 
-def _client(cluster_uri: str, principal: AuthPrincipal) -> KustoClient:
+def _client(
+    cluster_uri: str, principal: AuthPrincipal, *, tokens: TokenProvider | None = None,
+) -> KustoClient:
+    if tokens is not None:
+        if tokens.principal != principal:
+            raise KqlTransferError("KQL tokens must match the selected application identity.")
+        tokens.assert_active()
+        return KustoClient(kusto_connection(cluster_uri, tokens, use_token_provider=True))
     return KustoClient(kusto_connection(cluster_uri, TokenProvider(principal)))
 
 
