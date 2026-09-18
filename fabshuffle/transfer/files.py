@@ -17,7 +17,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
-from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.auth import AuthPrincipal, ManagedIdentity, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer.common import (
@@ -54,9 +54,9 @@ def copy_files(
     *,
     source_files_path: str,
     target_files_path: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     scratch_dir: Path,
-    target_principal: ServicePrincipal | None = None,
+    target_principal: AuthPrincipal | None = None,
     target_tokens: TokenProvider | None = None,
     tokens: TokenProvider | None = None,
     max_staging_bytes: int | None = None,
@@ -67,11 +67,18 @@ def copy_files(
     on_progress: Callable[[str], None] | None = None,
 ) -> CopyOutcome:
     """Stage ``Files/`` from the source lakehouse locally, then upload to the target."""
-    if target_principal is not None or target_tokens is not None:
+    if isinstance(principal, ManagedIdentity) or target_principal is not None or target_tokens is not None:
+        # AzCopy's documented MSI path targets VMs, not ACA's identity endpoint.
+        # Keep token acquisition in our SDK and reuse the bounded, ETag-pinned relay.
+        # https://learn.microsoft.com/azure/storage/common/storage-use-azcopy-authorize-managed-identity
+        source_tokens = tokens or TokenProvider(principal)
+        destination_tokens = target_tokens or (
+            TokenProvider(target_principal) if target_principal is not None else source_tokens
+        )
         return copy_tree_streaming(
             source_path=source_files_path, target_path=target_files_path,
-            tokens=tokens or TokenProvider(principal),
-            target_tokens=target_tokens or TokenProvider(target_principal),
+            tokens=source_tokens, target_tokens=destination_tokens,
+            scratch_dir=scratch_dir,
             max_staging_bytes=max_staging_bytes,
             max_memory_bytes=max_memory_bytes,
             max_disk_staging_bytes=max_disk_staging_bytes,
