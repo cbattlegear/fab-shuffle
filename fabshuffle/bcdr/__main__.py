@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
+from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider, managed_identity_principal
 from fabshuffle.bcdr.backend import RecoveryBlocked
 from fabshuffle.bcdr.catalog import CatalogError
 from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
@@ -68,6 +68,27 @@ class SafeParser(argparse.ArgumentParser):
 
 
 def credential_provider(environ: Mapping[str, str]) -> TokenProvider:
+    mode = environ.get("FAB_SHUFFLE_BCDR_AUTH_MODE", "service_principal")
+    if mode == "managed_identity":
+        fields = (
+            "FAB_SHUFFLE_BCDR_TENANT_ID", "FAB_SHUFFLE_BCDR_CLIENT_ID",
+            "FAB_SHUFFLE_BCDR_CLIENT_SECRET", "FAB_SHUFFLE_BCDR_CLIENT_SECRET_FILE",
+        )
+        if any(environ.get(name) for name in fields):
+            raise ValueError(
+                "Managed identity mode cannot include BCDR service-principal credentials. "
+                "Remove FAB_SHUFFLE_BCDR_TENANT_ID, FAB_SHUFFLE_BCDR_CLIENT_ID, "
+                "FAB_SHUFFLE_BCDR_CLIENT_SECRET and FAB_SHUFFLE_BCDR_CLIENT_SECRET_FILE."
+            )
+        principal = managed_identity_principal(environ)
+        if principal is None:
+            raise AuthError(
+                "Set FAB_SHUFFLE_MANAGED_IDENTITY_TENANT_ID and "
+                "FAB_SHUFFLE_MANAGED_IDENTITY_CLIENT_ID for managed_identity mode."
+            )
+        return TokenProvider(principal)
+    if mode != "service_principal":
+        raise ValueError("FAB_SHUFFLE_BCDR_AUTH_MODE must be service_principal or managed_identity.")
     tenant = environ.get("FAB_SHUFFLE_BCDR_TENANT_ID", "")
     client = environ.get("FAB_SHUFFLE_BCDR_CLIENT_ID", "")
     secret = environ.get("FAB_SHUFFLE_BCDR_CLIENT_SECRET", "")

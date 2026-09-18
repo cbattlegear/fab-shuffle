@@ -22,9 +22,10 @@ from pathlib import Path
 
 import pyodbc
 
-from fabshuffle.auth import ServicePrincipal, TokenProvider, sql_access_token_struct
+from fabshuffle.auth import AuthPrincipal, ManagedIdentity, TokenProvider, sql_access_token_struct
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric.definitions import build_rewriter
+from fabshuffle.lifecycle import safe_text
 from fabshuffle.transfer.common import (
     StagingBudgetError,
     check_budget,
@@ -224,8 +225,9 @@ def extract_dacpac(
     *,
     server: str,
     database: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     output: Path,
+    tokens: TokenProvider | None = None,
     attempts: int = EXTRACT_ATTEMPTS,
     staging_root: Path | None = None,
     max_staging_bytes: int | None = None,
@@ -242,9 +244,18 @@ def extract_dacpac(
     output.parent.mkdir(parents=True, exist_ok=True)
     connection_string = (
         f"Server={server};Initial Catalog={database};Encrypt=True;TrustServerCertificate=False;"
-        "Connection Timeout=60;Authentication=Active Directory Service Principal;"
-        f"User Id={principal.client_id};Password={principal.client_secret}"
+        "Connection Timeout=60;"
     )
+    managed = isinstance(principal, ManagedIdentity)
+    if managed:
+        tokens = tokens or TokenProvider(principal)
+        if tokens.principal != principal:
+            raise SchemaTransferError("Schema extraction tokens must match the selected managed identity.")
+    else:
+        connection_string += (
+            "Authentication=Active Directory Service Principal;"
+            f"User Id={principal.client_id};Password={principal.client_secret};"
+        )
 
     for attempt in range(1, attempts + 1):
         check_cancelled(cancel_requested)
@@ -267,6 +278,10 @@ def extract_dacpac(
                     "staging_root": staging_root, "max_disk_staging_bytes": disk_budget,
                     "cancel_requested": cancel_requested,
                 }
+            if managed and tokens is not None:
+                # A static CLI token cannot refresh mid-process; acquire again on each retry.
+                # https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-extract
+                extra.append(f"/AccessToken:{tokens.sql_token()}")
             runner(
                 [
                     SETTINGS.sqlpackage_path,
@@ -740,7 +755,7 @@ def transfer_schema(
     source_server: str,
     target_server: str,
     database: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     tokens: TokenProvider,
     scratch_dir: Path,
     source_type: str,
@@ -803,7 +818,8 @@ def transfer_schema(
         if on_progress:
             on_progress(f"Extracting schema from {database}")
         extract_dacpac(
-            server=source_server, database=database, principal=principal, output=dacpac, **tool_options,
+            server=source_server, database=database, principal=principal, tokens=tokens,
+            output=dacpac, **tool_options,
         )
 
         check_cancelled(cancel_requested)
@@ -937,10 +953,17 @@ def _stop_tool(process: subprocess.Popen, environment: dict[str, str]) -> None:
     process.wait()
 
 
-def _tool_output(path: Path) -> str:
+def _safe_tool_output(value: str, command: list[str]) -> str:
+    for argument in command:
+        if argument.casefold().startswith(("/accesstoken:", "/at:")):
+            value = value.replace(argument.partition(":")[2], "[redacted]")
+    return safe_text(value)
+
+
+def _tool_output(path: Path, command: list[str]) -> str:
     with path.open("rb") as stream:
         stream.seek(max(0, path.stat().st_size - 1500))
-        return stream.read(1500).decode("utf-8", errors="replace").strip()
+        return _safe_tool_output(stream.read(1500).decode("utf-8", errors="replace").strip(), command)
 
 
 def _run_bounded(
@@ -1006,7 +1029,7 @@ def _run_bounded(
             check_cancelled(cancel_requested)
         except SchemaStagingError as error:
             _stop_tool(process, environment)
-            detail = _tool_output(output)
+            detail = _tool_output(output, command)
             if detail:
                 raise SchemaStagingError(f"{error} Tool output: {detail}") from error
             raise
@@ -1014,7 +1037,7 @@ def _run_bounded(
             _stop_tool(process, environment)
     if process.returncode:
         raise SchemaTransferError(
-            f"{what} failed with exit code {process.returncode}: {_tool_output(output)}"
+            f"{what} failed with exit code {process.returncode}: {_tool_output(output, command)}"
         )
 
 
@@ -1028,7 +1051,7 @@ def _run(command: list[str], *, what: str) -> None:
             "T-SQL schema transfer needs sqlpackage and unpackdacpac."
         ) from error
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[-1500:]
+        detail = _safe_tool_output((result.stderr or result.stdout or "").strip(), command)[-1500:]
         raise SchemaTransferError(f"{what} failed with exit code {result.returncode}: {detail}")
 
 

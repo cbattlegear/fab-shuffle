@@ -93,7 +93,7 @@ from uuid import UUID
 
 from fabshuffle import concurrency
 from fabshuffle import journal as journal_module
-from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
+from fabshuffle.auth import AuthError, AuthPrincipal, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
     airflow,
@@ -265,7 +265,7 @@ class MigrationPlan:
 class _Context:
     client: FabricClient
     tokens: TokenProvider
-    principal: ServicePrincipal
+    principal: AuthPrincipal
     plan: MigrationPlan
     run: MigrationRun
     scratch_dir: Path
@@ -306,7 +306,7 @@ class _Context:
     active_copy_jobs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     target_client: FabricClient | None = None
     target_tokens: TokenProvider | None = None
-    target_principal: ServicePrincipal | None = None
+    target_principal: AuthPrincipal | None = None
     primary_item_ids: set[str] = field(default_factory=set)
 
     @property
@@ -318,7 +318,7 @@ class _Context:
         return self.target_tokens if self.target_tokens is not None else self.tokens
 
     @property
-    def destination_principal(self) -> ServicePrincipal:
+    def destination_principal(self) -> AuthPrincipal:
         return self.target_principal if self.target_principal is not None else self.principal
 
     @property
@@ -475,7 +475,7 @@ class _Context:
             attempt_id=self.run.id, source_workspace=self.plan.source_workspace_id,
             record=self.journal.outcome, changed=self.run.readiness_changed,
             initial=self.prior.outcomes if self.prior else None,
-            secrets=(getattr(self.principal, "client_secret", ""),),
+            secrets=(self.principal.client_secret,) if isinstance(self.principal, ServicePrincipal) else (),
         )
         self.run.inventory_complete = bool(self.prior and self.prior.inventory_complete)
         if self.prior:
@@ -502,12 +502,12 @@ def default_target_name(source_name: str, region: str) -> str:
 
 def run_migration(
     run: MigrationRun,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     plan: MigrationPlan,
     *,
     cleanup: bool = True,
     prior: journal_module.Replay | None = None,
-    target_principal: ServicePrincipal | None = None,
+    target_principal: AuthPrincipal | None = None,
 ) -> None:
     """Execute a migration, recording every phase on ``run``.
 

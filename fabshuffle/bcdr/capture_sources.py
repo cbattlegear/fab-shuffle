@@ -13,12 +13,13 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
+from azure.kusto.data import KustoClient
 
 from fabshuffle.auth import TokenProvider
 from fabshuffle.bcdr.contracts import ItemIdentity, logical_path, reject_embedded_secrets
 from fabshuffle.fabric.client import FabricApiError, FabricError
 from fabshuffle.transfer import sqlschema
+from fabshuffle.transfer.kql import kusto_connection
 
 MAX_METADATA_BYTES = 64 * 1024 * 1024
 MAX_METADATA_ROWS = 100_000
@@ -229,6 +230,7 @@ class MetadataReaders:
                 server=server,
                 database=database,
                 principal=self.tokens.principal,
+                tokens=self.tokens,
                 output=root / "source.dacpac",
                 staging_root=root,
                 max_disk_staging_bytes=self.max_bytes,
@@ -241,12 +243,7 @@ class MetadataReaders:
     def kql_metadata(self, cluster: str, database: str, *, follower: bool) -> dict[str, Any]:
         if not cluster or not database:
             raise FabricError("Capture needs the source KQL query endpoint and database ID")
-        builder = KustoConnectionStringBuilder.with_aad_application_key_authentication(
-            cluster,
-            self.tokens.principal.client_id,
-            self.tokens.principal.client_secret,
-            self.tokens.principal.tenant_id,
-        )
+        builder = kusto_connection(cluster, self.tokens)
         result: dict[str, Any] = {}
         with KustoClient(builder) as client:
             identity = client.execute_mgmt(database, ".show database identity")
