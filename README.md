@@ -291,6 +291,10 @@ See [the BCDR operator guide](docs/bcdr.md) for controller setup, capacity/metad
 source-retention obligations, qualification limits, API routes and the Linux-container
 `python -m fabshuffle.bcdr` scheduler entrypoint. Existing migration modes remain unchanged.
 
+For review and preproduction qualification, see the
+[BCDR research and design rationale](docs/bcdr-viability.md) and
+[live end-to-end testing runbook](docs/bcdr-live-validation.md).
+
 ## Migration modes
 
 Fab Shuffle is a Linux-container application with a web wizard. It either reassigns a
