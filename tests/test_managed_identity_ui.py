@@ -21,3 +21,11 @@ def test_managed_identity_ui(scenario):
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_authentication_form_preserves_hidden_and_mobile_constraints():
+    styles = (
+        Path(__file__).parents[1] / "fabshuffle" / "web" / "static" / "styles.css"
+    ).read_text(encoding="utf-8")
+    assert "#tenant-mode[hidden] { display: none; }" in styles
+    assert '.form select, .form input:not([type="checkbox"]) { width: 100%; min-width: 0; }' in styles

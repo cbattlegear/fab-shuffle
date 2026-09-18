@@ -152,7 +152,7 @@ def require_session(
 ) -> Session:
     session = SESSIONS.get(session_id)
     if not session:
-        raise HTTPException(status_code=401, detail="Connect a Fabric identity first.")
+        raise HTTPException(status_code=401, detail="Sign in and connect a Fabric identity first.")
     _require_session_owner(session, request)
     return session
 
@@ -902,7 +902,7 @@ def create_app() -> FastAPI:
         """Server-sent events feed. EventSource cannot set headers, so the id comes as a query."""
         session = SESSIONS.get(session_id)
         if not session:
-            raise HTTPException(status_code=401, detail="Connect a Fabric identity first.")
+            raise HTTPException(status_code=401, detail="Sign in and connect a Fabric identity first.")
         _require_session_owner(session, request)
         run = _require_run(run_id, session)
 

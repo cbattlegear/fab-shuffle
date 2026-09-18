@@ -19,6 +19,7 @@ from fabshuffle.bcdr.deployment_lock import (
     GuardedTokens,
 )
 from fabshuffle.bcdr.warehouse_catalog import WarehouseCatalog
+from tests.test_bcdr_bootstrap import descriptor
 from tests.test_bcdr_contracts import recovery_set
 from tests.test_bcdr_warehouse_catalog import SqlHarness
 
@@ -355,6 +356,26 @@ def test_bootstrap_reads_and_writes_fail_before_file_effect(tmp_path):
     with pytest.raises(RecoveryBlocked, match="lease lost"):
         store.save(None, expected_revision=None)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_distributed_bootstrap_initializes_a_fresh_share_directory(tmp_path):
+    parent = tmp_path / "new-share" / "bcdr"
+    guard = Mock()
+    store = BootstrapStore(parent / "bootstrap.json", guard=guard, distributed=True)
+    saved = store.save(descriptor(), expected_revision=None)
+    assert saved.revision == 0
+    assert store.load() == saved
+    assert guard.call_count > 1
+    assert not store.path.with_suffix(".json.lock").exists()
+
+
+def test_distributed_bootstrap_does_not_create_parent_after_lease_loss(tmp_path):
+    parent = tmp_path / "new-share" / "bcdr"
+    guard = Mock(side_effect=[None, RecoveryBlocked("lease lost")])
+    store = BootstrapStore(parent / "bootstrap.json", guard=guard, distributed=True)
+    with pytest.raises(RecoveryBlocked, match="lease lost"):
+        store.save(descriptor(), expected_revision=None)
+    assert not parent.exists()
 
 
 def test_arm_resume_loss_after_intent_never_sends_mutation():

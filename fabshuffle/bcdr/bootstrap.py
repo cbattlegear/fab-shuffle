@@ -267,6 +267,7 @@ class BootstrapStore:
                 raise BootstrapError("Distributed bootstrap access requires a live deployment guard")
             with self._mutex:
                 self._fence()
+                self.path.parent.mkdir(parents=True, exist_ok=True)
                 yield
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)

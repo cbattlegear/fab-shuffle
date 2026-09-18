@@ -39,15 +39,16 @@ async function api(path, { method = "GET", body, signal, download = false } = {}
     signal,
   });
 
+  if (response.redirected) {
+    throw new Error("Azure sign-in has expired. Reload this page to sign in again.");
+  }
   if (download && response.ok) return response.blob();
   const text = await response.text();
   let payload;
   try {
     payload = text ? JSON.parse(text) : {};
   } catch (_) {
-    throw new Error(response.redirected
-      ? "Azure sign-in has expired. Reload this page to sign in again."
-      : `The server returned an unreadable response (HTTP ${response.status}). Reload and retry.`);
+    throw new Error(`The server returned an unreadable response (HTTP ${response.status}). Reload and retry.`);
   }
   if (!response.ok) {
     const detail = payload.detail;

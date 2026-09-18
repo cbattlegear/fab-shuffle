@@ -149,7 +149,10 @@ main { max-width: 62rem; margin: 0 auto; padding: 1.5rem 2rem 4rem; }
 .panel h2 { margin: 0 0 0.35rem; font-size: 1.1rem; }
 .hint { margin: 0 0 1.25rem; color: var(--text-dim); font-size: 0.9rem; }
 
-.form { display: grid; gap: 0.9rem; max-width: 32rem; }
+.form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.9rem; max-width: 32rem; min-width: 0; }
+.form label { min-width: 0; }
+.form select, .form input:not([type="checkbox"]) { width: 100%; min-width: 0; }
+#tenant-mode[hidden] { display: none; }
 .credentials { display: grid; gap: 0.9rem; min-width: 0; margin: 0; padding: 0; border: 0; }
 .credentials legend { padding: 0; margin-bottom: 0.65rem; font-weight: 600; }
 .identity-context, .summary .v { min-width: 0; overflow-wrap: anywhere; }

@@ -96,6 +96,12 @@ const scenarios = {
     await pending;
     assert.match(f.get("alert").textContent, /Azure sign-in has expired/);
     assert.equal(f.ui.state.sessionId, null);
+    const download = vm.runInContext("api('/api/download', { download: true })", f.context);
+    f.requests[2].resolve({
+      ok: true, status: 200, redirected: true,
+      blob: () => assert.fail("An EasyAuth sign-in page must never become a downloaded report"),
+    });
+    await assert.rejects(download, /Azure sign-in has expired/);
   },
 };
 
