@@ -10,9 +10,11 @@ It does this by automating the API calls, data copy processes, and ID remapping 
 
 Configure access **before deploying or running Fab Shuffle**:
 
-1. **Create a service principal.** [Register a Microsoft Entra application and create a client secret](https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal).
+1. **Choose the Fabric runtime identity.** Normally,
+   [register a Microsoft Entra application and create a client secret](https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal).
    Keep its **tenant ID, application (client) ID, and client secret value** for the wizard.
-   Add the service principal to an [Entra security group](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-manage-groups).
+   Azure deployments can instead attach an [existing user-assigned managed identity](#optional-managed-identity).
+   Add the chosen principal to an [Entra security group](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-manage-groups).
 2. **Allow normal Fabric APIs.** Have a Fabric administrator open **Admin portal > Tenant settings > Developer settings**.
    Enable **Service principals can call Fabric public APIs** and
    **Service principals can create workspaces, connections, and deployment pipelines** for that security group.
@@ -64,9 +66,69 @@ the container is replaced; without it, they are lost with the container.
 
 Deploys [`deploy/azuredeploy.json`](deploy/azuredeploy.json): a Container App running the
 same public image, its environment, a Log Analytics workspace for the container's logs,
-and a storage account with a classic Azure Files SMB share mounted at `/app/local`.
-The template's output `url` is the wizard. Staging files and recovery journals use the share;
-session credentials and active workers remain in memory.
+and a storage account with a classic Azure Files SMB share mounted at `/app/local`, plus a
+private Blob container used **only for BCDR coordination**. The central Fabric Warehouse
+remains the sole metadata catalog. Staging files, controller bootstrap and recovery journals
+use the share; session credentials and active workers remain in memory.
+
+**Entra EasyAuth is mandatory in this Azure template**, whether the runtime uses a managed
+identity or a service-principal secret. It replaces the old optional client-IP restriction.
+Browser operator sign-in and authorization are separate from the identity calling Fabric:
+signing in does not grant the runtime access to Fabric. Only explicitly listed user object
+IDs can use the console. Do not add all tenant users or treat recovery workspace ACL groups
+as the operator allowlist.
+
+#### Register operator sign-in before deploying
+
+Follow [Container Apps authentication with an existing Entra registration](https://learn.microsoft.com/en-us/azure/container-apps/authentication-entra#option-2-use-an-existing-registration-created-separately).
+This template does **not** create an app registration or update Microsoft Graph.
+
+1. Create a separate **single-tenant** Entra app registration for the web console (accounts
+   in this organizational directory only). Record its tenant and application/client GUIDs.
+   Set its Application ID URI to `api://<client-id>` and add the `user_impersonation` scope
+   described in Learn. Enable **ID tokens (used for implicit and hybrid flows)** under
+   Authentication. Create a client secret and retain its **value**, not its secret ID.
+   The template requires this secret for the documented hybrid flow; it never falls back
+   to secretless implicit flow. This registration is not the Fabric runtime principal.
+2. Deploy with `easyAuthTenantId`, `easyAuthClientId`, `easyAuthClientSecret` and a nonempty
+   `allowedOperatorObjectIds` array of **individual user object-ID GUIDs in that tenant**.
+   No group IDs, client IDs, emails or wildcards. Enter the secret through the secure portal
+   field or a secret-backed deployment parameter, never a checked-in parameter file or
+   command-line literal. ARM stores it as the Container App's `fab-shuffle-easyauth` secret;
+   it is not passed to Python or returned as an output.
+3. Wait for the **entire** deployment to succeed, then run its `verifyAuthenticationCommand`
+   output. Inspect the actual auth configuration: platform and Entra provider enabled,
+   `RedirectToLoginPage`, your tenant-specific `/v2.0` issuer and application audiences,
+   the exact nonempty allowed operator **identities**, `fab-shuffle-easyauth` secret reference,
+   and only `/api/health` excluded. Do not continue after a failed or incomplete auth deployment.
+4. Run `enablePublicIngressCommand` **while `FAB_SHUFFLE_EASYAUTH_READY=false`**. The template
+   starts with internal ingress and the application closed even to internal callers with
+   forged principal headers. This supported ingress-only update does not replace the app's
+   environment, identity or volume configuration. Then run `readPublicFqdnCommand` to read
+   the actual external hostname; internal hostnames have an extra `.internal.` segment.
+5. Set the registration's **Web redirect URI** to
+   `https://<actual-external-fqdn>/.auth/login/aad/callback`. It must match the
+   `easyAuthCallbackUrl` output, which uses Azure's reported default environment domain,
+   not the temporary internal hostname. The generated domain is not known before deployment,
+   so registration deliberately has a postdeployment step. Do not guess a hostname or use a
+   wildcard callback. The template never writes Microsoft Graph.
+6. **Last**, run `activateApplicationCommand` (sets only
+   `FAB_SHUFFLE_EASYAUTH_READY=true`) and wait for its new revision to be ready. Open the `url`
+   output and verify an allowed operator can enter, a non-allowlisted user cannot, and an
+   unauthenticated request is redirected. Until activation, application routes return `503`
+   even with a valid or forged principal; health remains available. Rotate the registration
+   secret and Container App secret together before expiry; never disable authentication to
+   work around an expired secret or wrong callback.
+
+After activation, the application requires the platform principal headers and matches
+tenant/object ID against the same allowlist on every protected request. Only the exact
+`/api/health` probe path is excluded; `/api` is not public. The token store is disabled:
+operator authorization uses the platform identity claims, not access-token headers or
+persisted sign-in tokens. Use a released image containing these guards, not an older image
+that ignores their environment variables. Pin a published production image digest.
+Every ARM redeployment intentionally resets internal ingress and readiness to false:
+finish active work first, then repeat verification and activation. There is no public or
+ready-by-default parameter that can bypass the initial auth deployment.
 
 **App Name** and **Location** are optional overrides. Leave them blank to generate the
 app name and use the selected resource group's region; ARM resolves these defaults during
@@ -76,10 +138,6 @@ If you override Location, enter an Azure region code such as `canadacentral`.
 
 Worth knowing before you use it:
 
-- **Set `allowedClientIpAddress` to your own public IP.** Fab Shuffle has no sign-in of its
-  own, so leaving it empty publishes the wizard to the internet. Nobody can do anything
-  without supplying their own service principal, but an open migration console is not
-  something to leave lying around.
 - **It runs as exactly one replica, deliberately.** Sessions and run progress are held in the
   process, so a second replica would not know about your sign-in or your migration. Do not
   raise `maxReplicas`.
@@ -88,6 +146,62 @@ Worth knowing before you use it:
   group deletes those too.
 - The region you deploy into has nothing to do with the region you are migrating *to*. That
   comes from the capacity you pick in the wizard.
+
+#### Optional Managed Identity
+
+Set `managedIdentityResourceId` to the full ARM ID of an **existing user-assigned managed
+identity (UAMI)**, or leave it empty to retain runtime service-principal sign-in. No identity
+is silently created and no system-assigned identity is used. A shared UAMI survives an app
+recreation and can be attached to both the web controller and scheduled job. Do not recreate
+the UAMI or change its tenant/client/object ID after initializing a recovery bootstrap;
+the stored recovery identity is not rewritten to adopt a different principal.
+
+The template resolves the UAMI's actual **client ID, principal/object ID and tenant ID**
+through ARM and returns them as outputs. The resource ID is not any of those GUIDs.
+Only when a UAMI is attached does the container receive
+`FAB_SHUFFLE_MANAGED_IDENTITY_CLIENT_ID` and `FAB_SHUFFLE_MANAGED_IDENTITY_TENANT_ID`.
+Token acquisition uses the Container Apps identity endpoint; it does not fall back to
+developer credentials or a secretly configured service principal. Managed Identity is for
+the same-tenant runtime, not a substitute for separate principals in a cross-tenant move.
+Every allowed operator who uses it can exercise its granted runtime permissions: keep both
+the operator list and those permissions narrow.
+
+Grant the identity the [Fabric prerequisites above](#setup-prerequisites): applicable tenant
+settings/security-group membership, workspace access, destination capacity permissions,
+and required connection access. SQL/Warehouse and OneLake authorization are separate checks;
+attaching an identity does not create database users or grant data access. For BCDR capacity
+pause/resume, separately assign an Azure custom role with the
+[documented capacity actions](https://learn.microsoft.com/en-us/fabric/enterprise/pause-resume#prerequisites)
+(`Microsoft.Fabric/capacities/read`, `write`, `suspend/action`, `resume/action`), scoped only
+to the **explicit dedicated recovery capacity ARM resources**. The template does not assign
+subscription Contributor or any Fabric/capacity role.
+
+The one automatic data role is **Storage Blob Data Contributor**, assigned to the UAMI on
+the dedicated `fab-shuffle-locks` **container only**, for the BCDR remote lease. Deployment
+therefore needs permission to assign the existing UAMI and
+`Microsoft.Authorization/roleAssignments/write` at that container scope, in addition to
+creating the app/storage and listing the Azure Files account key. Without a UAMI, an
+administrator must grant the runtime SP that same container-scoped data role before using
+BCDR; use the `bcdrLeaseContainerResourceId` output, not a subscription-wide grant.
+Allow for [RBAC propagation](https://learn.microsoft.com/en-us/azure/storage/blobs/assign-azure-role-data-access);
+inspect the service error and retry after the grant takes effect, not by bypassing the lease.
+
+#### Scheduled metadata sync job
+
+[![Deploy scheduled sync job to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fcbattlegear%2Ffab-shuffle%2Fmain%2Fdeploy%2Fazuredeploy-sync-job.json)
+
+This **separate** [`deploy/azuredeploy-sync-job.json`](deploy/azuredeploy-sync-job.json)
+deployment adds a scheduled Container Apps Job, not another web console or Fabric notebook.
+First initialize BCDR with the UAMI and persist its approved sync request. Reuse the web
+deployment's **same environment/resource group/location, Azure Files storage, UAMI, bootstrap,
+lease URL and production image digest**. No second Warehouse or storage account is created.
+The job has no ingress, browser EasyAuth or runtime client secret; it runs only the guarded
+`scheduled-sync` command. The default schedule is **02:00 UTC daily** with a four-hour timeout,
+one replica per execution and no automatic retries. Follow the
+[job preparation and interruption runbook](docs/bcdr.md#azure-scheduled-metadata-sync-job)
+before deploying; successful deployment is not proof of a successful Fabric sync.
+
+#### Storage and lifecycle
 
 The `shareQuotaGiB` parameter defaults to **100 GiB** and accepts **1 through 102400 GiB**
 (100 TiB). This is persistent Azure Files storage, **not Azure Blob storage and not unlimited
@@ -131,20 +245,23 @@ configuration, using an account key obtained by ARM `listKeys`. The key is not a
 environment variable or a template output. The deployment identity needs permission to
 create the storage resources and list the account keys. Restrict management access to the
 account and environment, and update the environment storage configuration when rotating the
-key. This simple template uses an authenticated public storage endpoint; the wizard's IP
-restriction does not firewall storage. A private deployment needs compatible VNet, DNS,
+key. This simple template uses authenticated public storage endpoints; the wizard's
+EasyAuth does not firewall storage. A private deployment needs compatible VNet, DNS,
 storage firewall and SMB connectivity (TCP 445), not just a deny rule on the account.
 See [Container Apps storage mounts](https://learn.microsoft.com/en-us/azure/container-apps/storage-mounts).
 
 Replacing a revision does not erase the share, but **wait for active migrations to finish
 before deploying an update**: an in-memory worker can still be interrupted. After a restart,
-sign in again to resume from the retained journals. Do not point a second Fab Shuffle
-instance at the same share. Existing deployments without a mount need their old journals
+sign in again to resume from the retained journals. Do not point a second independent
+controller at the same share. The scheduled job is an explicitly coordinated worker of
+the original controller, using the same remote lease, not a second controller.
+Existing deployments without a mount need their old journals
 copied to the share before switching; adding the mount does not copy the old ephemeral data.
 
 ### The wizard
 
-1. **Sign in** with the service principal's tenant ID, client ID, and secret.
+1. **Sign in** with the service principal's tenant ID, client ID, and secret, or use the
+   configured Azure Managed Identity. In Azure, first pass the separate Entra operator sign-in.
 2. **Pick the target capacity** — its region is the destination region.
 3. **Pick the source workspace.**
 4. **Review** the plan. Fab Shuffle tells you whether the workspace can simply be reassigned

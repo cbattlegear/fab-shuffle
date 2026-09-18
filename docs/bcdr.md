@@ -273,7 +273,17 @@ Alternatively inject `FAB_SHUFFLE_BCDR_CLIENT_SECRET_FILE` pointing to an extern
 secret file instead of `FAB_SHUFFLE_BCDR_CLIENT_SECRET`. Supplying both is rejected.
 There are no secret command-line options and no stored password configuration.
 
-Commands are `setup`, `status`, `reconcile-operation`, `plan`, `synchronize`,
+In Azure Container Apps, the scheduled job instead sets
+`FAB_SHUFFLE_BCDR_AUTH_MODE=managed_identity` and the selected UAMI's
+`FAB_SHUFFLE_MANAGED_IDENTITY_CLIENT_ID` / `FAB_SHUFFLE_MANAGED_IDENTITY_TENANT_ID`.
+Omit **all** `FAB_SHUFFLE_BCDR_TENANT_ID`, `FAB_SHUFFLE_BCDR_CLIENT_ID`,
+`FAB_SHUFFLE_BCDR_CLIENT_SECRET` and `FAB_SHUFFLE_BCDR_CLIENT_SECRET_FILE` variables in
+that mode. The Container Apps identity endpoint must be available; there is no developer
+credential, implicit identity selection or service-principal fallback. The default
+noninteractive mode remains `service_principal`. An existing bootstrap cannot be edited
+to adopt a different tenant/application/recovery principal.
+
+Commands are `setup`, `status`, `reconcile-operation`, `plan`, `synchronize`, `scheduled-sync`,
 `configure-protection`, `configure-replica`, `enable-recovery`,
 `cutover`, `plan-failback`, `execute-failback`, `cutback`, and `rearm`. Supply typed JSON through standard input or
 `--request /controller/request.json`. Generate the actual request schema without
@@ -289,19 +299,26 @@ The noninteractive `setup` command uses the same typed setup request and
 primary intent-based setup interface, so an operator does not need to construct Python
 records manually.
 
-For a scheduled synchronization, persist only the non-secret request configuration in
-`/controller/sync.json`, including explicit source-to-target capacity routes and workspace
-selection. Then use the same environment/mount configuration as above with:
+For an unattended schedule, use **`scheduled-sync`**, not the general operator
+`synchronize` command. Persist an explicitly approved, non-secret `SyncRequest` with exact
+source-to-target capacity routes, workspace selection and approved dependency additions.
+`capture` and `park` must both be `true`. The scheduled command requires a request **file**
+of at most **128 KiB**; unknown fields, duplicate JSON keys and nonfinite values are rejected.
+It cannot be configured to enable recovery, activate items, reconcile an abandoned owner,
+cut over, fail back or rearm. In addition to the shared bootstrap/storage and credentials,
+configure the **same remote lease URL on every controller process and the job**:
+`FAB_SHUFFLE_BCDR_LEASE_BLOB_URL`. Then run inside the container:
 
 ```bash
-python -m fabshuffle.bcdr synchronize --bootstrap /controller/bootstrap.json \
-  --request /controller/sync.json --confirm synchronize
+python -m fabshuffle.bcdr scheduled-sync --bootstrap /app/local/bcdr/bootstrap.json \
+  --request /app/local/bcdr/scheduled-sync-request.json --confirm scheduled-sync
 ```
 
-That last command is the command **inside the container**, not a host Python invocation.
 Every consequential command requires `--confirm` followed by that exact action name.
-`--confirm synchronize` cannot confirm `enable-recovery`. Backend mode checks still refuse
-normal synchronization during enabled recovery; a scheduler cannot override them.
+`--confirm scheduled-sync` cannot confirm `enable-recovery`. Persisting the request is the
+operator's approval for the exact scheduled scope, not permission to perform other actions.
+Use `python -m fabshuffle.bcdr scheduled-sync --schema` **inside the production image** to
+obtain the current request schema without credentials.
 
 Use `reconcile-operation --confirm reconcile-operation` with the recorded operation/controller
 IDs and fencing evidence. Use `configure-replica --confirm configure-replica` for independently
@@ -316,6 +333,94 @@ Recovery/status commands do not supply a source metadata provider. Synchronizati
 source credentials only when capture is requested. **Plan failback** separately supplies
 source credentials for the explicit primary-availability check after the operator confirms
 that the primary is available; this is not an outage-recovery fallback read.
+
+### Azure scheduled metadata sync job
+
+Deploy the [web controller first](../README.md#in-azure), in an Azure region/environment
+independent of the source region and of the Fabric capacity it must resume. The controller
+and its durable storage/identity/lease endpoint must remain reachable during the planned
+incident. The simple web template uses `Standard_LRS`; that alone does not protect the
+controller from loss of its own region. A Fabric notebook scheduled on the paused/source
+capacity is not the controller scheduler.
+
+Before using the [separate job deployment](../deploy/azuredeploy-sync-job.json):
+
+1. Attach the existing UAMI to the web controller and grant its Fabric tenant, source/control
+   workspace, destination capacity, connection, SQL and OneLake access as required. Grant
+   [pause/resume permissions](https://learn.microsoft.com/en-us/fabric/enterprise/pause-resume#prerequisites)
+   only on the explicit dedicated recovery capacity ARM resources. Set up the single control
+   Warehouse **using this UAMI**, then complete an operator-reviewed standby sync. Compare
+   the web deployment's client/tenant/principal outputs with the bootstrap's recorded
+   recovery identity; a different identity must not silently take over.
+2. Keep the existing descriptor at `/app/local/bcdr/bootstrap.json` on the web template's
+   `fab-shuffle-storage` Azure Files mount. Save the reviewed request as
+   `/app/local/bcdr/scheduled-sync-request.json` on **that same share** with restricted write
+   access. Do not replace the bootstrap, copy results over it or include credentials in the
+   request. Stop active operations before changing a request. The template has no arbitrary
+   mount, file-path or shell-command parameter and never writes either file.
+3. Verify that both web and job use the **exact** `bcdrLeaseBlobUrl` from the web deployment.
+   The private `fab-shuffle-locks` container holds one empty `deployment.lock` coordination
+   blob, not metadata or data exports. The runtime conditionally creates it. OAuth authorizes
+   lease operations; no storage key or SAS is passed to the application. The template grants
+   the UAMI **Storage Blob Data Contributor at that container only**. Do not broaden this to
+   subscription Contributor. An SP-mode controller needs the same container data grant
+   explicitly; browser EasyAuth does not grant it.
+4. Deploy the job in the web controller's **existing resource group and environment
+   location**, supplying its `containerAppsEnvironmentName`, the same `managedIdentityResourceId`,
+   and `bcdrLeaseBlobUrl` outputs. Use the same published production image **digest** on both.
+   This is an existing environment/storage deployment: it does not create a second catalog,
+   environment, file share or controller bootstrap. The Azure Files environment mount still
+   uses its deployment-held account key; the runtime identity is for service access and the
+   Blob lease, not an automatic conversion of SMB authentication to OAuth.
+5. Choose `scheduleUtc` (five cron fields, **UTC**, not local time), allowing more than the
+   worst-case sync duration between executions. The default is `0 2 * * *` (daily 02:00 UTC).
+   `replicaTimeoutSeconds` defaults to four hours and is bounded by the template to one day;
+   set it from measured work, not a promised duration. The schedule becomes active on
+   deployment, so prepare files, grants and storage before deploying it.
+
+The job runs the exact `scheduled-sync` argument list above without a shell, has no ingress
+or EasyAuth configuration, and injects no client secret. It uses the same single controller's
+ownership record and catalog, not a new independent controller.
+
+**Overlap protection is not `parallelism=1`.**
+[Container Apps jobs](https://learn.microsoft.com/en-us/azure/container-apps/jobs#advanced-job-configuration)
+define parallelism and completion count **per execution**; separate cron or manually started
+executions can overlap. Both are fixed to one and replica retries to zero. The shared
+Azure Blob lease is acquired **before bootstrap/capacity effects**, with a finite 60-second
+lease and a 20-second renewal heartbeat. Catalog controller/epoch checks are an additional
+fence, not a substitute for that pre-capacity guard.
+[Azure Files on Linux](https://learn.microsoft.com/en-us/azure/storage/files/storage-how-to-use-files-linux#mount-options)
+does not provide the advisory-lock guarantee required between containers. Do not rely on
+`flock` over SMB, add `nobrl` as a lock fix, disable the remote guard, or give the job a
+different lock URL to get around a busy controller. This implementation supports public
+Azure `https://<account>.blob.core.windows.net/...` endpoints only, without query strings,
+SAS credentials or custom domains. Blocked lease access must be fixed, not bypassed.
+
+**Read the result, not just the schedule.** A non-standby recovery mode, any persisted
+controller owner or pending operation produces a visible blocked result with
+`details.scheduled_status="skipped"` and exit code `2`. It does not capture source metadata,
+resume business capacities or pause active recovery capacity. Reading authoritative mode
+can require resuming the **control Warehouse** capacity; that is not source access and is
+not a promise of zero capacity effects during an active incident. Eligible runs return
+`scheduled_status="completed"` with the normal result/partial exit code. Invalid requests
+exit `2`; authentication, bootstrap, lease and service failures exit nonzero with an
+actionable error. Missing persisted configuration is not a successful no-op.
+
+**Timeouts and lease loss require reconciliation.** A killed job or failed heartbeat can
+leave a service request in flight, a retained controller owner/pending receipt, or capacity
+still running and billing. Lease loss blocks new effects, but cannot undo an already sent
+request. The next run must not steal the catalog lease, guess whether a timed-out operation
+succeeded or automatically retry uncertain creates. Inspect Container Apps execution logs
+and the Warehouse's recorded operation; have an operator reconcile the exact receipt through
+the normal guarded controller before retrying. Disable the schedule while investigating.
+Do not delete or replace the lock, bootstrap or catalog to make the next run appear clean.
+Pausing a Fabric capacity also settles outstanding smoothed usage/overages; see
+[capacity billing effects](https://learn.microsoft.com/en-us/fabric/enterprise/pause-resume).
+
+Exercise sign-in, identity grants, cross-container lease exclusion/renewal, actual cron
+execution and interrupted-run reconciliation in a disposable environment before production.
+Offline template/runtime tests do not establish live Azure/Fabric or regional-outage
+qualification.
 
 ## API surface
 
