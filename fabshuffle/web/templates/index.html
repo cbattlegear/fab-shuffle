@@ -18,6 +18,7 @@
     <div class="masthead-actions">
       <button id="bcdr-open" class="secondary" type="button" hidden>Standby &amp; recovery</button>
       <button id="sign-out" class="link-button" hidden>Sign out</button>
+      <a id="azure-sign-out" class="link-button" href="/.auth/logout" hidden>Sign out of Azure</a>
     </div>
   </header>
 
@@ -52,23 +53,34 @@
 
     <!-- 1. Sign in -->
     <section class="panel" data-stage="login">
-      <h2>Sign in with a service principal</h2>
+      <h2>Connect to Fabric</h2>
       <p class="hint">
-        Credentials stay in this container's memory and are never written to disk.
-        Use a source principal with workspace access and a destination principal with access to the target capacity.
+        Choose the identity Fab Shuffle uses for workspace access. Service-principal credentials stay in
+        this container's memory. In Azure, an authorized operator can use the deployment's managed identity.
       </p>
+      <p id="operator-context" class="hint identity-context" hidden></p>
+      <p id="auth-options-status" class="hint" role="status" aria-live="polite"></p>
       <form id="login-form" class="form">
+        <label>Fabric authentication
+          <select id="fabric-auth-mode">
+            <option value="service_principal">Service principal with a client secret</option>
+            <option id="managed-identity-option" value="managed_identity" disabled hidden>
+              Azure managed identity
+            </option>
+          </select>
+        </label>
+        <p id="managed-identity-context" class="hint identity-context" hidden></p>
         <label>Workflow
           <select id="login-workflow">
             <option value="migration">Move a workspace</option>
             <option value="bcdr">Operate standby &amp; recovery (same tenant)</option>
           </select>
         </label>
-        <fieldset class="options login-mode">
+        <fieldset id="tenant-mode" class="options login-mode">
           <legend>Destination</legend>
           <label><input type="checkbox" id="another-tenant" /> Another tenant</label>
         </fieldset>
-        <fieldset class="credentials">
+        <fieldset id="source-credentials" class="credentials">
         <legend id="source-credentials-label">Service principal</legend>
         <label>Tenant ID
           <input name="tenant_id" autocomplete="off" spellcheck="false" required
@@ -391,5 +403,6 @@
 
   <script src="/static/app.js"></script>
   <script src="/static/bcdr.js"></script>
+  <script src="/static/auth.js"></script>
 </body>
 </html>
