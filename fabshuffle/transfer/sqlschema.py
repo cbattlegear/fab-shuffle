@@ -957,7 +957,7 @@ def _safe_tool_output(value: str, command: list[str]) -> str:
     for argument in command:
         if argument.casefold().startswith(("/accesstoken:", "/at:")):
             value = value.replace(argument.partition(":")[2], "[redacted]")
-    return safe_text(value)
+    return safe_text(value[-2000:])
 
 
 def _tool_output(path: Path, command: list[str]) -> str:
