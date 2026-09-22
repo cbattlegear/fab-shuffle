@@ -311,6 +311,38 @@ def test_warehouse_operation_location_cannot_exfiltrate_fabric_token(store, loca
     assert store.load().warehouse_intent.operation_id == OP
 
 
+def test_warehouse_operation_accepts_relative_location(store):
+    """Fabric's LRO Location header is a URI-reference (RFC 9110) and may be
+    returned relative to the request URI rather than as an absolute URL. A
+    same-origin relative Location must resolve and validate, not be rejected
+    outright as an unsafe absolute URL.
+    """
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        if request.method == "GET":
+            if request.url.path == f"/v1/workspaces/{WORKSPACE}":
+                return workspace_response()
+            if request.url.path == f"/v1/operations/{OP}":
+                return httpx.Response(200, json={"status": "Succeeded"}, headers={
+                    "Location": f"/v1/operations/{OP}/result",
+                })
+            if request.url.path.endswith("/result"):
+                return httpx.Response(200, json=warehouse_body(endpoint=False))
+            assert store.load().control_warehouse_id == WAREHOUSE
+            return httpx.Response(200, json=warehouse_body())
+        return httpx.Response(202, headers={
+            "x-ms-operation-id": OP, "Location": f"/v1/operations/{OP}",
+        })
+
+    with ControlWarehouseProvisioner(
+        store, Tokens(), transport=httpx.MockTransport(handler), sleep=lambda _: None,
+    ) as provisioner:
+        assert provisioner.ensure(display_name="Control", owner_id=OWNER).tds_host == HOST
+    assert set(hosts) == {"api.fabric.microsoft.com"}
+
+
 def test_warehouse_http_redirect_is_not_followed(store):
     hosts = []
 

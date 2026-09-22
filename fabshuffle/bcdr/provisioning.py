@@ -10,7 +10,7 @@ import json
 import time
 from collections.abc import Callable
 from typing import Self
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urljoin
 from uuid import UUID, uuid4
 
 import httpx
@@ -28,6 +28,19 @@ from fabshuffle.bcdr.bootstrap import (
 from fabshuffle.bcdr.capacity import CapacityError, _https_url, response_body, retry_after
 
 FABRIC_BASE = "https://api.fabric.microsoft.com/v1"
+
+
+def _fabric_https_url(value: str, host: str):
+    """Validate a Fabric-issued Location/continuation reference.
+
+    Fabric's LRO infrastructure documents the Location header as an absolute URL
+    (https://learn.microsoft.com/rest/api/fabric/articles/long-running-operation),
+    but the Location header is defined by RFC 9110 as a URI-reference and may
+    legitimately be returned relative to the request URI. Resolve it against the
+    known Fabric origin before applying the strict scheme/host/shape checks, so a
+    same-origin relative reference is not rejected as an unsafe absolute URL.
+    """
+    return _https_url(urljoin(f"https://{host}", value), host)
 
 
 class WarehouseCreationUnknown(BootstrapError):
@@ -116,7 +129,7 @@ class ControlWarehouseProvisioner(_ControlProvisioner):
     def _validate_location(response: httpx.Response, operation_id: str) -> None:
         location = response.headers.get("Location")
         if location:
-            parsed = _https_url(location, "api.fabric.microsoft.com")
+            parsed = _fabric_https_url(location, "api.fabric.microsoft.com")
             operation_path = f"/v1/operations/{operation_id}"
             if parsed.path not in {operation_path, operation_path + "/result"} or parsed.query:
                 raise BootstrapError("Fabric returned a Location outside the recorded Warehouse operation")
@@ -198,7 +211,7 @@ class ControlWarehouseProvisioner(_ControlProvisioner):
                 operation_id = response.headers.get("x-ms-operation-id")
                 if not operation_id:
                     location = response.headers.get("Location", "")
-                    parsed = _https_url(location, "api.fabric.microsoft.com")
+                    parsed = _fabric_https_url(location, "api.fabric.microsoft.com")
                     operation_id = parsed.path.rsplit("/", 1)[-1]
                 operation_id = str(UUID(operation_id))
                 intent = intent.model_copy(update={
@@ -439,7 +452,7 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
     def _resource_location(response: httpx.Response, expected_path: str) -> None:
         location = response.headers.get("Location")
         if location:
-            parsed = _https_url(location, "api.fabric.microsoft.com")
+            parsed = _fabric_https_url(location, "api.fabric.microsoft.com")
             if parsed.path != expected_path or parsed.query:
                 raise BootstrapError("Fabric Location does not identify the recorded control resource")
 
@@ -470,7 +483,7 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
                 raise BootstrapError("Control workspace role inventory exceeds the supported service limit")
             uri = body.get("continuationUri")
             if uri:
-                parsed = _https_url(uri, "api.fabric.microsoft.com")
+                parsed = _fabric_https_url(uri, "api.fabric.microsoft.com")
                 if (
                     parsed.path != f"/v1/workspaces/{workspace_id}/roleAssignments"
                     or set(parse_qs(parsed.query)) != {"continuationToken"}
