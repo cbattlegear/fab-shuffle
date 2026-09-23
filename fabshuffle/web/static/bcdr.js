@@ -12,6 +12,8 @@ const bcdr = {
   discoverySequence: 0,
   discovering: false,
   bindings: [],
+  capacityBindings: [],
+  recoveryRows: new Map(),
 };
 
 function bcdrElement(tag, text, className) {
@@ -32,15 +34,15 @@ function bcdrLabel(name) {
     control_workspace_name: "New control workspace name",
     warehouse_name: "New metadata Warehouse name",
     source_capacity_ids: "Source capacities",
-    source_capacity_id: "Source capacity ID",
-    target_capacity_ids: "Dedicated recovery capacity IDs",
-    target_capacity_id: "Dedicated recovery capacity ID",
+    source_capacity_id: "Source capacity",
+    target_capacity_ids: "Dedicated recovery capacities",
+    target_capacity_id: "Dedicated recovery capacity",
     connection_mappings: "Approved connection routes",
     return_connection_mappings: "Approved return connection routes",
     connection_id: "Connection ID",
     recovery_capacities: "Dedicated recovery capacities",
-    fabric_capacity_id: "Fabric capacity ID",
-    catalog_capacity_id: "Control Warehouse capacity ARM resource ID",
+    fabric_capacity_id: "Recovery capacity",
+    catalog_capacity_id: "Control Warehouse capacity",
     dedicated_recovery: "This capacity is dedicated to recovery",
     authorized_for_suspend: "I authorize suspension of this dedicated capacity",
     access_policy: "Restricted standby access",
@@ -102,11 +104,27 @@ function bcdrResolve(schema, root) {
 }
 
 function bcdrResourceChoices(name) {
-  if (name === "source_capacity_ids") {
+  if (["capacity_id", "target_capacity_ids"].includes(name)) {
+    return [...(bcdr.discovered.source?.capacities || []), ...(bcdr.discovered.recovery?.capacities || [])]
+      .map((entry) => ({ id: entry.id, label: [entry.displayName, entry.region].filter(Boolean).join(" - ") }));
+  }
+  if (["source_capacity_ids", "source_capacity_id"].includes(name)) {
     return (bcdr.discovered.source?.capacities || []).map((entry) => ({
       id: entry.id,
       label: [entry.displayName || "Unnamed capacity", entry.region, entry.sku].filter(Boolean).join(" - "),
     }));
+  }
+  if (["fabric_capacity_id", "target_capacity_id", "catalog_capacity_id", "arm_resource_id"].includes(name)) {
+    const selected = new Set(Array.from(bcdr.recoveryRows.values(), (read) => read()).filter(Boolean));
+    return (bcdr.discovered.recovery?.capacityChoices || [])
+      .filter((entry) => name !== "catalog_capacity_id" || selected.has(entry.id))
+      .map((entry) => ({
+        id: ["catalog_capacity_id", "arm_resource_id"].includes(name) ? entry.arm_resource_id : entry.id,
+        label: [entry.displayName || "Unnamed capacity", entry.region, entry.sku,
+          entry.subscriptionName, entry.resourceGroup].filter(Boolean).join(" - "),
+        unavailable: entry.matchStatus !== "matched",
+        message: entry.matchMessage,
+      }));
   }
   const captured = bcdr.latest.details?.inventory?.workspaces || [];
   if (name !== "control_workspace_id" && captured.length) {
@@ -125,6 +143,134 @@ function bcdrResourceChoices(name) {
         entry.capacityRegion || capacity?.region, entry.description].filter(Boolean).join(" - "),
     };
   });
+}
+
+function bcdrCapacitySelect(name, id, required) {
+  const label = bcdrElement("label", bcdrLabel(name));
+  const select = bcdrElement("select");
+  select.id = id;
+  select.name = name;
+  select.required = required;
+  label.htmlFor = id;
+  label.appendChild(select);
+  const hint = bcdrElement("span", "", "hint");
+  hint.id = `${id}-help`;
+  select.setAttribute("aria-describedby", hint.id);
+  label.appendChild(hint);
+  let available = new Set();
+  let selectedLabel = "";
+  const refresh = () => {
+    const selected = select.value;
+    const entries = bcdrResourceChoices(name);
+    available = new Set();
+    select.replaceChildren();
+    const empty = bcdrElement("option", "Choose a capacity");
+    empty.value = "";
+    select.appendChild(empty);
+    for (const entry of entries) {
+      const ambiguous = entries.filter((other) => other.label === entry.label).length > 1;
+      const option = bcdrElement("option", entry.label +
+        (entry.unavailable ? ` - ${entry.message}` : ambiguous ? " (ambiguous name)" : ""));
+      option.value = entry.id || "";
+      option.disabled = entry.unavailable || ambiguous || !entry.id;
+      if (!option.disabled) available.add(entry.id);
+      select.appendChild(option);
+    }
+    if (selected && !available.has(selected)) {
+      const missing = bcdrElement("option", `${selectedLabel || "Previous capacity"} (unavailable)`);
+      missing.value = selected;
+      missing.disabled = true;
+      select.appendChild(missing);
+    }
+    select.value = selected;
+    const error = name === "source_capacity_id" ? bcdr.discovered.source?.errors?.capacities :
+      bcdr.discovered.recovery?.errors?.capacityMapping || bcdr.discovered.recovery?.errors?.capacities;
+    hint.textContent = error ? `Discovery incomplete: ${error}. Resolve access and retry discovery.` :
+      selected && !available.has(selected) ? "This selection is no longer available. Choose again; it has not been replaced." :
+      name === "catalog_capacity_id" ? "Choose one of the dedicated recovery capacities selected above." :
+      name === "source_capacity_id" ? "Discover setup choices to load source capacity names." :
+      "Azure resources are matched by name and region, not by a shared ID. Review the subscription and resource group.";
+  };
+  select.addEventListener("change", () => {
+    selectedLabel = bcdrResourceChoices(name).find((entry) => entry.id === select.value)?.label || "";
+    bcdr.capacityBindings.forEach((update) => update());
+  });
+  bcdr.bindings.push(refresh);
+  bcdr.capacityBindings.push(refresh);
+  refresh();
+  return {
+    element: label, select,
+    dispose: () => {
+      bcdr.bindings = bcdr.bindings.filter((entry) => entry !== refresh);
+      bcdr.capacityBindings = bcdr.capacityBindings.filter((entry) => entry !== refresh);
+    },
+    read: () => {
+      if (!select.value && !required) return undefined;
+      const errors = name === "source_capacity_id" ? bcdr.discovered.source?.errors : bcdr.discovered.recovery?.errors;
+      if (errors?.capacities || (name !== "source_capacity_id" && errors?.capacityMapping)) {
+        throw new Error("Refresh capacity discovery successfully before submitting this selection.");
+      }
+      if (!available.has(select.value)) throw new Error(`Choose an available ${bcdrLabel(name).toLowerCase()} by name.`);
+      return select.value;
+    },
+  };
+}
+
+function bcdrRecoveryCapacity(id, schema, root, context) {
+  const group = bcdrElement("fieldset", undefined, "bcdr-wide");
+  group.appendChild(bcdrElement("legend", "Dedicated recovery capacity"));
+  const picker = bcdrCapacitySelect("fabric_capacity_id", id, true);
+  group.appendChild(picker.element);
+  const dedicated = bcdrField("dedicated_recovery", schema.properties.dedicated_recovery, root, true, context);
+  const suspend = bcdrField("authorized_for_suspend", schema.properties.authorized_for_suspend, root, true, context);
+  group.appendChild(dedicated.element);
+  group.appendChild(suspend.element);
+  const notice = bcdrElement("p", "", "hint");
+  notice.setAttribute("role", "status");
+  group.appendChild(notice);
+  let boundArm = null;
+  const choice = () => (bcdr.discovered.recovery?.capacityChoices || [])
+    .find((entry) => entry.id === picker.select.value && entry.matchStatus === "matched");
+  bcdr.recoveryRows.set(id, () => boundArm && boundArm === choice()?.arm_resource_id ? picker.select.value : "");
+  const resetApprovals = () => {
+    dedicated.element.querySelector("input").checked = false;
+    suspend.element.querySelector("input").checked = false;
+  };
+  picker.select.addEventListener("change", () => {
+    boundArm = choice()?.arm_resource_id || null;
+    notice.textContent = "";
+    resetApprovals();
+    bcdr.capacityBindings.forEach((refresh) => refresh());
+  });
+  const refreshMatch = () => {
+    if (boundArm && boundArm !== choice()?.arm_resource_id) {
+      boundArm = null;
+      picker.select.value = "";
+      resetApprovals();
+      notice.textContent = "The Azure match changed or disappeared. Select the capacity again and review both approvals.";
+      bcdr.capacityBindings.forEach((refresh) => refresh());
+    }
+  };
+  bcdr.bindings.push(refreshMatch);
+  return {
+    element: group,
+    dispose: () => {
+      bcdr.recoveryRows.delete(id);
+      picker.dispose();
+      bcdr.bindings = bcdr.bindings.filter((entry) => entry !== refreshMatch);
+      bcdr.capacityBindings.forEach((refresh) => refresh());
+    },
+    read: () => {
+      const fabricId = picker.read();
+      if (!boundArm || boundArm !== choice()?.arm_resource_id) throw new Error("Review the updated recovery capacity match.");
+      if (Array.from(bcdr.recoveryRows.values(), (read) => read()).filter((value) => value === fabricId).length > 1) {
+        throw new Error("Choose each dedicated recovery capacity only once.");
+      }
+      if (!dedicated.read() || !suspend.read()) throw new Error("Confirm dedicated recovery use and suspension authorization.");
+      return { fabric_capacity_id: fabricId, arm_resource_id: boundArm,
+        dedicated_recovery: true, authorized_for_suspend: true };
+    },
+  };
 }
 
 function bcdrNamedWorkspace(name, id, required) {
@@ -190,9 +336,11 @@ function bcdrNamedWorkspace(name, id, required) {
 
 function bcdrReviewRequest(value, key = "") {
   if (["control_workspace_id", "source_capacity_ids", "include_workspace_ids",
-    "exclude_workspace_ids", "approved_addition_ids"].includes(key)) {
+    "exclude_workspace_ids", "approved_addition_ids", "source_capacity_id", "target_capacity_id",
+    "fabric_capacity_id", "catalog_capacity_id", "arm_resource_id", "capacity_id", "target_capacity_ids"].includes(key)) {
     const entries = bcdrResourceChoices(key);
-    const display = (id) => entries.find((entry) => entry.id === id)?.label || "Name unavailable; see server logs";
+    const display = (id) => entries.find((entry) => entry.id === id)?.label ||
+      (key === "arm_resource_id" && typeof id === "string" ? id.split("/").at(-1) : "Name unavailable; see server logs");
     return Array.isArray(value) ? value.map(display) : value == null ? value : display(value);
   }
   if (Array.isArray(value)) return value.map((entry) => bcdrReviewRequest(entry));
@@ -268,6 +416,12 @@ function bcdrField(name, source, root, required = false, context = []) {
   const controllerEpoch = name === "expected_epoch" && !!root.properties?.expected_controller_id;
   const title = controllerEpoch ? "Recorded controller epoch (not writer epoch)" : bcdrLabel(name);
   if (name === "control_workspace_id") return bcdrNamedWorkspace(name, id, required);
+  if (["source_capacity_id", "target_capacity_id", "catalog_capacity_id"].includes(name)) {
+    return bcdrCapacitySelect(name, id, required);
+  }
+  if (schema.type === "object" && schema.properties?.arm_resource_id && schema.properties?.fabric_capacity_id) {
+    return bcdrRecoveryCapacity(id, schema, root, context);
+  }
   if (name === "recovery_spn" || name === "issuer") {
     const group = bcdrElement("div", undefined, "bcdr-wide");
     group.appendChild(bcdrElement("p",
@@ -576,7 +730,12 @@ function bcdrField(name, source, root, required = false, context = []) {
       row.appendChild(field.element);
       const remove = bcdrElement("button", "Remove entry", "secondary");
       remove.type = "button";
-      remove.addEventListener("click", () => { readers.delete(row); row.remove(); add.focus(); });
+      remove.addEventListener("click", () => {
+        readers.delete(row);
+        field.dispose?.();
+        row.remove();
+        add.focus();
+      });
       row.appendChild(remove);
       entries.appendChild(row);
       readers.set(row, field.read);
@@ -759,13 +918,11 @@ function bcdrRenderResult(result) {
     const capacities = bcdrElement("ul", undefined, "bcdr-results");
     for (const capacity of result.details.capacities) {
       const entry = bcdrElement("li");
-      entry.appendChild(bcdrElement("strong", `${capacity.state || "Unreported"} - ${capacity.capacity_id}`));
+      const name = bcdrResourceChoices("capacity_id").find((row) => row.id === capacity.capacity_id)?.label ||
+        capacity.arm_resource_id?.split("/").at(-1) || "Recovery capacity";
+      entry.appendChild(bcdrElement("strong", `${capacity.state || "Unreported"} - ${name}`));
       entry.appendChild(bcdrElement("p",
         `Provisioning: ${capacity.provisioning_state || "Unreported"}. Observed: ${capacity.observed_at}.`));
-      const resource = bcdrElement("details");
-      resource.appendChild(bcdrElement("summary", "Exact ARM resource"));
-      resource.appendChild(bcdrElement("p", capacity.arm_resource_id));
-      entry.appendChild(resource);
       capacities.appendChild(entry);
     }
     output.appendChild(capacities);
@@ -829,7 +986,7 @@ function bcdrRenderResult(result) {
   const details = bcdrElement("details");
   details.open = !result.groups?.length;
   details.appendChild(bcdrElement("summary", "Generation, group outcomes, warnings and evidence"));
-  const data = bcdrElement("pre", JSON.stringify(result, null, 2));
+  const data = bcdrElement("pre", JSON.stringify(bcdrReviewRequest(result), null, 2));
   data.tabIndex = 0;
   details.appendChild(data);
   output.appendChild(details);
@@ -925,6 +1082,8 @@ function bcdrRenderForms(commands) {
   const content = $("#bcdr-content");
   content.replaceChildren();
   bcdr.bindings = [];
+  bcdr.capacityBindings = [];
+  bcdr.recoveryRows = new Map();
   const preparation = bcdrElement("details");
   preparation.appendChild(bcdrElement("summary", "Healthy-source preparation: discover named setup choices"));
   preparation.appendChild(bcdrElement("p",
@@ -963,6 +1122,14 @@ function bcdrRenderForms(commands) {
           if (error) failures.push(`${bcdrLabel(side)} ${kind}: ${error}`);
           else summaries.push(`${bcdrLabel(side)}: ${(found[kind] || []).length} ${kind}`);
         }
+      }
+      const mappingError = inventory.recovery.errors?.capacityMapping;
+      if (mappingError) failures.push(`Recovery capacity matching: ${mappingError}`);
+      const matches = inventory.recovery.capacityChoices || [];
+      if (!mappingError && matches.length) {
+        summaries.push(`${matches.filter((entry) => entry.matchStatus === "matched").length} recovery capacities matched by name/region`);
+        const unavailable = matches.filter((entry) => entry.matchStatus !== "matched");
+        if (unavailable.length) failures.push(`${unavailable.length} recovery capacities have no unique Azure name/region match. Review the capacity choices below.`);
       }
       bcdr.bindings.forEach((refresh) => refresh("discovery"));
       const empty = !["source", "recovery"].some((side) =>
@@ -1066,6 +1233,8 @@ $("#sign-out").addEventListener("click", () => {
   bcdr.discovering = false;
   ++bcdr.discoverySequence;
   bcdr.bindings = [];
+  bcdr.capacityBindings = [];
+  bcdr.recoveryRows = new Map();
   $("#bcdr-content").replaceChildren();
   $("#bcdr-progress").textContent = "";
   bcdrError("");

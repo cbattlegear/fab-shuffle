@@ -281,6 +281,10 @@ def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch, 
         return service.result
 
     monkeypatch.setattr(bcdr, "setup_recovery", setup)
+    monkeypatch.setattr(bcdr, "_capacity_choices", lambda *args: [
+        {"id": TARGET_CAPACITY, "matchStatus": "matched", "arm_resource_id": ARM.lower()},
+    ])
+    monkeypatch.setattr(bcdr.workspaces, "get_workspace", lambda *_: {"capacityId": TARGET_CAPACITY})
     caplog.set_level("INFO", logger="fabshuffle.web.bcdr")
     response = client.post("/api/bcdr/setup", headers=headers, json={
         "confirmation": "setup", "request": SETUP,
@@ -296,7 +300,7 @@ def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch, 
     assert "never-persist-this" not in caplog.text
 
 
-@pytest.mark.parametrize("failed", [None, "capacities", "workspaces"])
+@pytest.mark.parametrize("failed", [None, "capacities", "workspaces", "mapping"])
 def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(
     product, monkeypatch, caplog, failed,
 ):
@@ -333,13 +337,23 @@ def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(
         }]
 
     monkeypatch.setattr(bcdr, "FabricClient", Client)
+    def matches(*args):
+        if failed == "mapping":
+            raise bcdr.BootstrapError("Grant Azure capacity read access")
+        return []
+
+    monkeypatch.setattr(bcdr, "_capacity_choices", matches)
     monkeypatch.setattr(bcdr.workspaces, "list_capacities", capacities)
     monkeypatch.setattr(bcdr.workspaces, "list_workspaces", workspaces)
     response = client.get("/api/bcdr/discovery", headers=headers)
     assert response.status_code == 200
     assert len(calls) == 2
     result = response.json()
-    if failed:
+    if failed == "mapping":
+        assert "Grant Azure" in result["recovery"]["errors"]["capacityMapping"]
+        assert result["source"]["errors"] == {}
+        assert "capacityChoices" not in result["recovery"]
+    elif failed:
         assert "AccessDenied" in result["source"]["errors"][failed]
         assert failed not in result["source"]
     else:
@@ -353,6 +367,68 @@ def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(
     assert "not-returned" not in response.text
     assert "not-returned" not in caplog.text and "never-persist-this" not in caplog.text
     assert created == []
+
+
+def test_discovery_capacity_matching_uses_recovery_identity(product, monkeypatch):
+    client, _, _, _, _ = product
+    source, target = Tokens(), Tokens()
+    session = web.SESSIONS.create(source.principal, source, target_tokens=target)
+    matched_tokens = []
+
+    class Client:
+        def __init__(self, tokens):
+            self.tokens = tokens
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def matches(tokens, capacities):
+        matched_tokens.append(tokens)
+        assert capacities[0]["id"] == TARGET_CAPACITY
+        return []
+
+    monkeypatch.setattr(bcdr, "FabricClient", Client)
+    monkeypatch.setattr(bcdr.workspaces, "list_workspaces", lambda _: [])
+    monkeypatch.setattr(bcdr.workspaces, "list_capacities", lambda client: [{
+        "id": TARGET_CAPACITY if client.tokens is target else SOURCE_CAPACITY,
+        "displayName": "Recovery" if client.tokens is target else "Primary",
+    }])
+    monkeypatch.setattr(bcdr, "_capacity_choices", matches)
+    try:
+        response = client.get("/api/bcdr/discovery", headers={web.SESSION_HEADER: session.id})
+        assert response.status_code == 200
+        assert response.json()["source"]["capacities"][0]["id"] == SOURCE_CAPACITY
+        assert response.json()["recovery"]["capacities"][0]["id"] == TARGET_CAPACITY
+        assert matched_tokens == [target]
+    finally:
+        web.SESSIONS.drop(session.id)
+
+
+@pytest.mark.parametrize("problem", ["changed", "ambiguous", "missing", "catalog", "workspace", "duplicate"])
+def test_web_setup_revalidates_capacity_matching_before_any_effect(product, monkeypatch, problem):
+    client, headers, _, created, _ = product
+    row = {"id": TARGET_CAPACITY, "matchStatus": "matched", "arm_resource_id": ARM.lower()}
+    if problem == "changed":
+        row["arm_resource_id"] = ARM.lower().replace("/recovery", "/different")
+    if problem == "ambiguous":
+        row["matchStatus"] = "ambiguous"
+    monkeypatch.setattr(bcdr, "_capacity_choices", lambda *args: [] if problem == "missing" else [row])
+    workspace_capacity = SOURCE_CAPACITY if problem == "workspace" else TARGET_CAPACITY
+    monkeypatch.setattr(bcdr.workspaces, "get_workspace", lambda *_: {"capacityId": workspace_capacity})
+    monkeypatch.setattr(bcdr, "setup_recovery", lambda *_args, **_kwargs: pytest.fail("must not mutate"))
+    request = {**SETUP}
+    if problem == "catalog":
+        request["catalog_capacity_id"] = ARM.replace("/recovery", "/different")
+    if problem == "duplicate":
+        request["recovery_capacities"] = SETUP["recovery_capacities"] * 2
+    response = client.post("/api/bcdr/setup", headers=headers, json={
+        "confirmation": "setup", "request": request,
+    })
+    assert response.status_code == 409 and response.json()["detail"]
+    assert not created
 
 
 def test_status_uses_real_factory_with_pinned_credentials_and_closes(product):

@@ -179,6 +179,11 @@ class ArmCapacityClient:
             or parsed.query != f"api-version={ARM_VERSION}"
         ):
             raise BootstrapError("ARM request is outside the explicitly authorized capacity")
+        return self._send(method, url, authorize=authorize)
+
+    def _send(
+        self, method: str, url: str, *, authorize: Callable[[], None] | None = None,
+    ) -> httpx.Response:
         for attempt in range(self.max_attempts):
             if self.guard is not None:
                 self.guard()
@@ -210,6 +215,64 @@ class ArmCapacityClient:
                 raise CapacityError(response, context=f"ARM {method}")
             return response
         raise AssertionError("ARM request attempts exhausted")
+
+    def _collection(self, path: str, version: str) -> list[dict]:
+        url = f"{ARM_BASE}{path}?api-version={version}"
+        result, seen = [], set()
+        while url:
+            parsed = _https_url(url, "management.azure.com")
+            if parsed.path.lower() != path.lower() or url in seen:
+                raise BootstrapError("ARM discovery continuation changed scope or repeated a page")
+            seen.add(url)
+            body = response_body(self._send("GET", url))
+            rows = body.get("value")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise BootstrapError("ARM discovery returned an invalid resource list; retry discovery")
+            result.extend(rows)
+            url = body.get("nextLink", "")
+            if not isinstance(url, str):
+                raise BootstrapError("ARM discovery returned an invalid continuation; retry discovery")
+        return result
+
+    def list_capacities(self) -> list[dict]:
+        """Read the recovery principal's same-tenant Azure Fabric resources only.
+
+        https://learn.microsoft.com/rest/api/resources/subscriptions/list
+        https://learn.microsoft.com/rest/api/microsoftfabric/fabric-capacities/list-by-subscription
+        """
+        tenant = str(UUID(self.tokens.tenant_id()))
+        resources = []
+        for subscription in self._collection("/subscriptions", "2022-12-01"):
+            try:
+                subscription_id = str(UUID(subscription["subscriptionId"]))
+                subscription_tenant = str(UUID(subscription["tenantId"]))
+            except (KeyError, ValueError, TypeError, AttributeError) as error:
+                raise BootstrapError("ARM discovery could not establish the subscription identity") from error
+            if subscription_tenant != tenant:
+                continue
+            name = subscription.get("displayName") or "Unnamed subscription"
+            path = f"/subscriptions/{subscription_id}/providers/Microsoft.Fabric/capacities"
+            try:
+                entries = self._collection(path, ARM_VERSION)
+            except CapacityError as error:
+                raise BootstrapError(
+                    f"Could not list Fabric capacities in subscription {name!r}: {error}. "
+                    "Check the recovery principal's capacity read access, then retry discovery."
+                ) from error
+            for entry in entries:
+                resource_id = canonical_arm_id(str(entry.get("id", "")))
+                if (
+                    resource_id.split("/")[2] != subscription_id
+                    or entry.get("type", "").lower() != "microsoft.fabric/capacities"
+                    or resource_id.rsplit("/", 1)[-1] != str(entry.get("name", "")).lower()
+                    or entry.get("sku", {}).get("tier") != "Fabric"
+                ):
+                    raise BootstrapError("ARM discovery returned an inconsistent Fabric capacity identity")
+                resources.append({
+                    "id": resource_id, "name": entry["name"], "location": entry.get("location", ""),
+                    "subscriptionName": name, "resourceGroup": resource_id.split("/")[4],
+                })
+        return resources
 
     def get(self, capacity: CapacityAuthorization) -> CapacityState:
         response = self._request(

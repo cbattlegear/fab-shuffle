@@ -56,6 +56,7 @@ const reconcileCommand = {
   description: "Inspect the exact service receipt.", confirmation: "Fence the previous controller before takeover.",
 };
 
+const armCapacity = "/subscriptions/demo/resourceGroups/qa/providers/Microsoft.Fabric/capacities/recovery";
 const discovery = {
   source: {
     capacities: [{ id: "source-capacity-guid", displayName: "Primary", region: "East US", sku: "F4" }],
@@ -65,8 +66,21 @@ const discovery = {
   recovery: {
     capacities: [{ id: "recovery-capacity-guid", displayName: "Recovery", region: "West US", sku: "F4" }],
     workspaces: [{ id: "control-workspace-guid", displayName: "Control", capacityId: "recovery-capacity-guid" }],
+    capacityChoices: [{
+      id: "recovery-capacity-guid", displayName: "Recovery", region: "West US", sku: "F4",
+      arm_resource_id: armCapacity, matchStatus: "matched", matchMethod: "name_region",
+      subscriptionName: "QA subscription", resourceGroup: "qa",
+      matchMessage: "Matched by name and region.",
+    }],
     errors: {},
   },
+};
+
+const recoveryCapacitySchema = {
+  type: "object", properties: {
+    fabric_capacity_id: { type: "string" }, arm_resource_id: { type: "string" },
+    dedicated_recovery: { type: "boolean" }, authorized_for_suspend: { type: "boolean" },
+  }, required: ["fabric_capacity_id", "arm_resource_id", "dedicated_recovery", "authorized_for_suspend"],
 };
 
 function discoverButton(f) {
@@ -75,6 +89,88 @@ function discoverButton(f) {
 }
 
 const scenarios = {
+  async recovery_capacity_names_submit_exact_pair_and_catalog(f) {
+    f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
+    const setupCommand = { name: "setup", label: "Setup", method: "POST", path: "/api/bcdr/setup",
+      confirmation: "Review the selected capacities.", schema: { type: "object", properties: {
+        recovery_capacities: { type: "array", items: recoveryCapacitySchema },
+        catalog_capacity_id: { type: "string" },
+      }, required: ["recovery_capacities", "catalog_capacity_id"] } };
+    f.product.bcdrRenderForms([setupCommand]);
+    const form = f.get("bcdr-content").querySelector("form");
+    const catalog = form.querySelectorAll("select").find((select) => select.name === "catalog_capacity_id");
+    assert.equal(catalog.children.length, 1, "Only selected recovery capacities can host the catalog");
+    form.querySelectorAll("button").find((button) => button.textContent === "Add dedicated recovery capacities").click();
+    const capacity = form.querySelectorAll("select").find((select) => select.name === "fabric_capacity_id");
+    assert.match(capacity.textContent, /Recovery - West US - F4 - QA subscription - qa/);
+    assert.equal(capacity.value, "");
+    capacity.value = "recovery-capacity-guid";
+    capacity.handlers.change();
+    assert.ok(catalog.children.some((option) => option.value === armCapacity));
+    catalog.value = armCapacity;
+    catalog.handlers.change();
+    const approvals = form.querySelectorAll("input").filter((input) => input.type === "checkbox");
+    assert.equal(approvals.length, 2);
+    assert.ok(approvals.every((input) => !input.checked));
+    form.handlers.submit({ preventDefault() {} });
+    assert.match(f.get("bcdr-error").textContent, /Confirm dedicated recovery use/);
+    approvals.forEach((input) => { input.checked = true; });
+    form.handlers.submit({ preventDefault() {} });
+    const dialog = f.document.querySelectorAll("dialog").find((node) => node.className.includes("bcdr-confirm"));
+    assert.doesNotMatch(dialog.textContent, /recovery-capacity-guid|\/subscriptions\//);
+    assert.match(dialog.textContent, /Recovery - West US/);
+    assert.ok(!form.querySelectorAll("input").some((input) => ["arm_resource_id", "fabric_capacity_id", "catalog_capacity_id"].includes(input.name)));
+    dialog.querySelectorAll("button")[1].click();
+    const body = JSON.parse(f.requests[0].options.body).request;
+    assert.equal(body.catalog_capacity_id, armCapacity);
+    assert.deepEqual(body.recovery_capacities, [{
+      arm_resource_id: armCapacity, fabric_capacity_id: "recovery-capacity-guid",
+      dedicated_recovery: true, authorized_for_suspend: true,
+    }]);
+    await f.reply(0, result);
+    form.querySelectorAll("button").find((button) => button.textContent === "Remove entry").click();
+    assert.equal(f.product.bcdr.recoveryRows.size, 0);
+    assert.ok(!catalog.children.some((option) => option.value === armCapacity && !option.disabled));
+  },
+  async capacity_match_refresh_preserves_only_same_identity_approvals(f) {
+    f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
+    const field = f.product.bcdrField("recovery", recoveryCapacitySchema, recoveryCapacitySchema, true);
+    const select = field.element.querySelector("select");
+    select.value = "recovery-capacity-guid";
+    select.handlers.change();
+    const approvals = field.element.querySelectorAll("input");
+    approvals.forEach((input) => { input.checked = true; });
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.equal(field.read().arm_resource_id, armCapacity);
+    assert.ok(approvals.every((input) => input.checked));
+    f.product.bcdr.discovered.recovery.capacityChoices[0].arm_resource_id = armCapacity.replace("/qa/", "/other/");
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.ok(approvals.every((input) => !input.checked));
+    assert.equal(select.value, "");
+    assert.match(field.element.textContent, /match changed or disappeared/);
+    assert.throws(() => field.read(), /Choose an available/);
+  },
+  async capacity_routes_are_named_and_unmatched_choices_are_disabled(f) {
+    f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
+    const source = f.product.bcdrField("source_capacity_id", { type: "string" }, {}, true);
+    const target = f.product.bcdrField("target_capacity_id", { type: "string" }, {}, true);
+    assert.match(source.element.textContent, /Primary - East US/);
+    assert.match(target.element.textContent, /Recovery - West US/);
+    assert.equal(source.element.querySelectorAll("input").length, 0);
+    source.element.querySelector("select").value = "source-capacity-guid";
+    target.element.querySelector("select").value = "recovery-capacity-guid";
+    assert.equal(source.read(), "source-capacity-guid");
+    assert.equal(target.read(), "recovery-capacity-guid");
+    f.product.bcdr.discovered.recovery.capacityChoices[0].matchStatus = "ambiguous";
+    f.product.bcdr.discovered.recovery.capacityChoices[0].matchMessage = "Resolve duplicate name and region.";
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.throws(() => target.read(), /Choose an available/);
+    assert.match(target.element.textContent, /Resolve duplicate/);
+    f.product.bcdr.discovered.recovery.errors.capacityMapping = "AuthorizationFailed: Grant read access";
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.throws(() => target.read(), /Refresh capacity discovery/);
+    assert.match(target.element.textContent, /AuthorizationFailed/);
+  },
   async discovery_feedback_and_preserved_selections(f) {
     f.product.bcdrRenderForms([command]);
     const field = f.product.bcdrField("source_capacity_ids", { type: "array", items: { type: "string" } }, {}, true);
@@ -431,8 +527,8 @@ const scenarios = {
         state: "Active", provisioning_state: "Succeeded", observed_at: "2026-09-17T18:00:00Z",
       }] },
     });
-    assert.match(f.get("bcdr-result").textContent, /Active - capacity-1/);
-    assert.doesNotMatch(f.get("bcdr-result").textContent, /Paused - capacity-1/);
+    assert.match(f.get("bcdr-result").textContent, /Active - dr/);
+    assert.doesNotMatch(f.get("bcdr-result").textContent, /Paused - dr|capacity-1|\/subscriptions\//);
     assert.match(f.get("bcdr-result").textContent, /not an inference from standby mode/);
   },
   async service_errors_and_pending_controls(f) {

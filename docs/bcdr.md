@@ -18,8 +18,9 @@ ARM permission to resume and suspend each explicitly designated recovery capacit
 management authorization and Fabric workspace/capacity authorization are different checks.
 
 Use dedicated recovery capacities: pausing a capacity affects every workspace assigned to it.
-Record the **ARM resource ID**, not just the Fabric capacity GUID. The controller must not
-guess an Azure resource from a capacity name or pause capacity that is serving production.
+The controller records the **ARM resource ID**, not just the Fabric capacity GUID.
+The web picker uses a unique name/region match; review its subscription/resource group
+before approval. Never authorize suspension of a capacity that is serving production.
 Choose explicit source-capacity scope and designated owner principals before setup.
 
 Deploy exactly one authorized controller for a recovery set. Keep its bootstrap descriptor
@@ -72,7 +73,8 @@ identity-bound observations, not an instruction to trust a general "ready" check
    the recovery SPN and designated-owner allowlist. Setup does not delete unrelated grants
    to force a match. Owners of a newly created control workspace currently use the Admin role.
 2. If the source is healthy, optionally expand **Healthy-source preparation** and choose
-   **Discover setup choices**. This explicitly reads source/recovery workspaces and capacities;
+   **Discover setup choices**. This explicitly reads source/recovery workspaces and capacities,
+   plus the recovery principal's same-tenant Azure subscriptions and Fabric capacity resources;
    it is never automatically invoked for outage recovery. Progress and resource counts appear
    beside the button. Empty results and partial failures include an action to take; discovery
    never saves setup or starts a capacity operation. Refreshing preserves still-valid resource
@@ -82,9 +84,12 @@ identity-bound observations, not an instruction to trust a general "ready" check
    name. Select the source capacities that define the recovery scope.
    Workspace and source-capacity selection has no manual-ID fallback. Resolve ambiguous names
    or missing access before selecting; a disappeared selection is not silently replaced.
-4. Add each dedicated recovery capacity with its Fabric GUID and explicit Azure ARM resource ID.
-   Confirm dedicated use and suspend authorization for each, and specify which ARM capacity
-   hosts the control Warehouse. Fabric GUIDs and ARM resource IDs are not interchangeable.
+4. Add each dedicated recovery capacity by name. The picker matches Fabric and Azure resources
+   using the exact name ignoring case and the normalized region. Review the subscription and
+   resource group shown with each match. Missing or ambiguous matches cannot be selected.
+   Confirm dedicated use and suspend authorization for each, then choose the control Warehouse
+   capacity from those selected capacities. An existing control workspace must be assigned to
+   that capacity. No workspace/capacity ID entry or manual pairing is needed.
 5. Review the authenticated recovery principal's tenant and **object ID**, derived from the
    session rather than its application ID. Add the designated owners' object IDs, kinds and
    workspace roles. Only these restricted workspace grants are allowed before enablement.
@@ -117,10 +122,15 @@ request ID, and does not blindly replay it on the next setup request. Check the 
 and query parameter names. Signed/opaque query values and credentials are omitted, including
 from HTTP request logs. Do not delete bootstrap or change API versions to force a retry.
 
-Recovery capacity ARM/Fabric pairing is not derived from matching display names. The current
-explicit capacity fields are not an automatic identity resolver; name-based workspace
-discovery does not verify that pair. A fully automatic capacity picker still requires an
-authoritative cross-API identity mapping.
+Recovery capacity pairing is a **name/region match, not an authoritative cross-API identity**.
+Names are compared ignoring case and surrounding whitespace; regions use the existing
+space-insensitive region normalization. Only a unique match among the visible Azure Fabric
+resources and Fabric capacities is selectable. Discovery requires Azure subscription/capacity
+read visibility in addition to Fabric permissions; an incomplete Azure read must be resolved
+before selection. Setup repeats the comparison before any effects and refuses a changed pair,
+duplicates or an incompatible control workspace. A changed match clears the old capacity
+approvals. Review the displayed subscription/resource group because matching cannot establish
+the identity of resources hidden from the signed-in principal.
 
 | Action | Meaning |
 | --- | --- |
@@ -173,7 +183,8 @@ Capture generation and applied standby generation measure different things. A su
 capture does not mean every destination definition was applied; applied metadata does not
 mean data, bindings or effective access are ready. Review each dependency group's separate
 metadata, data, access, readiness and active states, plus its blockers and warnings.
-Capacity state is shown from actual ARM observations with timestamps and exact resource IDs.
+Capacity state is shown from actual ARM observations with timestamps and capacity names.
+Exact resource IDs are recorded in the server logs rather than the resource-selection UI.
 `standby` mode alone does not mean capacity is paused; reading catalog status can resume its capacity.
 
 `restored_stopped`, `unverified`, `partial`, and `ready_for_cutover` are not interchangeable.

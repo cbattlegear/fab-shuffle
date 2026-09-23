@@ -24,6 +24,9 @@ import pytest
     "discovery_signout_ignores_late_result", "existing_workspace_picker_uses_recovery_names",
     "workspace_picker_rejects_missing_ambiguous_and_stale_choices",
     "named_choices_reject_missing_resources", "discovery_keeps_pending_operation_choice",
+    "recovery_capacity_names_submit_exact_pair_and_catalog",
+    "capacity_match_refresh_preserves_only_same_identity_approvals",
+    "capacity_routes_are_named_and_unmatched_choices_are_disabled",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

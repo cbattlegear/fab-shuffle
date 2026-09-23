@@ -152,6 +152,10 @@ or distribute administrator sessions.
    capacities and an existing control workspace by name, refresh discovery, and verify
    the selections and typed Warehouse name survive. Confirm that unavailable or ambiguous
    choices cannot be silently submitted. Check exact identities in restricted server logs.
+   Select recovery capacities by name and region; review the shown Azure subscription/resource
+   group, then choose the catalog capacity from the selected rows. Verify a duplicate or
+   unmatched name/region is disabled and that a changed Azure match clears prior suspension
+   approvals. The matching rule is a best-effort comparison, not proof of cross-API identity.
 4. Create a new restricted control workspace/Warehouse on R. Fresh setup currently expects
    designated owners with Admin roles.
 5. Inspect durable non-secret bootstrap coordinates and Warehouse-held definitions,

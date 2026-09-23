@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from uuid import uuid4
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -22,8 +23,10 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
 from fabshuffle.bcdr.backend import RecoveryBlocked
-from fabshuffle.bcdr.bootstrap import canonical_arm_id
+from fabshuffle.bcdr.bootstrap import BootstrapError, canonical_arm_id
+from fabshuffle.bcdr.capacity import ArmCapacityClient, CapacityError
 from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
+from fabshuffle.bcdr.discovery import match_recovery_capacities
 from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
 from fabshuffle.bcdr.service import (
     BcdrService,
@@ -179,13 +182,59 @@ def _service_call(
         source_tokens=session.tokens if source_access else None,
     )
     try:
-        return invoke(service)
+        result = invoke(service)
+        for capacity in result.details.get("capacities", []):
+            logger.info("BCDR observed capacity: fabric_capacity=%s arm_resource=%s state=%s",
+                        capacity.get("capacity_id"), capacity.get("arm_resource_id"), capacity.get("state"))
+        return result
     finally:
         service.close()
 
 
+def _capacity_choices(tokens, capacities: list[dict] | None = None) -> list[dict]:
+    if capacities is None:
+        with FabricClient(tokens) as client:
+            capacities = workspaces.list_capacities(client)
+    with ArmCapacityClient(tokens) as arm:
+        resources = arm.list_capacities()
+    return match_recovery_capacities(capacities, resources)
+
+
+def _validate_setup_choices(session: Session, request: SetupRequest) -> None:
+    try:
+        choices = {entry["id"]: entry for entry in _capacity_choices(session.destination_tokens)}
+        catalog = canonical_arm_id(request.catalog_capacity_id)
+        selected = {}
+        for capacity in request.recovery_capacities:
+            choice = choices.get(capacity.fabric_capacity_id)
+            resource = canonical_arm_id(capacity.arm_resource_id)
+            if not choice or choice["matchStatus"] != "matched" or choice["arm_resource_id"] != resource:
+                raise RecoveryBlocked(
+                    "The recovery capacity name/region match changed or is unavailable. "
+                    "Refresh Discover setup choices and review the named capacity before submitting."
+                )
+            if resource in selected or capacity.fabric_capacity_id in selected.values():
+                raise RecoveryBlocked("Choose each dedicated recovery capacity only once.")
+            selected[resource] = capacity.fabric_capacity_id
+        if catalog not in selected:
+            raise RecoveryBlocked(
+                "Choose the control Warehouse capacity from the selected recovery capacities."
+            )
+        if request.control_workspace_id:
+            with FabricClient(session.destination_tokens) as client:
+                workspace = workspaces.get_workspace(client, request.control_workspace_id)
+            if workspace.get("capacityId") != selected[catalog]:
+                raise RecoveryBlocked(
+                    "The control workspace is not assigned to the selected control Warehouse capacity. "
+                    "Choose its assigned recovery capacity or a different workspace."
+                )
+    except (BootstrapError, CapacityError, httpx.HTTPError, ValueError) as error:
+        raise RecoveryBlocked(safe_text(str(error))) from error
+
+
 def _setup_call(session: Session, request: SetupRequest) -> ServiceResult:
     _same_tenant(session)
+    _validate_setup_choices(session, request)
     logger.info(
         "BCDR setup selection: control_workspace=%s source_capacities=%s",
         request.control_workspace_id or "[new workspace]", request.source_capacity_ids,
@@ -200,7 +249,10 @@ def _setup_call(session: Session, request: SetupRequest) -> ServiceResult:
             capacity.fabric_capacity_id, resource,
             capacity.arm_resource_id.lower() == request.catalog_capacity_id.lower(),
         )
-    return setup_recovery(request, bootstrap_path(), target_tokens=session.destination_tokens)
+    result = setup_recovery(request, bootstrap_path(), target_tokens=session.destination_tokens)
+    logger.info("BCDR setup result: workspace=%s warehouse=%s",
+                result.details.get("control_workspace_id"), result.details.get("control_warehouse_id"))
+    return result
 
 
 def create_router(
@@ -311,7 +363,24 @@ def create_router(
                     return result
 
             source = inventory(session.tokens, "source")
-            target = inventory(session.destination_tokens, "recovery") if session.paired else source
+            target = inventory(session.destination_tokens, "recovery") if session.paired else {
+                **source, "errors": dict(source["errors"]),
+            }
+            if "capacities" in target:
+                try:
+                    target["capacityChoices"] = _capacity_choices(
+                        session.destination_tokens, target["capacities"],
+                    )
+                    for choice in target["capacityChoices"]:
+                        logger.info(
+                            "BCDR discovery=%s capacity=%s name=%r region=%r arm_resource=%s match=%s",
+                            discovery_id, choice["id"], safe_text(str(choice.get("displayName") or "")),
+                            choice.get("region"), choice["arm_resource_id"], choice["matchStatus"],
+                        )
+                except (BootstrapError, CapacityError, httpx.HTTPError, ValueError) as error:
+                    target["errors"]["capacityMapping"] = safe_text(str(error))
+                    logger.warning("BCDR discovery=%s capacity matching failed: %s",
+                                   discovery_id, target["errors"]["capacityMapping"])
             return {"source": source, "recovery": target, "discovery_id": discovery_id}
 
         return await execute(session, work)
