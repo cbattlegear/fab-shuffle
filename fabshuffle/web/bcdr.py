@@ -93,8 +93,9 @@ def bootstrap_path() -> Path:
 
 COMMANDS = (
     ("setup", "Set up the control Warehouse", SetupRequest,
-     "Create a restricted control workspace or choose an existing one whose access matches the recovery "
-     "principal and owner allowlist. New control workspace owners use the Admin role. "
+     "Create a control workspace or choose an existing one where the recovery principal has Admin access. "
+     "Additional members and owner-role differences produce warnings; existing grants stay unchanged. "
+     "New control workspace owners use the Admin role. "
      "Create one new central metadata Warehouse and persist its "
      "non-secret bootstrap in durable controller storage. No metadata lakehouse, Spark or Git is used.",
      "Create the central metadata Warehouse and, if selected, its restricted control workspace. Confirm the "
@@ -137,7 +138,7 @@ COMMANDS = (
      "ACL IDs. Enabling recovery stops scheduled source-to-standby sync and automatic pause.",
      "Enable recovery for the selected groups and replay only approved, backend-eligible ACLs. "
      "Recovery capacities remain running. This does not fence external writers or approve cutover. "
-     "The control workspace remains restricted."),
+     "Additional control workspace access is reported without changing existing grants."),
     ("cutover", "Approve cutover", CutoverRequest,
      "Supply identity-bound, time-limited readiness observations and separate operator evidence "
      "that primary writers are fenced. A controller lock is not a writer fence.",

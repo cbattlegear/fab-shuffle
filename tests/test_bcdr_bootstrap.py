@@ -464,7 +464,7 @@ def test_ambiguous_workspace_create_is_not_repeated_or_adopted_by_name(store):
     assert calls == ["POST"] and store.load().control_workspace_id is None
 
 
-def test_workspace_unexpected_roles_fail_without_creating_warehouse_or_removing_grants(store):
+def test_workspace_unexpected_roles_warn_without_removing_grants(store):
     unprovisioned(store)
     methods = []
 
@@ -479,13 +479,11 @@ def test_workspace_unexpected_roles_fail_without_creating_warehouse_or_removing_
         return workspace_response()
 
     with ControlWorkspaceProvisioner(store, Tokens(), transport=httpx.MockTransport(handler)) as provisioner:
-        with pytest.raises(BootstrapError, match=f"Remove unexpected principal {APP}"):
-            provisioner.ensure(display_name="Control", owner_id=OWNER, allowed_principals=())
+        provisioner.ensure(display_name="Control", owner_id=OWNER, allowed_principals=())
+        assert any(APP in warning and "left unchanged" in warning for warning in provisioner.warnings)
+        provisioner.ensure(display_name="Control", owner_id=OWNER, allowed_principals=())
     assert methods.count("POST") == 1 and "DELETE" not in methods
-    assert store.load().workspace_intent.phase == "created"
-    with ControlWarehouseProvisioner(store, Tokens(), transport=httpx.MockTransport(handler)) as provisioner:
-        with pytest.raises(BootstrapError, match="restricted control workspace"):
-            provisioner.ensure(display_name="Control", owner_id=OWNER)
+    assert store.load().workspace_intent.phase == "ready"
 
 
 def test_workspace_role_lost_response_reconciles_exact_principal_without_regrant(store):
@@ -555,7 +553,8 @@ def test_role_pagination_cannot_follow_foreign_continuation(store):
     assert store.load().workspace_intent.phase != "ready"
 
 
-def test_explicit_existing_workspace_is_audited_without_claiming_creation_or_mutating_roles(store):
+@pytest.mark.parametrize("drift", ["none", "extra", "missing-owner", "changed-role"])
+def test_explicit_existing_workspace_is_audited_without_claiming_creation_or_mutating_roles(store, drift):
     store.update(lambda current: current.model_copy(update={"workspace_intent": None}))
     owners = (WorkspacePrincipal(object_id=OWNER, principal_type="User"),)
     calls = []
@@ -564,20 +563,23 @@ def test_explicit_existing_workspace_is_audited_without_claiming_creation_or_mut
         calls.append(request.method)
         assert request.method == "GET"
         if request.url.path.endswith("/roleAssignments"):
-            return httpx.Response(200, json={"value": [
-                role_assignment(SPN_OBJECT, "ServicePrincipal"), role_assignment(OWNER),
-            ]})
+            roles = [role_assignment(SPN_OBJECT, "ServicePrincipal")]
+            if drift != "missing-owner":
+                roles.append(role_assignment(OWNER, role="Viewer" if drift == "changed-role" else "Admin"))
+            if drift == "extra":
+                roles.append(role_assignment(APP))
+            return httpx.Response(200, json={"value": roles})
         return workspace_response()
 
     with ControlWorkspaceProvisioner(store, Tokens(), transport=httpx.MockTransport(handler)) as provisioner:
         result = provisioner.verify_existing(owner_id=OWNER, allowed_principals=owners)
+        assert bool(provisioner.warnings) == (drift != "none")
     assert result.workspace_intent.origin == "designated"
     assert result.workspace_intent.phase == "ready"
     assert result.control_workspace_id == WORKSPACE and calls == ["GET", "GET"]
 
 
 @pytest.mark.parametrize("roles", [
-    [role_assignment(SPN_OBJECT, "ServicePrincipal"), role_assignment(APP)],
     [role_assignment(SPN_OBJECT, "ServicePrincipal", role="Member")],
     [],
 ])

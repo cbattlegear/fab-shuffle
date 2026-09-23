@@ -23,11 +23,11 @@ from fabshuffle.bcdr.contracts import (
     ItemIdentity,
     OperationRecord,
     OperationState,
-    Principal,
     RecoveryMode,
     RecoverySet,
     WorkspaceIdentity,
 )
+from fabshuffle.bcdr.control_access import control_workspace_warnings
 from fabshuffle.bcdr.deployment_lock import DeploymentLock, GuardedTokens
 from fabshuffle.bcdr.provisioning import ControlWarehouseProvisioner, ControlWorkspaceProvisioner
 from fabshuffle.bcdr.warehouse_catalog import WarehouseCatalog
@@ -434,23 +434,9 @@ def setup_recovery(
                 )
         with FabricClient(target_tokens) as client:
             assignments = list_role_assignments(client, descriptor.control_workspace_id)
-            allowed = request.access_policy.workspace_grants()
-            observed = []
-            for row in assignments:
-                principal = Principal(
-                    tenant_id=tenant,
-                    object_id=row["principal"]["id"],
-                    kind=row["principal"]["type"],
-                )
-                if not any(grant.principal == principal and grant.role == row["role"] for grant in allowed):
-                    raise RecoveryBlocked(
-                        "Restrict the control workspace to exactly the recovery SPN and named owners"
-                    )
-                observed.append((principal.key, row["role"]))
-            if set(observed) != {(grant.principal.key, grant.role) for grant in allowed}:
-                raise RecoveryBlocked(
-                    "Assign the recovery SPN and designated owners their exact workspace roles"
-                )
+            access_warnings = control_workspace_warnings(
+                assignments, request.access_policy.recovery_spn, request.access_policy.owners,
+            )
         with ControlWarehouseProvisioner(store, target_tokens) as provisioner:
             descriptor = provisioner.ensure(
                 display_name=request.warehouse_name, owner_id=descriptor.controller_id
@@ -477,6 +463,7 @@ def setup_recovery(
         catalog.initialize()
         return ServiceResult(
             mode=catalog.state().mode,
+            warnings=access_warnings,
             details={
                 "recovery_set_id": descriptor.recovery_set_id,
                 "control_workspace_id": descriptor.control_workspace_id,

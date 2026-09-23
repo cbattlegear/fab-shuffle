@@ -113,7 +113,8 @@ const scenarios = {
     assert.equal(approvals.length, 2);
     assert.ok(approvals.every((input) => !input.checked));
     form.handlers.submit({ preventDefault() {} });
-    assert.match(f.get("bcdr-error").textContent, /Confirm dedicated recovery use/);
+    assert.match(form.querySelector(".bcdr-action-error").textContent, /Confirm dedicated recovery use/);
+    assert.equal(f.get("bcdr-error").hidden, true);
     approvals.forEach((input) => { input.checked = true; });
     form.handlers.submit({ preventDefault() {} });
     const dialog = f.document.querySelectorAll("dialog").find((node) => node.className.includes("bcdr-confirm"));
@@ -533,16 +534,59 @@ const scenarios = {
   },
   async service_errors_and_pending_controls(f) {
     f.product.bcdrRenderForms([command]);
-    const button = f.get("bcdr-content").querySelector("button");
+    const form = f.get("bcdr-content").querySelector("form");
+    const button = form.querySelector("button");
     const pending = f.product.bcdrSubmit(command, { generation_id: "pinned" }, button);
     assert.equal(button.disabled, true);
-    assert.match(f.get("bcdr-progress").textContent, /does not cancel/);
+    assert.match(form.querySelector(".bcdr-action-progress").textContent, /does not cancel/);
     await f.reply(0, { detail: "CapacityNotActive: resume failed; retry the recorded operation." }, 409);
     await pending;
     assert.equal(button.disabled, false);
-    assert.equal(f.get("bcdr-error").hidden, false);
-    assert.match(f.get("bcdr-error").textContent, /CapacityNotActive/);
-    assert.equal(f.document.activeElement, f.get("bcdr-error"));
+    assert.equal(f.get("bcdr-error").hidden, true);
+    assert.match(form.querySelector(".bcdr-action-error").textContent, /CapacityNotActive/);
+    assert.equal(f.document.activeElement, button);
+  },
+  async feedback_stays_with_the_action_and_marks_only_its_fields(f) {
+    const schema = { type: "object", properties: { evidence: { type: "string" } } };
+    f.product.bcdrRenderForms([{ ...command, schema }, { ...command, schema, name: "second", label: "Second" }]);
+    const forms = f.get("bcdr-content").querySelectorAll("form");
+    const buttons = forms.map((form) => form.querySelector("button"));
+    const first = f.product.bcdrSubmit(command, {}, buttons[0]);
+    await f.reply(0, { detail: [{ loc: ["body", "request", "evidence"], msg: "Supply evidence", type: "missing" }] }, 422);
+    await first;
+    const error = forms[0].querySelector(".bcdr-action-error");
+    assert.match(error.textContent, /Supply evidence/);
+    const field = forms[0].querySelector("input");
+    assert.equal(field["aria-errormessage"], error.id);
+    assert.equal(field["aria-invalid"], "true");
+    assert.notEqual(forms[1].querySelector("input")["aria-invalid"], "true");
+    assert.equal(f.get("bcdr-error").hidden, true);
+    const second = f.product.bcdrSubmit(command, {}, buttons[1]);
+    await f.reply(1, { ...result, warnings: ["Control workspace: New owner has Admin access; review Manage access."] });
+    await second;
+    assert.equal(forms[1].querySelector(".bcdr-action-error").hidden, true);
+    assert.match(forms[1].querySelector(".bcdr-action-warnings").textContent, /New owner/);
+    assert.match(error.textContent, /Supply evidence/, "Another form must not clear this action's error");
+    assert.equal(field["aria-invalid"], "true");
+    assert.equal(f.document.activeElement, buttons[1]);
+  },
+  async native_validation_is_reported_at_the_action(f) {
+    f.product.bcdrRenderForms([command]);
+    const form = f.get("bcdr-content").querySelector("form");
+    const button = form.querySelector("button");
+    assert.equal(form.noValidate, true);
+    form.checkValidity = () => false;
+    const field = form.querySelector("input");
+    field.name = "generation_id";
+    field.validity = { valid: false };
+    field.validationMessage = "Select a captured generation.";
+    button.focus();
+    form.handlers.submit({ preventDefault() {} });
+    assert.match(form.querySelector(".bcdr-action-error").textContent, /Select a captured generation/);
+    assert.equal(field["aria-errormessage"], form.querySelector(".bcdr-action-error").id);
+    assert.equal(f.document.activeElement, button);
+    assert.equal(f.requests.length, 0);
+    assert.equal(f.get("bcdr-error").hidden, true);
   },
   async stale_session_never_renders_old_results(f) {
     f.product.bcdrRenderForms([command]);

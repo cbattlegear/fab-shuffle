@@ -125,12 +125,17 @@ function renderChoices(container, entries, onSelect) {
 
 function updateLoginMode() {
   const managed = $("#fabric-auth-mode").value === "managed_identity";
+  const standby = $("#login-workflow").value === "bcdr";
   $("#source-credentials").hidden = managed;
   $("#source-credentials").disabled = managed;
-  $("#tenant-mode").hidden = managed;
-  $("#tenant-mode").disabled = managed;
+  $("#tenant-mode").hidden = managed || standby;
+  $("#tenant-mode").disabled = managed || standby;
   $("#managed-identity-context").hidden = !managed;
-  if (managed) $("#another-tenant").checked = false;
+  $("#another-tenant").disabled = managed || standby;
+  if (managed || standby) {
+    $("#another-tenant").checked = false;
+    $("#destination-credentials").querySelectorAll("input").forEach((input) => { input.value = ""; });
+  }
   const paired = $("#another-tenant").checked;
   $("#destination-credentials").hidden = !paired;
   $("#destination-credentials").disabled = !paired;
@@ -139,12 +144,13 @@ function updateLoginMode() {
 
 $("#another-tenant").addEventListener("change", updateLoginMode);
 $("#fabric-auth-mode").addEventListener("change", updateLoginMode);
+$("#login-workflow").addEventListener("change", updateLoginMode);
 
 function loginBody(form) {
   if ($("#fabric-auth-mode").value === "managed_identity") return {};
   const data = Object.fromEntries(new FormData(form).entries());
   const body = { tenant_id: data.tenant_id, client_id: data.client_id, client_secret: data.client_secret };
-  if ($("#another-tenant").checked) {
+  if ($("#login-workflow").value !== "bcdr" && $("#another-tenant").checked) {
     body.destination = {
       tenant_id: data.destination_tenant_id,
       client_id: data.destination_client_id,

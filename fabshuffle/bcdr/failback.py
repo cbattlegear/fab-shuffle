@@ -374,7 +374,7 @@ class FailbackController:
                     ],
                     allowed,
                 )
-            c.access.restrict_workspace(c.recovery_set.control_workspace)
+            control_warnings = c.access.restrict_workspace(c.recovery_set.control_workspace)
             for group in c._groups(record["failover_generation_id"]):
                 c._save_group(
                     record["failover_generation_id"],
@@ -476,4 +476,5 @@ class FailbackController:
                 plan_id=request.plan_id,
                 generation_id=record["failover_generation_id"],
                 details={"rollback_retained": True},
+                warnings=control_warnings,
             )

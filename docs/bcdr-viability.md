@@ -86,7 +86,10 @@ desired ACLs, target mappings, applied hashes and operation history. Business-da
 remain separately protected inputs. Capture completion and actual application to standby
 are distinct states.
 
-The control workspace remains restricted even after business recovery access is enabled.
+The controller never replays business ACLs into the control workspace. Additional
+control-workspace members and owner-role differences are advisory warnings, not an
+exact-membership gate; their grants remain unchanged. Controller Admin access is still
+required. Business standby workspaces retain strict access checks until enablement.
 Loss of the catalog's own region is not solved by silently using an old local cache.
 ARM resume/suspend acts on explicitly authorized dedicated capacities, not capacities
 discovered by name. [capacity-resume], [capacity-suspend]

@@ -803,11 +803,39 @@ function bcdrField(name, source, root, required = false, context = []) {
   };
 }
 
-function bcdrError(message) {
-  const error = $("#bcdr-error");
+function bcdrActionFeedback(trigger) {
+  const host = trigger.closest("form") || trigger.parentElement;
+  let feedback = host.querySelector(".bcdr-feedback");
+  if (!feedback) {
+    feedback = bcdrElement("div", undefined, "bcdr-feedback");
+    const error = bcdrElement("p", "", "alert bcdr-action-error");
+    error.id = `bcdr-action-error-${++bcdr.sequence}`;
+    error.setAttribute("role", "alert");
+    error.hidden = true;
+    const progress = bcdrElement("p", "", "hint bcdr-action-progress");
+    progress.setAttribute("role", "status");
+    progress.setAttribute("aria-live", "polite");
+    const warnings = bcdrElement("div", "", "warnings bcdr-action-warnings");
+    warnings.setAttribute("role", "status");
+    warnings.setAttribute("aria-live", "polite");
+    warnings.hidden = true;
+    feedback.appendChild(error);
+    feedback.appendChild(progress);
+    feedback.appendChild(warnings);
+    host.appendChild(feedback);
+  }
+  return {
+    error: feedback.querySelector(".bcdr-action-error"),
+    progress: feedback.querySelector(".bcdr-action-progress"),
+    warnings: feedback.querySelector(".bcdr-action-warnings"),
+  };
+}
+
+function bcdrError(message, trigger) {
+  const error = trigger ? bcdrActionFeedback(trigger).error : $("#bcdr-error");
   error.textContent = message;
   error.hidden = !message;
-  if (message) { error.tabIndex = -1; error.focus(); }
+  if (message && !trigger) { error.tabIndex = -1; error.focus(); }
 }
 
 function bcdrRenderResult(result) {
@@ -996,50 +1024,65 @@ function bcdrRenderResult(result) {
 async function bcdrSubmit(command, body, button) {
   if (bcdr.pending) return;
   if (!state.sessionId || state.sessionId !== bcdr.sessionId) {
-    bcdrError("The sign-in changed. Reopen Standby & recovery and review the request again.");
+    bcdrError("The sign-in changed. Reopen Standby & recovery and review the request again.", button);
     return;
   }
   const sessionId = state.sessionId;
   bcdr.pending = true;
   bcdrError("");
+  bcdrError("", button);
+  const feedback = bcdrActionFeedback(button);
+  feedback.warnings.replaceChildren();
+  feedback.warnings.hidden = true;
+  $("#bcdr-progress").textContent = "Progress, errors and warnings are shown beside the selected action.";
   const panel = $("#bcdr-panel");
   panel.setAttribute("aria-busy", "true");
   const controls = Array.from(panel.querySelectorAll("button, input, select, textarea"));
   const disabled = controls.map((control) => control.disabled);
-  controls.forEach((control) => {
+  const actionControls = Array.from((button.closest("form") || button.parentElement)
+    .querySelectorAll("input, select, textarea"));
+  actionControls.forEach((control) => {
     control.setAttribute("aria-invalid", "false");
-    control.disabled = true;
+    control.setAttribute("aria-errormessage", "");
   });
-  $("#bcdr-progress").textContent =
+  controls.forEach((control) => { control.disabled = true; });
+  feedback.progress.textContent =
     `${command.label} is in progress. Closing this view does not cancel server-side work.`;
   try {
     const payload = command.confirmation ? { confirmation: command.name, request: body } : body;
     const result = await api(command.path, { method: command.method, body: payload });
     if (!bcdrCurrentSession(sessionId)) return;
     bcdrRenderResult(result);
-    $("#bcdr-progress").textContent = `${command.label}: result received. Review all group outcomes below.`;
+    feedback.progress.textContent = `${command.label}: result received. Review all group outcomes below.`;
+    if (result.warnings?.length) {
+      feedback.warnings.appendChild(bcdrElement("strong", "Review these warnings"));
+      const list = bcdrElement("ul");
+      result.warnings.forEach((warning) => list.appendChild(bcdrElement("li", warning)));
+      feedback.warnings.appendChild(list);
+      feedback.warnings.hidden = false;
+    }
   } catch (error) {
     if (bcdrCurrentSession(sessionId)) {
       for (const entry of error.details || []) {
         const name = entry.loc?.at(-1);
-        controls.filter((control) => control.name === name).forEach((control) => {
+        actionControls.filter((control) => control.name === name).forEach((control) => {
           control.setAttribute("aria-invalid", "true");
-          control.setAttribute("aria-errormessage", "bcdr-error");
+          control.setAttribute("aria-errormessage", feedback.error.id);
         });
       }
-      bcdrError(error.message);
-      $("#bcdr-progress").textContent = "The operation did not report success. Review the error before retrying.";
+      bcdrError(error.message, button);
+      feedback.progress.textContent = "The operation did not report success. Review the error here before retrying.";
     }
   } finally {
     bcdr.pending = false;
     panel.setAttribute("aria-busy", "false");
     controls.forEach((control, index) => { control.disabled = disabled[index]; });
-    if (bcdrCurrentSession(sessionId) && !$("#bcdr-error").hidden) $("#bcdr-error").focus();
-    else if (bcdrCurrentSession(sessionId)) button.focus();
+    if (bcdrCurrentSession(sessionId)) button.focus({ preventScroll: true });
   }
 }
 
 function bcdrConfirm(command, body, trigger) {
+  bcdrError("", trigger);
   const sessionId = state.sessionId;
   const dialog = bcdrElement("dialog", undefined, "bcdr bcdr-confirm");
   const heading = bcdrElement("h2", command.label);
@@ -1069,7 +1112,7 @@ function bcdrConfirm(command, body, trigger) {
   confirm.addEventListener("click", () => {
     dialog.close();
     if (!bcdrCurrentSession(sessionId)) {
-      bcdrError("The sign-in changed. Review this operation again in the current session.");
+      bcdrError("The sign-in changed. Review this operation again in the current session.", trigger);
       return;
     }
     bcdrSubmit(command, body, trigger);
@@ -1162,6 +1205,7 @@ function bcdrRenderForms(commands) {
     section.appendChild(bcdrElement("summary", command.label));
     section.appendChild(bcdrElement("p", command.description, "hint"));
     const form = bcdrElement("form");
+    form.noValidate = true;
     form.setAttribute("aria-label", command.label);
     const field = bcdrField(command.label, command.schema, command.schema, true);
     field.element.querySelector("legend")?.remove();
@@ -1169,15 +1213,29 @@ function bcdrRenderForms(commands) {
     const button = bcdrElement("button", command.label, command.primary ? "primary" : "secondary");
     button.type = "submit";
     form.appendChild(button);
+    bcdrActionFeedback(button);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      if (bcdr.pending || !form.reportValidity()) return;
+      if (bcdr.pending) return;
+      if (!form.checkValidity()) {
+        const feedback = bcdrActionFeedback(button);
+        const invalid = Array.from(form.querySelectorAll("input, select, textarea"))
+          .filter((control) => control.validity?.valid === false);
+        invalid.forEach((control) => {
+          control.setAttribute("aria-invalid", "true");
+          control.setAttribute("aria-errormessage", feedback.error.id);
+        });
+        const messages = invalid.map((control) =>
+          `${bcdrLabel(control.name || "field")}: ${control.validationMessage}`);
+        bcdrError(messages.join(" ") || "Complete the required fields in this form before continuing.", button);
+        return;
+      }
       try {
         const body = command.method === "GET" ? undefined : field.read();
         if (command.confirmation) bcdrConfirm(command, body, button);
         else bcdrSubmit(command, body, button);
       } catch (error) {
-        bcdrError(error.message);
+        bcdrError(error.message, button);
       }
     });
     section.appendChild(form);

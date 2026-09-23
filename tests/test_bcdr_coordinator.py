@@ -829,11 +829,13 @@ def test_source_reference_connection_is_rejected_before_mutation(system, referen
 
 
 @pytest.mark.parametrize("new_workspace", [False, True])
+@pytest.mark.parametrize("additional_access", [False, True])
 def test_production_setup_wires_real_provisioners_and_sql_catalog(
     system,
     tmp_path,
     monkeypatch,
     new_workspace,
+    additional_access,
 ):
     from functools import partial
 
@@ -865,8 +867,18 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
                     "properties": {"connectionString": "example.datawarehouse.fabric.microsoft.com"},
                 },
             )
-        return system.estate.handler(request)
+        response = system.estate.handler(request)
+        if additional_access and path.endswith("/roleAssignments") and request.method == "GET":
+            body = response.json()
+            body["value"].append({
+                "id": guid(), "principal": {"id": extra_principal, "type": "User",
+                                           "displayName": "New workspace admin"},
+                "role": "Admin",
+            })
+            return httpx.Response(response.status_code, json=body)
+        return response
 
+    extra_principal = guid()
     transport = httpx.MockTransport(fabric_handler)
     monkeypatch.setattr(production, "FabricClient", partial(FabricClient, transport=transport))
     monkeypatch.setattr(
@@ -913,6 +925,8 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
     assert created[0].state().mode == RecoveryMode.STANDBY
     assert created[0].recovery_set.control_workspace.workspace_id == stored.control_workspace_id
     assert "not-a-real-secret" not in path.read_text()
+    assert any("New workspace admin" in warning for warning in result.warnings) == additional_access
+    assert not any(method == "DELETE" for method, _ in system.estate.calls)
 
 
 def test_setup_reuses_pending_capacity_intent_instead_of_posting_again(system, tmp_path, monkeypatch):

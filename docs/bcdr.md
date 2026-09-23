@@ -68,10 +68,12 @@ identity-bound observations, not an instruction to trust a general "ready" check
 
 ### Set up one central control Warehouse
 
-1. Choose whether to create a new restricted control workspace or use an existing designated
-   workspace on a dedicated recovery capacity. Existing workspace access must already match
-   the recovery SPN and designated-owner allowlist. Setup does not delete unrelated grants
-   to force a match. Owners of a newly created control workspace currently use the Admin role.
+1. Choose whether to create a new control workspace or use an existing designated
+   workspace on a dedicated recovery capacity. The recovery SPN must have Admin access.
+   Additional members, different owner roles, and missing designated-owner grants are
+   warnings rather than membership blockers. Existing grants are not removed, rewritten
+   or silently restored. Explicit owners of a newly created workspace still receive their
+   requested Admin grants during initial provisioning.
 2. If the source is healthy, optionally expand **Healthy-source preparation** and choose
    **Discover setup choices**. This explicitly reads source/recovery workspaces and capacities,
    plus the recovery principal's same-tenant Azure subscriptions and Fabric capacity resources;
@@ -92,7 +94,8 @@ identity-bound observations, not an instruction to trust a general "ready" check
    that capacity. No workspace/capacity ID entry or manual pairing is needed.
 5. Review the authenticated recovery principal's tenant and **object ID**, derived from the
    session rather than its application ID. Add the designated owners' object IDs, kinds and
-   workspace roles. Only these restricted workspace grants are allowed before enablement.
+   workspace roles. These define the grants the controller applies to business standby
+   workspaces; additional control-workspace members may be managed independently.
 6. Confirm **Set up the control Warehouse**. The backend creates the new Warehouse and persists
    its bootstrap using the deployment-configured path. Keep that storage durable and restricted.
    Then configure source-to-recovery capacity routes and exact workspace selection for
@@ -103,6 +106,14 @@ Do not repeatedly submit setup after an ambiguous create. Read the service error
 the recorded provisioning operation; the backend must not adopt an unrelated Warehouse by name.
 
 ### Setup troubleshooting
+
+Selecting **Operate standby & recovery** hides **Another tenant** and clears any previous
+destination credentials. Switching back to migration restores the option without restoring
+the discarded credentials.
+
+Each operation form shows validation errors, service errors, progress and returned warnings
+beside its action button. Messages retain service error codes and actionable guidance;
+an error in one form does not clear another form's feedback or send you to the page top.
 
 Discovery logs include a correlation ID, resource names and exact workspace/capacity IDs.
 Confirmed setup logs record the selected workspace, source capacities and recovery
@@ -168,9 +179,13 @@ connection is not automatically a valid primary-return connection.
 ### Access remains restricted until enablement
 
 Before explicit recovery enablement, only the recovery service principal and designated
-owners receive workspace-level access. Other captured workspace, item, SQL, OneLake,
-semantic-model and connection ACLs are deferred. The control workspace stays restricted
-even after consumer access is enabled elsewhere.
+owners receive controller-applied workspace-level access. Other captured workspace, item,
+SQL, OneLake, semantic-model and connection ACLs are deferred. Business standby workspaces
+retain their strict access checks. The control workspace is different: added people and
+owner-role drift are reported as warnings during setup, sync, enablement and rearm, without
+blocking those operations or automatically changing grants. Required controller Admin
+access and actual permission/service failures still block. Business ACLs are never
+automatically replayed into the control workspace.
 
 Review exact deferred ACL IDs before approving replay. Workspace access does not establish
 SQL/model/OneLake/connection security equivalence. Supply the relevant runtime identity

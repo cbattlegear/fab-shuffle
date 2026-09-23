@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import Self
@@ -26,6 +27,8 @@ from fabshuffle.bcdr.bootstrap import (
     WorkspaceRoleIntent,
 )
 from fabshuffle.bcdr.capacity import CapacityError, _https_url, response_body, retry_after
+from fabshuffle.bcdr.contracts import Principal, WorkspaceGrant
+from fabshuffle.bcdr.control_access import control_workspace_warnings
 
 FABRIC_BASE = "https://api.fabric.microsoft.com/v1"
 
@@ -64,6 +67,7 @@ class _ControlProvisioner:
         self.sleep = sleep
         self.clock = clock
         self.http = httpx.Client(transport=transport, timeout=60, follow_redirects=False)
+        self.warnings: tuple[str, ...] = ()
 
     def close(self) -> None:
         self.http.close()
@@ -388,7 +392,12 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
             if self.clock() + delay >= deadline:
                 raise WarehouseCreationUnknown("Control workspace capacity assignment is not yet ready")
             self.sleep(delay)
-        intent = self._restrict_roles(intent, principals)
+        if intent.phase == "ready":
+            self._check_roles(self._roles(intent.workspace_id), principals)
+        else:
+            intent = self._restrict_roles(intent, principals)
+        for warning in self.warnings:
+            logging.getLogger(__name__).warning("%s", warning)
         return self._persist_workspace(intent.model_copy(update={"phase": "ready"}))
 
     def verify_existing(
@@ -421,11 +430,8 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
             raise BootstrapError("Designated workspace is not settled on the recorded catalog capacity")
         roles = self._roles(workspace_id)
         self._check_roles(roles, principals)
-        if set(roles) != set(principals):
-            raise BootstrapError(
-                "Assign only the recovery SPN and every designated owner the Admin role, "
-                "then rerun verification"
-            )
+        for warning in self.warnings:
+            logging.getLogger(__name__).warning("%s", warning)
         if intent is None:
             intent = WorkspaceIntent(
                 owner_id=descriptor.controller_id, intent_id=str(uuid4()), origin="designated",
@@ -502,23 +508,17 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
                 raise BootstrapError("Role inventory continuation is invalid or repeated")
             seen.add(token)
 
-    @staticmethod
-    def _check_roles(roles: dict[str, dict], principals: dict[str, WorkspacePrincipal]) -> None:
-        for principal_id, assignment in roles.items():
-            expected = principals.get(principal_id)
-            if expected is None:
-                raise BootstrapError(
-                    f"Remove unexpected principal {principal_id} from the control workspace, "
-                    "then resume setup"
-                )
-            if (
-                assignment["principal"].get("type") != expected.principal_type
-                or assignment.get("role") != expected.role
-            ):
-                raise BootstrapError(
-                    f"Reconcile the control workspace role for designated owner {principal_id}; "
-                    "expected Admin"
-                )
+    def _check_roles(self, roles: dict[str, dict], principals: dict[str, WorkspacePrincipal]) -> None:
+        tenant = self.tokens.tenant_id()
+        controller = Principal(tenant_id=tenant, object_id=self.tokens.object_id(), kind="ServicePrincipal")
+        owners = tuple(
+            WorkspaceGrant(
+                principal=Principal(tenant_id=tenant, object_id=row.object_id, kind=row.principal_type),
+                role=row.role,
+            )
+            for row in principals.values() if row.object_id != controller.object_id
+        )
+        self.warnings = control_workspace_warnings(tuple(roles.values()), controller, owners)
 
     def _restrict_roles(
         self, intent: WorkspaceIntent, principals: dict[str, WorkspacePrincipal],
@@ -530,6 +530,9 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
             observed = roles.get(pending.principal.object_id)
             if observed is None or (
                 pending.assignment_id is not None and pending.assignment_id != observed["id"]
+            ) or (
+                observed["principal"].get("type") != pending.principal.principal_type
+                or observed.get("role") != pending.principal.role
             ):
                 raise WarehouseCreationUnknown(
                     "Owner role mutation has no matching assignment receipt; "
@@ -567,7 +570,11 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
             )
             roles = self._roles(intent.workspace_id)
             self._check_roles(roles, principals)
-            if roles.get(principal.object_id, {}).get("id") != assignment_id:
+            observed = roles.get(principal.object_id, {})
+            if (
+                observed.get("id") != assignment_id or observed.get("role") != principal.role
+                or observed.get("principal", {}).get("type") != principal.principal_type
+            ):
                 raise WarehouseCreationUnknown(
                     "Owner role grant is not yet observable; resume setup to reconcile"
                 )
@@ -575,8 +582,4 @@ class ControlWorkspaceProvisioner(_ControlProvisioner):
             self._persist_workspace(intent)
         roles = self._roles(intent.workspace_id)
         self._check_roles(roles, principals)
-        if set(roles) != set(principals):
-            raise BootstrapError(
-                "Control workspace owner/SPN role inventory is incomplete; reconcile access"
-            )
         return intent

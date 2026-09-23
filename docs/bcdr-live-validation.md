@@ -160,7 +160,10 @@ or distribute administrator sessions.
    designated owners with Admin roles.
 5. Inspect durable non-secret bootstrap coordinates and Warehouse-held definitions,
    generations and history.
-6. Verify only UAMI/designated owners can access the control workspace; reader is denied.
+6. Verify the UAMI retains Admin access. Add a disposable named reader to the control
+   workspace and confirm setup/sync shows a warning beside its action rather than blocking
+   or removing the grant. A different designated-owner role is also advisory. Missing
+   controller Admin remains blocking; business standby workspace access remains restricted.
 7. Restart the idle controller, reconnect and load status. Same catalog IDs, no duplicate.
 
 Observe Fabric activity: metadata preparation must not submit a metadata Notebook/Spark

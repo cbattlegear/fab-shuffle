@@ -4,6 +4,7 @@ import pytest
 
 from fabshuffle.bcdr.access import AccessController, FabricAccess, remap_acl
 from fabshuffle.bcdr.backend import DurableRuntime, RecoveryBlocked, safe_error
+from fabshuffle.bcdr.bootstrap import BootstrapError
 from fabshuffle.bcdr.contracts import (
     AclScope,
     ConnectionIdentity,
@@ -13,6 +14,7 @@ from fabshuffle.bcdr.contracts import (
     RecoveryMode,
     WorkspaceIdentity,
 )
+from fabshuffle.bcdr.control_access import control_workspace_warnings
 from fabshuffle.fabric.client import FabricApiError
 from tests.test_bcdr_contracts import guid, recovery_set
 from tests.test_bcdr_coordinator import system as system
@@ -76,17 +78,79 @@ def test_unqualified_surface_is_actionable_not_admin_fallback(scope):
     transport.client.post.assert_not_called()
 
 
-def test_unowned_workspace_admin_drift_is_never_removed(system):
+def test_additional_control_workspace_admin_warns_without_changing_access(system):
     extra = {
         "id": guid(),
-        "principal": {"id": guid(), "type": "User"},
+        "principal": {"id": guid(), "type": "User", "displayName": "Additional owner"},
         "role": "Admin",
     }
-    system.estate.roles[system.config.control_workspace.workspace_id] = [extra]
-    with pytest.raises(RecoveryBlocked, match="unowned"):
-        system.service.synchronize(system.request)
-    assert system.estate.roles[system.config.control_workspace.workspace_id] == [extra]
+    roles = [
+        {"id": guid(), "principal": {"id": grant.principal.object_id, "type": grant.principal.kind},
+         "role": grant.role}
+        for grant in system.config.access_policy.workspace_grants()
+    ] + [extra]
+    system.estate.roles[system.config.control_workspace.workspace_id] = roles.copy()
+    result = system.service.synchronize(system.request)
+    assert any("Additional owner" in warning and "left unchanged" in warning for warning in result.warnings)
+    assert system.estate.roles[system.config.control_workspace.workspace_id] == roles
     assert not any(method == "DELETE" for method, _ in system.estate.calls)
+
+
+@pytest.mark.parametrize("mode", list(RecoveryMode))
+def test_control_workspace_membership_is_advisory_in_every_mode(mode):
+    config = recovery_set()
+    policy = config.access_policy
+    rows = [
+        {"principal": {"id": policy.recovery_spn.object_id, "type": "ServicePrincipal"}, "role": "Admin"},
+        {"principal": {"id": policy.owners[0].principal.object_id, "type": "User",
+                       "displayName": "Configured owner"}, "role": "Viewer"},
+        {"principal": {"id": guid(), "type": "Group", "displayName": "New team"}, "role": "Member"},
+    ]
+    runtime = Mock(spec=DurableRuntime)
+    runtime.mode = mode
+    fabric = Mock(spec=FabricAccess)
+    fabric.assignments.return_value = rows
+    access = AccessController(runtime, fabric, config)
+    warnings = access.restrict_workspace(config.control_workspace)
+    assert len(warnings) == 2
+    assert "Configured owner has Viewer" in warnings[0] and "New team has Member" in warnings[1]
+    fabric.grant.assert_not_called()
+    fabric.revoke.assert_not_called()
+    runtime.effect.assert_not_called()
+
+
+@pytest.mark.parametrize("role", [None, "Member", "Viewer"])
+def test_controller_admin_access_is_still_required(role):
+    config = recovery_set()
+    rows = [] if role is None else [{
+        "principal": {"id": config.access_policy.recovery_spn.object_id, "type": "ServicePrincipal"},
+        "role": role,
+    }]
+    with pytest.raises(BootstrapError, match="required Admin role"):
+        control_workspace_warnings(rows, config.access_policy.recovery_spn, config.access_policy.owners)
+
+
+def test_missing_control_owner_is_a_warning_not_an_automatic_grant():
+    config = recovery_set()
+    rows = [{"principal": {"id": config.access_policy.recovery_spn.object_id, "type": "ServicePrincipal"},
+             "role": "Admin"}]
+    warnings = control_workspace_warnings(
+        rows, config.access_policy.recovery_spn, config.access_policy.owners,
+    )
+    assert len(warnings) == 1 and "no access was added" in warnings[0]
+
+
+def test_business_workspace_unowned_access_remains_blocking():
+    config = recovery_set()
+    fabric = Mock(spec=FabricAccess)
+    fabric.assignments.return_value = [{
+        "principal": {"id": guid(), "type": "User"}, "role": "Admin",
+    }]
+    access = AccessController(Mock(spec=DurableRuntime), fabric, config)
+    with pytest.raises(RecoveryBlocked, match="unowned"):
+        access.restrict_workspace(WorkspaceIdentity(tenant_id=config.tenant_id, workspace_id=guid()))
+    fabric.grant.assert_not_called()
+    fabric.revoke.assert_not_called()
 
 
 def test_supported_grant_and_owned_revoke_are_journaled(system):

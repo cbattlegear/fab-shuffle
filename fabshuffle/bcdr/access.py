@@ -22,6 +22,7 @@ from fabshuffle.bcdr.contracts import (
     RecoverySet,
     WorkspaceIdentity,
 )
+from fabshuffle.bcdr.control_access import control_workspace_warnings
 from fabshuffle.fabric.client import FabricClient
 from fabshuffle.fabric.workspaces import add_role_assignment, list_role_assignments
 
@@ -141,9 +142,13 @@ class AccessController:
             for grant in self.recovery_set.access_policy.workspace_grants()
         )
 
-    def restrict_workspace(self, workspace: WorkspaceIdentity) -> None:
+    def restrict_workspace(self, workspace: WorkspaceIdentity) -> tuple[str, ...]:
+        """Restrict business targets; only audit membership on the control workspace."""
         allowed = self.owner_acls(workspace)
         assignments = self.fabric.assignments(allowed[0])
+        if workspace == self.recovery_set.control_workspace:
+            policy = self.recovery_set.access_policy
+            return control_workspace_warnings(assignments, policy.recovery_spn, policy.owners)
         for row in assignments:
             principal = _principal(row["principal"], workspace.tenant_id)
             if not any(principal == acl.principal and row["role"] == acl.permission for acl in allowed):
@@ -158,6 +163,7 @@ class AccessController:
                 for row in assignments
             ):
                 self.apply(acl, approved=True)
+        return ()
 
     def apply(self, acl: DesiredAcl, *, approved: bool) -> None:
         self.runtime.fence()

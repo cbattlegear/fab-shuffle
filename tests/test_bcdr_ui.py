@@ -27,6 +27,8 @@ import pytest
     "recovery_capacity_names_submit_exact_pair_and_catalog",
     "capacity_match_refresh_preserves_only_same_identity_approvals",
     "capacity_routes_are_named_and_unmatched_choices_are_disabled",
+    "feedback_stays_with_the_action_and_marks_only_its_fields",
+    "native_validation_is_reported_at_the_action",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

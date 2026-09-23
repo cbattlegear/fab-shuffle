@@ -743,7 +743,7 @@ class RecoveryCoordinator:
             for row in self.catalog.list_records("connections")
             if row.document["generation_id"] == generation_id
         }
-        self.access.restrict_workspace(self.recovery_set.control_workspace)
+        warnings.extend(self.access.restrict_workspace(self.recovery_set.control_workspace))
         for key in plan.executable_order:
             op = operations[key]
             if any(prerequisite not in completed for prerequisite in op.prerequisites):
@@ -1255,7 +1255,7 @@ class RecoveryCoordinator:
             desired = {row.acl_id: row for row in generation.snapshot.desired_acls}
             if approved - desired.keys():
                 raise RecoveryBlocked("Approve only ACL IDs from the selected captured generation")
-            self.access.restrict_workspace(self.recovery_set.control_workspace)
+            control_warnings = self.access.restrict_workspace(self.recovery_set.control_workspace)
             for group in groups:
                 if group.active:
                     results.append(group)
@@ -1446,6 +1446,7 @@ class RecoveryCoordinator:
                 },
                 warnings=(
                     "Recovery access is staged; production jobs remain stopped until separately authorized.",
+                    *control_warnings,
                     *tuple(dict.fromkeys(attachment_warnings)),
                 ),
             )

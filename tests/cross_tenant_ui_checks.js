@@ -57,6 +57,7 @@ function fixture() {
     close() { this.open = false; }
     scrollIntoView() {}
     reportValidity() { return true; }
+    checkValidity() { return true; }
     remove() { this.parentElement.children = this.parentElement.children.filter((child) => child !== this); }
     click() { return this.handlers.click?.({ target: this, currentTarget: this }); }
     reset() {
@@ -128,6 +129,33 @@ function fixture() {
 }
 
 const scenarios = {
+  async standby_login_hides_other_tenant(f) {
+    const workflow = f.get("login-workflow");
+    const another = f.get("another-tenant");
+    another.checked = true;
+    f.ui.updateLoginMode();
+    f.get("destination-credentials").querySelectorAll("input").forEach((input) => { input.value = "stale"; });
+    workflow.value = "bcdr";
+    workflow.handlers.change();
+    assert.equal(f.get("tenant-mode").hidden, true);
+    assert.equal(f.get("tenant-mode").disabled, true);
+    assert.equal(another.disabled, true);
+    assert.equal(another.checked, false);
+    assert.equal(f.get("destination-credentials").hidden, true);
+    assert.ok(f.get("destination-credentials").querySelectorAll("input").every((input) => input.value === ""));
+    assert.equal(f.ui.loginBody(f.get("login-form")).destination, undefined);
+    another.checked = true;
+    assert.equal(f.ui.loginBody(f.get("login-form")).destination, undefined, "Standby payload ignores stale pairing");
+    another.checked = false;
+    workflow.value = "migration";
+    workflow.handlers.change();
+    assert.equal(f.get("tenant-mode").hidden, false);
+    assert.equal(another.disabled, false);
+    assert.equal(another.checked, false);
+    another.checked = true;
+    another.handlers.change();
+    assert.equal(f.get("destination-credentials").hidden, false);
+  },
   async login(f) {
     f.ui.state.forceRebuild = true;
     const form = f.get("login-form");
