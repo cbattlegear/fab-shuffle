@@ -161,6 +161,29 @@ def test_read_only_navigation_summary_does_not_confuse_data_with_metadata(system
     assert status["recovery_gap_groups"] == [group.group_id]
 
 
+def test_healthy_group_can_be_tested_when_an_unrelated_group_is_blocked(system):
+    synced = system.service.synchronize(system.request)
+    healthy = synced.groups[0]
+    blocked = healthy.model_copy(update={
+        "group_id": "blocked-group",
+        "items": (healthy.items[0].model_copy(update={"item_id": guid()}),),
+        "metadata_applied": False, "blockers": ("Unrelated metadata failed to apply",),
+    })
+    with system.c.runtime.controller({RecoveryMode.STANDBY}):
+        system.c._save_group(synced.generation_id, blocked)
+    workflow = system.service.status().details["workflow"]
+    assert not workflow["schedule_eligible"]
+    assert workflow["test_eligible"] and workflow["test_eligible_group_ids"] == [healthy.group_id]
+    with pytest.raises(RecoveryBlocked, match="metadata failures"):
+        system.service.start_dr_test(StartDrTestRequest(
+            generation_id=synced.generation_id, group_ids=(blocked.group_id,),
+        ))
+    started = system.service.start_dr_test(StartDrTestRequest(
+        generation_id=synced.generation_id, group_ids=(healthy.group_id,),
+    ))
+    assert started.mode == RecoveryMode.TESTING
+
+
 def test_test_restores_data_only_through_existing_provider_and_requires_owner_evidence(system):
     item = system.captured.items[0].model_copy(update={"item_type": "Lakehouse"})
     generation = system.captured.model_copy(update={"items": (item,)})

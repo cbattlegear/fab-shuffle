@@ -7,15 +7,49 @@ import os
 from fabshuffle.bcdr.backend import RecoveryBlocked
 from fabshuffle.bcdr.contracts import RecoveryMode, reject_embedded_secrets
 from fabshuffle.bcdr.deployment_lock import LEASE_ENV
+from fabshuffle.bcdr.protection_binding import owns_schema
 from fabshuffle.bcdr.service import ScheduleGuideRequest, ServiceResult, SyncRequest
 
 
-def workflow_summary(coordinator) -> dict:
+def prepared_metadata_groups(coordinator, generation, groups) -> set[str]:
+    """Owned provider shells are prepared metadata, not fully restored schema/data."""
+    if generation is None:
+        return set()
+    mappings = coordinator.item_mappings()
+    items = {item.identity.key: item for item in generation.snapshot.items}
+    prepared = set()
+    for group in groups:
+        if not group.items or any(
+            item.key not in items or item.key not in mappings
+            or mappings[item.key].capture_generation_id != generation.snapshot.generation_id
+            for item in group.items
+        ):
+            continue
+        if group.metadata_applied:
+            prepared.add(group.group_id)
+            continue
+        stored = coordinator.runtime.get("groups", group.group_id) or {}
+        blockers = set(stored.get("metadata_blockers", group.blockers))
+        deferred = {
+            f"Complete provider-owned metadata for '{items[item.key].display_name}'"
+            for item in group.items if owns_schema(generation, items[item.key], coordinator.catalog)
+        }
+        if blockers and blockers <= deferred:
+            prepared.add(group.group_id)
+    return prepared
+
+
+def workflow_summary(coordinator, generation=None) -> dict:
     state = coordinator.catalog.state()
     generation_id = state.current_generation_id
     groups = coordinator._groups(generation_id) if generation_id else ()
     pending = coordinator.catalog.pending_operations()
-    baseline = bool(groups) and all(group.metadata_applied for group in groups)
+    if generation is None and generation_id:
+        generation = coordinator.catalog.load_generation(generation_id)
+    prepared = prepared_metadata_groups(coordinator, generation, groups)
+    baseline = bool(groups) and len(prepared) == len(groups)
+    testable = [group.group_id for group in groups
+                if group.group_id in prepared and not group.active and not group.access_enabled]
     idle = state.mode == RecoveryMode.STANDBY and state.controller_id is None and not pending
     test = coordinator.runtime.get("lifecycle", "dr-test")
     if test and state.mode in {RecoveryMode.TESTING, RecoveryMode.ENDING_TEST}:
@@ -31,7 +65,8 @@ def workflow_summary(coordinator) -> dict:
         "last_scheduled_sync": coordinator.runtime.get("lifecycle", "last-scheduled-sync"),
         "test": test,
         "schedule_eligible": idle and baseline,
-        "test_eligible": idle and baseline,
+        "test_eligible": idle and bool(testable),
+        "test_eligible_group_ids": testable,
         "schedule_reason": (
             "Review the scope and prepare scheduled-sync instructions." if idle and baseline else
             "Complete the metadata sync and reconcile active or interrupted work before scheduling."
@@ -56,9 +91,15 @@ def schedule_guide(coordinator, request: ScheduleGuideRequest) -> ServiceResult:
     with coordinator.runtime.controller({RecoveryMode.STANDBY}):
         state = coordinator.catalog.state()
         groups = coordinator._groups(state.current_generation_id) if state.current_generation_id else ()
+        generation = (
+            coordinator.catalog.load_generation(state.current_generation_id)
+            if state.current_generation_id else None
+        )
+        prepared = prepared_metadata_groups(coordinator, generation, groups)
         if (
             request.generation_id != state.current_generation_id
-            or not groups or not all(group.metadata_applied for group in groups)
+            or not groups or len(prepared) != len(groups)
+            or any(group.active or group.access_enabled for group in groups)
         ):
             raise RecoveryBlocked("Complete metadata sync and review its current generation first.")
         saved = coordinator.runtime.get("plans", request.generation_id)
@@ -72,7 +113,6 @@ def schedule_guide(coordinator, request: ScheduleGuideRequest) -> ServiceResult:
         if len(document.encode("utf-8")) > MAX_REQUEST_BYTES:
             raise RecoveryBlocked("The scheduled request is too large; reduce the approved scope.")
         reject_embedded_secrets(document.encode("utf-8"))
-        generation = coordinator.catalog.load_generation(request.generation_id)
         selected_workspaces = {item.workspace_id for group in groups for item in group.items}
         return ServiceResult(
             mode=state.mode, generation_id=request.generation_id,

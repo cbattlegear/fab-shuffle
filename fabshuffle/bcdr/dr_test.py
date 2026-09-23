@@ -7,6 +7,7 @@ from uuid import uuid4
 from fabshuffle.bcdr.backend import RecoveryBlocked, now
 from fabshuffle.bcdr.contracts import RecoveryMode
 from fabshuffle.bcdr.service import ContinueDrTestRequest, EndDrTestRequest, ServiceResult, StartDrTestRequest
+from fabshuffle.bcdr.workflow import prepared_metadata_groups
 
 
 class DrTestController:
@@ -60,8 +61,14 @@ class DrTestController:
             if self.c.catalog.state().current_generation_id != request.generation_id:
                 raise RecoveryBlocked("Choose the current captured recovery point for the DR Test.")
             groups = self.c._selected_groups(request.generation_id, request.group_ids)
-            if any(not group.metadata_applied or group.active or group.access_enabled for group in groups):
-                raise RecoveryBlocked("Complete metadata sync and use inactive standby groups for this test.")
+            generation = self.c.catalog.load_generation(request.generation_id)
+            prepared = prepared_metadata_groups(self.c, generation, groups)
+            if any(
+                group.group_id not in prepared or group.active or group.access_enabled for group in groups
+            ):
+                raise RecoveryBlocked(
+                    "Resolve metadata failures and use inactive, owned standby targets for this test."
+                )
             writer = self.runtime.get("lifecycle", "writer") or {"epoch": 0, "side": "primary"}
             if writer["side"] != "primary":
                 raise RecoveryBlocked("DR Test cannot run while recovery has production writer authority.")
@@ -88,6 +95,17 @@ class DrTestController:
         self.c.capacities.resume_business(self.runtime)
         generation = self.c.catalog.load_generation(record["generation_id"])
         applied = self.c.item_mappings()
+        items = {item.identity.key: item for item in generation.snapshot.items}
+        for group in groups:
+            for item in group.items:
+                current = applied.get(item.key)
+                if current is None or self.c.observe(
+                    self.c.destination, current.target, items[item.key].item_type,
+                ) != current.target_observed_sha256:
+                    raise RecoveryBlocked(
+                        "A standby target changed before test preparation. "
+                        "Reconcile the target before restoring data."
+                    )
         results, warnings, evidence = [], [], []
         for group in groups:
             prepared, messages = self.c.prepare_group_data(generation, group, applied, owners_only=True)

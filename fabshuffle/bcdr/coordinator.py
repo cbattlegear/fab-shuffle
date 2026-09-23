@@ -239,13 +239,14 @@ class RecoveryCoordinator:
         self._wake()
         state = self.catalog.state()
         generation_id = state.current_generation_id
-        inventory = self.catalog.load_generation(generation_id).snapshot if generation_id else None
+        generation = self.catalog.load_generation(generation_id) if generation_id else None
+        inventory = generation.snapshot if generation else None
         return ServiceResult(
             mode=state.mode,
             generation_id=generation_id,
             groups=self._groups(generation_id) if generation_id else (),
             details={
-                "workflow": workflow_summary(self),
+                "workflow": workflow_summary(self, generation),
                 "writer": self.runtime.get("lifecycle", "writer") or {"epoch": 0, "side": "primary"},
                 "pending_operations": [
                     row.model_dump(mode="json") for row in self.catalog.pending_operations()
@@ -703,9 +704,12 @@ class RecoveryCoordinator:
                     },
                 )
             groups, warnings = self._apply_plan(generation, plan, request.suffix)
+            from fabshuffle.bcdr.workflow import prepared_metadata_groups
+
+            prepared = prepared_metadata_groups(self, generation, groups)
             summary = {
                 "generation_id": generation.snapshot.generation_id, "completed_at": now().isoformat(),
-                "metadata_ready": bool(groups) and all(group.metadata_applied for group in groups),
+                "metadata_ready": bool(groups) and len(prepared) == len(groups),
                 "data_gap_groups": [group.group_id for group in groups if not group.data_ready],
                 "kind": "scheduled" if standby_only else "manual",
             }

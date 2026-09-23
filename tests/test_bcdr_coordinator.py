@@ -1624,11 +1624,13 @@ def lakehouse_setup(monkeypatch):
     return lakehouse_cases.setup.__wrapped__(monkeypatch)
 
 
+@pytest.mark.parametrize("owners_only", [False, True])
 def test_independent_lakehouse_real_copy_finalizes_metadata_then_requires_new_proof(
     system,
     lakehouse_setup,
     tmp_path,
     monkeypatch,
+    owners_only,
 ):
     from dataclasses import replace
 
@@ -1638,6 +1640,7 @@ def test_independent_lakehouse_real_copy_finalizes_metadata_then_requires_new_pr
         ProtectionConfiguration,
         build_data_recovery,
     )
+    from fabshuffle.bcdr.service import ContinueDrTestRequest, StartDrTestRequest
     from tests import test_bcdr_protection_lakehouse as lake_tests
 
     lake, template = lakehouse_setup
@@ -1687,6 +1690,10 @@ def test_independent_lakehouse_real_copy_finalizes_metadata_then_requires_new_pr
     system.c.apply = applying
     synced = system.service.synchronize(system.request)
     assert not synced.groups[0].metadata_applied and modes == [True]
+    if owners_only:
+        workflow = system.service.status().details["workflow"]
+        assert workflow["test_eligible"] and workflow["schedule_eligible"]
+        assert workflow["recovery_gap_groups"] == [synced.groups[0].group_id]
     target = system.c.item_mappings()[source.identity.key].target
     system.estate.workspaces[target.workspace_id]["capacityRegion"] = "West US"
     monkeypatch.setattr(lake_tests, "SOURCE", source.identity)
@@ -1699,7 +1706,9 @@ def test_independent_lakehouse_real_copy_finalizes_metadata_then_requires_new_pr
         limits=lake_tests.LIMITS,
     )
     system.c.source = None
-    first = system.service.enable_recovery(
+    first = system.service.start_dr_test(
+        StartDrTestRequest(generation_id=synced.generation_id, group_ids=(synced.groups[0].group_id,)),
+    ) if owners_only else system.service.enable_recovery(
         EnableRecoveryRequest(
             generation_id=synced.generation_id,
             group_ids=(synced.groups[0].group_id,),
@@ -1715,14 +1724,21 @@ def test_independent_lakehouse_real_copy_finalizes_metadata_then_requires_new_pr
     postcopy = tuple(
         proof.model_copy(update={"observed_at": now()}) for proof in proofs(system, synced.generation_id)
     )
-    second = system.service.enable_recovery(
+    second = system.service.continue_dr_test(
+        ContinueDrTestRequest(test_id=first.details["dr_test"]["test_id"], readiness=postcopy),
+    ) if owners_only else system.service.enable_recovery(
         EnableRecoveryRequest(
             generation_id=synced.generation_id,
             group_ids=(synced.groups[0].group_id,),
             readiness=postcopy,
         )
     )
-    assert second.groups[0].access_enabled
+    if owners_only:
+        assert second.details["dr_test"]["results"][0]["outcome"] == "passed"
+        assert not second.groups[0].access_enabled and not second.groups[0].active
+        assert system.c.runtime.get("lifecycle", "writer") is None
+    else:
+        assert second.groups[0].access_enabled
     assert len(lake.writes) == writes
     assert all(
         request.method in ("GET", "HEAD")

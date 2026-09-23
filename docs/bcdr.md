@@ -229,6 +229,11 @@ manual and scheduled synchronization, while production remains primary. No sourc
 capture, primary-capacity pause, production ACL replay, writer-authority change, consumer
 routing, job/mirror/rule activation or production failback is part of this flow.
 
+Eligibility is evaluated per selected group: an unrelated blocked group does not prevent
+testing healthy groups. An owned, synchronized provider shell awaiting its qualified data
+restore is eligible for preparation; that is not a claim that its schema/data are already
+fully restored. Genuine metadata failures, missing ownership and target drift remain blocked.
+
 The test uses qualified independent data-restoration providers where configured. Workloads
 requiring incident-qualified temporary attachments remain blocked in this owners-only
 exercise until independent protection is configured. Restored bytes are not a passed test:
