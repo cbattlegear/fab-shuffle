@@ -83,12 +83,113 @@ const recoveryCapacitySchema = {
   }, required: ["fabric_capacity_id", "arm_resource_id", "dedicated_recovery", "authorized_for_suspend"],
 };
 
+const warehouseSetupCommand = {
+  name: "setup", label: "Set up metadata", path: "/api/bcdr/setup", method: "POST",
+  confirmation: "Check the selected Warehouse before initializing its catalog.",
+  schema: { type: "object", properties: {
+    control_workspace_id: { type: "string" }, control_workspace_name: { type: "string" },
+    warehouse_action: { type: "string", enum: ["continue", "existing", "create"] },
+    warehouse_id: { type: "string" }, expected_setup_revision: { type: "integer" },
+    warehouse_name: { type: "string", default: "New metadata" },
+  } },
+};
+
 function discoverButton(f) {
   return f.get("bcdr-content").querySelectorAll("button").find((button) =>
     button.textContent === "Discover setup choices" || button.textContent === "Discovering choices...");
 }
 
 const scenarios = {
+  async warehouse_list_signout_drops_late_choices(f) {
+    f.product.bcdr.savedSetup = { revision: 1, workspaceId: "control-workspace-guid",
+      warehouseName: "Saved metadata", warehousePhase: "accepted" };
+    f.product.bcdrRenderForms([warehouseSetupCommand]);
+    const form = f.get("bcdr-content").querySelector("form");
+    form.querySelectorAll("button").find((button) => button.textContent.startsWith("List Warehouses")).click();
+    f.get("sign-out").click();
+    await f.reply(0, { workspaceId: "control-workspace-guid", savedSetup: {},
+      warehouses: [{ id: "stale", displayName: "Old session metadata" }] });
+    assert.equal(f.product.bcdr.warehouseChoices.length, 0);
+    assert.equal(f.product.bcdr.savedSetup, null);
+    assert.equal(f.get("bcdr-content").textContent, "");
+  },
+  async warehouse_setup_prefills_saved_name_and_uses_selected_exact_item(f) {
+    f.product.bcdr.savedSetup = { revision: 12, workspaceId: "control-workspace-guid",
+      workspaceName: "Recovery metadata", warehouseName: "BCDR_Metadata",
+      warehousePhase: "accepted", warehouseId: null, hasOperation: true };
+    f.product.bcdrRenderForms([warehouseSetupCommand]);
+    const form = f.get("bcdr-content").querySelector("form");
+    const selects = form.querySelectorAll("select");
+    const workspace = selects.find((row) => row.name === "control_workspace_id");
+    const action = selects.find((row) => row.name === "warehouse_action");
+    const item = selects.find((row) => row.name === "warehouse_id");
+    assert.equal(workspace.value, "control-workspace-guid");
+    assert.match(workspace.textContent, /Recovery metadata/);
+    assert.equal(workspace.disabled, true);
+    assert.equal(action.value, "continue");
+    assert.equal(form.querySelectorAll("input").find((row) => row.name === "warehouse_name").value, "BCDR_Metadata");
+    assert.ok(action.children.find((row) => row.value === "create").disabled);
+    assert.equal(f.requests.length, 0, "Opening setup must not read SQL or start capacity");
+    form.querySelectorAll("button").find((button) => button.textContent.startsWith("List Warehouses")).click();
+    assert.equal(f.requests[0].url, "/api/bcdr/workspaces/control-workspace-guid/warehouses");
+    await f.reply(0, { workspaceId: "control-workspace-guid", workspaceName: "Recovery metadata",
+      savedSetup: f.product.bcdr.savedSetup,
+      warehouses: [{ id: "selected-wh-guid", displayName: "BCDR_Metadata", recorded: false, endpointReported: true }] });
+    assert.equal(item.value, "", "A name match is never selected automatically");
+    action.value = "existing";
+    action.handlers.change();
+    item.value = "selected-wh-guid";
+    form.handlers.submit({ preventDefault() {} });
+    const dialog = f.document.querySelectorAll("dialog").find((node) => node.className.includes("bcdr-confirm"));
+    assert.match(dialog.textContent, /BCDR_Metadata/);
+    assert.doesNotMatch(dialog.textContent, /selected-wh-guid/);
+    dialog.querySelectorAll("button")[1].click();
+    const body = JSON.parse(f.requests[1].options.body).request;
+    assert.equal(body.warehouse_id, "selected-wh-guid");
+    assert.equal(body.warehouse_action, "existing");
+    assert.equal(body.expected_setup_revision, 12);
+    await f.reply(1, { ...result, details: { setup_phase: "catalog_ready", setup_revision: 15,
+      warehouse_name: "BCDR_Metadata", control_warehouse_id: "selected-wh-guid",
+      control_workspace_id: "control-workspace-guid", next_action: "Preview standby selection." } });
+    assert.match(form.querySelector(".bcdr-action-progress").textContent, /BCDR_Metadata is ready.*Preview/);
+  },
+  async warehouse_list_errors_and_workspace_changes_do_not_select_stale_items(f) {
+    f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
+    f.product.bcdr.discovered.recovery.workspaces.push({ id: "second-workspace", displayName: "Second metadata" });
+    f.product.bcdrRenderForms([warehouseSetupCommand]);
+    const form = f.get("bcdr-content").querySelector("form");
+    const selects = form.querySelectorAll("select");
+    const mode = selects[0];
+    mode.value = "existing";
+    mode.handlers.change();
+    const workspace = selects.find((row) => row.name === "control_workspace_id");
+    workspace.value = "control-workspace-guid";
+    workspace.handlers.change();
+    assert.equal(f.requests.length, 1, "Selecting a workspace loads its Warehouses");
+    workspace.value = "second-workspace";
+    workspace.handlers.change();
+    assert.equal(f.requests.length, 2);
+    await f.reply(0, { workspaceId: "control-workspace-guid", warehouses: [{ id: "old", displayName: "Old" }] });
+    assert.equal(f.product.bcdr.warehouseChoices.length, 0);
+    await f.reply(1, { detail: "AccessDenied: Request read access" }, 403);
+    assert.match(form.textContent, /Could not list Warehouses.*AccessDenied/);
+    form.querySelectorAll("button").find((button) => button.textContent.startsWith("List Warehouses")).click();
+    await f.reply(2, { workspaceId: "second-workspace", warehouses: [], savedSetup: null });
+    assert.match(form.textContent, /No Warehouses were returned/);
+    const action = selects.find((row) => row.name === "warehouse_action");
+    action.value = "create";
+    action.handlers.change();
+    const name = form.querySelectorAll("input").find((row) => row.name === "warehouse_name");
+    name.value = "Fresh metadata";
+    form.handlers.submit({ preventDefault() {} });
+    const dialog = f.document.querySelectorAll("dialog").find((node) => node.className.includes("bcdr-confirm"));
+    dialog.querySelectorAll("button")[1].click();
+    const body = JSON.parse(f.requests[3].options.body).request;
+    assert.equal(body.warehouse_action, "create");
+    assert.equal(body.warehouse_id, undefined);
+    assert.equal(body.control_workspace_id, "second-workspace");
+    await f.reply(3, result);
+  },
   async recovery_capacity_names_submit_exact_pair_and_catalog(f) {
     f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
     const setupCommand = { name: "setup", label: "Setup", method: "POST", path: "/api/bcdr/setup",

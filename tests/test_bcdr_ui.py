@@ -29,6 +29,9 @@ import pytest
     "capacity_routes_are_named_and_unmatched_choices_are_disabled",
     "feedback_stays_with_the_action_and_marks_only_its_fields",
     "native_validation_is_reported_at_the_action",
+    "warehouse_setup_prefills_saved_name_and_uses_selected_exact_item",
+    "warehouse_list_errors_and_workspace_changes_do_not_select_stale_items",
+    "warehouse_list_signout_drops_late_choices",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

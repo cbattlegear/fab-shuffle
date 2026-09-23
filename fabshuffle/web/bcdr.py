@@ -13,7 +13,7 @@ import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,7 +23,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
 from fabshuffle.bcdr.backend import RecoveryBlocked
-from fabshuffle.bcdr.bootstrap import BootstrapError, canonical_arm_id
+from fabshuffle.bcdr.bootstrap import BootstrapError, BootstrapStore, canonical_arm_id
 from fabshuffle.bcdr.capacity import ArmCapacityClient, CapacityError
 from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.discovery import match_recovery_capacities
@@ -48,7 +48,7 @@ from fabshuffle.bcdr.service import (
     setup as setup_recovery,
 )
 from fabshuffle.config import SETTINGS
-from fabshuffle.fabric import workspaces
+from fabshuffle.fabric import data_stores, workspaces
 from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.lifecycle import safe_text
 
@@ -96,9 +96,13 @@ COMMANDS = (
      "Create a control workspace or choose an existing one where the recovery principal has Admin access. "
      "Additional members and owner-role differences produce warnings; existing grants stay unchanged. "
      "New control workspace owners use the Admin role. "
-     "Create one new central metadata Warehouse and persist its "
+     "Choose an existing metadata Warehouse, continue saved setup, or create a new Warehouse. "
+     "A selected Warehouse must be empty or contain this recovery set's compatible catalog. Persist its "
      "non-secret bootstrap in durable controller storage. No metadata lakehouse, Spark or Git is used.",
-     "Create the central metadata Warehouse and, if selected, its restricted control workspace. Confirm the "
+     "Continue or prepare the selected metadata Warehouse and, if selected, create its control workspace. "
+     "An existing Warehouse is explicitly designated, not adopted by name. "
+     "Incompatible contents are not overwritten. "
+     "Confirm the "
      "source-capacity scope, dedicated recovery capacities, suspend authorization and owner allowlist. "
      "This does not enable recovery or grant general user access."),
     ("status", "Read recovery status", None,
@@ -171,6 +175,30 @@ def _same_tenant(session: Session) -> str:
         raise ValueError("BCDR requires source and recovery credentials in the same tenant. "
                          "Use the separate migration workflow for another tenant.")
     return tenant
+
+
+def _saved_setup(session: Session) -> dict | None:
+    path = bootstrap_path()
+    if not path.exists():
+        return None
+    try:
+        descriptor = BootstrapStore(path).load()
+        if (
+            descriptor.tenant_id != session.destination_tokens.tenant_id()
+            or descriptor.application_id != str(UUID(session.destination_tokens.principal.client_id))
+        ):
+            raise RecoveryBlocked("Saved setup belongs to a different recovery identity. Use its sign-in.")
+    except BootstrapError as error:
+        raise RecoveryBlocked(safe_text(str(error))) from error
+    intent = descriptor.warehouse_intent
+    return {
+        "revision": descriptor.revision, "workspaceId": descriptor.control_workspace_id,
+        "workspaceName": descriptor.workspace_intent.display_name if descriptor.workspace_intent else None,
+        "warehouseId": descriptor.control_warehouse_id,
+        "warehouseName": intent.display_name if intent else None,
+        "warehousePhase": intent.phase if intent else None,
+        "hasOperation": bool(intent and intent.operation_id),
+    }
 
 
 def _service_call(
@@ -300,7 +328,8 @@ def create_router(
             }
 
         principal = await execute(session, identity)
-        return {"identity": principal, "commands": [
+        saved = await execute(session, lambda: _saved_setup(session))
+        return {"identity": principal, "savedSetup": saved, "commands": [
             {
                 "name": name, "label": label, "path": f"/api/bcdr/{name}",
                 "method": "GET" if model is None else "POST",
@@ -310,6 +339,42 @@ def create_router(
             }
             for name, label, model, description, confirmation in COMMANDS
         ]}
+
+    @router.get("/workspaces/{workspace_id}/warehouses")
+    async def warehouse_choices(workspace_id: UUID, session=Depends(require_session)):
+        def work():
+            _same_tenant(session)
+            saved = _saved_setup(session)
+            identifier = str(workspace_id)
+            if saved and saved["workspaceId"] and saved["workspaceId"] != identifier:
+                raise RecoveryBlocked(
+                    "This deployment has setup saved in another metadata workspace. "
+                    "Use that workspace to continue; no saved state was replaced."
+                )
+            with FabricClient(session.destination_tokens) as client:
+                workspace = workspaces.get_workspace(client, identifier)
+                if workspace.get("id") != identifier:
+                    raise RecoveryBlocked("The service returned a different metadata workspace.")
+                entries = data_stores.list_warehouses(client, identifier)
+            choices = []
+            for entry in entries:
+                if entry.get("workspaceId") != identifier or entry.get("type") != "Warehouse":
+                    raise RecoveryBlocked("Warehouse discovery returned an item from another workspace.")
+                item_id = str(UUID(entry["id"]))
+                choices.append({
+                    "id": item_id, "displayName": entry.get("displayName") or "Unnamed Warehouse",
+                    "recorded": bool(saved and saved["warehouseId"] == item_id),
+                    "endpointReported": bool(entry.get("properties", {}).get("connectionString")),
+                })
+            logger.info("BCDR Warehouse choices: workspace=%s count=%s", identifier, len(choices))
+            for entry in choices:
+                logger.info("BCDR Warehouse choice: workspace=%s warehouse=%s name=%r",
+                            identifier, entry["id"], safe_text(entry["displayName"]))
+            return {
+                "workspaceId": identifier, "workspaceName": workspace.get("displayName"),
+                "warehouses": choices, "savedSetup": saved,
+            }
+        return await execute(session, work)
 
     @router.post("/setup", response_model=ServiceResult)
     async def setup(body: ConfirmedRequest[SetupRequest], session=Depends(require_session)):
@@ -382,7 +447,8 @@ def create_router(
                     target["errors"]["capacityMapping"] = safe_text(str(error))
                     logger.warning("BCDR discovery=%s capacity matching failed: %s",
                                    discovery_id, target["errors"]["capacityMapping"])
-            return {"source": source, "recovery": target, "discovery_id": discovery_id}
+            return {"source": source, "recovery": target, "discovery_id": discovery_id,
+                    "savedSetup": _saved_setup(session)}
 
         return await execute(session, work)
 

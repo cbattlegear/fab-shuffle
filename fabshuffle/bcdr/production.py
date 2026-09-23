@@ -389,6 +389,11 @@ def setup_recovery(
         if bootstrap_path.exists():
             descriptor = store.load()
             if (
+                request.expected_setup_revision is not None
+                and request.expected_setup_revision != descriptor.revision
+            ):
+                raise RecoveryBlocked("Saved setup changed. Refresh setup choices before continuing.")
+            if (
                 descriptor.tenant_id != tenant
                 or descriptor.application_id != target_tokens.principal.client_id
                 or (
@@ -396,11 +401,21 @@ def setup_recovery(
                     and descriptor.control_workspace_id != request.control_workspace_id
                 )
                 or descriptor.capacities != capacities
+                or descriptor.catalog_capacity_id != request.catalog_capacity_id.lower()
             ):
                 raise RecoveryBlocked(
                     "Setup request differs from the existing owned bootstrap; do not overwrite it"
                 )
+            if request.warehouse_action == "create" and (
+                descriptor.warehouse_intent or descriptor.control_warehouse_id
+            ):
+                raise RecoveryBlocked(
+                    "This recovery set already has a Warehouse setup in progress. "
+                    "Continue saved setup or explicitly use an existing Warehouse; no duplicate was created."
+                )
         else:
+            if request.expected_setup_revision is not None:
+                raise RecoveryBlocked("Saved setup is no longer present. Refresh the setup form.")
             descriptor = BootstrapDescriptor(
                 recovery_set_id=str(uuid4()),
                 tenant_id=tenant,
@@ -438,9 +453,14 @@ def setup_recovery(
                 assignments, request.access_policy.recovery_spn, request.access_policy.owners,
             )
         with ControlWarehouseProvisioner(store, target_tokens) as provisioner:
-            descriptor = provisioner.ensure(
-                display_name=request.warehouse_name, owner_id=descriptor.controller_id
-            )
+            if request.warehouse_action == "existing":
+                descriptor = provisioner.inspect_selected(
+                    request.warehouse_id, owner_id=descriptor.controller_id,
+                )
+            else:
+                descriptor = provisioner.ensure(
+                    display_name=request.warehouse_name, owner_id=descriptor.controller_id,
+                )
         config = RecoverySet(
             recovery_set_id=descriptor.recovery_set_id,
             tenant_id=tenant,
@@ -460,7 +480,11 @@ def setup_recovery(
             descriptor.tds_host, descriptor.tds_catalog, target_tokens, config,
             guard=lock.assert_held,
         )
-        catalog.initialize()
+        selected = request.warehouse_action == "existing"
+        if selected:
+            catalog.validate_setup_target()
+            descriptor = store.save(descriptor, expected_revision=descriptor.revision)
+        catalog.initialize(require_empty=descriptor.warehouse_intent.origin == "designated")
         return ServiceResult(
             mode=catalog.state().mode,
             warnings=access_warnings,
@@ -468,6 +492,10 @@ def setup_recovery(
                 "recovery_set_id": descriptor.recovery_set_id,
                 "control_workspace_id": descriptor.control_workspace_id,
                 "control_warehouse_id": descriptor.control_warehouse_id,
+                "warehouse_name": descriptor.warehouse_intent.display_name,
+                "setup_phase": "catalog_ready",
+                "setup_revision": store.load().revision,
+                "next_action": "Preview standby selection, then Sync standby when ready.",
             },
         )
     finally:

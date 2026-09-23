@@ -58,6 +58,9 @@ class SetupRequest(Record):
     control_workspace_id: Guid | None = None
     control_workspace_name: Nonempty | None = None
     warehouse_name: Nonempty = "Fab Shuffle recovery catalog"
+    warehouse_action: Literal["continue", "create", "existing"] = "continue"
+    warehouse_id: Guid | None = None
+    expected_setup_revision: int | None = Field(default=None, ge=0)
     source_capacity_ids: tuple[Guid, ...]
     recovery_capacities: tuple[SetupCapacity, ...]
     catalog_capacity_id: Nonempty
@@ -65,6 +68,11 @@ class SetupRequest(Record):
 
     @model_validator(mode="after")
     def one_control_workspace(self) -> SetupRequest:
+        if self.warehouse_action == "existing":
+            if self.warehouse_id is None or self.control_workspace_id is None:
+                raise ValueError("Choose the metadata workspace and an existing Warehouse")
+        elif self.warehouse_id is not None:
+            raise ValueError("A Warehouse selection requires the use-existing action")
         if (self.control_workspace_id is None) == (self.control_workspace_name is None):
             raise ValueError("Choose an existing control workspace ID or a name for a new one, not both")
         if not self.source_capacity_ids or len(self.source_capacity_ids) != len(

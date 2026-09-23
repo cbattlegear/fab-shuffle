@@ -99,6 +99,9 @@ class TestCursor:
         elif "FROM sys.schemas" in sql:
             sql = "SELECT 1 FROM sqlite_master WHERE name = 'bcdr_schema_marker'"
             params = ()
+        elif "FROM sys.objects" in sql:
+            sql = "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'"
+            params = ()
         sql = sql.replace("bcdr.", "bcdr_")
         sql = re.sub(r"varbinary\(max\)", "BLOB", sql, flags=re.I)
         cursor = self.connection.db.execute(sql, params)
@@ -155,6 +158,39 @@ def test_real_sql_schema_avoids_unsupported_or_unenforced_locking_assumptions():
     for unsupported in ("nvarchar", "primary key", "unique", "savepoint", "sp_getapplock", "identity("):
         assert unsupported not in ddl
 
+
+def test_selected_empty_warehouse_is_checked_before_initialization(tmp_path):
+    harness = SqlHarness(tmp_path / "empty.db")
+    config = recovery_set()
+    catalog = WarehouseCatalog(harness.connect, config)
+    catalog.validate_setup_target()
+    assert not any(sql.startswith("CREATE") for sql, _ in harness.sql)
+    catalog.initialize(require_empty=True)
+    assert catalog.state().recovery_set_id == config.recovery_set_id
+    count = len(harness.sql)
+    catalog.validate_setup_target()
+    catalog.initialize(require_empty=True)
+    assert not any(sql.startswith(("CREATE", "INSERT", "UPDATE")) for sql, _ in harness.sql[count:])
+
+
+@pytest.mark.parametrize("foreign_catalog", [False, True])
+def test_selected_unrelated_warehouse_is_never_modified(tmp_path, foreign_catalog):
+    harness = SqlHarness(tmp_path / "existing.db")
+    if foreign_catalog:
+        WarehouseCatalog(harness.connect, recovery_set()).initialize()
+    else:
+        harness.raw("CREATE TABLE business_orders (id int)")
+        harness.raw("INSERT INTO business_orders VALUES (42)")
+    catalog = WarehouseCatalog(harness.connect, recovery_set())
+    count = len(harness.sql)
+    with pytest.raises(IntegrityError):
+        catalog.validate_setup_target()
+    with pytest.raises(IntegrityError):
+        catalog.initialize(require_empty=True)
+    assert not any(sql.startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "DROP"))
+                   for sql, _ in harness.sql[count:])
+    if not foreign_catalog:
+        assert harness.raw("SELECT id FROM business_orders") == [(42,)]
 
 def test_publish_large_payload_preserves_exact_bytes_and_old_generation(catalog):
     catalog, harness, lease = catalog

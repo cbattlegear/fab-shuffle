@@ -115,6 +115,7 @@ class WarehouseIntent(BootstrapRecord):
     operation_id: Guid | None = None
     warehouse_id: Guid | None = None
     request_id: Guid | None = None
+    origin: Literal["created", "designated"] = "created"
 
     @model_validator(mode="after")
     def evidence(self) -> Self:
@@ -122,6 +123,8 @@ class WarehouseIntent(BootstrapRecord):
             raise ValueError("An accepted create requires its returned operation ID")
         if self.phase in {"created", "ready"} and self.warehouse_id is None:
             raise ValueError("A created Warehouse requires its returned resource ID")
+        if self.origin == "designated" and self.warehouse_id is None:
+            raise ValueError("An explicitly selected Warehouse requires its exact resource ID")
         return self
 
 

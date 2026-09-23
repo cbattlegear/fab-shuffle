@@ -81,9 +81,13 @@ identity-bound observations, not an instruction to trust a general "ready" check
    beside the button. Empty results and partial failures include an action to take; discovery
    never saves setup or starts a capacity operation. Refreshing preserves still-valid resource
    selections and unrelated form inputs.
-3. Open **Set up the control Warehouse**. Enter a new control workspace name or choose the existing
-   control workspace by name from the recovery principal's inventory, then enter the new Warehouse
-   name. Select the source capacities that define the recovery scope.
+3. Open **Set up the control Warehouse**. Choose the recovery metadata workspace first.
+   Selecting an existing workspace lists its Warehouses by name; **List Warehouses in this workspace**
+   refreshes that read. Choose **Use an existing Warehouse**, **Create a new Warehouse**, or
+   **Continue saved setup** when a previous attempt is recorded. Saved workspace and Warehouse
+   details are prefilled; continuation uses the recorded name rather than a new form default.
+   A new workspace offers creation rather than an existing-Warehouse selection.
+   Select the source capacities that define the recovery scope.
    Workspace and source-capacity selection has no manual-ID fallback. Resolve ambiguous names
    or missing access before selecting; a disappeared selection is not silently replaced.
 4. Add each dedicated recovery capacity by name. The picker matches Fabric and Azure resources
@@ -96,14 +100,26 @@ identity-bound observations, not an instruction to trust a general "ready" check
    session rather than its application ID. Add the designated owners' object IDs, kinds and
    workspace roles. These define the grants the controller applies to business standby
    workspaces; additional control-workspace members may be managed independently.
-6. Confirm **Set up the control Warehouse**. The backend creates the new Warehouse and persists
-   its bootstrap using the deployment-configured path. Keep that storage durable and restricted.
+6. Confirm **Set up the control Warehouse**. The backend creates or continues the chosen resource,
+   or explicitly designates the selected existing Warehouse by its exact ID. Existing selections
+   are checked through REST and SQL before their binding is saved: only an empty Warehouse or
+   this recovery set's compatible catalog is accepted. Existing business objects, a foreign
+   recovery catalog or a changed configuration are never overwritten. The UI reports when the
+   metadata catalog is ready and names the next action. Keep the bootstrap storage durable and restricted.
    Then configure source-to-recovery capacity routes and exact workspace selection for
    **Sync standby**. Read the captured inventory, preview dependencies and explicitly approve
    any required additions before attempting their dependent groups.
 
-Do not repeatedly submit setup after an ambiguous create. Read the service error and reconcile
-the recorded provisioning operation; the backend must not adopt an unrelated Warehouse by name.
+If continuation reports `NotFound` for its recorded creation operation, use **List Warehouses**,
+choose **Use an existing Warehouse**, and explicitly select the intended resource. A matching
+display name alone never selects or adopts it. The old operation receipt remains recorded for
+diagnostics; it is not polled when using the explicit selection. If an item has no SQL endpoint
+yet, refresh and retry that selection rather than creating a duplicate.
+
+Once a Warehouse is attached, setup cannot switch this recovery set to another Warehouse.
+An outstanding creation also disables creating another one in the same bootstrap; investigate
+the pending resource rather than clearing state. Refresh setup choices if another controller
+changes the saved revision. Setup SQL initialization rechecks compatibility before writing.
 
 ### Setup troubleshooting
 
@@ -145,7 +161,7 @@ the identity of resources hidden from the signed-in principal.
 
 | Action | Meaning |
 | --- | --- |
-| Set up the control Warehouse | Create or choose the restricted control workspace, create its single new metadata Warehouse, and persist the ownership/bootstrap descriptor. |
+| Set up the control Warehouse | Choose/create the metadata workspace, continue its saved Warehouse setup or explicitly select/create a Warehouse, validate its catalog, and persist bootstrap coordinates. |
 | Read recovery status | Read the recorded mode, generations, groups, writer state and pending operations without source metadata reads. It can resume the control Warehouse capacity; opening the panel itself does not. |
 | Reconcile interrupted operation | Fence the previous controller and reconcile an exact recorded service receipt or saved completed result; never repeat an uncertain create or adopt by name. |
 | Preview standby selection | Preview exact include/exclude workspace IDs, positive name keywords, capacity routes and required dependency additions against captured metadata. |
@@ -354,6 +370,12 @@ The noninteractive `setup` command uses the same typed setup request and
 `--confirm setup`; it creates the bootstrap before opening a catalog. The wizard is the
 primary intent-based setup interface, so an operator does not need to construct Python
 records manually.
+
+`warehouse_action` is `continue` (the backward-compatible default), `create`, or `existing`.
+The `existing` action requires `control_workspace_id` and `warehouse_id`; it does not use
+the display name as identity. Optional `expected_setup_revision` prevents submitting a
+stale form against changed bootstrap state. Continuation ignores a different supplied
+Warehouse-name default and follows its recorded intent.
 
 For an unattended schedule, use **`scheduled-sync`**, not the general operator
 `synchronize` command. Persist an explicitly approved, non-secret `SyncRequest` with exact

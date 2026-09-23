@@ -828,7 +828,10 @@ def test_source_reference_connection_is_rejected_before_mutation(system, referen
         )
 
 
-@pytest.mark.parametrize("new_workspace", [False, True])
+@pytest.mark.parametrize("new_workspace,existing_contents", [
+    (False, None), (True, None), (False, "empty"), (False, "business"), (False, "foreign-catalog"),
+    (False, "stale-revision"), (False, "duplicate-create"),
+])
 @pytest.mark.parametrize("additional_access", [False, True])
 def test_production_setup_wires_real_provisioners_and_sql_catalog(
     system,
@@ -836,15 +839,18 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
     monkeypatch,
     new_workspace,
     additional_access,
+    existing_contents,
 ):
     from functools import partial
 
     from fabshuffle.bcdr import production
-    from fabshuffle.bcdr.bootstrap import BootstrapStore
+    from fabshuffle.bcdr.bootstrap import BootstrapStore, WarehouseIntent
+    from fabshuffle.bcdr.payloads import IntegrityError
     from fabshuffle.bcdr.service import SetupCapacity, SetupRequest, setup
 
     capacities, descriptor_store, _ = production_capacities(system, tmp_path, monkeypatch)
     descriptor = descriptor_store.load()
+    use_existing = existing_contents is not None
     system.c.tokens.object_id.return_value = system.config.access_policy.recovery_spn.object_id
     control_id = system.config.control_workspace.workspace_id
     system.estate.workspaces[control_id] = {
@@ -854,16 +860,19 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
         "capacityAssignmentProgress": "Completed",
     }
     warehouse_id = guid()
+    warehouse_requests = []
 
     def fabric_handler(request):
         path = request.url.path.removeprefix("/v1/")
         if path.endswith("/warehouses") or "/warehouses/" in path:
+            warehouse_requests.append(request.method)
             return httpx.Response(
                 201 if request.method == "POST" else 200,
                 json={
                     "id": warehouse_id,
                     "type": "Warehouse",
                     "workspaceId": path.split("/")[1],
+                    "displayName": "Selected metadata Warehouse",
                     "properties": {"connectionString": "example.datawarehouse.fabric.microsoft.com"},
                 },
             )
@@ -896,12 +905,27 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
 
     def new_catalog(server, database, tokens, config, **kwargs):
         harness = SqlHarness(tmp_path / "setup-catalog.db")
+        if existing_contents == "business":
+            harness.raw("CREATE TABLE orders (id int)")
+        elif existing_contents == "foreign-catalog":
+            foreign = config.model_copy(update={"recovery_set_id": guid()})
+            WarehouseCatalog(harness.connect, foreign).initialize()
         catalog = WarehouseCatalog(harness.connect, config, sleep=Mock())
         created.append(catalog)
         return catalog
 
     monkeypatch.setattr(WarehouseCatalog, "from_endpoint", new_catalog)
     path = tmp_path / "new-deployment.json"
+    previous_operation = guid()
+    if use_existing:
+        BootstrapStore(path).save(descriptor.model_copy(update={
+            "control_warehouse_id": None, "tds_host": None, "tds_catalog": None,
+            "warehouse_intent": WarehouseIntent(
+                owner_id=descriptor.controller_id, intent_id=guid(), display_name="Old form name",
+                phase="accepted", operation_id=previous_operation,
+            ),
+        }), expected_revision=None)
+    stored_before = BootstrapStore(path).load() if use_existing else None
     request = SetupRequest(
         control_workspace_name="Recovery control" if new_workspace else None,
         control_workspace_id=None if new_workspace else control_id,
@@ -917,7 +941,24 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
         ),
         catalog_capacity_id=descriptor.catalog_capacity_id,
         access_policy=system.config.access_policy,
+        warehouse_action="create" if existing_contents == "duplicate-create" else (
+            "existing" if use_existing else "continue"
+        ),
+        warehouse_id=warehouse_id if use_existing and existing_contents != "duplicate-create" else None,
+        expected_setup_revision=stored_before.revision + 1 if existing_contents == "stale-revision" else None,
     )
+    if existing_contents in {"stale-revision", "duplicate-create"}:
+        with pytest.raises(RecoveryBlocked):
+            setup(request, path, target_tokens=system.c.tokens)
+        assert BootstrapStore(path).load() == stored_before and not warehouse_requests
+        return
+    if existing_contents in {"business", "foreign-catalog"}:
+        before = BootstrapStore(path).load()
+        with pytest.raises(IntegrityError):
+            setup(request, path, target_tokens=system.c.tokens)
+        assert BootstrapStore(path).load() == before
+        assert warehouse_requests == ["GET"]
+        return
     result = setup(request, path, target_tokens=system.c.tokens)
     stored = BootstrapStore(path).load()
     assert stored.control_warehouse_id == warehouse_id
@@ -927,6 +968,11 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
     assert "not-a-real-secret" not in path.read_text()
     assert any("New workspace admin" in warning for warning in result.warnings) == additional_access
     assert not any(method == "DELETE" for method, _ in system.estate.calls)
+    if use_existing:
+        assert warehouse_requests == ["GET"]
+        assert stored.warehouse_intent.origin == "designated"
+        assert stored.warehouse_intent.operation_id == previous_operation
+        assert stored.warehouse_intent.display_name == "Selected metadata Warehouse"
 
 
 def test_setup_reuses_pending_capacity_intent_instead_of_posting_again(system, tmp_path, monkeypatch):

@@ -280,7 +280,34 @@ class WarehouseCatalog(RecoveryCatalog):
         finally:
             connection.close()
 
-    def initialize(self) -> None:
+    def validate_setup_target(self) -> None:
+        """Check a selected Warehouse without changing its schema or configuration."""
+        with self._mutex, self._connection() as connection:
+            self._setup_exists(connection.cursor(), require_empty=True)
+
+    def _setup_exists(self, cursor, *, require_empty: bool) -> bool:
+        exists = cursor.execute(
+            "SELECT schema_id FROM sys.schemas WHERE name = ?", "bcdr",
+        ).fetchall()
+        if exists:
+            self._read_state(cursor)
+            self._read_config(cursor)
+            return True
+        if require_empty:
+            # The setup caller verified workspace Admin. Do not interpret a
+            # low-privilege, partial SQL metadata inventory as an empty Warehouse.
+            # https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-objects-transact-sql
+            objects = cursor.execute(
+                "SELECT name FROM sys.objects WHERE is_ms_shipped = 0",
+            ).fetchall()
+            if objects:
+                raise IntegrityError(
+                    "This Warehouse contains non-catalog objects. Select an empty metadata Warehouse "
+                    "or this recovery set's existing catalog; no contents were changed."
+                )
+        return False
+
+    def initialize(self, *, require_empty: bool = False) -> None:
         """Create a fresh, versioned schema or validate the existing singleton.
 
         CREATE SCHEMA is the initial serialization point. A racing initializer fails
@@ -288,14 +315,7 @@ class WarehouseCatalog(RecoveryCatalog):
         """
         with self._mutex, self._connection() as connection:
             cursor = connection.cursor()
-            exists = cursor.execute(
-                "SELECT schema_id FROM sys.schemas WHERE name = ?", "bcdr",
-            ).fetchall()
-            if exists:
-                state = self._read_state(cursor)
-                self._read_config(cursor)
-                if state.recovery_set_id != self.recovery_set.recovery_set_id:
-                    raise IntegrityError("This Warehouse belongs to another recovery set")
+            if self._setup_exists(cursor, require_empty=require_empty):
                 return
             try:
                 for statement in _DDL:

@@ -15,7 +15,12 @@ from httpx import ASGITransport, AsyncClient
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.bcdr import __main__ as cli
 from fabshuffle.bcdr.backend import RecoveryBlocked
-from fabshuffle.bcdr.bootstrap import BootstrapDescriptor, BootstrapStore, CapacityAuthorization
+from fabshuffle.bcdr.bootstrap import (
+    BootstrapDescriptor,
+    BootstrapStore,
+    CapacityAuthorization,
+    WarehouseIntent,
+)
 from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.contracts import RecoveryMode
 from fabshuffle.bcdr.service import (
@@ -298,6 +303,87 @@ def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch, 
     assert calls[0][2].principal.client_id == CLIENT
     assert CONTROL in caplog.text and TARGET_CAPACITY in caplog.text and ARM.lower() in caplog.text
     assert "never-persist-this" not in caplog.text
+
+
+def test_forms_show_owned_saved_setup_without_service_reads(product):
+    client, headers, _, created, path = product
+    store = BootstrapStore(path)
+    store.save(BootstrapDescriptor(
+        recovery_set_id=GENERATION, tenant_id=TENANT, application_id=CLIENT, controller_id=SPN,
+        capacities=(CapacityAuthorization(
+            arm_resource_id=ARM, fabric_capacity_id=TARGET_CAPACITY,
+            dedicated_recovery=True, authorized_for_suspend=True,
+        ),), catalog_capacity_id=ARM, control_workspace_id=CONTROL,
+        warehouse_intent=WarehouseIntent(
+            owner_id=SPN, intent_id=GENERATION, display_name="BCDR_Metadata",
+            phase="accepted", operation_id=GENERATION,
+        ),
+    ), expected_revision=None)
+    response = client.get("/api/bcdr/forms", headers=headers)
+    assert response.status_code == 200
+    saved = response.json()["savedSetup"]
+    assert saved["warehouseName"] == "BCDR_Metadata" and saved["warehousePhase"] == "accepted"
+    assert saved["workspaceId"] == CONTROL and saved["hasOperation"]
+    assert "operation_id" not in str(saved) and "never-persist-this" not in response.text
+    assert not created
+    mismatch = client.get(f"/api/bcdr/workspaces/{SOURCE_CAPACITY}/warehouses", headers=headers)
+    assert mismatch.status_code == 409
+    store.update(lambda row: row.model_copy(update={"application_id": CONTROL}))
+    denied = client.get("/api/bcdr/forms", headers=headers)
+    assert denied.status_code == 409 and "BCDR_Metadata" not in denied.text
+
+
+def test_warehouse_choices_are_scoped_readonly_paginated_and_nonsecret(product, monkeypatch):
+    import httpx
+
+    from fabshuffle.fabric.client import FabricClient
+
+    client, headers, _, created, _ = product
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.method == "GET"
+        assert request.url.path.startswith(f"/v1/workspaces/{CONTROL}")
+        if request.url.path.endswith("/warehouses"):
+            if "continuationToken" in request.url.params:
+                return httpx.Response(200, json={"value": []})
+            return httpx.Response(200, json={"value": [{
+                "id": GENERATION, "workspaceId": CONTROL, "type": "Warehouse", "displayName": "Metadata",
+                "properties": {"connectionString": "do-not-return-host"}, "unexpectedSecret": "do-not-return",
+            }], "continuationToken": "next"})
+        return httpx.Response(200, json={"id": CONTROL, "displayName": "Recovery metadata"})
+
+    tokens = Tokens()
+    tokens.fabric_token = lambda: "fabric-token"
+    session = web.SESSIONS.create(tokens.principal, tokens)
+    monkeypatch.setattr(bcdr, "FabricClient",
+                        lambda provider: FabricClient(provider, transport=httpx.MockTransport(handler)))
+    try:
+        response = client.get(f"/api/bcdr/workspaces/{CONTROL}/warehouses",
+                              headers={web.SESSION_HEADER: session.id})
+        assert response.status_code == 200
+        assert response.json()["warehouses"] == [{
+            "id": GENERATION, "displayName": "Metadata", "recorded": False, "endpointReported": True,
+        }]
+        assert len(calls) == 3 and not created
+        assert "do-not-return" not in response.text and "fabric-token" not in response.text
+        assert client.get("/api/bcdr/workspaces/not-a-guid/warehouses", headers=headers).status_code == 422
+        assert client.get(f"/api/bcdr/workspaces/{CONTROL}/warehouses").status_code == 401
+    finally:
+        web.SESSIONS.drop(session.id)
+
+
+@pytest.mark.parametrize("fields", [
+    {"warehouse_action": "existing"},
+    {"warehouse_action": "create", "warehouse_id": GENERATION},
+    {"warehouse_action": "continue", "warehouse_id": GENERATION},
+    {"warehouse_action": "existing", "warehouse_id": GENERATION, "control_workspace_id": None,
+     "control_workspace_name": "new"},
+])
+def test_warehouse_action_contract_rejects_incomplete_or_conflicting_selection(fields):
+    with pytest.raises(ValueError):
+        SetupRequest.model_validate({**SETUP, **fields})
 
 
 @pytest.mark.parametrize("failed", [None, "capacities", "workspaces", "mapping"])

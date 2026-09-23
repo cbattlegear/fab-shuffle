@@ -14,6 +14,8 @@ const bcdr = {
   bindings: [],
   capacityBindings: [],
   recoveryRows: new Map(),
+  savedSetup: null,
+  warehouseChoices: [],
 };
 
 function bcdrElement(tag, text, className) {
@@ -32,7 +34,9 @@ function bcdrLabel(name) {
     recovery_set_id: "Recovery set ID",
     control_workspace_id: "Existing control workspace",
     control_workspace_name: "New control workspace name",
-    warehouse_name: "New metadata Warehouse name",
+    warehouse_name: "Metadata Warehouse name",
+    warehouse_id: "Selected metadata Warehouse",
+    warehouse_action: "Warehouse action",
     source_capacity_ids: "Source capacities",
     source_capacity_id: "Source capacity",
     target_capacity_ids: "Dedicated recovery capacities",
@@ -104,6 +108,13 @@ function bcdrResolve(schema, root) {
 }
 
 function bcdrResourceChoices(name) {
+  if (name === "warehouse_id" || name === "control_warehouse_id") {
+    const choices = bcdr.warehouseChoices.map((entry) => ({ id: entry.id, label: entry.displayName }));
+    if (bcdr.savedSetup?.warehouseId && !choices.some((entry) => entry.id === bcdr.savedSetup.warehouseId)) {
+      choices.push({ id: bcdr.savedSetup.warehouseId, label: bcdr.savedSetup.warehouseName || "Saved Warehouse" });
+    }
+    return choices;
+  }
   if (["capacity_id", "target_capacity_ids"].includes(name)) {
     return [...(bcdr.discovered.source?.capacities || []), ...(bcdr.discovered.recovery?.capacities || [])]
       .map((entry) => ({ id: entry.id, label: [entry.displayName, entry.region].filter(Boolean).join(" - ") }));
@@ -135,7 +146,7 @@ function bcdrResourceChoices(name) {
   }
   if (name === "approved_addition_ids") return [];
   const side = name === "control_workspace_id" ? bcdr.discovered.recovery : bcdr.discovered.source;
-  return (side?.workspaces || []).map((entry) => {
+  const choices = (side?.workspaces || []).map((entry) => {
     const capacity = side?.capacities?.find((row) => row.id === entry.capacityId);
     return {
       id: entry.id,
@@ -143,6 +154,12 @@ function bcdrResourceChoices(name) {
         entry.capacityRegion || capacity?.region, entry.description].filter(Boolean).join(" - "),
     };
   });
+  if (name === "control_workspace_id" && bcdr.savedSetup?.workspaceId &&
+    !choices.some((entry) => entry.id === bcdr.savedSetup.workspaceId)) {
+    choices.push({ id: bcdr.savedSetup.workspaceId,
+      label: bcdr.savedSetup.workspaceName || "Saved recovery metadata workspace" });
+  }
+  return choices;
 }
 
 function bcdrCapacitySelect(name, id, required) {
@@ -322,7 +339,12 @@ function bcdrNamedWorkspace(name, id, required) {
   bcdr.bindings.push(refresh);
   refresh();
   return {
-    element: label,
+    element: label, select,
+    setValue: (value) => {
+      select.value = value;
+      selectedLabel = bcdrResourceChoices(name).find((entry) => entry.id === value)?.label || "";
+      refresh();
+    },
     read: () => {
       if (!select.value && !required) return undefined;
       if (bcdr.discovered.recovery?.errors?.workspaces) {
@@ -334,10 +356,164 @@ function bcdrNamedWorkspace(name, id, required) {
   };
 }
 
+function bcdrWarehouseSetup(workspaceId, schema) {
+  const group = bcdrElement("fieldset", undefined, "bcdr-wide");
+  group.appendChild(bcdrElement("legend", "Metadata Warehouse: choose or create"));
+  const recorded = bcdrElement("p", "", "hint");
+  group.appendChild(recorded);
+  const actionLabel = bcdrElement("label", "How would you like to continue?");
+  const action = bcdrElement("select");
+  action.name = "warehouse_action";
+  const options = {};
+  for (const [value, text] of [
+    ["continue", "Continue saved setup"], ["existing", "Use an existing Warehouse"], ["create", "Create a new Warehouse"],
+  ]) {
+    const option = bcdrElement("option", text);
+    option.value = value;
+    options[value] = option;
+    action.appendChild(option);
+  }
+  actionLabel.appendChild(action);
+  group.appendChild(actionLabel);
+  const load = bcdrElement("button", "List Warehouses in this workspace", "secondary");
+  load.type = "button";
+  group.appendChild(load);
+  const status = bcdrElement("p",
+    "Choose an existing metadata workspace, then list its Warehouses. Listing does not resume capacity or initialize SQL.",
+    "hint");
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  group.appendChild(status);
+  const existing = bcdrElement("label", "Existing metadata Warehouse");
+  const select = bcdrElement("select");
+  select.name = "warehouse_id";
+  existing.appendChild(select);
+  group.appendChild(existing);
+  const create = bcdrField("warehouse_name", schema.properties.warehouse_name, schema, true);
+  group.appendChild(create.element);
+  const name = create.element.querySelector("input");
+  const saved = () => bcdr.savedSetup?.workspaceId === workspaceId() ? bcdr.savedSetup : null;
+  let loadedWorkspace = null;
+  let sequence = 0;
+  let loading = false;
+  const show = () => {
+    existing.hidden = select.disabled = action.value !== "existing";
+    select.required = action.value === "existing";
+    create.element.hidden = name.disabled = action.value !== "create";
+    name.required = action.value === "create";
+  };
+  const renderSaved = () => {
+    const previous = saved();
+    options.continue.disabled = !previous?.warehousePhase;
+    options.existing.disabled = !workspaceId();
+    options.create.disabled = !!previous?.warehousePhase;
+    load.disabled = loading || !workspaceId();
+    recorded.textContent = previous?.warehousePhase ?
+      `Saved setup: ${previous.warehouseName || "Metadata Warehouse"} - ${bcdrLabel(previous.warehousePhase)}. ` +
+        (previous.warehouseId ? "Continue using the recorded Warehouse, or list it below. " :
+          "A prior creation was recorded. If its operation is unavailable, list Warehouses and explicitly select the intended item. ") +
+        "Existing catalog compatibility is checked before initialization; no Warehouse is adopted by name." :
+      "Use an empty existing Warehouse or create a new metadata Warehouse. Unrelated contents are never overwritten.";
+  };
+  const reset = () => {
+    ++sequence;
+    loading = false;
+    loadedWorkspace = null;
+    bcdr.warehouseChoices = [];
+    select.replaceChildren();
+    const empty = bcdrElement("option", "List Warehouses, then choose one");
+    empty.value = "";
+    select.appendChild(empty);
+    select.value = "";
+    name.value = saved()?.warehouseName || schema.properties.warehouse_name.default || "";
+    action.value = saved()?.warehousePhase ? "continue" : workspaceId() ? "existing" : "create";
+    renderSaved();
+    show();
+  };
+  const list = async () => {
+    if (loading || bcdr.pending || !bcdrCurrentSession(state.sessionId) || !workspaceId()) return;
+    const sessionId = state.sessionId;
+    const workspace = workspaceId();
+    const version = ++sequence;
+    const previous = select.value;
+    loading = true;
+    loadedWorkspace = null;
+    load.disabled = true;
+    status.textContent = "Reading Warehouses in the selected metadata workspace...";
+    try {
+      const result = await api(`/api/bcdr/workspaces/${encodeURIComponent(workspace)}/warehouses`);
+      if (!bcdrCurrentSession(sessionId) || version !== sequence || workspace !== workspaceId()) return;
+      if (result.workspaceId !== workspace || !Array.isArray(result.warehouses)) {
+        throw new Error("The service returned an incomplete Warehouse list");
+      }
+      bcdr.savedSetup = result.savedSetup;
+      if (bcdr.savedSetup && result.workspaceName) bcdr.savedSetup.workspaceName = result.workspaceName;
+      bcdr.warehouseChoices = result.warehouses;
+      select.replaceChildren();
+      const empty = bcdrElement("option", "Choose a Warehouse");
+      empty.value = "";
+      select.appendChild(empty);
+      for (const entry of result.warehouses) {
+        const option = bcdrElement("option", `${entry.displayName} - ` +
+          (entry.recorded ? "saved selection" : entry.endpointReported ? "SQL endpoint reported" : "endpoint not reported yet"));
+        option.value = entry.id;
+        select.appendChild(option);
+      }
+      select.value = result.warehouses.some((entry) => entry.id === previous) ? previous : "";
+      loadedWorkspace = workspace;
+      status.textContent = result.warehouses.length ?
+        `Found ${result.warehouses.length} Warehouse(s). Choose Use an existing Warehouse, then select one by name. ` +
+          "Catalog compatibility will be checked before setup; nothing was changed." :
+        "No Warehouses were returned. Check workspace access or choose Create a new Warehouse when no setup is pending.";
+      renderSaved();
+      show();
+    } catch (error) {
+      if (bcdrCurrentSession(sessionId) && version === sequence) {
+        status.textContent = `Could not list Warehouses: ${error.message}. Retry this read; no setup was started.`;
+      }
+    } finally {
+      if (version === sequence) {
+        loading = false;
+        load.disabled = !workspaceId();
+      }
+    }
+  };
+  action.addEventListener("change", show);
+  load.addEventListener("click", list);
+  reset();
+  bcdr.bindings.push(renderSaved);
+  return {
+    element: group,
+    contextChanged: (loadChoices = true) => {
+      reset();
+      status.textContent = "Choose or create a Warehouse for this metadata workspace.";
+      if (workspaceId() && loadChoices !== false) list();
+    },
+    read: () => {
+      const result = { warehouse_action: action.value };
+      if (loading) throw new Error("Wait for the Warehouse list to finish loading.");
+      if (options[action.value]?.disabled) throw new Error("Choose an available Warehouse setup action.");
+      if (action.value === "existing") {
+        const entry = bcdr.warehouseChoices.find((row) => row.id === select.value);
+        if (loadedWorkspace !== workspaceId() || !entry) throw new Error("List Warehouses and select the intended item.");
+        result.warehouse_id = entry.id;
+        result.warehouse_name = entry.displayName;
+      } else if (action.value === "continue") {
+        result.warehouse_name = saved().warehouseName;
+      } else {
+        result.warehouse_name = create.read();
+      }
+      if (saved()) result.expected_setup_revision = saved().revision;
+      return result;
+    },
+  };
+}
+
 function bcdrReviewRequest(value, key = "") {
   if (["control_workspace_id", "source_capacity_ids", "include_workspace_ids",
     "exclude_workspace_ids", "approved_addition_ids", "source_capacity_id", "target_capacity_id",
-    "fabric_capacity_id", "catalog_capacity_id", "arm_resource_id", "capacity_id", "target_capacity_ids"].includes(key)) {
+    "fabric_capacity_id", "catalog_capacity_id", "arm_resource_id", "capacity_id", "target_capacity_ids",
+    "warehouse_id", "control_warehouse_id"].includes(key)) {
     const entries = bcdrResourceChoices(key);
     const display = (id) => entries.find((entry) => entry.id === id)?.label ||
       (key === "arm_resource_id" && typeof id === "string" ? id.split("/").at(-1) : "Name unavailable; see server logs");
@@ -670,6 +846,7 @@ function bcdrField(name, source, root, required = false, context = []) {
     const fields = bcdrElement("div", undefined, "bcdr-fields");
     const readers = [];
     let workspace;
+    let warehouse;
     if (schema.properties?.control_workspace_id && schema.properties?.control_workspace_name) {
       const group = bcdrElement("fieldset", undefined, "bcdr-wide");
       group.appendChild(bcdrElement("legend", "Control workspace"));
@@ -680,11 +857,15 @@ function bcdrField(name, source, root, required = false, context = []) {
         option.value = value;
         select.appendChild(option);
       }
-      select.value = "create";
+      select.value = bcdr.savedSetup?.workspaceId ? "existing" : "create";
+      select.disabled = !!bcdr.savedSetup?.workspaceId;
       label.appendChild(select);
       group.appendChild(label);
       const create = bcdrField("control_workspace_name", schema.properties.control_workspace_name, root, true);
       const existing = bcdrField("control_workspace_id", schema.properties.control_workspace_id, root, true);
+      if (bcdr.savedSetup?.workspaceId) existing.setValue(bcdr.savedSetup.workspaceId);
+      else if (bcdr.savedSetup?.workspaceName) create.element.querySelector("input").value = bcdr.savedSetup.workspaceName;
+      if (bcdr.savedSetup?.workspaceId) existing.select.disabled = true;
       const createFields = bcdrElement("fieldset");
       const existingFields = bcdrElement("fieldset");
       createFields.appendChild(create.element);
@@ -698,11 +879,31 @@ function bcdrField(name, source, root, required = false, context = []) {
       select.addEventListener("change", change);
       change();
       fields.appendChild(group);
+      if (schema.properties.warehouse_action) {
+        warehouse = bcdrWarehouseSetup(() => select.value === "existing" ? existing.select.value : null, root);
+        fields.appendChild(warehouse.element);
+        select.addEventListener("change", warehouse.contextChanged);
+        existing.select.addEventListener("change", warehouse.contextChanged);
+        const syncSavedWorkspace = () => {
+          const savedId = bcdr.savedSetup?.workspaceId;
+          if (!savedId) return;
+          if (select.value !== "existing" || existing.select.value !== savedId) {
+            select.value = "existing";
+            existing.setValue(savedId);
+            change();
+            warehouse.contextChanged(false);
+          }
+          group.disabled = true;
+        };
+        bcdr.bindings.push(syncSavedWorkspace);
+        syncSavedWorkspace();
+      }
       workspace = () => select.value === "create" ?
         { control_workspace_name: create.read() } : { control_workspace_id: existing.read() };
     }
     for (const [key, value] of Object.entries(schema.properties || {})) {
       if (workspace && ["control_workspace_name", "control_workspace_id"].includes(key)) continue;
+      if (warehouse && ["warehouse_name", "warehouse_action", "warehouse_id", "expected_setup_revision"].includes(key)) continue;
       const field = bcdrField(key, value, root, (schema.required || []).includes(key), [...context, name]);
       fields.appendChild(field.element);
       readers.push([key, field.read]);
@@ -713,6 +914,7 @@ function bcdrField(name, source, root, required = false, context = []) {
       read: () => ({
         ...Object.fromEntries(readers.map(([key, read]) => [key, read()]).filter(([, value]) => value !== undefined)),
         ...(workspace ? workspace() : {}),
+        ...(warehouse ? warehouse.read() : {}),
       }),
     };
   }
@@ -839,6 +1041,11 @@ function bcdrError(message, trigger) {
 }
 
 function bcdrRenderResult(result) {
+  if (result.details?.setup_phase === "catalog_ready") {
+    bcdr.savedSetup = { ...bcdr.savedSetup, workspaceId: result.details.control_workspace_id,
+      warehouseId: result.details.control_warehouse_id, warehouseName: result.details.warehouse_name,
+      warehousePhase: "ready", revision: result.details.setup_revision };
+  }
   bcdr.latest = { ...bcdr.latest, ...result };
   bcdr.bindings.forEach((refresh) => refresh());
   const output = $("#bcdr-result");
@@ -1054,6 +1261,9 @@ async function bcdrSubmit(command, body, button) {
     if (!bcdrCurrentSession(sessionId)) return;
     bcdrRenderResult(result);
     feedback.progress.textContent = `${command.label}: result received. Review all group outcomes below.`;
+    if (result.details?.setup_phase === "catalog_ready") {
+      feedback.progress.textContent = `Metadata Warehouse ${result.details.warehouse_name} is ready. ${result.details.next_action}`;
+    }
     if (result.warnings?.length) {
       feedback.warnings.appendChild(bcdrElement("strong", "Review these warnings"));
       const list = bcdrElement("ul");
@@ -1155,6 +1365,7 @@ function bcdrRenderForms(commands) {
           Array.isArray(inventory[side][kind]) || typeof inventory[side].errors?.[kind] === "string"))) {
         throw new Error("The discovery response is incomplete. Inspect the server logs before retrying");
       }
+      if ("savedSetup" in inventory) bcdr.savedSetup = inventory.savedSetup;
       const summaries = [];
       const failures = [];
       for (const side of ["source", "recovery"]) {
@@ -1271,6 +1482,8 @@ $("#bcdr-open").addEventListener("click", async () => {
     const response = await api("/api/bcdr/forms");
     if (!bcdrCurrentSession(sessionId)) return;
     bcdr.identity = response.identity || {};
+    bcdr.savedSetup = response.savedSetup || null;
+    bcdr.warehouseChoices = [];
     bcdrRenderForms(response.commands);
     bcdr.forms = response.commands;
     $("#bcdr-progress").textContent = "Choose setup or read the saved recovery status. No operation has started.";
@@ -1293,6 +1506,8 @@ $("#sign-out").addEventListener("click", () => {
   bcdr.bindings = [];
   bcdr.capacityBindings = [];
   bcdr.recoveryRows = new Map();
+  bcdr.savedSetup = null;
+  bcdr.warehouseChoices = [];
   $("#bcdr-content").replaceChildren();
   $("#bcdr-progress").textContent = "";
   bcdrError("");

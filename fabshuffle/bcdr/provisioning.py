@@ -80,11 +80,14 @@ class _ControlProvisioner:
 
     def _request(
         self, method: str, path: str, *, json: dict | None = None, params: dict | None = None,
+        selected_warehouse_id: str | None = None,
     ) -> httpx.Response:
         descriptor = self.store.load()
         workspace_path = f"/v1/workspaces/{descriptor.control_workspace_id}"
         role_path = workspace_path + "/roleAssignments"
         allowed = {workspace_path, workspace_path + "/warehouses", role_path}
+        if selected_warehouse_id is not None and method == "GET":
+            allowed.add(workspace_path + "/warehouses/" + str(UUID(selected_warehouse_id)))
         if method == "POST":
             allowed.add("/v1/workspaces")
         if descriptor.control_warehouse_id:
@@ -129,6 +132,59 @@ class _ControlProvisioner:
 
 
 class ControlWarehouseProvisioner(_ControlProvisioner):
+    def inspect_selected(self, warehouse_id: str, *, owner_id: str) -> BootstrapDescriptor:
+        """Read an explicitly selected resource; commit selection only after SQL checks."""
+        warehouse_id = str(UUID(warehouse_id))
+        descriptor = self.store.load()
+        if (
+            str(UUID(owner_id)) != descriptor.controller_id
+            or self.tokens.tenant_id() != descriptor.tenant_id
+            or str(UUID(self.tokens.principal.client_id)) != descriptor.application_id
+        ):
+            raise BootstrapError("Authenticated tenant/application/controller does not own this bootstrap")
+        if not descriptor.control_workspace_id:
+            raise BootstrapError("Choose the recovery metadata workspace before selecting a Warehouse")
+        if descriptor.workspace_intent and descriptor.workspace_intent.phase != "ready":
+            raise BootstrapError("Continue the saved workspace setup before selecting its Warehouse")
+        if descriptor.control_warehouse_id and descriptor.control_warehouse_id != warehouse_id:
+            raise BootstrapError(
+                "This recovery set is already attached to another Warehouse. "
+                "Select its recorded Warehouse; setup cannot replace an attached catalog."
+            )
+        workspace = response_body(self._request("GET", f"/workspaces/{descriptor.control_workspace_id}"))
+        capacity_id = descriptor.capacity(descriptor.catalog_capacity_id).fabric_capacity_id
+        if (
+            str(UUID(str(workspace.get("id", "")))) != descriptor.control_workspace_id
+            or workspace.get("capacityId") != capacity_id
+            or workspace.get("capacityAssignmentProgress") != "Completed"
+        ):
+            raise BootstrapError("The metadata workspace is not settled on its configured recovery capacity")
+        response = self._request(
+            "GET", f"/workspaces/{descriptor.control_workspace_id}/warehouses/{warehouse_id}",
+            selected_warehouse_id=warehouse_id,
+        )
+        body = response_body(response)
+        self._check_resource(body, descriptor, expected_id=warehouse_id)
+        host = body.get("properties", {}).get("connectionString")
+        if not host:
+            raise WarehouseCreationUnknown(
+                "The selected Warehouse has not reported its SQL endpoint yet. "
+                "Refresh the Warehouse list and continue with the same selection; "
+                "no new Warehouse was created."
+            )
+        previous = descriptor.warehouse_intent
+        intent = WarehouseIntent(
+            owner_id=descriptor.controller_id,
+            intent_id=previous.intent_id if previous else str(uuid4()),
+            display_name=body["displayName"], origin="designated", phase="ready", warehouse_id=warehouse_id,
+            operation_id=previous.operation_id if previous else None,
+            request_id=previous.request_id if previous else None,
+        )
+        return BootstrapDescriptor.model_validate({
+            **descriptor.model_dump(), "warehouse_intent": intent,
+            "control_warehouse_id": warehouse_id, "tds_host": host, "tds_catalog": warehouse_id,
+        })
+
     @staticmethod
     def _validate_location(response: httpx.Response, operation_id: str) -> None:
         location = response.headers.get("Location")
@@ -186,8 +242,8 @@ class ControlWarehouseProvisioner(_ControlProvisioner):
             )
         if intent is None and descriptor.control_warehouse_id is not None:
             raise BootstrapError("Control Warehouse ID has no recorded provisioning ownership intent")
-        if intent is not None and intent.display_name != display_name:
-            raise BootstrapError("Requested Warehouse name does not match the recorded provisioning intent")
+        if intent is not None:
+            display_name = intent.display_name
         workspace = response_body(self._request("GET", f"/workspaces/{descriptor.control_workspace_id}"))
         catalog_capacity = descriptor.capacity(descriptor.catalog_capacity_id)
         if (
@@ -232,14 +288,31 @@ class ControlWarehouseProvisioner(_ControlProvisioner):
         if intent.phase == "accepted":
             while True:
                 self._wait(0, deadline)
-                response = self._request("GET", f"/operations/{intent.operation_id}")
+                try:
+                    response = self._request("GET", f"/operations/{intent.operation_id}")
+                except CapacityError as error:
+                    if error.status_code != 404:
+                        raise
+                    raise WarehouseCreationUnknown(
+                        f"{error}. The saved creation operation is unavailable. "
+                        "List Warehouses in the recovery metadata workspace, explicitly select the intended "
+                        "Warehouse, then choose Use this Warehouse to continue. No creation was repeated."
+                    ) from error
                 self._validate_location(response, intent.operation_id)
                 status = str(response_body(response).get("status", ""))
                 if status in {"Failed", "Canceled", "Cancelled", "Undefined"}:
                     self._persist(intent.model_copy(update={"phase": "failed"}))
                     raise CapacityError(response, context=f"Fabric Warehouse operation {status}")
                 if status == "Succeeded":
-                    result = self._request("GET", f"/operations/{intent.operation_id}/result")
+                    try:
+                        result = self._request("GET", f"/operations/{intent.operation_id}/result")
+                    except CapacityError as error:
+                        if error.status_code != 404:
+                            raise
+                        raise WarehouseCreationUnknown(
+                            f"{error}. The saved operation result is unavailable. List Warehouses and "
+                            "choose Use this Warehouse for the intended item; no creation was repeated."
+                        ) from error
                     self._validate_location(result, intent.operation_id)
                     intent = self._created(intent, response_body(result), descriptor)
                     break

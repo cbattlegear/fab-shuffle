@@ -173,6 +173,87 @@ def warehouse_body(*, endpoint=True):
     return body
 
 
+def test_select_existing_warehouse_does_not_replay_or_poll_old_operation(store):
+    intent = WarehouseIntent(owner_id=OWNER, intent_id=OP, display_name="Original name",
+                             phase="accepted", operation_id=OP)
+    store.update(lambda row: row.model_copy(update={"warehouse_intent": intent}))
+    before = store.load()
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        assert request.method == "GET" and "/operations/" not in request.url.path
+        return workspace_response() if request.url.path == f"/v1/workspaces/{WORKSPACE}" else (
+            httpx.Response(200, json=warehouse_body())
+        )
+
+    with ControlWarehouseProvisioner(store, Tokens(), transport=httpx.MockTransport(handler)) as provisioner:
+        selected = provisioner.inspect_selected(WAREHOUSE, owner_id=OWNER)
+    assert selected.control_warehouse_id == WAREHOUSE and selected.tds_host == HOST
+    assert selected.warehouse_intent.origin == "designated"
+    assert selected.warehouse_intent.display_name == "Control"
+    assert selected.warehouse_intent.operation_id == OP
+    assert store.load() == before, "Selection cannot be committed before catalog compatibility is checked"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("problem", ["foreign-workspace", "foreign-item", "no-endpoint", "unsafe-endpoint"])
+def test_invalid_selected_warehouse_never_changes_bootstrap(store, problem):
+    before = store.load()
+    body = warehouse_body()
+    if problem == "foreign-workspace":
+        body["workspaceId"] = APP
+    elif problem == "foreign-item":
+        body["id"] = APP
+    elif problem == "no-endpoint":
+        body["properties"] = {}
+    else:
+        body["properties"]["connectionString"] = "evil.example;password=never"
+
+    def handler(request):
+        assert request.method == "GET"
+        return workspace_response() if request.url.path == f"/v1/workspaces/{WORKSPACE}" else (
+            httpx.Response(200, json=body)
+        )
+
+    with ControlWarehouseProvisioner(store, Tokens(), transport=httpx.MockTransport(handler)) as provisioner:
+        with pytest.raises((BootstrapError, ValueError)):
+            provisioner.inspect_selected(WAREHOUSE, owner_id=OWNER)
+    assert store.load() == before
+
+
+def test_missing_saved_operation_explains_existing_warehouse_path_without_recreation(store):
+    intent = WarehouseIntent(owner_id=OWNER, intent_id=OP, display_name="Original name",
+                             phase="accepted", operation_id=OP)
+    store.update(lambda row: row.model_copy(update={"warehouse_intent": intent}))
+    before = store.load()
+
+    def handler(request):
+        assert request.method == "GET"
+        if "/operations/" in request.url.path:
+            return httpx.Response(404, json={"errorCode": "NotFound", "message": "Operation missing"},
+                                  headers={"request-id": OP})
+        return workspace_response()
+
+    with ControlWarehouseProvisioner(store, Tokens(), transport=httpx.MockTransport(handler)) as provisioner:
+        with pytest.raises(WarehouseCreationUnknown, match="List Warehouses") as error:
+            provisioner.ensure(display_name="Different current form default", owner_id=OWNER)
+    assert "NotFound" in str(error.value) and OP in str(error.value)
+    assert store.load() == before
+
+
+def test_attached_catalog_cannot_be_replaced_by_another_selection(store):
+    store.update(lambda row: row.model_copy(update={
+        "control_warehouse_id": WAREHOUSE, "tds_host": HOST, "tds_catalog": WAREHOUSE,
+        "warehouse_intent": WarehouseIntent(owner_id=OWNER, intent_id=OP, display_name="Control",
+                                            phase="ready", warehouse_id=WAREHOUSE),
+    }))
+    with ControlWarehouseProvisioner(store, Tokens(), transport=httpx.MockTransport(
+        lambda _: pytest.fail("another selection must be rejected before any network request"),
+    )) as provisioner:
+        with pytest.raises(BootstrapError, match="already attached"):
+            provisioner.inspect_selected(APP, owner_id=OWNER)
+
 def test_real_warehouse_post_persists_intent_id_before_followup(store):
     calls = []
 

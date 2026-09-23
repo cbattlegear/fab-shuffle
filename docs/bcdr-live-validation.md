@@ -158,6 +158,14 @@ or distribute administrator sessions.
    approvals. The matching rule is a best-effort comparison, not proof of cross-API identity.
 4. Create a new restricted control workspace/Warehouse on R. Fresh setup currently expects
    designated owners with Admin roles.
+   Also exercise **Use an existing Warehouse** with an empty disposable Warehouse: the
+   exact selected resource should become the catalog without another REST creation.
+   An unrelated nonempty Warehouse or another recovery set's catalog must be refused
+   without changing its contents or the saved Warehouse binding.
+   Reopen an interrupted setup and confirm saved names appear. If its operation is unavailable,
+   list Warehouses in that metadata workspace and explicitly select the intended item.
+   Confirm a workspace switch/sign-out discards late list responses and that listing alone
+   does not resume capacity, create a Warehouse or initialize SQL.
 5. Inspect durable non-secret bootstrap coordinates and Warehouse-held definitions,
    generations and history.
 6. Verify the UAMI retains Admin access. Add a disposable named reader to the control
