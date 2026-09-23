@@ -20,6 +20,10 @@ import pytest
     "readiness_pins_issuer_generation_and_writer", "qualification_is_not_generated_by_defaults",
     "missing_readiness_context_never_uses_lineage_generation",
     "temporary_attachment_retains_source_and_is_not_ready",
+    "discovery_feedback_and_preserved_selections", "discovery_empty_partial_and_failed",
+    "discovery_signout_ignores_late_result", "existing_workspace_picker_uses_recovery_names",
+    "workspace_picker_rejects_missing_ambiguous_and_stale_choices",
+    "named_choices_reject_missing_resources", "discovery_keeps_pending_operation_choice",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

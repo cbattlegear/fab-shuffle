@@ -147,6 +147,11 @@ or distribute administrator sessions.
 2. Compare actual tenant/client/object IDs with the UAMI.
 3. Demonstrate source discovery and target access; test a denial using a disposable
    unshared workspace, not tenant-wide permission changes.
+   **Discover setup choices** must show local progress and source/recovery counts next
+   to the button, including empty/partial failures and the next action. Select source
+   capacities and an existing control workspace by name, refresh discovery, and verify
+   the selections and typed Warehouse name survive. Confirm that unavailable or ambiguous
+   choices cannot be silently submitted. Check exact identities in restricted server logs.
 4. Create a new restricted control workspace/Warehouse on R. Fresh setup currently expects
    designated owners with Admin roles.
 5. Inspect durable non-secret bootstrap coordinates and Warehouse-held definitions,

@@ -6,6 +6,7 @@ FabricClient's permissive absolute-URL/redirect transport.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
@@ -33,10 +34,27 @@ from fabshuffle.bcdr.contracts import CatalogState, ControllerLease, RecoveryMod
 
 ARM_BASE = "https://management.azure.com"
 ARM_SCOPE = "https://management.azure.com/.default"
+logger = logging.getLogger(__name__)
 _POLL_PATH = re.compile(
     r"/subscriptions/([0-9a-f-]{36})/providers/microsoft\.fabric/locations/"
     r"([a-z0-9-]+)/operation(?:statuses|results)/([0-9a-f-]{36})", re.IGNORECASE,
 )
+
+
+class _ArmQueryLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                str(value.copy_with(query=None)) + "?[redacted]"
+                if isinstance(value, httpx.URL) and value.host == "management.azure.com" and value.query
+                else value
+                for value in record.args
+            )
+        return True
+
+
+# httpx logs full request URLs at INFO, including ARM's opaque polling context.
+logging.getLogger("httpx").addFilter(_ArmQueryLogFilter())
 
 
 def _https_url(url: str, host: str) -> Any:
@@ -65,10 +83,12 @@ def validate_poll_url(url: str, arm_resource_id: str, *, previous: str | None = 
         raise BootstrapError("ARM polling URL is outside the authorized Fabric subscription/operation scope")
     UUID(match[3])
     query = parse_qs(parsed.query, keep_blank_values=True)
-    if query.get("api-version") != [ARM_VERSION] or set(query) - {"api-version", "t", "c"}:
-        raise BootstrapError("ARM polling URL has an unsupported API version or query")
     if any(len(values) != 1 for values in query.values()):
         raise BootstrapError("ARM polling URL contains duplicate query parameters")
+    if query.get("api-version") != [ARM_VERSION]:
+        raise BootstrapError("ARM polling URL has an unsupported or missing API version")
+    if set(query) - {"api-version", "t", "c"}:
+        raise BootstrapError("ARM polling URL contains unsupported query parameters")
     if previous:
         old = _POLL_PATH.fullmatch(urlsplit(validate_poll_url(previous, resource)).path)
         if old is None or (match[2].lower(), match[3].lower()) != (old[2].lower(), old[3].lower()):
@@ -238,10 +258,31 @@ class ArmCapacityClient:
         for header, kind in (("Location", "location"), ("Azure-AsyncOperation", "async")):
             url = response.headers.get(header)
             if url:
-                validate_poll_url(
-                    url, capacity.arm_resource_id,
-                    previous=previous or (selected[0] if selected else None),
-                )
+                try:
+                    validate_poll_url(
+                        url, capacity.arm_resource_id,
+                        previous=previous or (selected[0] if selected else None),
+                    )
+                except (BootstrapError, ValueError):
+                    # Log shape, not the URL: c/t and unknown query values can be signed.
+                    try:
+                        parsed = urlsplit(url)
+                        query = parse_qs(parsed.query, keep_blank_values=True)
+                        match = _POLL_PATH.fullmatch(parsed.path)
+                    except ValueError:
+                        query, match = {}, None
+                    versions = query.get("api-version", [])
+                    logger.warning(
+                        "ARM polling header rejected: resource=%s header=%s http_status=%s "
+                        "operation=%s region=%s api_versions=%s query_keys=%s",
+                        capacity.arm_resource_id, header, response.status_code,
+                        match[3] if match else "unrecognized", match[2] if match else "unrecognized",
+                        [value if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:-preview)?", value)
+                         else "[nonstandard]" for value in versions],
+                        [key if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]{0,63}", key)
+                         else "[nonstandard]" for key in query],
+                    )
+                    raise
                 selected = (url, kind)
         return selected
 
@@ -278,13 +319,24 @@ class ArmCapacityClient:
                 "POST", f"{ARM_BASE}{capacity.arm_resource_id}/{action}?api-version={ARM_VERSION}",
                 capacity, authorize=authorize,
             )
-            poll = self._poll_headers(response, capacity)
+            request_id = response.headers.get("x-ms-request-id")
+            if request_id and re.fullmatch(r"[a-zA-Z0-9:_.-]{1,256}", request_id):
+                operation = operation.model_copy(update={"request_id": request_id})
+                on_progress(operation)
+            try:
+                poll = self._poll_headers(response, capacity)
+            except (BootstrapError, ValueError) as error:
+                raise CapacityOutcomeUnknown(
+                    f"ARM {action} returned HTTP {response.status_code}, but its polling receipt "
+                    f"could not be used: {error}. The operation may already have taken effect. "
+                    "Reconcile the recorded intent; do not submit another operation. "
+                    "See the server logs for the polling header details."
+                ) from error
             if response.status_code == 202:
                 if poll is None:
                     raise CapacityOutcomeUnknown("ARM accepted the operation without a usable polling URL")
                 operation = operation.model_copy(update={
                     "phase": "accepted", "poll_url": poll[0], "poll_kind": poll[1],
-                    "request_id": response.headers.get("x-ms-request-id"),
                 })
                 on_progress(operation)
                 self._wait(retry_after(response), deadline)
@@ -441,16 +493,8 @@ class CapacityCoordinator:
 
         self.store.update(change)
 
-    def resume_catalog(
-        self, *, wait_sql: Callable[[BootstrapDescriptor], None],
-        reconcile: Callable[[BootstrapDescriptor], None],
-    ) -> BootstrapDescriptor:
-        """Resume before the first SQL callback; reconcile before clearing receipts.
-
-        wait_sql must actually establish TDS readiness and fail on timeout.
-        reconcile must commit all observations to the catalog and resolve PARKING
-        under its authoritative controller lease. Failure retains deployment state.
-        """
+    def resume_catalog_capacity(self) -> BootstrapDescriptor:
+        """Settle the recorded capacity operation before any SQL or provisioning."""
         descriptor = self.store.load()
         self._identity(descriptor)
         capacity = descriptor.capacity(descriptor.catalog_capacity_id)
@@ -470,6 +514,19 @@ class CapacityCoordinator:
             capacity, owner_id=descriptor.controller_id, on_progress=self._record,
             pending=pending[0] if pending else None,
         )
+        return self.store.load()
+
+    def resume_catalog(
+        self, *, wait_sql: Callable[[BootstrapDescriptor], None],
+        reconcile: Callable[[BootstrapDescriptor], None],
+    ) -> BootstrapDescriptor:
+        """Resume before the first SQL callback; reconcile before clearing receipts.
+
+        wait_sql must actually establish TDS readiness and fail on timeout.
+        reconcile must commit all observations to the catalog and resolve PARKING
+        under its authoritative controller lease. Failure retains deployment state.
+        """
+        self.resume_catalog_capacity()
         descriptor = self.store.load()
         wait_sql(descriptor)
         descriptor = self.store.load()

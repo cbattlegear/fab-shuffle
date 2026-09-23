@@ -56,7 +56,170 @@ const reconcileCommand = {
   description: "Inspect the exact service receipt.", confirmation: "Fence the previous controller before takeover.",
 };
 
+const discovery = {
+  source: {
+    capacities: [{ id: "source-capacity-guid", displayName: "Primary", region: "East US", sku: "F4" }],
+    workspaces: [{ id: "source-workspace-guid", displayName: "Source work", capacityId: "source-capacity-guid" }],
+    errors: {},
+  },
+  recovery: {
+    capacities: [{ id: "recovery-capacity-guid", displayName: "Recovery", region: "West US", sku: "F4" }],
+    workspaces: [{ id: "control-workspace-guid", displayName: "Control", capacityId: "recovery-capacity-guid" }],
+    errors: {},
+  },
+};
+
+function discoverButton(f) {
+  return f.get("bcdr-content").querySelectorAll("button").find((button) =>
+    button.textContent === "Discover setup choices" || button.textContent === "Discovering choices...");
+}
+
 const scenarios = {
+  async discovery_feedback_and_preserved_selections(f) {
+    f.product.bcdrRenderForms([command]);
+    const field = f.product.bcdrField("source_capacity_ids", { type: "array", items: { type: "string" } }, {}, true);
+    f.get("bcdr-content").appendChild(field.element);
+    const text = f.product.bcdrField("warehouse_name", { type: "string" }, {}, true);
+    text.element.querySelector("input").value = "Keep my Warehouse name";
+    const button = discoverButton(f);
+    button.click();
+    assert.match(f.get("bcdr-discovery-status").textContent, /Reading source and recovery/);
+    button.click();
+    assert.equal(f.requests.length, 1, "Repeated click must not issue concurrent discovery");
+    await f.reply(0, discovery);
+    const status = f.get("bcdr-discovery-status");
+    assert.equal(status.parentElement, button.parentElement, "Feedback must be beside the button");
+    assert.equal(status["aria-live"], "polite");
+    assert.match(status.textContent, /Discovery complete.*Source: 1 workspaces.*Recovery: 1 capacities/s);
+    assert.match(status.textContent, /No configuration was saved/);
+    assert.equal(field.element.querySelectorAll("textarea").length, 0);
+    assert.doesNotMatch(field.element.textContent, /source-capacity-guid/);
+    field.element.querySelector("input").checked = true;
+    button.click();
+    await f.reply(1, discovery);
+    assert.equal(field.element.querySelector("input").checked, true);
+    assert.equal(field.read()[0], "source-capacity-guid");
+    assert.equal(text.read(), "Keep my Warehouse name");
+    assert.ok(f.requests.every((request) => request.url === "/api/bcdr/discovery"));
+  },
+  async discovery_empty_partial_and_failed(f) {
+    f.product.bcdrRenderForms([command]);
+    const button = discoverButton(f);
+    button.click();
+    await f.reply(0, { source: { capacities: [], workspaces: [] }, recovery: { capacities: [], workspaces: [] } });
+    assert.match(f.get("bcdr-discovery-status").textContent, /No resources are visible.*access/);
+    button.click();
+    await f.reply(1, discovery);
+    button.click();
+    await f.reply(2, {
+      source: discovery.source,
+      recovery: { capacities: [], errors: { workspaces: "AccessDenied: Grant read access" } },
+    });
+    assert.match(f.get("bcdr-discovery-status").textContent, /Discovery incomplete.*AccessDenied.*Previous choices/s);
+    assert.equal(f.product.bcdr.discovered.recovery.workspaces[0].id, "control-workspace-guid");
+    button.click();
+    await f.reply(3, { detail: "ServiceBusy: Try again later" }, 503);
+    assert.match(f.get("bcdr-discovery-status").textContent, /Discovery failed.*ServiceBusy.*not changed/s);
+    assert.equal(button.disabled, false);
+    assert.equal(f.product.bcdr.discovered.source.capacities[0].id, "source-capacity-guid");
+    button.click();
+    await f.reply(4, {});
+    assert.match(f.get("bcdr-discovery-status").textContent, /Discovery failed.*response is incomplete/s);
+    assert.equal(f.product.bcdr.discovered.source.capacities[0].id, "source-capacity-guid");
+  },
+  async discovery_signout_ignores_late_result(f) {
+    f.product.bcdrRenderForms([command]);
+    const button = discoverButton(f);
+    button.click();
+    f.get("sign-out").click();
+    await f.reply(0, discovery);
+    assert.equal(f.get("bcdr-content").textContent, "");
+    assert.equal(Object.keys(f.product.bcdr.discovered).length, 0);
+    assert.equal(f.product.bcdr.discovering, false);
+    assert.equal(f.get("bcdr-progress").textContent, "");
+    f.ui.state.sessionId = "another-session";
+    button.click();
+    assert.equal(f.requests.length, 2, "Only discovery and logout; stale controls cannot query the new session");
+  },
+  async existing_workspace_picker_uses_recovery_names(f) {
+    f.product.bcdr.discovered = discovery;
+    const setupSchema = { type: "object", properties: {
+      control_workspace_name: { type: "string" }, control_workspace_id: { type: "string" },
+      warehouse_name: { type: "string", default: "Catalog" },
+    } };
+    const setupCommand = { name: "setup", label: "Setup", path: "/api/bcdr/setup", method: "POST",
+      schema: setupSchema, confirmation: "Create the catalog." };
+    f.product.bcdrRenderForms([setupCommand]);
+    const form = f.get("bcdr-content").querySelector("form");
+    const selects = form.querySelectorAll("select");
+    selects[0].value = "existing";
+    selects[0].handlers.change();
+    const select = selects[1];
+    assert.equal(select.value, "", "No workspace is selected automatically");
+    assert.match(select.textContent, /Control - Recovery - West US/);
+    assert.doesNotMatch(select.textContent, /guid|Source work/);
+    assert.ok(!form.querySelectorAll("input").some((input) => input.name === "control_workspace_id"));
+    select.value = "control-workspace-guid";
+    select.handlers.change();
+    form.handlers.submit({ preventDefault() {} });
+    const dialog = f.document.querySelectorAll("dialog").find((node) => node.className.includes("bcdr-confirm"));
+    assert.match(dialog.textContent, /Control - Recovery/);
+    assert.doesNotMatch(dialog.textContent, /control-workspace-guid/);
+    dialog.querySelectorAll("button")[1].click();
+    const payload = JSON.parse(f.requests[0].options.body).request;
+    assert.equal(payload.control_workspace_id, "control-workspace-guid");
+    assert.equal(payload.control_workspace_name, undefined);
+    await f.reply(0, result);
+  },
+  async workspace_picker_rejects_missing_ambiguous_and_stale_choices(f) {
+    f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
+    const field = f.product.bcdrField("control_workspace_id", { type: "string" }, {}, true);
+    const select = field.element.querySelector("select");
+    assert.throws(() => field.read(), /select an available/);
+    select.value = "control-workspace-guid";
+    select.handlers.change();
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.equal(field.read(), "control-workspace-guid");
+    f.product.bcdr.discovered.recovery.workspaces.push({
+      id: "another-guid", displayName: "Control", capacityId: "recovery-capacity-guid",
+    });
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.throws(() => field.read(), /select an available/);
+    assert.match(field.element.textContent, /ambiguous/);
+    f.product.bcdr.discovered.recovery.workspaces = [];
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.throws(() => field.read(), /select an available/);
+    assert.match(field.element.textContent, /unavailable/);
+    f.product.bcdr.discovered.recovery.workspaces = discovery.recovery.workspaces;
+    f.product.bcdr.discovered.recovery.errors = { workspaces: "Denied" };
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.throws(() => field.read(), /Refresh recovery workspace/);
+  },
+  async named_choices_reject_missing_resources(f) {
+    f.product.bcdr.discovered = JSON.parse(JSON.stringify(discovery));
+    const field = f.product.bcdrField("source_capacity_ids", { type: "array", items: { type: "string" } }, {}, true);
+    field.element.querySelector("input").checked = true;
+    f.product.bcdr.discovered.source.capacities = [];
+    f.product.bcdr.bindings.forEach((refresh) => refresh("discovery"));
+    assert.throws(() => field.read(), /remove unavailable/);
+    assert.match(field.element.textContent, /Primary.*unavailable/s);
+    assert.doesNotMatch(field.element.textContent, /source-capacity-guid/);
+    field.element.querySelector("input").checked = false;
+    assert.throws(() => field.read(), /Select at least one/);
+  },
+  async discovery_keeps_pending_operation_choice(f) {
+    f.product.bcdrRenderForms([reconcileCommand]);
+    f.product.bcdrRenderResult({ ...result, details: {
+      controller_id: "controller", controller_epoch: 9,
+      pending_operations: [{ operation_id: "op", kind: "item-apply", state: "ambiguous" }],
+    } });
+    const select = f.get("bcdr-content").querySelector("form").querySelector("select");
+    select.value = "op";
+    select.handlers.change();
+    discoverButton(f).click();
+    await f.reply(0, discovery);
+    assert.equal(select.value, "op", "Discovery must not reset an unrelated catalog operation choice");
+  },
   async reconciliation_pins_controller_not_writer_epoch(f) {
     f.product.bcdrRenderForms([reconcileCommand]);
     const field = f.product.bcdrField("reconciliation", reconcileSchema, reconcileSchema, true);

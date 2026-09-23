@@ -73,10 +73,15 @@ identity-bound observations, not an instruction to trust a general "ready" check
    to force a match. Owners of a newly created control workspace currently use the Admin role.
 2. If the source is healthy, optionally expand **Healthy-source preparation** and choose
    **Discover setup choices**. This explicitly reads source/recovery workspaces and capacities;
-   it is never automatically invoked for outage recovery. Exact-ID input remains available.
+   it is never automatically invoked for outage recovery. Progress and resource counts appear
+   beside the button. Empty results and partial failures include an action to take; discovery
+   never saves setup or starts a capacity operation. Refreshing preserves still-valid resource
+   selections and unrelated form inputs.
 3. Open **Set up the control Warehouse**. Enter a new control workspace name or choose the existing
-   control workspace, then enter the new Warehouse
+   control workspace by name from the recovery principal's inventory, then enter the new Warehouse
    name. Select the source capacities that define the recovery scope.
+   Workspace and source-capacity selection has no manual-ID fallback. Resolve ambiguous names
+   or missing access before selecting; a disappeared selection is not silently replaced.
 4. Add each dedicated recovery capacity with its Fabric GUID and explicit Azure ARM resource ID.
    Confirm dedicated use and suspend authorization for each, and specify which ARM capacity
    hosts the control Warehouse. Fabric GUIDs and ARM resource IDs are not interchangeable.
@@ -91,6 +96,26 @@ identity-bound observations, not an instruction to trust a general "ready" check
 
 Do not repeatedly submit setup after an ambiguous create. Read the service error and reconcile
 the recorded provisioning operation; the backend must not adopt an unrelated Warehouse by name.
+
+### Setup troubleshooting
+
+Discovery logs include a correlation ID, resource names and exact workspace/capacity IDs.
+Confirmed setup logs record the selected workspace, source capacities and recovery
+Fabric/ARM identifiers. Use restricted server logs for identity troubleshooting, not
+screenshots of resource pickers. Discovery failures preserve successful independent results;
+selections from a failed refresh cannot substitute for a successful read of that inventory.
+
+If an ARM polling header is rejected after `202 Accepted`, Azure has accepted the operation;
+the local error does not mean it failed. The controller retains the intent and any valid
+request ID, and does not blindly replay it on the next setup request. Check the server's
+`ARM polling header rejected` diagnostic for the header name, operation, region, API version
+and query parameter names. Signed/opaque query values and credentials are omitted, including
+from HTTP request logs. Do not delete bootstrap or change API versions to force a retry.
+
+Recovery capacity ARM/Fabric pairing is not derived from matching display names. The current
+explicit capacity fields are not an automatic identity resolver; name-based workspace
+discovery does not verify that pair. A fully automatic capacity picker still requires an
+authoritative cross-API identity mapping.
 
 | Action | Meaning |
 | --- | --- |

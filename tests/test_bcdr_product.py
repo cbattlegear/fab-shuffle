@@ -272,7 +272,7 @@ def test_new_actions_require_exact_confirmation_and_complete_evidence(product, c
     assert not service.calls and not created
 
 
-def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch):
+def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch, caplog):
     client, headers, service, created, bootstrap = product
     calls = []
 
@@ -281,6 +281,7 @@ def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch):
         return service.result
 
     monkeypatch.setattr(bcdr, "setup_recovery", setup)
+    caplog.set_level("INFO", logger="fabshuffle.web.bcdr")
     response = client.post("/api/bcdr/setup", headers=headers, json={
         "confirmation": "setup", "request": SETUP,
     })
@@ -291,11 +292,22 @@ def test_setup_uses_public_facade_not_an_existing_catalog(product, monkeypatch):
     assert calls[0][0].access_policy.recovery_spn.object_id == SPN
     assert calls[0][1] == bootstrap.resolve()
     assert calls[0][2].principal.client_id == CLIENT
+    assert CONTROL in caplog.text and TARGET_CAPACITY in caplog.text and ARM.lower() in caplog.text
+    assert "never-persist-this" not in caplog.text
 
 
-def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(product, monkeypatch):
+@pytest.mark.parametrize("failed", [None, "capacities", "workspaces"])
+def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(
+    product, monkeypatch, caplog, failed,
+):
     client, headers, _, created, _ = product
     calls = []
+    caplog.set_level("INFO", logger="fabshuffle.web.bcdr")
+
+    def fail(kind):
+        if failed == kind:
+            raise FabricApiError("GET", f"https://api.fabric.microsoft.com/v1/{kind}", 403,
+                                 '{"errorCode":"AccessDenied","message":"Grant read access"}')
 
     class Client:
         def __init__(self, tokens):
@@ -309,10 +321,12 @@ def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(produc
 
     def capacities(client):
         calls.append(("capacities", client.tokens))
+        fail("capacities")
         return [{"id": TARGET_CAPACITY, "displayName": "Recovery F64", "region": "West US"}]
 
     def workspaces(client):
         calls.append(("workspaces", client.tokens))
+        fail("workspaces")
         return [{
             "id": CONTROL, "displayName": "Restricted control", "type": "Workspace",
             "capacityId": TARGET_CAPACITY, "unexpectedSecret": "not-returned",
@@ -324,8 +338,20 @@ def test_preparation_discovery_is_explicit_principal_scoped_and_nonsecret(produc
     response = client.get("/api/bcdr/discovery", headers=headers)
     assert response.status_code == 200
     assert len(calls) == 2
-    assert response.json()["recovery"]["workspaces"][0]["id"] == CONTROL
+    result = response.json()
+    if failed:
+        assert "AccessDenied" in result["source"]["errors"][failed]
+        assert failed not in result["source"]
+    else:
+        assert result["source"]["errors"] == {}
+    if failed != "workspaces":
+        assert result["recovery"]["workspaces"][0]["id"] == CONTROL
+        assert CONTROL in caplog.text and "Restricted control" in caplog.text
+    if failed != "capacities":
+        assert result["source"]["capacities"][0]["id"] == TARGET_CAPACITY
+    assert result["discovery_id"] in caplog.text
     assert "not-returned" not in response.text
+    assert "not-returned" not in caplog.text and "never-persist-this" not in caplog.text
     assert created == []
 
 

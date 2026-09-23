@@ -915,6 +915,38 @@ def test_production_setup_wires_real_provisioners_and_sql_catalog(
     assert "not-a-real-secret" not in path.read_text()
 
 
+def test_setup_reuses_pending_capacity_intent_instead_of_posting_again(system, tmp_path, monkeypatch):
+    from fabshuffle.bcdr import production
+    from fabshuffle.bcdr.bootstrap import CapacityOperation
+    from fabshuffle.bcdr.service import SetupCapacity, SetupRequest, setup
+
+    capacities, store, state = production_capacities(system, tmp_path, monkeypatch)
+    descriptor = store.load()
+    system.c.tokens.object_id.return_value = system.config.access_policy.recovery_spn.object_id
+    pending = CapacityOperation(
+        intent_id=guid(), owner_id=descriptor.controller_id,
+        arm_resource_id=descriptor.catalog_capacity_id, action="resume",
+    )
+    store.update(lambda current: current.model_copy(update={"capacity_operations": (pending,)}))
+    state["value"] = "Suspended"
+    monkeypatch.setattr(production, "ArmCapacityClient", lambda tokens, **kwargs: capacities.arm)
+    request = SetupRequest(
+        control_workspace_id=descriptor.control_workspace_id,
+        source_capacity_ids=system.config.source_capacity_ids,
+        recovery_capacities=tuple(
+            SetupCapacity(
+                arm_resource_id=row.arm_resource_id, fabric_capacity_id=row.fabric_capacity_id,
+                dedicated_recovery=True, authorized_for_suspend=True,
+            ) for row in descriptor.capacities
+        ),
+        catalog_capacity_id=descriptor.catalog_capacity_id, access_policy=system.config.access_policy,
+    )
+    with pytest.raises(RecoveryBlocked, match="no receipt"):
+        setup(request, store.path, target_tokens=system.c.tokens)
+    assert state["calls"] and all(method == "GET" for method, _ in state["calls"])
+    assert store.load().capacity_operations == (pending,)
+
+
 def test_reconcile_uses_exact_lro_receipt_without_recreating_item(system):
     from fabshuffle.bcdr.service import ReconcileOperationRequest
     from fabshuffle.fabric.client import OperationTimeout

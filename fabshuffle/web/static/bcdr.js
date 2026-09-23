@@ -9,6 +9,8 @@ const bcdr = {
   latest: {},
   identity: {},
   discovered: {},
+  discoverySequence: 0,
+  discovering: false,
   bindings: [],
 };
 
@@ -26,10 +28,10 @@ function bcdrCurrentSession(sessionId) {
 function bcdrLabel(name) {
   const labels = {
     recovery_set_id: "Recovery set ID",
-    control_workspace_id: "Control workspace ID",
+    control_workspace_id: "Existing control workspace",
     control_workspace_name: "New control workspace name",
     warehouse_name: "New metadata Warehouse name",
-    source_capacity_ids: "Source capacity IDs",
+    source_capacity_ids: "Source capacities",
     source_capacity_id: "Source capacity ID",
     target_capacity_ids: "Dedicated recovery capacity IDs",
     target_capacity_id: "Dedicated recovery capacity ID",
@@ -48,8 +50,8 @@ function bcdrLabel(name) {
     capacity_id: "Fabric capacity ID",
     object_id: "Principal object ID (not application ID)",
     client_id: "Application (client) ID",
-    include_workspace_ids: "Include exact workspace IDs",
-    exclude_workspace_ids: "Exclude exact workspace IDs",
+    include_workspace_ids: "Include workspaces",
+    exclude_workspace_ids: "Exclude workspaces",
     keywords: "Positive workspace-name keywords",
     approved_dependency_workspace_ids: "Approved dependency workspace additions",
     approved_addition_ids: "Approved dependency workspace additions",
@@ -97,6 +99,107 @@ function bcdrResolve(schema, root) {
   const resolved = root.$defs?.[schema.$ref.slice(prefix.length)];
   if (!resolved) throw new Error("The server returned an incomplete request schema.");
   return { ...resolved, ...schema, $ref: undefined };
+}
+
+function bcdrResourceChoices(name) {
+  if (name === "source_capacity_ids") {
+    return (bcdr.discovered.source?.capacities || []).map((entry) => ({
+      id: entry.id,
+      label: [entry.displayName || "Unnamed capacity", entry.region, entry.sku].filter(Boolean).join(" - "),
+    }));
+  }
+  const captured = bcdr.latest.details?.inventory?.workspaces || [];
+  if (name !== "control_workspace_id" && captured.length) {
+    return captured.map((entry) => ({
+      id: entry.identity.workspace_id,
+      label: entry.display_name || "Unnamed workspace",
+    }));
+  }
+  if (name === "approved_addition_ids") return [];
+  const side = name === "control_workspace_id" ? bcdr.discovered.recovery : bcdr.discovered.source;
+  return (side?.workspaces || []).map((entry) => {
+    const capacity = side?.capacities?.find((row) => row.id === entry.capacityId);
+    return {
+      id: entry.id,
+      label: [entry.displayName || "Unnamed workspace", capacity?.displayName,
+        entry.capacityRegion || capacity?.region, entry.description].filter(Boolean).join(" - "),
+    };
+  });
+}
+
+function bcdrNamedWorkspace(name, id, required) {
+  const label = bcdrElement("label", bcdrLabel(name));
+  label.htmlFor = id;
+  const select = bcdrElement("select");
+  select.id = id;
+  select.name = name;
+  select.required = required;
+  label.appendChild(select);
+  const hint = bcdrElement("span", "", "hint");
+  hint.id = `${id}-help`;
+  select.setAttribute("aria-describedby", hint.id);
+  label.appendChild(hint);
+  let available = new Set();
+  let selectedLabel = "";
+  const refresh = () => {
+    const selected = select.value;
+    const entries = bcdrResourceChoices(name);
+    available = new Set();
+    select.replaceChildren();
+    const placeholder = bcdrElement("option", "Choose a workspace");
+    placeholder.value = "";
+    select.appendChild(placeholder);
+    for (const entry of entries) {
+      const ambiguous = entries.filter((other) => other.label === entry.label).length > 1;
+      const option = bcdrElement("option", entry.label + (ambiguous ? " (ambiguous name)" : ""));
+      option.value = entry.id;
+      option.disabled = ambiguous;
+      if (!ambiguous) available.add(entry.id);
+      select.appendChild(option);
+    }
+    if (selected && !available.has(selected)) {
+      const missing = bcdrElement("option", `${selectedLabel || "Previous workspace"} (unavailable)`);
+      missing.value = selected;
+      missing.disabled = true;
+      select.appendChild(missing);
+    }
+    select.value = selected;
+    hint.textContent = selected && !available.has(selected) ?
+      "The selected workspace is no longer available unambiguously. Choose another or refresh discovery." :
+      !entries.length ? "Discover setup choices while the source is healthy to load recovery workspace names." :
+      "Select the restricted control workspace by name. Ambiguous names must be resolved before selection.";
+  };
+  select.addEventListener("change", () => {
+    selectedLabel = bcdrResourceChoices(name).find((entry) => entry.id === select.value)?.label || "";
+    refresh();
+  });
+  bcdr.bindings.push(refresh);
+  refresh();
+  return {
+    element: label,
+    read: () => {
+      if (!select.value && !required) return undefined;
+      if (bcdr.discovered.recovery?.errors?.workspaces) {
+        throw new Error("Refresh recovery workspace discovery successfully before choosing the control workspace.");
+      }
+      if (!available.has(select.value)) throw new Error("Discover setup choices, then select an available control workspace.");
+      return select.value;
+    },
+  };
+}
+
+function bcdrReviewRequest(value, key = "") {
+  if (["control_workspace_id", "source_capacity_ids", "include_workspace_ids",
+    "exclude_workspace_ids", "approved_addition_ids"].includes(key)) {
+    const entries = bcdrResourceChoices(key);
+    const display = (id) => entries.find((entry) => entry.id === id)?.label || "Name unavailable; see server logs";
+    return Array.isArray(value) ? value.map(display) : value == null ? value : display(value);
+  }
+  if (Array.isArray(value)) return value.map((entry) => bcdrReviewRequest(entry));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, bcdrReviewRequest(entry, name)]));
+  }
+  return value;
 }
 
 function bcdrField(name, source, root, required = false, context = []) {
@@ -164,6 +267,7 @@ function bcdrField(name, source, root, required = false, context = []) {
   const id = `bcdr-field-${++bcdr.sequence}`;
   const controllerEpoch = name === "expected_epoch" && !!root.properties?.expected_controller_id;
   const title = controllerEpoch ? "Recorded controller epoch (not writer epoch)" : bcdrLabel(name);
+  if (name === "control_workspace_id") return bcdrNamedWorkspace(name, id, required);
   if (name === "recovery_spn" || name === "issuer") {
     const group = bcdrElement("div", undefined, "bcdr-wide");
     group.appendChild(bcdrElement("p",
@@ -203,7 +307,8 @@ function bcdrField(name, source, root, required = false, context = []) {
     group.appendChild(advanced);
     select.addEventListener("change", () => { exact.value = ""; });
     exact.addEventListener("input", () => { select.value = ""; });
-    const refresh = () => {
+    const refresh = (reason) => {
+      if (reason === "discovery") return;
       select.replaceChildren();
       const empty = bcdrElement("option", "Read status, then select an operation");
       empty.value = "";
@@ -264,7 +369,8 @@ function bcdrField(name, source, root, required = false, context = []) {
     const choices = bcdrElement("div");
     fieldset.appendChild(choices);
     let controls = [];
-    const refresh = () => {
+    const refresh = (reason) => {
+      if (reason === "discovery") return;
       choices.replaceChildren();
       controls = [];
       const groups = bcdr.latest.groups || [];
@@ -292,43 +398,41 @@ function bcdrField(name, source, root, required = false, context = []) {
     const fieldset = bcdrElement("fieldset", undefined, "bcdr-wide");
     fieldset.appendChild(bcdrElement("legend", title));
     const choices = bcdrElement("div");
-    const manual = bcdrElement("details");
-    manual.appendChild(bcdrElement("summary", "Enter exact IDs instead"));
-    const label = bcdrElement("label", `${title}, one per line`);
-    const input = bcdrElement("textarea");
-    input.id = id;
-    label.htmlFor = id;
-    label.appendChild(input);
-    manual.appendChild(label);
     fieldset.appendChild(choices);
-    fieldset.appendChild(manual);
     let controls = [];
     const refresh = () => {
+      const selected = new Map(controls.filter((control) => control.checked)
+        .map((control) => [control.value, control.dataset.label]));
       choices.replaceChildren();
       controls = [];
-      const captured = bcdr.latest.details?.inventory?.workspaces || [];
-      const entries = name === "source_capacity_ids" ?
-        (bcdr.discovered.source?.capacities || []).map((entry) => [entry.id, entry.displayName]) :
-        captured.length ? captured.map((entry) => [entry.identity.workspace_id, entry.display_name]) :
-        name === "approved_addition_ids" ? [] :
-        (bcdr.discovered.source?.workspaces || []).map((entry) => [entry.id, entry.displayName]);
+      const entries = bcdrResourceChoices(name);
       if (name === "approved_addition_ids") choices.appendChild(bcdrElement("p",
         "Approve only the required additions named by the latest preview. Exclusions are not overridden silently.",
         "hint"));
       if (!entries.length) {
         choices.appendChild(bcdrElement("p",
-          name === "source_capacity_ids" ? "Discover setup choices or enter the exact source capacity IDs." :
+          name === "source_capacity_ids" ? "Discover setup choices to select source capacities by name." :
           "Workspace choices appear after discovery or catalog status. Empty inclusion uses only the configured source-capacity scope.",
           "hint"));
       }
-      for (const [value, displayName] of entries) {
+      const rows = entries.map((entry) => ({
+        ...entry, unavailable: entries.filter((other) => other.label === entry.label).length > 1,
+      }));
+      for (const [value, label] of selected) {
+        if (!entries.some((entry) => entry.id === value)) rows.push({ id: value, label, unavailable: true });
+      }
+      for (const entry of rows) {
         const label = bcdrElement("label", undefined, "bcdr-check");
         const checkbox = bcdrElement("input");
         checkbox.type = "checkbox";
-        checkbox.value = value;
-        checkbox.checked = false;
+        checkbox.value = entry.id;
+        checkbox.dataset.label = entry.label;
+        checkbox.dataset.unavailable = entry.unavailable ? "true" : "";
+        checkbox.checked = selected.has(entry.id);
+        checkbox.disabled = entry.unavailable && !checkbox.checked;
         label.appendChild(checkbox);
-        label.appendChild(bcdrElement("span", `${displayName} - ${value}`));
+        label.appendChild(bcdrElement("span", entry.label +
+          (entry.unavailable ? " (unavailable or ambiguous; uncheck or refresh discovery)" : "")));
         choices.appendChild(label);
         controls.push(checkbox);
       }
@@ -337,10 +441,19 @@ function bcdrField(name, source, root, required = false, context = []) {
     refresh();
     return {
       element: fieldset,
-      read: () => [...new Set([
-        ...controls.filter((control) => control.checked).map((control) => control.value),
-        ...input.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-      ])],
+      read: () => {
+        const selected = controls.filter((control) => control.checked);
+        const captured = name !== "source_capacity_ids" && bcdr.latest.details?.inventory?.workspaces?.length;
+        const kind = name === "source_capacity_ids" ? "capacities" : "workspaces";
+        if (selected.length && !captured && bcdr.discovered.source?.errors?.[kind]) {
+          throw new Error(`Refresh source ${kind} successfully before submitting these selections.`);
+        }
+        if (selected.some((control) => control.dataset.unavailable)) {
+          throw new Error(`${title}: remove unavailable selections or refresh discovery.`);
+        }
+        if (required && !selected.length) throw new Error(`Select at least one of the ${title.toLowerCase()}.`);
+        return selected.map((control) => control.value);
+      },
     };
   }
   if (name === "approved_acl_ids") {
@@ -349,7 +462,8 @@ function bcdrField(name, source, root, required = false, context = []) {
     const choices = bcdrElement("div");
     fieldset.appendChild(choices);
     let controls = [];
-    const refresh = () => {
+    const refresh = (reason) => {
+      if (reason === "discovery") return;
       choices.replaceChildren();
       controls = [];
       const acls = bcdr.latest.details?.desired_acls || [];
@@ -363,25 +477,6 @@ function bcdrField(name, source, root, required = false, context = []) {
         input.checked = false;
         const target = acl.item?.item_id || acl.workspace?.workspace_id || acl.connection?.connection_id;
         label.appendChild(input);
-        if (["control_workspace_id", "fabric_capacity_id", "source_capacity_id", "target_capacity_id"].includes(name)) {
-          const choices = bcdrElement("datalist");
-          choices.id = `${id}-choices`;
-          input.setAttribute("list", choices.id);
-          label.appendChild(choices);
-          const refresh = () => {
-            const side = name === "source_capacity_id" ? bcdr.discovered.source : bcdr.discovered.recovery;
-            const entries = name === "control_workspace_id" ? side?.workspaces || [] : side?.capacities || [];
-            choices.replaceChildren();
-            for (const entry of entries) {
-              const option = bcdrElement("option");
-              option.value = entry.id;
-              option.label = entry.displayName;
-              choices.appendChild(option);
-            }
-          };
-          bcdr.bindings.push(refresh);
-          refresh();
-        }
         label.appendChild(bcdrElement("span",
           `${acl.principal.kind} ${acl.principal.object_id}: ${acl.permission} on ${acl.scope} ${target}` +
           (acl.securable ? ` (${acl.securable})` : "") + ` - ACL ${acl.acl_id}`));
@@ -799,8 +894,8 @@ function bcdrConfirm(command, body, trigger) {
   dialog.setAttribute("aria-describedby", description.id);
   dialog.appendChild(description);
   const chosen = bcdrElement("details");
-  chosen.appendChild(bcdrElement("summary", "Review exact request IDs and approvals"));
-  chosen.appendChild(bcdrElement("pre", JSON.stringify(body, null, 2)));
+  chosen.appendChild(bcdrElement("summary", "Review selected resources and approvals"));
+  chosen.appendChild(bcdrElement("pre", JSON.stringify(bcdrReviewRequest(body), null, 2)));
   dialog.appendChild(chosen);
   const actions = bcdrElement("div", undefined, "actions");
   const cancel = bcdrElement("button", "Cancel", "secondary");
@@ -837,24 +932,62 @@ function bcdrRenderForms(commands) {
     "recovery actions use captured catalog inventory instead. It does not resume capacity or enable recovery.", "hint"));
   const discover = bcdrElement("button", "Discover setup choices", "secondary");
   discover.type = "button";
+  const discoveryStatus = bcdrElement("p", "", "hint");
+  discoveryStatus.id = "bcdr-discovery-status";
+  discoveryStatus.setAttribute("role", "status");
+  discoveryStatus.setAttribute("aria-live", "polite");
+  discover.setAttribute("aria-describedby", discoveryStatus.id);
   discover.addEventListener("click", async () => {
-    if (bcdr.pending) return;
+    if (bcdr.pending || bcdr.discovering || !bcdrCurrentSession(state.sessionId)) return;
     const sessionId = state.sessionId;
+    const sequence = ++bcdr.discoverySequence;
+    bcdr.discovering = true;
     busy(discover, true, "Discovering choices...");
+    discoveryStatus.textContent = "Reading source and recovery workspace and capacity names. No setup is being saved.";
     bcdrError("");
     try {
       const inventory = await api("/api/bcdr/discovery");
-      if (!bcdrCurrentSession(sessionId)) return;
-      bcdr.discovered = inventory;
-      bcdr.bindings.forEach((refresh) => refresh());
-      $("#bcdr-progress").textContent = "Named setup choices loaded. Review exact IDs; no configuration has been saved.";
+      if (!bcdrCurrentSession(sessionId) || sequence !== bcdr.discoverySequence) return;
+      if (!["source", "recovery"].every((side) => inventory[side] &&
+        ["workspaces", "capacities"].every((kind) =>
+          Array.isArray(inventory[side][kind]) || typeof inventory[side].errors?.[kind] === "string"))) {
+        throw new Error("The discovery response is incomplete. Inspect the server logs before retrying");
+      }
+      const summaries = [];
+      const failures = [];
+      for (const side of ["source", "recovery"]) {
+        const found = inventory[side] || {};
+        bcdr.discovered[side] = { ...bcdr.discovered[side], ...found, errors: found.errors || {} };
+        for (const kind of ["workspaces", "capacities"]) {
+          const error = found.errors?.[kind];
+          if (error) failures.push(`${bcdrLabel(side)} ${kind}: ${error}`);
+          else summaries.push(`${bcdrLabel(side)}: ${(found[kind] || []).length} ${kind}`);
+        }
+      }
+      bcdr.bindings.forEach((refresh) => refresh("discovery"));
+      const empty = !["source", "recovery"].some((side) =>
+        inventory[side]?.workspaces?.length || inventory[side]?.capacities?.length);
+      discoveryStatus.textContent = `${failures.length ? "Discovery incomplete. " : "Discovery complete. "}` +
+        (summaries.length ? summaries.join("; ") + ". " : "") +
+        (failures.length ? `${failures.join(" ")} Previous choices are retained where refresh failed. Retry discovery after resolving the error. ` :
+          empty ? "No resources are visible. Check the source and recovery principals' workspace and capacity access, then retry discovery. " :
+          "Choose the named resources below. Existing valid selections have been kept. ") +
+        "No configuration was saved and no capacity operation was started.";
+      $("#bcdr-progress").textContent = "Discovery results are shown beside Discover setup choices.";
     } catch (error) {
-      if (bcdrCurrentSession(sessionId)) bcdrError(error.message);
+      if (bcdrCurrentSession(sessionId) && sequence === bcdr.discoverySequence) {
+        discoveryStatus.textContent = `Discovery failed: ${error.message}. Existing choices were not changed. ` +
+          "Resolve the error and retry. No configuration was saved and no capacity operation was started.";
+      }
     } finally {
-      busy(discover, false);
+      if (sequence === bcdr.discoverySequence) {
+        bcdr.discovering = false;
+        busy(discover, false);
+      }
     }
   });
   preparation.appendChild(discover);
+  preparation.appendChild(discoveryStatus);
   content.appendChild(preparation);
   for (const command of commands) {
     const section = bcdrElement("details");
@@ -903,6 +1036,8 @@ $("#bcdr-open").addEventListener("click", async () => {
   bcdr.latest = {};
   bcdr.identity = {};
   bcdr.discovered = {};
+  bcdr.discovering = false;
+  ++bcdr.discoverySequence;
   $("#bcdr-content").replaceChildren();
   bcdrError("");
   $("#bcdr-progress").textContent = "Loading operation forms. Recovery is not being enabled.";
@@ -928,6 +1063,8 @@ $("#sign-out").addEventListener("click", () => {
   bcdr.latest = {};
   bcdr.identity = {};
   bcdr.discovered = {};
+  bcdr.discovering = false;
+  ++bcdr.discoverySequence;
   bcdr.bindings = [];
   $("#bcdr-content").replaceChildren();
   $("#bcdr-progress").textContent = "";

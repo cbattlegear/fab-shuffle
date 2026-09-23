@@ -412,11 +412,7 @@ def setup_recovery(
             )
             store.save(descriptor, expected_revision=None)
         with ArmCapacityClient(target_tokens, guard=lock.assert_held) as arm:
-            arm.resume(
-                descriptor.capacity(descriptor.catalog_capacity_id),
-                owner_id=descriptor.controller_id,
-                on_progress=lambda operation: _record_capacity(store, operation),
-            )
+            descriptor = CapacityCoordinator(store, arm).resume_catalog_capacity()
         if request.control_workspace_name is not None:
             if any(grant.role != "Admin" for grant in request.access_policy.owners):
                 raise RecoveryBlocked(

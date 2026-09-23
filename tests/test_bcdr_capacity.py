@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -160,8 +161,8 @@ def test_arm_resume_lro_persists_receipts_before_poll_and_waits_for_actual_state
         tokens, transport=httpx.MockTransport(handler), sleep=sleeps.append,
     ) as arm:
         assert arm.resume(capacity(), owner_id=OWNER, on_progress=phases.append).state == "Active"
-    assert [op.phase for op in phases] == ["intent", "accepted", "succeeded"]
-    assert phases[1].request_id == OP and 5 in sleeps
+    assert [op.phase for op in phases] == ["intent", "intent", "accepted", "succeeded"]
+    assert phases[1].request_id == OP and phases[2].poll_url == POLL and 5 in sleeps
     assert set(tokens.scopes) == {ARM_SCOPE}
     assert [method for method, _ in calls].count("POST") == 1
 
@@ -188,6 +189,75 @@ def test_arm_location_polling_honors_202_then_204():
         arm.suspend(capacity(), owner_id=OWNER, on_progress=observations.append, authorize=lambda: None)
     assert polls == 2 and 7 in sleeps and 9 in sleeps
     assert observations[-1].phase == "succeeded"
+
+
+@pytest.mark.parametrize("query,reason", [
+    ("api-version=2025-01-15-preview&t=opaque-time&c=opaque-context", "API version"),
+    (f"api-version={ARM_VERSION}&unexpected=opaque-context", "unsupported query"),
+    (f"api-version={ARM_VERSION}&api-version={ARM_VERSION}", "duplicate query"),
+])
+def test_rejected_accepted_receipt_retains_request_id_without_replaying(query, reason, caplog):
+    observations, calls = [], []
+    caplog.set_level(logging.INFO)
+    poll = POLL.split("?")[0] + "?" + query
+
+    def handler(request):
+        calls.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": poll, "x-ms-request-id": OP})
+        return httpx.Response(200, json=resource("Suspended"))
+
+    with ArmCapacityClient(Tokens(), transport=httpx.MockTransport(handler)) as arm:
+        with pytest.raises(CapacityOutcomeUnknown, match=reason) as failure:
+            arm.resume(capacity(), owner_id=OWNER, on_progress=observations.append)
+        assert "HTTP 202" in str(failure.value)
+        assert "may already have taken effect" in str(failure.value)
+        receipt = observations[-1]
+        assert receipt.phase == "intent" and receipt.request_id == OP and receipt.poll_url is None
+        with pytest.raises(CapacityOutcomeUnknown, match="no receipt"):
+            arm.resume(capacity(), owner_id=OWNER, on_progress=observations.append, pending=receipt)
+    assert calls.count("POST") == 1
+    assert "header=Location" in caplog.text and "query_keys=" in caplog.text
+    assert ARM_ID in caplog.text
+    assert "opaque-context" not in caplog.text and "opaque-time" not in caplog.text
+    assert "arm-test-token" not in caplog.text
+
+
+def test_httpx_logging_does_not_expose_arm_poll_context(caplog):
+    caplog.set_level(logging.INFO)
+    url = POLL + "&t=opaque-time&c=opaque-context"
+    tokens = Tokens()
+    with ArmCapacityClient(
+        tokens, transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"status": "Succeeded"})),
+    ) as arm:
+        arm._request("GET", url, capacity(), polling=True)
+    assert "/operationresults/" in caplog.text
+    assert "opaque-context" not in caplog.text and "opaque-time" not in caplog.text
+    assert "arm-test-token" not in caplog.text
+
+
+@pytest.mark.parametrize("desired", [False, True])
+def test_catalog_capacity_only_reconciles_unknown_intent_without_post(store, desired):
+    pending = CapacityOperation(intent_id=OP, owner_id=OWNER, arm_resource_id=ARM_ID, action="resume")
+    store.update(lambda current: current.model_copy(update={"capacity_operations": (pending,)}))
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        assert request.method == "GET"
+        return httpx.Response(200, json=resource("Active" if desired else "Suspended"))
+
+    with ArmCapacityClient(Tokens(), transport=httpx.MockTransport(handler)) as arm:
+        driver = CapacityCoordinator(store, arm)
+        if desired:
+            result = driver.resume_catalog_capacity()
+            assert result.capacity_operations[0].phase == "succeeded"
+            assert result.capacity_operations[0].intent_id == OP
+        else:
+            with pytest.raises(CapacityOutcomeUnknown, match="no receipt"):
+                driver.resume_catalog_capacity()
+            assert store.load().capacity_operations == (pending,)
+    assert "POST" not in calls
 
 
 def test_arm_lro_failure_exposes_service_code_message_request_id():

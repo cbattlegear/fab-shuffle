@@ -8,10 +8,12 @@ the synchronous service has settled its operation and closed its clients.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -20,6 +22,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
 from fabshuffle.bcdr.backend import RecoveryBlocked
+from fabshuffle.bcdr.bootstrap import canonical_arm_id
 from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
 from fabshuffle.bcdr.service import (
@@ -43,12 +46,14 @@ from fabshuffle.bcdr.service import (
 )
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import workspaces
-from fabshuffle.fabric.client import FabricClient
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
+from fabshuffle.lifecycle import safe_text
 
 if TYPE_CHECKING:
     from fabshuffle.web.app import Session
 
 T = TypeVar("T", bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 
 class ConfirmedRequest(BaseModel, Generic[T]):
@@ -181,6 +186,20 @@ def _service_call(
 
 def _setup_call(session: Session, request: SetupRequest) -> ServiceResult:
     _same_tenant(session)
+    logger.info(
+        "BCDR setup selection: control_workspace=%s source_capacities=%s",
+        request.control_workspace_id or "[new workspace]", request.source_capacity_ids,
+    )
+    for capacity in request.recovery_capacities:
+        try:
+            resource = canonical_arm_id(capacity.arm_resource_id)
+        except ValueError:
+            resource = "[invalid ARM resource ID]"
+        logger.info(
+            "BCDR setup recovery capacity: fabric_capacity=%s arm_resource=%s catalog=%s",
+            capacity.fabric_capacity_id, resource,
+            capacity.arm_resource_id.lower() == request.catalog_capacity_id.lower(),
+        )
     return setup_recovery(request, bootstrap_path(), target_tokens=session.destination_tokens)
 
 
@@ -248,26 +267,52 @@ def create_router(
     async def discovery(session=Depends(require_session)):
         def work():
             _same_tenant(session)
+            discovery_id = str(uuid4())
 
-            def inventory(tokens):
+            def inventory(tokens, side):
                 # These principal-scoped, paginated reads are explicit preparation,
                 # never an implicit dependency of recovery or catalog status.
                 # https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces
                 # https://learn.microsoft.com/rest/api/fabric/core/capacities/list-capacities
                 with FabricClient(tokens) as client:
-                    return {
-                        "capacities": [{
-                            key: entry.get(key) for key in ("id", "displayName", "region", "state")
-                        } for entry in workspaces.list_capacities(client)],
-                        "workspaces": [{
-                            key: entry.get(key) for key in ("id", "displayName", "capacityId")
-                        } for entry in workspaces.list_workspaces(client)
-                          if entry.get("type") == "Workspace"],
-                    }
+                    result: dict[str, Any] = {"errors": {}}
+                    for kind, read, keys in (
+                        ("capacities", workspaces.list_capacities,
+                         ("id", "displayName", "region", "state", "sku")),
+                        ("workspaces", workspaces.list_workspaces,
+                         ("id", "displayName", "capacityId", "capacityRegion", "description")),
+                    ):
+                        try:
+                            entries = read(client)
+                        except FabricError as error:
+                            result["errors"][kind] = safe_text(
+                                f"HTTP {error.status_code}; {error.error_code}: {error.detail or error.body}"
+                                if isinstance(error, FabricApiError) else str(error)
+                            )
+                            logger.warning(
+                                "BCDR discovery=%s side=%s kind=%s failed: %s",
+                                discovery_id, side, kind, result["errors"][kind],
+                            )
+                            continue
+                        result[kind] = [
+                            {key: entry.get(key) for key in keys}
+                            for entry in entries if kind != "workspaces" or entry.get("type") == "Workspace"
+                        ]
+                        logger.info(
+                            "BCDR discovery=%s side=%s kind=%s count=%s",
+                            discovery_id, side, kind, len(result[kind]),
+                        )
+                        for entry in result[kind]:
+                            logger.info(
+                                "BCDR discovery=%s side=%s kind=%s name=%r resource_id=%r capacity_id=%r",
+                                discovery_id, side, kind, safe_text(str(entry.get("displayName") or "")),
+                                safe_text(str(entry.get("id") or "")), entry.get("capacityId"),
+                            )
+                    return result
 
-            source = inventory(session.tokens)
-            target = inventory(session.destination_tokens) if session.paired else source
-            return {"source": source, "recovery": target}
+            source = inventory(session.tokens, "source")
+            target = inventory(session.destination_tokens, "recovery") if session.paired else source
+            return {"source": source, "recovery": target, "discovery_id": discovery_id}
 
         return await execute(session, work)
 
