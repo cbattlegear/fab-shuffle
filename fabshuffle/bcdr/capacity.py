@@ -82,13 +82,10 @@ def validate_poll_url(url: str, arm_resource_id: str, *, previous: str | None = 
     if not match or match[1].lower() != resource.split("/")[2]:
         raise BootstrapError("ARM polling URL is outside the authorized Fabric subscription/operation scope")
     UUID(match[3])
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    if any(len(values) != 1 for values in query.values()):
-        raise BootstrapError("ARM polling URL contains duplicate query parameters")
-    if query.get("api-version") != [ARM_VERSION]:
-        raise BootstrapError("ARM polling URL has an unsupported or missing API version")
-    if set(query) - {"api-version", "t", "c"}:
-        raise BootstrapError("ARM polling URL contains unsupported query parameters")
+    # ARM says GET the returned monitoring URL, not rebuild its query using the
+    # initiating request's version or an example's t/c keys. The exact host/path
+    # and operation identity above/below bind this read; query context is opaque.
+    # https://learn.microsoft.com/azure/azure-resource-manager/management/async-operations
     if previous:
         old = _POLL_PATH.fullmatch(urlsplit(validate_poll_url(previous, resource)).path)
         if old is None or (match[2].lower(), match[3].lower()) != (old[2].lower(), old[3].lower()):

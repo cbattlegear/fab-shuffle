@@ -105,6 +105,11 @@ Fabric/ARM identifiers. Use restricted server logs for identity troubleshooting,
 screenshots of resource pickers. Discovery failures preserve successful independent results;
 selections from a failed refresh cannot substitute for a successful read of that inventory.
 
+ARM monitoring queries are service-issued opaque context: the controller uses the returned
+query unchanged after validating the host, subscription, Fabric operation path and operation
+identity. The initiating request's API version and a documentation example's query keys
+are not an allow-list for the monitoring URL.
+
 If an ARM polling header is rejected after `202 Accepted`, Azure has accepted the operation;
 the local error does not mean it failed. The controller retains the intent and any valid
 request ID, and does not blindly replay it on the next setup request. Check the server's

@@ -103,8 +103,6 @@ def resource(state="Active", resource_id=ARM_ID):
     POLL.replace("/locations/westus/operationresults/", "/capacities/"),
     POLL.replace("/locations/westus/", "/locations/../westus/"),
     POLL.replace("/locations/westus/", "/locations/%2e%2e/westus/"),
-    POLL + "&sig=secret",
-    POLL + "&api-version=2023-11-01",
     POLL + "#fragment",
 ])
 def test_unsafe_polling_scope_is_rejected_before_token_acquisition(url):
@@ -191,15 +189,14 @@ def test_arm_location_polling_honors_202_then_204():
     assert observations[-1].phase == "succeeded"
 
 
-@pytest.mark.parametrize("query,reason", [
-    ("api-version=2025-01-15-preview&t=opaque-time&c=opaque-context", "API version"),
-    (f"api-version={ARM_VERSION}&unexpected=opaque-context", "unsupported query"),
-    (f"api-version={ARM_VERSION}&api-version={ARM_VERSION}", "duplicate query"),
+@pytest.mark.parametrize("poll,reason", [
+    (POLL.replace(TENANT, APP) + "&c=opaque-context", "subscription"),
+    (POLL.replace("management.azure.com", "evil.example") + "&t=opaque-time", "unsafe"),
+    (POLL.replace("Microsoft.Fabric", "Microsoft.Compute") + "&c=opaque-context", "scope"),
 ])
-def test_rejected_accepted_receipt_retains_request_id_without_replaying(query, reason, caplog):
+def test_rejected_accepted_receipt_retains_request_id_without_replaying(poll, reason, caplog):
     observations, calls = [], []
     caplog.set_level(logging.INFO)
-    poll = POLL.split("?")[0] + "?" + query
 
     def handler(request):
         calls.append(request.method)
@@ -221,6 +218,41 @@ def test_rejected_accepted_receipt_retains_request_id_without_replaying(query, r
     assert ARM_ID in caplog.text
     assert "opaque-context" not in caplog.text and "opaque-time" not in caplog.text
     assert "arm-test-token" not in caplog.text
+
+
+@pytest.mark.parametrize("query", [
+    "api-version=2025-01-15-preview&t=opaque-time&c=opaque%2Bcontext%3D",
+    f"api-version={ARM_VERSION}&context=opaque-context&monitor=true",
+    "operationToken=opaque%2Ftoken%3D",
+])
+@pytest.mark.parametrize("header", ["Location", "Azure-AsyncOperation"])
+def test_arm_uses_returned_monitor_query_unchanged_and_reloads_receipt(store, query, header, caplog):
+    caplog.set_level(logging.INFO)
+    poll = POLL.split("?")[0] + "?" + query
+    observations, calls = [], []
+    reads = 0
+
+    def persist(operation):
+        observations.append(operation)
+        store.update(lambda current: current.model_copy(update={"capacity_operations": (operation,)}))
+
+    def handler(request):
+        nonlocal reads
+        calls.append((request.method, str(request.url)))
+        if request.method == "POST":
+            return httpx.Response(202, headers={header: poll, "Retry-After": "0"})
+        if "operationresults" in request.url.path:
+            assert str(request.url) == poll
+            assert store.load().capacity_operations[0].poll_url == poll
+            return httpx.Response(200, json={"status": "Succeeded"})
+        reads += 1
+        return httpx.Response(200, json=resource("Suspended" if reads == 1 else "Active"))
+
+    with ArmCapacityClient(Tokens(), transport=httpx.MockTransport(handler), sleep=lambda _: None) as arm:
+        arm.resume(capacity(), owner_id=OWNER, on_progress=persist)
+    assert observations[-1].phase == "succeeded"
+    assert sum(method == "POST" for method, _ in calls) == 1
+    assert "opaque" not in caplog.text and "arm-test-token" not in caplog.text
 
 
 def test_httpx_logging_does_not_expose_arm_poll_context(caplog):
