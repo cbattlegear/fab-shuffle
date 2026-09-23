@@ -113,17 +113,22 @@ _DDL = (
     )""",
 )
 _TRANSITIONS = {
-    RecoveryMode.STANDBY: {RecoveryMode.SYNCING, RecoveryMode.ENABLING_RECOVERY, RecoveryMode.PARKING},
+    RecoveryMode.STANDBY: {
+        RecoveryMode.SYNCING, RecoveryMode.ENABLING_RECOVERY, RecoveryMode.PARKING, RecoveryMode.TESTING,
+    },
     RecoveryMode.SYNCING: {RecoveryMode.STANDBY},
     RecoveryMode.PARKING: {RecoveryMode.STANDBY},
     RecoveryMode.ENABLING_RECOVERY: {RecoveryMode.ACTIVE_RECOVERY},
     RecoveryMode.ACTIVE_RECOVERY: {RecoveryMode.FAILING_BACK},
     RecoveryMode.FAILING_BACK: {RecoveryMode.REARMING, RecoveryMode.ACTIVE_RECOVERY},
     RecoveryMode.REARMING: {RecoveryMode.STANDBY},
+    RecoveryMode.TESTING: {RecoveryMode.ENDING_TEST},
+    RecoveryMode.ENDING_TEST: {RecoveryMode.STANDBY},
 }
 _BUSINESS_MODES = {
     RecoveryMode.SYNCING, RecoveryMode.ENABLING_RECOVERY, RecoveryMode.ACTIVE_RECOVERY,
     RecoveryMode.FAILING_BACK, RecoveryMode.REARMING,
+    RecoveryMode.TESTING,
 }
 _PENDING = {OperationState.INTENT, OperationState.RUNNING, OperationState.AMBIGUOUS}
 

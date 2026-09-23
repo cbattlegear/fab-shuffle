@@ -32,6 +32,10 @@ import pytest
     "warehouse_setup_prefills_saved_name_and_uses_selected_exact_item",
     "warehouse_list_errors_and_workspace_changes_do_not_select_stale_items",
     "warehouse_list_signout_drops_late_choices",
+    "journeys_are_separate_and_navigation_never_reads_the_source",
+    "initial_metadata_sync_offers_schedule_despite_data_gaps",
+    "test_state_blocks_setup_and_incident_controls_without_claiming_production",
+    "schedule_handoff_is_downloadable_not_a_deployment_claim",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

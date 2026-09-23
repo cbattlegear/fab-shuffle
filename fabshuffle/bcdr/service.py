@@ -108,6 +108,28 @@ class EnableRecoveryRequest(Record):
     readiness: tuple[ItemReadiness, ...] = ()
 
 
+class StartDrTestRequest(Record):
+    generation_id: Guid
+    group_ids: tuple[Nonempty, ...]
+
+
+class ContinueDrTestRequest(Record):
+    test_id: Guid
+    readiness: tuple[ItemReadiness, ...] = ()
+
+
+class EndDrTestRequest(Record):
+    test_id: Guid
+    park: StrictBool = True
+
+
+class ScheduleGuideRequest(Record):
+    generation_id: Guid
+    approve_scope: Literal[True]
+    schedule_utc: str = Field(default="0 2 * * *", min_length=9, max_length=256,
+                              pattern=r"^[0-9*/,\-]+(?: [0-9*/,\-]+){4}$")
+
+
 class ItemReadiness(Record):
     """Time-bounded, identity-bound operator/runtime evidence, not a controller lock."""
 
@@ -299,6 +321,22 @@ class BcdrService:
 
     def synchronize(self, request: SyncRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.synchronize(request))
+
+    def start_dr_test(self, request: StartDrTestRequest) -> ServiceResult:
+        from fabshuffle.bcdr.dr_test import DrTestController
+        return self._call(lambda: DrTestController(self.coordinator).start(request))
+
+    def continue_dr_test(self, request: ContinueDrTestRequest) -> ServiceResult:
+        from fabshuffle.bcdr.dr_test import DrTestController
+        return self._call(lambda: DrTestController(self.coordinator).continue_test(request))
+
+    def end_dr_test(self, request: EndDrTestRequest) -> ServiceResult:
+        from fabshuffle.bcdr.dr_test import DrTestController
+        return self._call(lambda: DrTestController(self.coordinator).end(request))
+
+    def schedule_guide(self, request: ScheduleGuideRequest) -> ServiceResult:
+        from fabshuffle.bcdr.workflow import schedule_guide
+        return self._call(lambda: schedule_guide(self.coordinator, request))
 
     def configure_protection(self, request: ConfigureProtectionRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.configure_protection(request))

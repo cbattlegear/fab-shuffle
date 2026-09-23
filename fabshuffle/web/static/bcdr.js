@@ -37,6 +37,9 @@ function bcdrLabel(name) {
     warehouse_name: "Metadata Warehouse name",
     warehouse_id: "Selected metadata Warehouse",
     warehouse_action: "Warehouse action",
+    test_id: "Recorded DR Test",
+    schedule_utc: "Recurring schedule (five-field UTC cron)",
+    approve_scope: "I approve this scope for recurring fresh capture and safe parking",
     source_capacity_ids: "Source capacities",
     source_capacity_id: "Source capacity",
     target_capacity_ids: "Dedicated recovery capacities",
@@ -61,10 +64,10 @@ function bcdrLabel(name) {
     keywords: "Positive workspace-name keywords",
     approved_dependency_workspace_ids: "Approved dependency workspace additions",
     approved_addition_ids: "Approved dependency workspace additions",
-    approved_acl_ids: "Approved deferred ACL IDs",
-    group_ids: "Selected dependency group IDs",
-    selected_group_ids: "Selected dependency group IDs",
-    generation_id: "Captured generation ID",
+    approved_acl_ids: "Approved access grants",
+    group_ids: "Workloads to include",
+    selected_group_ids: "Selected workloads",
+    generation_id: "Captured recovery point",
     writer_fence: "Writer-fence evidence",
     readiness: "Readiness evidence",
     target_observed_sha256: "Observed target content hash (SHA-256)",
@@ -664,7 +667,7 @@ function bcdrField(name, source, root, required = false, context = []) {
       },
     };
   }
-  if (["generation_id", "plan_id", "expected_epoch", "writer_epoch", "tenant_id", "expected_controller_id"].includes(name)) {
+  if (["generation_id", "plan_id", "test_id", "expected_epoch", "writer_epoch", "tenant_id", "expected_controller_id"].includes(name)) {
     const label = bcdrElement("label", title);
     const input = bcdrElement("input");
     input.type = "text";
@@ -673,14 +676,28 @@ function bcdrField(name, source, root, required = false, context = []) {
     label.htmlFor = id;
     input.placeholder = name === "plan_id" ? "Create a failback plan first" : "Read status or preview first";
     label.appendChild(input);
+    const namedPin = ["generation_id", "test_id", "plan_id"].includes(name) ? bcdrElement("span", "", "hint") : null;
+    if (namedPin) {
+      input.type = "hidden";
+      label.appendChild(namedPin);
+    }
     const refresh = () => {
-      input.value = String(name === "expected_controller_id" ? bcdr.latest.details?.controller_id || "" :
+      input.value = String(name === "test_id" ?
+        bcdr.latest.details?.dr_test?.test_id || bcdr.latest.details?.workflow?.test?.test_id || "" :
+        name === "expected_controller_id" ? bcdr.latest.details?.controller_id || "" :
         controllerEpoch ? bcdr.latest.details?.controller_epoch ?? "" :
         name === "writer_epoch" ? bcdr.latest.details?.readiness_context?.writer_epoch ?? "" :
         name === "generation_id" && context.includes("readiness") ?
           bcdr.latest.details?.readiness_context?.generation_id || "" :
         name === "expected_epoch" ? bcdr.latest.details?.writer?.epoch ?? "" :
         name === "tenant_id" ? bcdr.identity.tenant_id || "" : bcdr.latest[name] || "");
+      if (namedPin) {
+        const test = bcdr.latest.details?.dr_test || bcdr.latest.details?.workflow?.test;
+        namedPin.textContent = !input.value ? input.placeholder :
+          name === "generation_id" ? "Current saved recovery point; exact identity is pinned in the request." :
+          name === "test_id" ? `Recorded owners-only test${test?.started_at ? ` started ${test.started_at}` : ""}.` :
+          "Recorded return-to-primary plan; exact identity is pinned in the request.";
+      }
     };
     bcdr.bindings.push(refresh);
     refresh();
@@ -713,7 +730,7 @@ function bcdrField(name, source, root, required = false, context = []) {
         input.value = group.group_id;
         input.checked = false;
         label.appendChild(input);
-        const description = `${group.group_id} (${group.items.length} items)` +
+        const description = `${bcdrGroupName(group)} (${group.items.length} items)` +
           (group.blockers.length ? ` - ${group.blockers.join("; ")}` : "");
         label.appendChild(bcdrElement("span", description));
         choices.appendChild(label);
@@ -1041,6 +1058,7 @@ function bcdrError(message, trigger) {
 }
 
 function bcdrRenderResult(result) {
+  bcdr.resultJourney = bcdr.journey || "overview";
   if (result.details?.setup_phase === "catalog_ready") {
     bcdr.savedSetup = { ...bcdr.savedSetup, workspaceId: result.details.control_workspace_id,
       warehouseId: result.details.control_warehouse_id, warehouseName: result.details.warehouse_name,
@@ -1175,7 +1193,7 @@ function bcdrRenderResult(result) {
     const groups = bcdrElement("ul", undefined, "bcdr-results");
     result.groups.forEach((group) => {
       const entry = bcdrElement("li");
-      entry.appendChild(bcdrElement("strong", group.group_id));
+      entry.appendChild(bcdrElement("strong", bcdrGroupName(group)));
       const state = [
         `Metadata applied: ${group.metadata_applied ? "yes" : "no"}`,
         `Data ready: ${group.data_ready ? "yes" : "no"}`,
@@ -1226,6 +1244,8 @@ function bcdrRenderResult(result) {
   details.appendChild(data);
   output.appendChild(details);
   output.hidden = false;
+  if (result.details?.schedule_guide) bcdrRenderScheduleGuide(output, result.details.schedule_guide);
+  bcdrRefreshJourney();
 }
 
 async function bcdrSubmit(command, body, button) {
@@ -1271,6 +1291,14 @@ async function bcdrSubmit(command, body, button) {
       feedback.warnings.appendChild(list);
       feedback.warnings.hidden = false;
     }
+    if (result.details?.sync_summary?.metadata_ready) {
+      bcdrJourneyButton(feedback.warnings, "Set up scheduled sync", "setup", "schedule", true);
+      feedback.warnings.hidden = false;
+    }
+    if (result.details?.schedule_guide) {
+      bcdrRenderScheduleGuide(feedback.warnings, result.details.schedule_guide);
+      feedback.warnings.hidden = false;
+    }
   } catch (error) {
     if (bcdrCurrentSession(sessionId)) {
       for (const entry of error.details || []) {
@@ -1287,7 +1315,10 @@ async function bcdrSubmit(command, body, button) {
     bcdr.pending = false;
     panel.setAttribute("aria-busy", "false");
     controls.forEach((control, index) => { control.disabled = disabled[index]; });
-    if (bcdrCurrentSession(sessionId)) button.focus({ preventScroll: true });
+    if (bcdrCurrentSession(sessionId)) {
+      const target = button.closest("details")?.hidden ? $("#bcdr-journey-title") : button;
+      target.focus({ preventScroll: true });
+    }
   }
 }
 
@@ -1337,7 +1368,9 @@ function bcdrRenderForms(commands) {
   bcdr.bindings = [];
   bcdr.capacityBindings = [];
   bcdr.recoveryRows = new Map();
+  bcdrBuildJourneyShell(content, commands);
   const preparation = bcdrElement("details");
+  preparation.id = "bcdr-preparation";
   preparation.appendChild(bcdrElement("summary", "Healthy-source preparation: discover named setup choices"));
   preparation.appendChild(bcdrElement("p",
     "This optional read contacts the source and recovery Fabric APIs. Do not use it during a source outage; " +
@@ -1412,6 +1445,8 @@ function bcdrRenderForms(commands) {
   content.appendChild(preparation);
   for (const command of commands) {
     const section = bcdrElement("details");
+    section.dataset.command = command.name;
+    bcdr.commandSections.set(command.name, section);
     section.open = command.name === "setup";
     section.appendChild(bcdrElement("summary", command.label));
     section.appendChild(bcdrElement("p", command.description, "hint"));
@@ -1456,6 +1491,7 @@ function bcdrRenderForms(commands) {
   result.id = "bcdr-result";
   result.hidden = true;
   content.appendChild(result);
+  bcdrRefreshJourney();
 }
 
 $("#bcdr-open").addEventListener("click", async () => {
@@ -1486,7 +1522,7 @@ $("#bcdr-open").addEventListener("click", async () => {
     bcdr.warehouseChoices = [];
     bcdrRenderForms(response.commands);
     bcdr.forms = response.commands;
-    $("#bcdr-progress").textContent = "Choose setup or read the saved recovery status. No operation has started.";
+    $("#bcdr-progress").textContent = "Choose setup, a DR Test, or incident recovery. No operation has started.";
   } catch (error) {
     if (bcdrCurrentSession(sessionId)) {
       bcdrError(error.message);
@@ -1515,6 +1551,10 @@ $("#sign-out").addEventListener("click", () => {
 });
 
 $("#bcdr-back").addEventListener("click", async () => {
+  $("#bcdr-open").hidden = false;
+  if (globalThis.history && globalThis.location?.hash.startsWith("#bcdr/")) {
+    globalThis.history.replaceState(null, "", globalThis.location.pathname + globalThis.location.search);
+  }
   const sessionId = state.sessionId;
   $(".wizard-nav").hidden = false;
   const fromRecoverySignIn = bcdr.returnStage === "login";

@@ -19,16 +19,20 @@ from fabshuffle.bcdr.scheduled import read_request, scheduled_sync
 from fabshuffle.bcdr.service import (
     BcdrService,
     ConfigureReplicaRequest,
+    ContinueDrTestRequest,
     CutbackRequest,
     CutoverRequest,
     EnableRecoveryRequest,
+    EndDrTestRequest,
     FailbackExecuteRequest,
     FailbackRequest,
     PlanRequest,
     RearmRequest,
     ReconcileOperationRequest,
+    ScheduleGuideRequest,
     ServiceResult,
     SetupRequest,
+    StartDrTestRequest,
     SyncRequest,
     create_service,
 )
@@ -39,6 +43,10 @@ from fabshuffle.fabric.client import FabricApiError, FabricError
 from fabshuffle.lifecycle import safe_text
 
 REQUESTS = {
+    "start-dr-test": StartDrTestRequest,
+    "continue-dr-test": ContinueDrTestRequest,
+    "end-dr-test": EndDrTestRequest,
+    "schedule-guide": ScheduleGuideRequest,
     "reconcile-operation": ReconcileOperationRequest,
     "configure-replica": ConfigureReplicaRequest,
     "setup": SetupRequest,
@@ -57,6 +65,7 @@ CONSEQUENTIAL = frozenset({
     "setup", "configure-protection", "synchronize", "enable-recovery",
     "cutover", "execute-failback", "cutback", "rearm", "reconcile-operation", "configure-replica",
     "scheduled-sync",
+    "start-dr-test", "continue-dr-test", "end-dr-test", "schedule-guide",
 })
 
 
@@ -113,6 +122,14 @@ def dispatch(service: BcdrService, command: str, text: str) -> ServiceResult:
     """Explicit typed calls; unsupported commands cannot reach a dynamic service member."""
     if command == "status":
         return service.status()
+    if command == "start-dr-test":
+        return service.start_dr_test(StartDrTestRequest.model_validate_json(text))
+    if command == "continue-dr-test":
+        return service.continue_dr_test(ContinueDrTestRequest.model_validate_json(text))
+    if command == "end-dr-test":
+        return service.end_dr_test(EndDrTestRequest.model_validate_json(text))
+    if command == "schedule-guide":
+        return service.schedule_guide(ScheduleGuideRequest.model_validate_json(text))
     if command == "reconcile-operation":
         return service.reconcile_operation(ReconcileOperationRequest.model_validate_json(text))
     if command == "configure-replica":

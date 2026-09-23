@@ -31,16 +31,20 @@ from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
 from fabshuffle.bcdr.service import (
     BcdrService,
     ConfigureReplicaRequest,
+    ContinueDrTestRequest,
     CutbackRequest,
     CutoverRequest,
     EnableRecoveryRequest,
+    EndDrTestRequest,
     FailbackExecuteRequest,
     FailbackRequest,
     PlanRequest,
     RearmRequest,
     ReconcileOperationRequest,
+    ScheduleGuideRequest,
     ServiceResult,
     SetupRequest,
+    StartDrTestRequest,
     SyncRequest,
     create_service,
 )
@@ -92,6 +96,26 @@ def bootstrap_path() -> Path:
 
 
 COMMANDS = (
+    ("start-dr-test", "Start DR Test", StartDrTestRequest,
+     "Exercise selected existing standby groups with recovery owners only. Production stays primary. "
+     "Automatic synchronization is held until the test ends; no source metadata is captured.",
+     "Resume recovery capacity and prepare stopped standby targets for an owners-only test. "
+     "Do not pause production, replay business ACLs, change writer authority or route production consumers."),
+    ("continue-dr-test", "Validate DR Test", ContinueDrTestRequest,
+     "Continue the recorded test and supply current owner data, reference and access evidence. "
+     "Untested and blocked workloads are not a passed recovery exercise.",
+     "Prepare or recheck the same pinned test targets. "
+     "This is not production admission or proof of regional failover."),
+    ("end-dr-test", "End test and return to standby", EndDrTestRequest,
+     "Verify the shared standby is unchanged except for recorded restoration, retain its resources, "
+     "and release automatic sync only after ending safely.",
+     "End this DR Test without production cutover or failback. Do not delete the standby estate. "
+     "Park only when the existing capacity safety checks allow it."),
+    ("schedule-guide", "Prepare scheduled-sync instructions", ScheduleGuideRequest,
+     "Review the completed metadata scope and export a guarded recurring request. "
+     "Data-recovery gaps stay visible. No Azure job is created or enabled.",
+     "Approve this scope for fresh metadata capture and safe parking in recurring runs. "
+     "This only prepares a configuration download and deployment instructions."),
     ("setup", "Set up the control Warehouse", SetupRequest,
      "Create a control workspace or choose an existing one where the recovery principal has Admin access. "
      "Additional members and owner-role differences produce warnings; existing grants stay unchanged. "
@@ -476,6 +500,36 @@ def create_router(
             session, lambda: _service_call(
                 session, lambda service: service.synchronize(request), source_access=request.capture,
             )
+        )
+
+    @router.post("/start-dr-test", response_model=ServiceResult)
+    async def start_dr_test(body: ConfirmedRequest[StartDrTestRequest], session=Depends(require_session)):
+        request = confirmed(body, "start-dr-test")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.start_dr_test(request)),
+        )
+
+    @router.post("/continue-dr-test", response_model=ServiceResult)
+    async def continue_dr_test(
+        body: ConfirmedRequest[ContinueDrTestRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "continue-dr-test")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.continue_dr_test(request)),
+        )
+
+    @router.post("/end-dr-test", response_model=ServiceResult)
+    async def end_dr_test(body: ConfirmedRequest[EndDrTestRequest], session=Depends(require_session)):
+        request = confirmed(body, "end-dr-test")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.end_dr_test(request)),
+        )
+
+    @router.post("/schedule-guide", response_model=ServiceResult)
+    async def schedule_guide(body: ConfirmedRequest[ScheduleGuideRequest], session=Depends(require_session)):
+        request = confirmed(body, "schedule-guide")
+        return await execute(
+            session, lambda: _service_call(session, lambda service: service.schedule_guide(request)),
         )
 
     @router.post("/enable-recovery", response_model=ServiceResult)

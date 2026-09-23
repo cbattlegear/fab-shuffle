@@ -143,6 +143,10 @@ or distribute administrator sessions.
 
 ## Gate 2: managed identity and fresh catalog
 
+Enter **Set up standby** for first-run preparation, not the incident or test paths.
+Complete the metadata baseline before preparing scheduled-sync instructions. A configuration
+download must not claim a scheduler has been deployed, and optional data gaps must remain visible.
+
 1. Choose Azure managed identity. No Fabric client secret should be requested.
 2. Compare actual tenant/client/object IDs with the UAMI.
 3. Demonstrate source discovery and target access; test a denial using a disposable
@@ -234,6 +238,28 @@ capacity effects. `parallelism=1` is per execution, not overlap protection; the 
 Blob lease is the guard. Disable scheduling before fault injection or request-file changes.
 
 ## Gate 5: independent data recovery first
+
+### Non-production DR Test first
+
+With production still running, use **DR Test**, not **I'm currently down**. Select the
+existing inactive standby groups and start an owners-only test. Verify that scheduled and
+manual source synchronization are refused/held during `testing` and `ending_test`.
+No primary pause, production ACL replay, writer-side change, consumer routing or workload
+activation should occur. Submit real owner data/reference/access evidence and retain
+passed/failed/blocked/not-tested outcomes.
+
+End the test without deleting the standby estate or invoking production failback. Interrupt
+one disposable test and confirm it resumes with the same test ID and generation; change a
+disposable target and confirm ending remains blocked until its state is reconciled. Restore
+safe standby before any scheduled run can capture again. A healthy-primary owners-only
+exercise does not qualify actual regional storage failover or production-user readiness.
+
+### Incident recovery
+
+Use **I'm currently down** for the following outage exercises. Its navigation and status
+loading must not issue healthy-source discovery or source metadata capture. Production
+cutover remains a separate approval from recovery preparation, and **Return to primary**
+is separate from ending a test.
 
 ### Prepare
 

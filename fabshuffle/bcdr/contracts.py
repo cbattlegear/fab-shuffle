@@ -93,6 +93,8 @@ class RecoveryMode(StrEnum):
     ACTIVE_RECOVERY = "active_recovery"
     FAILING_BACK = "failing_back"
     REARMING = "rearming"
+    TESTING = "testing"
+    ENDING_TEST = "ending_test"
 
 
 class RecoveryStrategy(StrEnum):

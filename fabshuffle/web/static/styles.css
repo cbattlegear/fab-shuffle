@@ -76,6 +76,26 @@ body {
 .bcdr input[type="checkbox"] { width: auto; flex: 0 0 auto; margin-top: 0.2rem; }
 .bcdr-check { display: flex; align-items: flex-start; gap: 0.6rem; color: var(--text); }
 .bcdr button { min-height: 2.75rem; }
+.bcdr-journey-nav, .bcdr-stage-nav { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 1rem 0; }
+.bcdr-journey-nav { border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
+.bcdr-journey-nav [aria-current="page"], .bcdr-stage-nav [aria-current="step"] {
+  border-color: var(--accent); color: var(--text); background: var(--surface-raised);
+}
+.bcdr-journey-help { margin: 1.5rem 0; }
+.bcdr-journey-help > button { margin: 0 0.6rem 0.6rem 0; }
+.bcdr-status-action { margin-bottom: 1rem; }
+.bcdr-status-action .hint { margin-top: 0.5rem; }
+.bcdr #bcdr-workflow-facts .summary {
+  display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2fr);
+  gap: 0.65rem 1.25rem; margin: 1rem 0; padding: 0;
+  background: transparent; border: 0;
+}
+.bcdr #bcdr-workflow-facts dt, .bcdr #bcdr-workflow-facts dd { margin: 0; }
+.bcdr #bcdr-workflow-facts dt { color: var(--text-dim); }
+.bcdr-schedule-guide { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.bcdr-schedule-guide li + li { margin-top: 0.6rem; }
+.bcdr-schedule-guide a { display: inline-block; margin: 0.8rem 1rem 0 0; color: var(--accent); }
+.bcdr-test-summary { border-top: 1px solid var(--border); margin-top: 1.5rem; padding-top: 0.5rem; }
 .bcdr :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .bcdr-results { margin: 1rem 0; padding-left: 1.25rem; }
 .bcdr-results li + li { margin-top: 0.75rem; }
@@ -94,7 +114,11 @@ body {
 @media (max-width: 40rem) {
   .masthead { flex-wrap: wrap; padding: 1rem; }
   .masthead-actions { flex-wrap: wrap; }
-  .bcdr-heading { flex-direction: column; }
+  .bcdr-heading { flex-direction: row; }
+  .bcdr-heading > div { min-width: 0; flex: 1; }
+  .bcdr-heading #bcdr-back { max-width: 7rem; padding: 0.4rem; font-size: 0.8rem; }
+  .bcdr #bcdr-workflow-facts .summary { grid-template-columns: minmax(0, 1fr); gap: 0.25rem; }
+  .bcdr #bcdr-workflow-facts dd { margin-bottom: 0.7rem; }
   .bcdr-fields { grid-template-columns: minmax(0, 1fr); }
   main { padding-right: 1rem; padding-left: 1rem; }
 }

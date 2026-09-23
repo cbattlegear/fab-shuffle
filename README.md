@@ -287,6 +287,11 @@ enablement, deferred ACL replay, writer-fenced cutover, failback and rearm are e
 operations. Captured metadata and restored definitions are not proof of application
 readiness; inspect partial group outcomes and optional-data protection warnings.
 
+The standby UI separates **Set up standby**, **DR Test**, and **I'm currently down**.
+Initial metadata synchronization leads to a guided scheduled-sync handoff, not automatic
+job creation. DR Test uses the existing standby with recovery owners, holds synchronization,
+and never cuts over production; incident recovery uses saved state without primary discovery.
+
 See [the BCDR operator guide](docs/bcdr.md) for controller setup, capacity/metadata costs,
 source-retention obligations, qualification limits, API routes and the Linux-container
 `python -m fabshuffle.bcdr` scheduler entrypoint. Existing migration modes remain unchanged.

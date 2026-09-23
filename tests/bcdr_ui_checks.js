@@ -6,8 +6,10 @@ const { fixture } = require("./cross_tenant_ui_checks");
 
 function setup() {
   const f = fixture();
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "fabshuffle", "web", "static",
+    "bcdr-workflows.js"), "utf8"), f.context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "fabshuffle", "web", "static", "bcdr.js"), "utf8") + `
-    globalThis.product = { bcdr, bcdrField, bcdrRenderForms, bcdrRenderResult, bcdrSubmit, bcdrConfirm };
+    globalThis.product = { bcdr, bcdrField, bcdrRenderForms, bcdrRenderResult, bcdrSubmit, bcdrConfirm, bcdrJourney };
   `, f.context);
   f.product = f.context.product;
   Object.assign(f.ui.state, { sessionId: "same-tenant-session" });
@@ -100,6 +102,80 @@ function discoverButton(f) {
 }
 
 const scenarios = {
+  async journeys_are_separate_and_navigation_never_reads_the_source(f) {
+    const commands = ["setup", "status", "synchronize", "schedule-guide", "start-dr-test",
+      "continue-dr-test", "end-dr-test", "enable-recovery", "cutover", "plan-failback", "reconcile-operation"]
+      .map((name) => ({ ...command, name, label: name, path: `/api/bcdr/${name}` }));
+    f.product.bcdrRenderForms(commands);
+    assert.equal(f.product.bcdr.journey, "overview");
+    assert.ok(Array.from(f.product.bcdr.commandSections.values()).every((section) => section.hidden));
+    f.product.bcdrJourney("incident", "assess");
+    assert.equal(f.get("bcdr-preparation").hidden, true);
+    assert.equal(f.product.bcdr.commandSections.get("setup").hidden, true);
+    assert.equal(f.product.bcdr.commandSections.get("synchronize").hidden, true);
+    assert.match(f.get("bcdr-journey-help").textContent, /No healthy-source discovery/);
+    f.product.bcdrJourney("test", "exercise");
+    assert.equal(f.product.bcdr.commandSections.get("start-dr-test").hidden, false);
+    assert.equal(f.product.bcdr.commandSections.get("cutover").hidden, true);
+    f.product.bcdrJourney("setup", "home");
+    assert.equal(f.get("bcdr-preparation").hidden, false);
+    assert.equal(f.product.bcdr.commandSections.get("setup").hidden, false);
+    assert.equal(f.requests.length, 0);
+  },
+  async initial_metadata_sync_offers_schedule_despite_data_gaps(f) {
+    f.product.bcdrRenderForms([{ ...command, name: "synchronize" },
+      { ...command, name: "schedule-guide", label: "Schedule" }]);
+    f.product.bcdrJourney("setup", "sync");
+    f.product.bcdrRenderResult({ ...result, details: {
+      sync_summary: { metadata_ready: true, completed_at: "2026-09-23T18:00:00Z", data_gap_groups: ["group-1"] },
+    } });
+    const next = f.get("bcdr-journey-help").querySelectorAll("button")
+      .find((button) => button.textContent === "Set up scheduled sync");
+    assert.ok(next, "Data gaps must not hide the scheduling handoff");
+    next.click();
+    assert.equal(f.product.bcdr.journeyStage, "schedule");
+    assert.equal(f.product.bcdr.commandSections.get("schedule-guide").hidden, false);
+    assert.match(f.get("bcdr-workflow-facts").textContent, /1 group.*unresolved data readiness/s);
+    assert.match(f.get("bcdr-journey-help").textContent, /does not create a job/);
+    assert.equal(f.requests.length, 0);
+  },
+  async test_state_blocks_setup_and_incident_controls_without_claiming_production(f) {
+    f.product.bcdrRenderForms(["setup", "synchronize", "start-dr-test", "continue-dr-test",
+      "end-dr-test", "enable-recovery", "cutover"].map((name) => ({ ...command, name })));
+    f.product.bcdrRenderResult({ ...result, mode: "testing", details: { dr_test: {
+      test_id: "test-1", phase: "testing", production_cutover: false,
+      results: [{ group_id: "group-1", outcome: "not_tested", messages: ["Supply owner evidence."] }],
+    } } });
+    f.product.bcdrJourney("test", "exercise");
+    assert.equal(f.product.bcdr.commandSections.get("continue-dr-test").hidden, false);
+    assert.equal(f.product.bcdr.commandSections.get("start-dr-test").hidden, true);
+    assert.match(f.get("bcdr-journey-help").textContent, /Production cutover: no/);
+    const test = f.product.bcdrField("test_id", { type: "string" }, {}, true);
+    assert.equal(test.read(), "test-1");
+    f.product.bcdrJourney("setup", "sync");
+    assert.equal(f.product.bcdr.commandSections.get("synchronize").hidden, true);
+    f.product.bcdrJourney("incident", "prepare");
+    assert.equal(f.product.bcdr.commandSections.get("enable-recovery").hidden, true);
+    assert.match(f.get("bcdr-journey-help").textContent, /End test safely/);
+  },
+  async schedule_handoff_is_downloadable_not_a_deployment_claim(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup", "schedule");
+    const request = { capacity_routes: [], capture: true, park: true };
+    f.product.bcdrRenderResult({ ...result, details: { schedule_guide: {
+      request, request_filename: "scheduled-sync-request.json", schedule_utc: "0 2 * * *",
+      remote_lease_configured: false, workspace_names: ["Sales"], steps: ["Review the shared storage."],
+      command: "python -m fabshuffle.bcdr scheduled-sync",
+      template_url: "https://github.com/cbattlegear/fab-shuffle/blob/main/deploy/azuredeploy-sync-job.json",
+    } } });
+    const section = f.get("bcdr-result").querySelector(".bcdr-schedule-guide");
+    assert.match(section.textContent, /Job deployment is not verified/);
+    assert.match(section.textContent, /shared remote lease is not configured/);
+    const link = section.querySelectorAll("a").find((entry) => entry.download);
+    assert.equal(link.download, "scheduled-sync-request.json");
+    assert.deepEqual(JSON.parse(decodeURIComponent(link.href.split(",").slice(1).join(","))), request);
+    assert.equal(f.requests.length, 0);
+  },
   async warehouse_list_signout_drops_late_choices(f) {
     f.product.bcdr.savedSetup = { revision: 1, workspaceId: "control-workspace-guid",
       warehouseName: "Saved metadata", warehousePhase: "accepted" };
@@ -635,6 +711,7 @@ const scenarios = {
   },
   async service_errors_and_pending_controls(f) {
     f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup", "sync");
     const form = f.get("bcdr-content").querySelector("form");
     const button = form.querySelector("button");
     const pending = f.product.bcdrSubmit(command, { generation_id: "pinned" }, button);
@@ -649,7 +726,8 @@ const scenarios = {
   },
   async feedback_stays_with_the_action_and_marks_only_its_fields(f) {
     const schema = { type: "object", properties: { evidence: { type: "string" } } };
-    f.product.bcdrRenderForms([{ ...command, schema }, { ...command, schema, name: "second", label: "Second" }]);
+    f.product.bcdrRenderForms([{ ...command, schema, name: "plan" }, { ...command, schema }]);
+    f.product.bcdrJourney("setup", "sync");
     const forms = f.get("bcdr-content").querySelectorAll("form");
     const buttons = forms.map((form) => form.querySelector("button"));
     const first = f.product.bcdrSubmit(command, {}, buttons[0]);

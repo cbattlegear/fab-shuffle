@@ -234,6 +234,8 @@ class RecoveryCoordinator:
         )
 
     def status(self) -> ServiceResult:
+        from fabshuffle.bcdr.workflow import workflow_summary
+
         self._wake()
         state = self.catalog.state()
         generation_id = state.current_generation_id
@@ -243,6 +245,7 @@ class RecoveryCoordinator:
             generation_id=generation_id,
             groups=self._groups(generation_id) if generation_id else (),
             details={
+                "workflow": workflow_summary(self),
                 "writer": self.runtime.get("lifecycle", "writer") or {"epoch": 0, "side": "primary"},
                 "pending_operations": [
                     row.model_dump(mode="json") for row in self.catalog.pending_operations()
@@ -700,6 +703,15 @@ class RecoveryCoordinator:
                     },
                 )
             groups, warnings = self._apply_plan(generation, plan, request.suffix)
+            summary = {
+                "generation_id": generation.snapshot.generation_id, "completed_at": now().isoformat(),
+                "metadata_ready": bool(groups) and all(group.metadata_applied for group in groups),
+                "data_gap_groups": [group.group_id for group in groups if not group.data_ready],
+                "kind": "scheduled" if standby_only else "manual",
+            }
+            self.runtime.put("lifecycle", "last-sync", summary)
+            if standby_only:
+                self.runtime.put("lifecycle", "last-scheduled-sync", summary)
             self.runtime.transition(RecoveryMode.STANDBY)
             result = ServiceResult(
                 mode=RecoveryMode.STANDBY,
@@ -712,7 +724,7 @@ class RecoveryCoordinator:
             return result.model_copy(
                 update={
                     "mode": self.runtime.mode,
-                    "details": {"capacities": list(self.capacities.observations())},
+                    "details": {"capacities": list(self.capacities.observations()), "sync_summary": summary},
                 }
             )
 
@@ -1095,7 +1107,12 @@ class RecoveryCoordinator:
         *,
         security: bool,
         mappings: Mapping[str, AppliedItem] | None = None,
+        owners_only: bool = False,
     ) -> None:
+        if owners_only and self.runtime.mode != RecoveryMode.TESTING:
+            raise RecoveryBlocked(
+                "Owner-only evidence is restricted to a DR Test, never production admission"
+            )
         proofs = {row.source.key: row for row in evidence}
         if len(proofs) != len(evidence):
             raise RecoveryBlocked("Readiness evidence contains duplicate item identities")
@@ -1141,11 +1158,19 @@ class RecoveryCoordinator:
                         f"Revalidate current data, bindings and effective identity for {identity.key}; "
                         "the evidence does not match this generation/target state"
                     )
-                expected = self.intended_runtime_principals(generation, group)
-                if {principal.key for principal in proof.effective_principals} != {
-                    principal.key for principal in expected
-                }:
+                expected = self.intended_runtime_principals(generation, group) if not owners_only else tuple(
+                    grant.principal for grant in self.recovery_set.access_policy.workspace_grants()
+                )
+                observed_principals = {principal.key for principal in proof.effective_principals}
+                expected_principals = {principal.key for principal in expected}
+                if (
+                    (owners_only and (
+                        not observed_principals or not observed_principals <= expected_principals
+                    ))
+                    or (not owners_only and observed_principals != expected_principals)
+                ):
                     raise RecoveryBlocked(
+                        "Verify only configured recovery owners for this DR Test." if owners_only else
                         "Verify every intended runtime principal from the captured group grants; "
                         "an unrelated effective identity or administrator-only test is insufficient"
                     )
@@ -1156,11 +1181,12 @@ class RecoveryCoordinator:
                     raise RecoveryBlocked(
                         f"Verify '{items[identity.key].display_name}' after the independent copy completed"
                     )
-            self.replica.verify_runtime_principals(
-                generation.snapshot.generation_id,
-                [identity.key for identity in group.items],
-                evidence,
-            )
+            if not owners_only:
+                self.replica.verify_runtime_principals(
+                    generation.snapshot.generation_id,
+                    [identity.key for identity in group.items],
+                    evidence,
+                )
 
     def intended_runtime_principals(
         self,
@@ -1198,21 +1224,105 @@ class RecoveryCoordinator:
     def readiness_context(self, generation_id: str) -> dict[str, JsonValue]:
         writer = self.runtime.get("lifecycle", "writer") or {"epoch": 0, "side": "primary"}
         generation = self.catalog.load_generation(generation_id)
+        testing = self.catalog.state().mode in {RecoveryMode.TESTING, RecoveryMode.ENDING_TEST}
+        owners = tuple(grant.principal for grant in self.recovery_set.access_policy.workspace_grants())
         return {
             "generation_id": generation_id,
             "writer_epoch": writer["epoch"],
             "issuer": self.recovery_set.access_policy.recovery_spn.model_dump(mode="json"),
+            "principal_policy": (
+                "one_or_more_configured_owners" if testing else "all_intended_runtime_principals"
+            ),
             "groups": [
                 {
                     "group_id": group.group_id,
                     "effective_principals": [
                         principal.model_dump(mode="json")
-                        for principal in self.intended_runtime_principals(generation, group)
+                        for principal in (
+                            owners if testing else self.intended_runtime_principals(generation, group)
+                        )
                     ],
                 }
                 for group in self._groups(generation_id)
             ],
         }
+
+    def prepare_group_data(self, generation, group, applied, *, owners_only: bool = False):
+        """Prepare stopped targets without granting access or changing writer authority."""
+        generation_id = generation.snapshot.generation_id
+        items = {row.identity.key: row for row in generation.snapshot.items}
+        stored_group = self.runtime.get("groups", group.group_id) or {}
+        group = group.model_copy(update={
+            "blockers": tuple(stored_group.get("metadata_blockers", group.blockers)),
+        })
+        metadata_pending = {
+            f"Complete provider-owned metadata for '{items[source.key].display_name}'"
+            for source in group.items if owns_schema(generation, items[source.key], self.catalog)
+        }
+        reasons = [reason for reason in group.blockers if reason not in metadata_pending]
+        warnings = []
+        for source in group.items:
+            item = items[source.key]
+            if not needs_data(item):
+                continue
+            if self.replica.selected(generation_id, source.key) is not None:
+                if owners_only:
+                    reasons.append(
+                        f"'{item.display_name}' uses incident-qualified temporary attachments. "
+                        "Configure independent protection to test it without relying on primary data."
+                    )
+                    continue
+                current = applied.get(source.key)
+                if current is None:
+                    reasons.append(f"Restore metadata for '{item.display_name}' before attachment")
+                else:
+                    try:
+                        updated, messages = self.replica.prepare(generation, item, current)
+                        applied[source.key] = updated
+                        warnings.extend(messages)
+                    except RecoveryBlocked as error:
+                        if self.catalog.pending_operations():
+                            raise
+                        reasons.append(str(error))
+                continue
+            if self.data_recovery is None or source.key not in applied:
+                reasons.append(f"Configure optional protected data for '{item.display_name}'")
+                continue
+            prior_data = self.runtime.get("data-restored", f"{generation_id}/{source.key}")
+            current = applied[source.key]
+            if prior_data and prior_data["target"] == current.target.model_dump(mode="json"):
+                restored, messages = True, ()
+            else:
+                restored, messages = self.data_recovery.restore(
+                    generation, item, current.target, self.runtime,
+                )
+            if self.catalog.pending_operations():
+                raise RecoveryBlocked(
+                    f"Reconcile the failed data restoration for '{item.display_name}' "
+                    "before another group can mutate recovery resources"
+                )
+            if not restored:
+                preparation = self._prepared_data(generation, item, current)
+                if preparation is None:
+                    reasons.extend(messages)
+                else:
+                    try:
+                        applied[source.key] = self._complete_prepared_metadata(generation, item, current)
+                    except RecoveryBlocked as error:
+                        if self.catalog.pending_operations():
+                            raise
+                        reasons.append(str(error))
+                    warnings.extend(messages)
+            else:
+                self.runtime.put("data-restored", f"{generation_id}/{source.key}", {
+                    "target": current.target.model_dump(mode="json"), "provider_completed": True,
+                })
+                if owns_schema(generation, item, self.catalog):
+                    self._accept_provider_metadata(generation, item, current)
+        return group.model_copy(update={
+            "metadata_applied": not reasons, "blockers": tuple(dict.fromkeys(reasons)),
+            "data_ready": False if reasons else group.data_ready,
+        }), tuple(warnings)
 
     def enable_recovery(self, request: EnableRecoveryRequest) -> ServiceResult:
         self._wake()
@@ -1248,7 +1358,6 @@ class RecoveryCoordinator:
                 for row in self.catalog.list_records("connections")
                 if row.document["generation_id"] == request.generation_id
             }
-            items = {row.identity.key: row for row in generation.snapshot.items}
             results = []
             attachment_warnings = []
             approved = set(request.approved_acl_ids)
@@ -1260,93 +1369,11 @@ class RecoveryCoordinator:
                 if group.active:
                     results.append(group)
                     continue
-                stored_group = self.runtime.get("groups", group.group_id)
-                group = group.model_copy(
-                    update={
-                        "blockers": tuple(stored_group.get("metadata_blockers", group.blockers)),
-                    }
-                )
-                metadata_pending = {
-                    f"Complete provider-owned metadata for '{items[source.key].display_name}'"
-                    for source in group.items
-                    if owns_schema(generation, items[source.key], self.catalog)
-                }
-                reasons = [reason for reason in group.blockers if reason not in metadata_pending]
-                for source in group.items:
-                    item = items[source.key]
-                    if needs_data(item):
-                        if self.replica.selected(request.generation_id, source.key) is not None:
-                            current = applied.get(source.key)
-                            if current is None:
-                                reasons.append(
-                                    f"Restore metadata for '{item.display_name}' before attachment"
-                                )
-                            else:
-                                try:
-                                    updated, messages = self.replica.prepare(generation, item, current)
-                                    applied[source.key] = updated
-                                    attachment_warnings.extend(messages)
-                                except RecoveryBlocked as error:
-                                    if self.catalog.pending_operations():
-                                        raise
-                                    reasons.append(str(error))
-                            continue
-                        if self.data_recovery is None or source.key not in applied:
-                            reasons.append(f"Configure optional protected data for '{item.display_name}'")
-                        else:
-                            prior_data = self.runtime.get(
-                                "data-restored", f"{request.generation_id}/{source.key}"
-                            )
-                            current = applied[source.key]
-                            if prior_data and prior_data["target"] == current.target.model_dump(mode="json"):
-                                restored, messages = True, ()
-                            else:
-                                restored, messages = self.data_recovery.restore(
-                                    generation,
-                                    item,
-                                    current.target,
-                                    self.runtime,
-                                )
-                            if self.catalog.pending_operations():
-                                raise RecoveryBlocked(
-                                    f"Reconcile the failed data restoration for '{item.display_name}' "
-                                    "before another group can mutate recovery resources"
-                                )
-                            if not restored:
-                                preparation = self._prepared_data(generation, item, current)
-                                if preparation is None:
-                                    reasons.extend(messages)
-                                else:
-                                    try:
-                                        applied[source.key] = self._complete_prepared_metadata(
-                                            generation,
-                                            item,
-                                            current,
-                                        )
-                                    except RecoveryBlocked as error:
-                                        if self.catalog.pending_operations():
-                                            raise
-                                        reasons.append(str(error))
-                                    attachment_warnings.extend(messages)
-                            else:
-                                self.runtime.put(
-                                    "data-restored",
-                                    f"{request.generation_id}/{source.key}",
-                                    {
-                                        "target": current.target.model_dump(mode="json"),
-                                        "provider_completed": True,
-                                    },
-                                )
-                                if owns_schema(generation, item, self.catalog):
-                                    self._accept_provider_metadata(generation, item, current)
-                if not reasons:
-                    group = group.model_copy(update={"metadata_applied": True, "blockers": ()})
-                if reasons:
-                    result = group.model_copy(
-                        update={"blockers": tuple(dict.fromkeys(reasons)), "data_ready": False}
-                    )
-                    self._save_group(request.generation_id, result)
-                    results.append(result)
+                group, messages = self.prepare_group_data(generation, group, applied)
+                attachment_warnings.extend(messages)
+                if group.blockers:
+                    self._save_group(request.generation_id, group)
+                    results.append(group)
                     continue
                 attempted_grants = []
                 try:
@@ -1649,6 +1676,8 @@ class RecoveryCoordinator:
             RecoveryMode.SYNCING,
             RecoveryMode.ENABLING_RECOVERY,
             RecoveryMode.FAILING_BACK,
+            RecoveryMode.TESTING,
+            RecoveryMode.ENDING_TEST,
         }:
             raise RecoveryBlocked("Business reconciliation is not allowed while serving or parking")
         if not request.previous_controller_stopped:

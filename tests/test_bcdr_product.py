@@ -116,6 +116,10 @@ LAKEHOUSE = {
     },
 }
 LIFECYCLE_REQUESTS = [
+    ("start-dr-test", {"generation_id": GENERATION, "group_ids": ["sales"]}),
+    ("continue-dr-test", {"test_id": GENERATION}),
+    ("end-dr-test", {"test_id": GENERATION}),
+    ("schedule-guide", {"generation_id": GENERATION, "approve_scope": True}),
     ("reconcile-operation", RECONCILE),
     ("configure-replica", REPLICA),
     ("configure-protection", LAKEHOUSE),
@@ -176,6 +180,22 @@ class Service:
 
     def enable_recovery(self, request):
         self.calls.append(("enable-recovery", request))
+        return self.result
+
+    def start_dr_test(self, request):
+        self.calls.append(("start-dr-test", request))
+        return self.result
+
+    def continue_dr_test(self, request):
+        self.calls.append(("continue-dr-test", request))
+        return self.result
+
+    def end_dr_test(self, request):
+        self.calls.append(("end-dr-test", request))
+        return self.result
+
+    def schedule_guide(self, request):
+        self.calls.append(("schedule-guide", request))
         return self.result
 
     def cutover(self, request):

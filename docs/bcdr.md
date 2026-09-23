@@ -68,6 +68,16 @@ identity-bound observations, not an instruction to trust a general "ready" check
 
 ### Set up one central control Warehouse
 
+The standby console now has separate **Set up standby**, **DR Test**, and **I'm currently down**
+journeys. Opening a journey does not start work or discover the primary. **Load recovery status**
+is explicit and may resume the metadata capacity. Unrefreshed facts are labeled unknown.
+Workflow navigation is not authorization: the same lifecycle checks apply to direct API/CLI calls.
+
+The setup wizard moves through **Metadata & scope**, **Data protection**, **Initial sync**, and
+**Scheduled sync**. It is an initial preparation flow, not the incident runbook. After a completed
+metadata baseline, **Manage standby** offers manual sync and scheduling separately from data
+readiness. Metadata success with data gaps is not production recoverability.
+
 1. Choose whether to create a new control workspace or use an existing designated
    workspace on a dedicated recovery capacity. The recovery SPN must have Admin access.
    Additional members, different owner roles, and missing designated-owner grants are
@@ -162,6 +172,9 @@ the identity of resources hidden from the signed-in principal.
 | Action | Meaning |
 | --- | --- |
 | Set up the control Warehouse | Choose/create the metadata workspace, continue its saved Warehouse setup or explicitly select/create a Warehouse, validate its catalog, and persist bootstrap coordinates. |
+| Prepare scheduled-sync instructions | Review the completed metadata scope, approve fresh capture/safe parking, and download the request. No scheduler is created or enabled. |
+| Start / Validate DR Test | Exercise the current selected standby groups with configured owners; hold automatic sync without production admission. |
+| End test and return to standby | Verify shared standby state, retain resources, and safely release the test hold; this is not production failback. |
 | Read recovery status | Read the recorded mode, generations, groups, writer state and pending operations without source metadata reads. It can resume the control Warehouse capacity; opening the panel itself does not. |
 | Reconcile interrupted operation | Fence the previous controller and reconcile an exact recorded service receipt or saved completed result; never repeat an uncertain create or adopt by name. |
 | Preview standby selection | Preview exact include/exclude workspace IDs, positive name keywords, capacity routes and required dependency additions against captured metadata. |
@@ -207,6 +220,44 @@ Review exact deferred ACL IDs before approving replay. Workspace access does not
 SQL/model/OneLake/connection security equivalence. Supply the relevant runtime identity
 and effective-access evidence, and keep secrets in the approved external credential
 provider rather than recovery metadata.
+
+### DR Test: existing standby, no production cutover
+
+Use **DR Test** to review the saved recovery point, select inactive dependency groups, and
+start an owners-only exercise of the existing standby. Its dedicated `testing` state holds
+manual and scheduled synchronization, while production remains primary. No source metadata
+capture, primary-capacity pause, production ACL replay, writer-authority change, consumer
+routing, job/mirror/rule activation or production failback is part of this flow.
+
+The test uses qualified independent data-restoration providers where configured. Workloads
+requiring incident-qualified temporary attachments remain blocked in this owners-only
+exercise until independent protection is configured. Restored bytes are not a passed test:
+submit current identity-bound owner evidence for data, references and access. Results are
+**passed**, **failed**, **blocked** or **not tested**, and are kept separately from production
+admission. A successful owner test does not prove production-user access or regional storage
+failover.
+
+**Validate DR Test** continues the pinned test without replaying completed restoration.
+**End test and return to standby** checks owned targets and owner access, retains the shared
+standby estate and restored data, and parks only when the existing capacity guards allow it.
+If targets changed or an operation is uncertain, `ending_test` stays fenced; closing a browser
+does not end a test. Reconcile the actual state before retrying. Automatic sync is held by the
+catalog mode; the application does not disable the Azure Job schedule itself.
+
+If a real incident occurs during a test, the incident journey points back to its recorded
+work and safe ending/reconciliation. It never silently promotes test evidence into cutover.
+
+### I'm currently down: incident recovery
+
+This path starts from existing bootstrap/catalog state and the recovery identity. It does
+not run healthy-source discovery, initial setup or fresh source capture. Review the recovery
+point and per-group gaps, prepare protected data, explicitly enable eligible access, and
+approve cutover only with current readiness and primary-writer-fencing evidence.
+
+Production traffic switching and workload activation remain explicit operator actions.
+After actual recovery, **Return to primary** guides the existing failback, reconciliation,
+cutback and rearm steps. That path explicitly checks primary availability; it is not an
+implicit dependency of outage recovery or a way to end a DR Test.
 
 ### Read partial results honestly
 
@@ -325,6 +376,25 @@ continuity, never a general claim that native replica outage behavior has been d
 
 ## Noninteractive operations
 
+### Guided scheduling handoff
+
+After the first metadata baseline is applied, choose **Scheduled sync** in the setup wizard
+or **Set up scheduled sync** from Manage standby. Review the captured scope and UTC cron,
+then prepare instructions and download `scheduled-sync-request.json`. The exported request
+uses the completed scope with `capture=true`, `park=true` and no one-off generation pin.
+Data-protection gaps remain visible but do not prevent scheduling metadata maintenance.
+
+The download is a handoff, not a deployment. Place it on the same controller storage,
+configure the shared remote lease and runtime identity, then use the job template from
+the same reviewed release/image as the web controller. The UI reports deployment as
+unverified, and separately shows the last observed completed scheduled metadata sync.
+Neither clicking Prepare nor downloading a file establishes that a job exists or is running.
+
+Update the web controller and job to matching code before using the new `testing` and
+`ending_test` lifecycle modes. Older clients may not recognize those modes and must not
+be used to bypass the schedule hold. Existing catalog data and CLI commands remain compatible;
+no secondary local metadata store is introduced.
+
 Use the same production service from an external scheduler, not a notebook on the capacity
 it must resume. Execute only inside the Linux image:
 
@@ -356,6 +426,7 @@ noninteractive mode remains `service_principal`. An existing bootstrap cannot be
 to adopt a different tenant/application/recovery principal.
 
 Commands are `setup`, `status`, `reconcile-operation`, `plan`, `synchronize`, `scheduled-sync`,
+`schedule-guide`, `start-dr-test`, `continue-dr-test`, `end-dr-test`,
 `configure-protection`, `configure-replica`, `enable-recovery`,
 `cutover`, `plan-failback`, `execute-failback`, `cutback`, and `rearm`. Supply typed JSON through standard input or
 `--request /controller/request.json`. Generate the actual request schema without
