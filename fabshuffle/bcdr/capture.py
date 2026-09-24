@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -55,7 +56,10 @@ from fabshuffle.fabric import analytics, special_items
 from fabshuffle.fabric.client import FabricClient, FabricError
 from fabshuffle.fabric.definitions import decode_json_part, find_part, is_text_part, part
 from fabshuffle.fabric.items import get_item_definition, is_system_item
-from fabshuffle.fabric.support import is_derived_type
+from fabshuffle.fabric.support import assess_workspace, is_derived_type
+from fabshuffle.lifecycle import safe_text
+
+logger = logging.getLogger(__name__)
 
 TYPED_COLLECTIONS = {
     "Lakehouse": "lakehouses",
@@ -302,8 +306,48 @@ def capture_item(
     *,
     readers: MetadataReaders,
     captured_at: datetime | None = None,
+    inventory_item: Mapping[str, Any] | None = None,
 ) -> ItemCapture:
     captured_at = captured_at or datetime.now(UTC)
+    listed = dict(inventory_item or {
+        "id": identity.item_id, "type": item_type, "displayName": identity.item_id,
+    })
+    if canonical_id(listed["id"]) != identity.item_id or listed.get("type") != item_type:
+        raise FabricError("Capture item identity differs from its source inventory")
+    if listed.get("workspaceId") and canonical_id(listed["workspaceId"]) != identity.workspace_id:
+        raise FabricError("Capture inventory returned an item from another workspace")
+    assessment = assess_workspace((listed,), force_rebuild=True, require_stopped=True)
+    if assessment.unsupported:
+        unsupported = assessment.unsupported[0]
+        logger.warning(
+            "BCDR inventory-only item: id=%s type=%s name=%r reason=%s",
+            identity.item_id, item_type, safe_text(unsupported.name), unsupported.reason,
+        )
+        properties = {"bcdr": {
+            "raw_item": listed, "inventory_only": True,
+            "unsupported_reason": unsupported.reason,
+            "dependency_evidence": "not_captured",
+            "dependency_action": (
+                "This item is excluded by the shared rebuild policy; replace dependencies explicitly."
+            ),
+        }}
+        reject_embedded_secrets(canonical_json(properties))
+        return ItemCapture(ItemRecord(
+            identity=identity, item_type=item_type, display_name=unsupported.name,
+            captured_at=captured_at, api_version="v1", properties=properties,
+            capture_complete=False, activation="unknown",
+        ), ())
+    if not assessment.migrated:
+        raise FabricError("Derived items require their owning item's inventory path, not independent capture")
+    contract = TYPE_REGISTRY.get(item_type)
+    if contract is None or not contract.migration_rebuild:
+        raise FabricError(
+            f"The shared migration policy supports '{item_type}', "
+            "but its recovery capture contract is missing."
+        )
+    logger.info("BCDR capturing item: id=%s type=%s name=%r",
+                identity.item_id, item_type, safe_text(str(listed.get("displayName") or "")))
+    report_activity(detail=f"Reading {item_type} '{listed.get('displayName') or identity.item_id}'")
     raw = item_document(client, identity, item_type)
     name = raw["displayName"]
     properties = dict(raw.get("properties") or {})
@@ -316,13 +360,7 @@ def capture_item(
     unresolved: list[str] = []
     payloads: list[CapturedPayload] = []
     fmt = definition_format(item_type)
-    contract = TYPE_REGISTRY.get(item_type)
-    if contract is None or not contract.migration_rebuild:
-        metadata["unsupported_reason"] = (
-            f"'{name}' ({item_type}) has no source-independent reconstruction adapter. "
-            "Use documented platform continuity or supply an independently prepared replacement."
-        )
-    elif item_type not in NO_DEFINITION:
+    if item_type not in NO_DEFINITION:
         definition = get_item_definition(client, identity.workspace_id, identity.item_id, fmt=fmt)
         if definition.get("format") and fmt and definition["format"] != fmt:
             raise FabricError(f"'{name}' returned '{definition['format']}' instead of requested '{fmt}'")
@@ -636,6 +674,7 @@ def _workspace_inventory(
                 ),
                 row["type"],
                 readers=readers,
+                inventory_item=row,
             )
         )
     owners = [(capture.record.identity, capture.record.properties, False, "") for capture in captures] + [
@@ -905,11 +944,17 @@ def capture_workspaces(
         desired.extend(acls)
         unresolved.extend(gaps)
         inventory = capture_list(client, f"{root}/items")
-        # Only skip Spark reads when the complete inventory is exclusively non-Spark.
-        # Spark/unknown workloads keep strict reads: a 404 is never an empty-pool claim.
+        # Classify through the migration policy before workload-specific reads.
+        # Eligible Spark workloads keep strict reads: a 404 is never an empty-pool claim.
         # https://learn.microsoft.com/fabric/data-engineering/workspace-admin-settings
-        spark_required = not inventory or any(
-            row.get("type") not in NON_SPARK_WORKSPACE_ITEMS for row in inventory
+        assessment = assess_workspace(inventory, force_rebuild=True, require_stopped=True)
+        spark_required = any(
+            row.get("type") not in NON_SPARK_WORKSPACE_ITEMS
+            for row in assessment.migrated
+            if not (
+                is_system_item(row)
+                and SYSTEM_ITEM_TYPES.get(str(row.get("displayName", "")).casefold()) == row["type"]
+            )
         )
         spark_pools = capture_list(client, f"{root}/spark/pools") if spark_required else []
         spark_settings = capture_json(client, f"{root}/spark/settings") if spark_required else {}

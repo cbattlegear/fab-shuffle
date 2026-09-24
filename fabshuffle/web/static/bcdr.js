@@ -1233,6 +1233,18 @@ function bcdrRenderResult(result) {
     output.appendChild(groups);
   }
   const inventory = result.details?.inventory;
+  const unsupported = (inventory?.items || []).filter((item) => item.properties?.bcdr?.unsupported_reason);
+  if (unsupported.length) {
+    const excluded = bcdrElement("details");
+    excluded.appendChild(bcdrElement("summary", "Source items excluded by the shared migration policy"));
+    excluded.appendChild(bcdrElement("p",
+      "These remain in the source inventory, not in reconstructed standby. Consumers still needing them remain blocked.", "hint"));
+    const list = bcdrElement("ul");
+    unsupported.forEach((item) => list.appendChild(bcdrElement("li",
+      `${item.display_name} (${item.item_type}): ${item.properties.bcdr.unsupported_reason}`)));
+    excluded.appendChild(list);
+    output.appendChild(excluded);
+  }
   const unresolved = (inventory?.items || []).filter((item) => item.unresolved.length);
   if (unresolved.length) {
     const section = bcdrElement("details");

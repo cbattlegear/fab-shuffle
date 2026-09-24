@@ -49,6 +49,7 @@ import pytest
     "workspace_loading_and_preview_show_and_clear_activity_indicators",
     "retry_saved_sync_is_offered_without_rebuilding_its_selection",
     "legacy_resume_requires_review_and_sends_an_explicit_resume_flag",
+    "shared_policy_exclusions_are_visible_as_inventory_not_recovery",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

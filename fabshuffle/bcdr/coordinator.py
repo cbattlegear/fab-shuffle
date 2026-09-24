@@ -86,6 +86,7 @@ from fabshuffle.bcdr.service import (
     SyncRequest,
 )
 from fabshuffle.fabric.client import FabricClient
+from fabshuffle.fabric.support import assess_workspace
 from fabshuffle.fabric.workspaces import create_workspace
 from fabshuffle.lifecycle import safe_text
 
@@ -284,6 +285,12 @@ class RecoveryCoordinator:
 
     def _inventory(self, generation: CapturedGeneration) -> EstateInventory:
         snapshot = generation.snapshot
+        assessment = assess_workspace(
+            [{"id": item.identity.key, "type": item.item_type, "displayName": item.display_name}
+             for item in snapshot.items],
+            force_rebuild=True, require_stopped=True,
+        )
+        rebuildable = {item["id"] for item in assessment.migrated}
         items = []
         for item in snapshot.items:
             cap = self.capabilities(item)
@@ -311,7 +318,7 @@ class RecoveryCoordinator:
                         is_store=cap.is_store,
                         provenance=cap.reason or "Qualified destination-only capture adapter",
                     ),
-                    eligible=not item.tombstone,
+                    eligible=not item.tombstone and item.identity.key in rebuildable,
                     data_required=needs_data(item),
                     protection_available=any(
                         p.item == item.identity and p.outcome == RecoveryOutcome.PROTECTED
@@ -768,7 +775,16 @@ class RecoveryCoordinator:
         operations = {row.key: row for row in plan.operations}
         completed = set()
         blockers: dict[str, list[str]] = {}
-        warnings = []
+        selected_workspaces = set(plan.selected_workspaces) | {
+            placement.source for placement in plan.placements
+        }
+        warnings = [
+            f"{item.item_type} '{item.display_name}' is not included in standby: "
+            f"{item.properties['bcdr']['unsupported_reason']}"
+            for item in snapshot.items
+            if workspace_key(item.identity) in selected_workspaces
+            and item.properties.get("bcdr", {}).get("unsupported_reason")
+        ]
         plan_settings = self.runtime.get("plans", generation_id) or {}
         connections = {
             row.key: ConnectionIdentity.model_validate(row.document["target"])

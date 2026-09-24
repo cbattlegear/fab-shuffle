@@ -183,9 +183,28 @@ or pre-restart worker has stopped. Catalog status remains the authoritative read
   or start an overlapping create merely to escape the message.
 
 The recorded failure preserves the service message and code. For example, a required
-Spark metadata 404 is not treated as an empty pool list. Capture skips workspace Spark
-configuration only when the complete inventory contains exclusively known non-Spark
-item types; Spark and unknown workloads retain strict required reads.
+Spark metadata 404 is not treated as an empty pool list. Capture evaluates the shared
+migration item policy first, then reads Spark configuration only for eligible workloads
+that need it. Excluded item types do not create a Spark-read requirement.
+
+### Shared migration item eligibility
+
+BCDR uses `fabric.support.assess_workspace` with rebuild/stopped semantics **before**
+item metadata or definition reads, the same assessment used by workspace migration.
+The recovery registry describes additional capture/data requirements; it is not an
+independent support list. Unsupported types are retained from the item inventory with
+their exact identities, names and the shared policy's reason, without calling their
+unsupported APIs or claiming a complete metadata backup.
+
+Those entries are not standalone recovery candidates. Supported consumers that reference
+them remain blocked until their dependencies have a qualified replacement; unrelated
+supported items can synchronize. The operator receives named exclusion warnings rather
+than an inventory-wide PrincipalTypeNotSupported failure. Unexpected failures for types
+the shared policy permits still propagate the actual service error.
+
+Inventory-only exclusion records require a compatible controller/job build. They use the
+existing document tables, not a SQL schema migration; older application readers may reject
+them. Do not mix or downgrade controller/job versions without checking record compatibility.
 
 Discovery logs include a correlation ID, resource names and exact workspace/capacity IDs.
 Confirmed setup logs record the selected workspace, source capacities and recovery

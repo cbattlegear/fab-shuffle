@@ -129,6 +129,16 @@ def test_publication_distinguishes_partial_capture_and_control_workspace():
         capture.model_copy(update={"workspaces": (workspace,)}).require_publishable(config)
 
 
+def test_inventory_only_cannot_hide_missing_metadata_for_a_supported_type():
+    config = recovery_set()
+    capture = snapshot(config)
+    item = capture.items[0].model_copy(update={
+        "capture_complete": False,
+        "properties": {"bcdr": {"inventory_only": True, "unsupported_reason": "Pretend it is unsupported"}},
+    })
+    with pytest.raises(ValueError, match="Invalid unsupported-inventory"):
+        capture.model_copy(update={"items": (item,)}).require_publishable(config)
+
 def test_standby_is_only_spn_and_explicit_owner_workspace_roles_forever_on_control():
     config = recovery_set()
     policy = config.access_policy

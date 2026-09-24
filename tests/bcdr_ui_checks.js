@@ -108,6 +108,19 @@ function discoverButton(f) {
 }
 
 const scenarios = {
+  async shared_policy_exclusions_are_visible_as_inventory_not_recovery(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrRenderResult({ ...result, details: { inventory: { items: [{
+      display_name: "Excluded trained model", item_type: "MLModel", unresolved: [],
+      identity: { workspace_id: "source", item_id: "excluded-model" },
+      capture_complete: false, properties: { bcdr: {
+        inventory_only: true, unsupported_reason: "Re-register the model in the new workspace",
+      } },
+    }] } } });
+    assert.match(f.get("bcdr-result").textContent, /excluded by the shared migration policy/);
+    assert.match(f.get("bcdr-result").textContent, /Excluded trained model.*Re-register/s);
+    assert.match(f.get("bcdr-result").textContent, /not in reconstructed standby/);
+  },
   async activity_observation_identifies_the_local_worker_without_catalog_requests(f) {
     f.get("bcdr-panel").hidden = false;
     f.observations.response = { active: [{

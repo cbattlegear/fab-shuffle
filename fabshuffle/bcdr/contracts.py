@@ -431,6 +431,20 @@ class CaptureSnapshot(Record):
             if not workspace.inventory_complete or workspace.unresolved:
                 raise ValueError(f"Complete the inventory for workspace '{workspace.display_name}'")
         for item in self.items:
+            inventory_only = item.properties.get("bcdr", {}).get("inventory_only") is True
+            if inventory_only:
+                from fabshuffle.fabric.support import assess_workspace
+
+                assessment = assess_workspace(
+                    [{"id": item.identity.item_id, "type": item.item_type, "displayName": item.display_name}],
+                    force_rebuild=True, require_stopped=True,
+                )
+                if (
+                    not assessment.unsupported or item.capture_complete or item.unresolved or item.payload_ids
+                    or not item.properties["bcdr"].get("unsupported_reason")
+                ):
+                    raise ValueError(f"Invalid unsupported-inventory record for '{item.display_name}'")
+                continue
             if not item.capture_complete or item.unresolved:
                 raise ValueError(f"Complete metadata for '{item.display_name}' before publication")
         for edge in self.dependencies:

@@ -26,6 +26,7 @@ from fabshuffle.bcdr.contracts import (
 from fabshuffle.bcdr.registry import TYPE_REGISTRY
 from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.fabric.definitions import part
+from fabshuffle.fabric.support import SPECIFIC_REASONS, assess_workspace
 
 TENANT = "10000000-0000-0000-0000-000000000001"
 SOURCE = "20000000-0000-0000-0000-000000000001"
@@ -446,6 +447,57 @@ def test_every_registry_type_has_an_explicit_capture_route(item_type):
         assert captured.record.properties["bcdr"]["unsupported_reason"]
 
 
+@pytest.mark.parametrize("item_type", [*sorted(SPECIFIC_REASONS), "FutureWorkload", "Eventstream"])
+def test_migration_exclusions_are_applied_before_any_item_read(item_type):
+    listed = {"id": ITEM, "type": item_type, "displayName": "Excluded fixture"}
+    expected = assess_workspace([listed], force_rebuild=True, require_stopped=True)
+    assert expected.unsupported
+
+    class NoItemReads:
+        def __getattr__(self, name):
+            raise AssertionError(f"Unsupported item must not call {name}")
+
+    captured = capture_item(NoItemReads(), IDENTITY, item_type, readers=Readers(), inventory_item=listed)
+    assert captured.record.display_name == listed["displayName"]
+    assert captured.record.properties["bcdr"]["unsupported_reason"] == expected.unsupported[0].reason
+    assert captured.record.properties["bcdr"]["inventory_only"]
+    assert not captured.record.capture_complete and not captured.payloads
+
+
+def test_unsupported_only_inventory_does_not_probe_item_or_spark_endpoints():
+    client = SourceClient("MLExperiment")
+    original_get, original_request = client.get, client.request
+
+    def get(path):
+        assert path == f"workspaces/{SOURCE}", "The migration filter must precede Get Item"
+        return original_get(path)
+
+    def request(method, path, **kwargs):
+        assert "/spark/" not in path, "Excluded types must not create a Spark metadata requirement"
+        return original_request(method, path, **kwargs)
+
+    client.get, client.request = get, request
+    captured = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    captured.snapshot.require_publishable(recovery_set())
+    assert len(captured.snapshot.items) == 1 and not captured.snapshot.items[0].capture_complete
+    assert captured.snapshot.items[0].properties["bcdr"]["inventory_only"]
+
+
+def test_supported_item_principal_error_is_not_reclassified_as_an_unsupported_type():
+    client = SourceClient("Notebook")
+    error = FabricApiError(
+        "GET", f"workspaces/{SOURCE}/items/{ITEM}", 400,
+        '{"errorCode":"PrincipalTypeNotSupported",'
+        '"message":"The operation is not supported for this principal"}',
+    )
+
+    def denied(_):
+        raise error
+
+    client.get = denied
+    with pytest.raises(FabricApiError) as observed:
+        capture_item(client, IDENTITY, "Notebook", readers=Readers())
+    assert observed.value is error
 @pytest.mark.parametrize("body", [b"{}", b"not json", b'{"value":null}', b"[]"])
 def test_real_client_malformed_inventory_never_publishes_empty(body):
     class Tokens:

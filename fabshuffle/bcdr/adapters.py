@@ -121,8 +121,10 @@ class AdapterResult:
 
 
 def adapter_capabilities(item: ItemRecord) -> AdapterCapabilities:
-    reason = BLOCKED_TYPES.get(item.item_type, "")
-    if item.item_type not in TYPE_REGISTRY:
+    reason = (
+        item.properties.get("bcdr", {}).get("unsupported_reason") or BLOCKED_TYPES.get(item.item_type, "")
+    )
+    if item.item_type not in TYPE_REGISTRY and not reason:
         reason = f"Supply a qualified reconstruction adapter for '{item.item_type}'."
     return AdapterCapabilities(
         inactive_create=not reason,
@@ -823,6 +825,8 @@ def apply_captured_item(
     Destination service/transport errors propagate unchanged, including uncertain operations.
     """
     capabilities = adapter_capabilities(item)
+    if item.properties.get("bcdr", {}).get("inventory_only") is True:
+        return AdapterResult(RecoveryOutcome.BLOCKED, diagnostics=(capabilities.reason,))
     if item.tombstone or not item.capture_complete or item.unresolved:
         return AdapterResult(
             RecoveryOutcome.BLOCKED,
