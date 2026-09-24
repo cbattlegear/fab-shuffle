@@ -143,7 +143,11 @@ or distribute administrator sessions.
 
 ## Gate 2: managed identity and fresh catalog
 
-Enter **Set up standby** for first-run preparation, not the incident or test paths.
+Use **Settings > Environment** for one-time infrastructure preparation. Normal **Set up standby**
+must only ask for individual workspaces or a name-contains rule, show the matches and saved
+destination, and run the initial sync after review. No Warehouse, owner, ARM-ID or mapping
+fields belong in that normal flow. Test a rule with no matches, a removed workspace, and
+changed routing between review and sync; none may silently broaden scope or guess a target.
 Complete the metadata baseline before preparing scheduled-sync instructions. A configuration
 download must not claim a scheduler has been deployed, and optional data gaps must remain visible.
 

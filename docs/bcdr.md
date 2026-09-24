@@ -66,17 +66,36 @@ contracts. Generation and failback plan IDs are pinned from backend results rath
 typed as new IDs. Groups must be selected explicitly. Advanced evidence records are
 identity-bound observations, not an instruction to trust a general "ready" checkbox.
 
-### Set up one central control Warehouse
+### Set up standby: choose what to protect
 
 The standby console now has separate **Set up standby**, **DR Test**, and **I'm currently down**
-journeys. Opening a journey does not start work or discover the primary. **Load recovery status**
+journeys. Test and outage navigation never discovers the primary. **Load recovery status**
 is explicit and may resume the metadata capacity. Unrefreshed facts are labeled unknown.
 Workflow navigation is not authorization: the same lifecycle checks apply to direct API/CLI calls.
 
-The setup wizard moves through **Metadata & scope**, **Data protection**, **Initial sync**, and
-**Scheduled sync**. It is an initial preparation flow, not the incident runbook. After a completed
-metadata baseline, **Manage standby** offers manual sync and scheduling separately from data
-readiness. Metadata success with data gaps is not production recoverability.
+**Set up standby** asks only which workspaces to protect: choose names from the list or
+enter a **Workspace name contains** rule, review the matches, then choose **Create standby**
+(or **Update standby** for an established baseline). Selecting this preparation path
+loads source workspace choices and reuses the saved recovery configuration.
+
+The name rule is a case-insensitive substring match, not a wildcard or regular expression.
+It is preserved for recurring sync and includes future matching workspaces within the
+configured source-capacity scope. Empty selections never implicitly mean "everything."
+Review shows the current matches and saved recovery destination; the sync rechecks settings
+before effects. Metadata success then offers scheduling, while data-recovery gaps remain separate.
+
+Infrastructure and advanced options belong in **Settings**, not this normal selection flow.
+Saved capacity routes, connection mappings and naming defaults are reused. A single authorized
+recovery capacity is unambiguous; otherwise configure **Settings > Default destination** once
+for source capacities without an existing route. An existing approved route is never silently
+replaced by that default. Test/incident activity or unresolved operations block changes.
+
+### One-time recovery environment settings
+
+For a new deployment, open **Settings > Environment** to prepare the metadata home and
+authorized capacity scope. Existing installations reuse this configuration. Optional
+protection is under **Settings > Data protection**; full plan/sync controls remain under
+**Settings > Advanced mappings** for explicit connection or dependency handling.
 
 1. Choose whether to create a new control workspace or use an existing designated
    workspace on a dedicated recovery capacity. The recovery SPN must have Admin access.
@@ -91,7 +110,7 @@ readiness. Metadata success with data gaps is not production recoverability.
    beside the button. Empty results and partial failures include an action to take; discovery
    never saves setup or starts a capacity operation. Refreshing preserves still-valid resource
    selections and unrelated form inputs.
-3. Open **Set up the control Warehouse**. Choose the recovery metadata workspace first.
+3. In Settings, open **Set up the control Warehouse**. Choose the metadata workspace first.
    Selecting an existing workspace lists its Warehouses by name; **List Warehouses in this workspace**
    refreshes that read. Choose **Use an existing Warehouse**, **Create a new Warehouse**, or
    **Continue saved setup** when a previous attempt is recorded. Saved workspace and Warehouse
@@ -116,9 +135,9 @@ readiness. Metadata success with data gaps is not production recoverability.
    this recovery set's compatible catalog is accepted. Existing business objects, a foreign
    recovery catalog or a changed configuration are never overwritten. The UI reports when the
    metadata catalog is ready and names the next action. Keep the bootstrap storage durable and restricted.
-   Then configure source-to-recovery capacity routes and exact workspace selection for
-   **Sync standby**. Read the captured inventory, preview dependencies and explicitly approve
-   any required additions before attempting their dependent groups.
+   Return to **Set up standby**, select workspaces or a name rule, and review the matches.
+   Missing dependency or connection approvals are actionable exceptions, not mandatory
+   setup steps; use Advanced mappings where needed rather than silently expanding scope.
 
 If continuation reports `NotFound` for its recorded creation operation, use **List Warehouses**,
 choose **Use an existing Warehouse**, and explicitly select the intended resource. A matching
@@ -432,6 +451,7 @@ to adopt a different tenant/application/recovery principal.
 
 Commands are `setup`, `status`, `reconcile-operation`, `plan`, `synchronize`, `scheduled-sync`,
 `schedule-guide`, `start-dr-test`, `continue-dr-test`, `end-dr-test`,
+`preview-standby`, `create-standby`, `configure-standby-defaults`,
 `configure-protection`, `configure-replica`, `enable-recovery`,
 `cutover`, `plan-failback`, `execute-failback`, `cutback`, and `rearm`. Supply typed JSON through standard input or
 `--request /controller/request.json`. Generate the actual request schema without
@@ -446,6 +466,13 @@ The noninteractive `setup` command uses the same typed setup request and
 `--confirm setup`; it creates the bootstrap before opening a catalog. The wizard is the
 primary intent-based setup interface, so an operator does not need to construct Python
 records manually.
+
+For scope-only preparation, `preview-standby` accepts `selection_mode` (`workspaces` or
+`pattern`) with either `workspace_ids` or `name_pattern`. Supply its configuration hash as
+`expected_configuration` to `create-standby --confirm create-standby`. The service resolves
+saved routes and runs a fresh, safely parked metadata sync; it does not guess a new
+recovery environment. `configure-standby-defaults` explicitly saves an already authorized
+target capacity for otherwise-unmapped sources.
 
 `warehouse_action` is `continue` (the backward-compatible default), `create`, or `existing`.
 The `existing` action requires `control_workspace_id` and `warehouse_id`; it does not use

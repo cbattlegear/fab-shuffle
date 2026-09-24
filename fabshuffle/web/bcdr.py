@@ -44,6 +44,8 @@ from fabshuffle.bcdr.service import (
     ScheduleGuideRequest,
     ServiceResult,
     SetupRequest,
+    StandbyDefaultsRequest,
+    StandbySelectionRequest,
     StartDrTestRequest,
     SyncRequest,
     create_service,
@@ -96,6 +98,10 @@ def bootstrap_path() -> Path:
 
 
 COMMANDS = (
+    ("configure-standby-defaults", "Save default recovery capacity", StandbyDefaultsRequest,
+     "One-time routing default for sources without an existing approved route. "
+     "Choose an already authorized recovery capacity; existing routes remain unchanged.",
+     "Save this default for later workspace selections. This does not move or synchronize any workspace."),
     ("start-dr-test", "Start DR Test", StartDrTestRequest,
      "Exercise selected existing standby groups with recovery owners only. Production stays primary. "
      "Automatic synchronization is held until the test ends; no source metadata is captured.",
@@ -479,6 +485,48 @@ def create_router(
     @router.get("/status", response_model=ServiceResult)
     async def status(session=Depends(require_session)):
         return await execute(session, lambda: _service_call(session, lambda service: service.status()))
+
+    @router.get("/standby-scope")
+    async def standby_scope(include_workspaces: bool = True, session=Depends(require_session)):
+        def work():
+            _same_tenant(session)
+            saved = _saved_setup(session)
+            if saved is None or saved["warehousePhase"] != "ready":
+                return {
+                    "needs_configuration": True,
+                    "message": (
+                        "Configure the recovery environment once in Settings, then select workspaces here."
+                    ),
+                }
+            return _service_call(
+                session, lambda service: service.standby_scope_options(include_workspaces=include_workspaces),
+                source_access=include_workspaces,
+            )
+        return await execute(session, work)
+
+    @router.post("/preview-standby", response_model=ServiceResult)
+    async def preview_standby(body: StandbySelectionRequest, session=Depends(require_session)):
+        return await execute(session, lambda: _service_call(
+            session, lambda service: service.preview_standby_selection(body), source_access=True,
+        ))
+
+    @router.post("/create-standby", response_model=ServiceResult)
+    async def create_standby(
+        body: ConfirmedRequest[StandbySelectionRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "create-standby")
+        return await execute(session, lambda: _service_call(
+            session, lambda service: service.create_standby(request), source_access=True,
+        ))
+
+    @router.post("/configure-standby-defaults", response_model=ServiceResult)
+    async def configure_standby_defaults(
+        body: ConfirmedRequest[StandbyDefaultsRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "configure-standby-defaults")
+        return await execute(session, lambda: _service_call(
+            session, lambda service: service.configure_standby_defaults(request),
+        ))
 
     @router.post("/reconcile-operation", response_model=ServiceResult)
     async def reconcile_operation(

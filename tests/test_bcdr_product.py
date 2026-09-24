@@ -116,6 +116,7 @@ LAKEHOUSE = {
     },
 }
 LIFECYCLE_REQUESTS = [
+    ("configure-standby-defaults", {"target_capacity_id": TARGET_CAPACITY}),
     ("start-dr-test", {"generation_id": GENERATION, "group_ids": ["sales"]}),
     ("continue-dr-test", {"test_id": GENERATION}),
     ("end-dr-test", {"test_id": GENERATION}),
@@ -168,6 +169,22 @@ class Service:
 
     def status(self):
         self.calls.append(("status", None))
+        return self.result
+
+    def standby_scope_options(self, *, include_workspaces=True):
+        self.calls.append(("standby-scope", include_workspaces))
+        return self.result
+
+    def preview_standby_selection(self, request):
+        self.calls.append(("preview-standby", request))
+        return self.result
+
+    def create_standby(self, request):
+        self.calls.append(("create-standby", request))
+        return self.result
+
+    def configure_standby_defaults(self, request):
+        self.calls.append(("configure-standby-defaults", request))
         return self.result
 
     def plan(self, request):
@@ -550,6 +567,37 @@ def test_status_uses_real_factory_with_pinned_credentials_and_closes(product):
     assert service.calls == [("status", None)]
     assert service.closed
     assert "never-persist-this" not in response.text
+
+
+@pytest.mark.parametrize("path,confirmed", [("preview-standby", False), ("create-standby", True)])
+def test_simple_standby_scope_routes_use_source_identity_only_for_setup(product, path, confirmed):
+    client, headers, service, created, _ = product
+    request = {"workspace_ids": [CONTROL], "expected_configuration": "a" * 64}
+    body = {"confirmation": path, "request": request} if confirmed else request
+    response = client.post(f"/api/bcdr/{path}", headers=headers, json=body)
+    assert response.status_code == 200
+    assert created[0][1]["source_tokens"] is not None
+    assert service.calls[0][0] == path
+    assert client.post(f"/api/bcdr/{path}", json=body).status_code == 401
+
+
+def test_scope_options_explain_missing_environment_without_opening_catalog(product):
+    client, headers, _, created, _ = product
+    response = client.get("/api/bcdr/standby-scope", headers=headers)
+    assert response.status_code == 200 and response.json()["needs_configuration"]
+    assert "Settings" in response.json()["message"] and not created
+
+
+@pytest.mark.parametrize("include", [True, False])
+def test_scope_options_keep_administrator_defaults_read_source_free(product, monkeypatch, include):
+    client, headers, service, created, _ = product
+    monkeypatch.setattr(bcdr, "_saved_setup", lambda _: {"warehousePhase": "ready"})
+    response = client.get(
+        f"/api/bcdr/standby-scope?include_workspaces={str(include).lower()}", headers=headers,
+    )
+    assert response.status_code == 200
+    assert (created[0][1]["source_tokens"] is not None) == include
+    assert service.calls == [("standby-scope", include)]
 
 
 def test_sync_requires_explicit_matching_confirmation(product):

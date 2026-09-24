@@ -96,12 +96,155 @@ const warehouseSetupCommand = {
   } },
 };
 
+const simpleScope = { mode: "standby", details: { standby_scope: {
+  workspaces: [{ id: "source-workspace-guid", displayName: "Sales workspace", capacityRegion: "East US" }],
+  target_capacities: [{ id: "recovery-capacity-guid", displayName: "Recovery", region: "West US" }],
+  default_target_id: "recovery-capacity-guid", saved_selection: null,
+} } };
+
 function discoverButton(f) {
   return f.get("bcdr-content").querySelectorAll("button").find((button) =>
     button.textContent === "Discover setup choices" || button.textContent === "Discovering choices...");
 }
 
 const scenarios = {
+  async normal_standby_setup_only_selects_workspace_scope(f) {
+    f.product.bcdrRenderForms([warehouseSetupCommand, command]);
+    f.product.bcdrJourney("setup", "select");
+    assert.equal(f.requests[0].url, "/api/bcdr/standby-scope?include_workspaces=true");
+    await f.reply(0, simpleScope);
+    const scope = f.product.bcdr.scope;
+    assert.equal(scope.section.hidden, false);
+    assert.equal(f.get("bcdr-preparation").hidden, true);
+    assert.equal(f.product.bcdr.commandSections.get("setup").hidden, true);
+    assert.equal(f.product.bcdr.commandSections.get("synchronize").hidden, true);
+    assert.doesNotMatch(scope.section.textContent, /source-workspace-guid|recovery-capacity-guid|ARM resource/);
+    const checkbox = scope.entries.querySelector("input");
+    checkbox.checked = true;
+    checkbox.handlers.change();
+    scope.review.click();
+    assert.deepEqual(JSON.parse(f.requests[1].options.body), {
+      selection_mode: "workspaces", workspace_ids: ["source-workspace-guid"],
+    });
+    await f.reply(1, { details: { standby_preview: {
+      configuration: "a".repeat(64), workspaces: simpleScope.details.standby_scope.workspaces,
+      message: "Saved recovery settings will be reused.",
+    } } });
+    assert.match(scope.preview.textContent, /Sales workspace/);
+    assert.equal(scope.start.hidden, false);
+    scope.start.click();
+    const request = JSON.parse(f.requests[2].options.body);
+    assert.equal(request.confirmation, "create-standby");
+    assert.equal(request.request.expected_configuration, "a".repeat(64));
+    assert.equal(request.request.warehouse_name, undefined);
+    assert.equal(request.request.recovery_capacities, undefined);
+    await f.reply(2, { ...result, details: { sync_summary: { metadata_ready: true, data_gap_groups: [] } } });
+    assert.match(scope.section.textContent, /Set up scheduled sync/);
+  },
+  async standby_name_rule_invalidates_stale_selection_preview(f) {
+    f.product.bcdrRenderForms([warehouseSetupCommand]);
+    f.product.bcdrJourney("setup");
+    await f.reply(0, simpleScope);
+    const scope = f.product.bcdr.scope;
+    scope.mode.value = "pattern";
+    scope.mode.handlers.change();
+    scope.pattern.value = "sales";
+    scope.pattern.handlers.input();
+    scope.review.click();
+    assert.deepEqual(JSON.parse(f.requests[1].options.body), { selection_mode: "pattern", name_pattern: "sales" });
+    scope.pattern.value = "finance";
+    scope.pattern.handlers.input();
+    await f.reply(1, { details: { standby_preview: {
+      configuration: "a".repeat(64), workspaces: simpleScope.details.standby_scope.workspaces,
+    } } });
+    assert.equal(scope.start.hidden, true);
+    assert.equal(scope.reviewed, null);
+    scope.start.click();
+    assert.equal(f.requests.length, 2);
+  },
+  async standby_prerequisites_belong_in_settings_not_the_selection_form(f) {
+    f.product.bcdrRenderForms([warehouseSetupCommand]);
+    f.product.bcdrJourney("setup");
+    await f.reply(0, { needs_configuration: true, message: "Configure the environment once in Settings." });
+    const scope = f.product.bcdr.scope;
+    assert.equal(scope.review.disabled, true);
+    assert.match(scope.status.textContent, /once in Settings/);
+    scope.section.querySelectorAll("button").find((button) => button.textContent === "Recovery environment settings").click();
+    assert.equal(f.product.bcdr.journey, "settings");
+    assert.equal(f.product.bcdr.commandSections.get("setup").hidden, false);
+    assert.equal(scope.section.hidden, true);
+    assert.equal(f.requests.length, 1, "Settings environment does not implicitly discover the source");
+  },
+  async late_workspace_choices_do_not_populate_an_incident(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    f.product.bcdrJourney("incident", "assess");
+    await f.reply(0, simpleScope);
+    assert.equal(f.product.bcdr.scope.loaded, false);
+    assert.equal(f.product.bcdr.scope.section.hidden, true);
+    assert.equal(f.requests.length, 1);
+  },
+  async destination_settings_load_without_source_discovery(f) {
+    f.product.bcdrRenderForms([{ ...command, name: "configure-standby-defaults",
+      schema: { type: "object", properties: { target_capacity_id: { type: "string" } },
+        required: ["target_capacity_id"] } }]);
+    f.product.bcdrJourney("settings", "routing");
+    assert.equal(f.requests[0].url, "/api/bcdr/standby-scope?include_workspaces=false");
+    await f.reply(0, simpleScope);
+    const form = f.get("bcdr-content").querySelector("form");
+    const select = form.querySelector("select");
+    assert.match(select.textContent, /Recovery - West US/);
+    assert.doesNotMatch(select.textContent, /recovery-capacity-guid/);
+  },
+  async settings_load_is_not_lost_behind_pending_workspace_discovery(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    f.product.bcdrJourney("settings", "routing");
+    assert.equal(f.requests.length, 1);
+    await f.reply(0, simpleScope);
+    assert.equal(f.requests[1].url, "/api/bcdr/standby-scope?include_workspaces=false");
+    await f.reply(1, simpleScope);
+    assert.match(f.get("bcdr-settings-load-status").textContent, /Choose a default/);
+    assert.equal(f.product.bcdr.scope.loading, false);
+  },
+  async ambiguous_workspace_names_are_not_selected_by_guessing(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    const data = JSON.parse(JSON.stringify(simpleScope));
+    data.details.standby_scope.workspaces.push({
+      ...data.details.standby_scope.workspaces[0], id: "second-workspace-guid",
+    });
+    await f.reply(0, data);
+    const scope = f.product.bcdr.scope;
+    assert.ok(scope.entries.querySelectorAll("input").every((input) => input.disabled && !input.checked));
+    assert.match(scope.entries.textContent, /use a rule to include all matches/);
+    assert.equal(scope.start.hidden, true);
+  },
+  async scope_loading_errors_never_leave_an_enabled_noop_review_button(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    assert.equal(f.product.bcdr.scope.review.disabled, true);
+    await f.reply(0, { detail: "AccessDenied: Grant source read access" }, 403);
+    const scope = f.product.bcdr.scope;
+    assert.match(scope.status.textContent, /AccessDenied/);
+    assert.equal(scope.review.disabled, true);
+    assert.equal(scope.reload.disabled, false);
+    scope.reload.click();
+    await f.reply(1, simpleScope);
+    assert.equal(scope.review.disabled, false);
+    assert.equal(scope.loaded, true);
+  },
+  async late_settings_error_does_not_disable_a_loaded_workspace_selection(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    await f.reply(0, simpleScope);
+    f.product.bcdrJourney("settings", "routing");
+    f.product.bcdrJourney("setup");
+    await f.reply(1, { detail: "AccessDenied: Check destination access" }, 403);
+    assert.equal(f.product.bcdr.scope.loaded, true);
+    assert.equal(f.product.bcdr.scope.review.disabled, false);
+    assert.match(f.product.bcdr.scope.status.textContent, /workspace.*available/);
+  },
   async journeys_are_separate_and_navigation_never_reads_the_source(f) {
     const commands = ["setup", "status", "synchronize", "schedule-guide", "start-dr-test",
       "continue-dr-test", "end-dr-test", "enable-recovery", "cutover", "plan-failback", "reconcile-operation"]
@@ -117,7 +260,7 @@ const scenarios = {
     f.product.bcdrJourney("test", "exercise");
     assert.equal(f.product.bcdr.commandSections.get("start-dr-test").hidden, false);
     assert.equal(f.product.bcdr.commandSections.get("cutover").hidden, true);
-    f.product.bcdrJourney("setup", "home");
+    f.product.bcdrJourney("settings", "environment");
     assert.equal(f.get("bcdr-preparation").hidden, false);
     assert.equal(f.product.bcdr.commandSections.get("setup").hidden, false);
     assert.equal(f.requests.length, 0);
@@ -126,6 +269,7 @@ const scenarios = {
     f.product.bcdrRenderForms([{ ...command, name: "synchronize" },
       { ...command, name: "schedule-guide", label: "Schedule" }]);
     f.product.bcdrJourney("setup", "sync");
+    await f.reply(0, simpleScope);
     f.product.bcdrRenderResult({ ...result, details: {
       sync_summary: { metadata_ready: true, completed_at: "2026-09-23T18:00:00Z", data_gap_groups: ["group-1"] },
     } });
@@ -136,8 +280,8 @@ const scenarios = {
     assert.equal(f.product.bcdr.journeyStage, "schedule");
     assert.equal(f.product.bcdr.commandSections.get("schedule-guide").hidden, false);
     assert.match(f.get("bcdr-workflow-facts").textContent, /1 group.*unresolved data readiness/s);
-    assert.match(f.get("bcdr-journey-help").textContent, /does not create a job/);
-    assert.equal(f.requests.length, 0);
+    assert.match(f.get("bcdr-journey-help").textContent, /same identity/);
+    assert.equal(f.requests.length, 1);
   },
   async test_state_blocks_setup_and_incident_controls_without_claiming_production(f) {
     f.product.bcdrRenderForms(["setup", "synchronize", "start-dr-test", "continue-dr-test",
@@ -711,7 +855,7 @@ const scenarios = {
   },
   async service_errors_and_pending_controls(f) {
     f.product.bcdrRenderForms([command]);
-    f.product.bcdrJourney("setup", "sync");
+    f.product.bcdrJourney("settings", "advanced");
     const form = f.get("bcdr-content").querySelector("form");
     const button = form.querySelector("button");
     const pending = f.product.bcdrSubmit(command, { generation_id: "pinned" }, button);
@@ -727,7 +871,7 @@ const scenarios = {
   async feedback_stays_with_the_action_and_marks_only_its_fields(f) {
     const schema = { type: "object", properties: { evidence: { type: "string" } } };
     f.product.bcdrRenderForms([{ ...command, schema, name: "plan" }, { ...command, schema }]);
-    f.product.bcdrJourney("setup", "sync");
+    f.product.bcdrJourney("settings", "advanced");
     const forms = f.get("bcdr-content").querySelectorAll("form");
     const buttons = forms.map((form) => form.querySelector("button"));
     const first = f.product.bcdrSubmit(command, {}, buttons[0]);

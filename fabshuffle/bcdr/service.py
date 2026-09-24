@@ -130,6 +130,28 @@ class ScheduleGuideRequest(Record):
                               pattern=r"^[0-9*/,\-]+(?: [0-9*/,\-]+){4}$")
 
 
+class StandbySelectionRequest(Record):
+    selection_mode: Literal["workspaces", "pattern"] = "workspaces"
+    workspace_ids: tuple[Guid, ...] = ()
+    name_pattern: str = Field(default="", max_length=256, pattern=r"^[^\r\n\x00]*$")
+    expected_configuration: Digest | None = None
+
+    @model_validator(mode="after")
+    def explicit_selection(self) -> StandbySelectionRequest:
+        if self.selection_mode == "workspaces":
+            if not self.workspace_ids or self.name_pattern.strip():
+                raise ValueError("Select workspaces, or switch to a name rule")
+            if len(set(self.workspace_ids)) != len(self.workspace_ids):
+                raise ValueError("Select each workspace once")
+        elif self.workspace_ids or not self.name_pattern.strip():
+            raise ValueError("Enter a nonempty name-contains rule without individual workspace selections")
+        return self
+
+
+class StandbyDefaultsRequest(Record):
+    target_capacity_id: Guid
+
+
 class ItemReadiness(Record):
     """Time-bounded, identity-bound operator/runtime evidence, not a controller lock."""
 
@@ -337,6 +359,24 @@ class BcdrService:
     def schedule_guide(self, request: ScheduleGuideRequest) -> ServiceResult:
         from fabshuffle.bcdr.workflow import schedule_guide
         return self._call(lambda: schedule_guide(self.coordinator, request))
+
+    def standby_scope_options(self, *, include_workspaces: bool = True) -> ServiceResult:
+        from fabshuffle.bcdr.workflow import standby_scope_options
+        return self._call(
+            lambda: standby_scope_options(self.coordinator, include_workspaces=include_workspaces)
+        )
+
+    def preview_standby_selection(self, request: StandbySelectionRequest) -> ServiceResult:
+        from fabshuffle.bcdr.workflow import preview_standby_selection
+        return self._call(lambda: preview_standby_selection(self.coordinator, request))
+
+    def create_standby(self, request: StandbySelectionRequest) -> ServiceResult:
+        from fabshuffle.bcdr.workflow import create_standby
+        return self._call(lambda: create_standby(self.coordinator, request))
+
+    def configure_standby_defaults(self, request: StandbyDefaultsRequest) -> ServiceResult:
+        from fabshuffle.bcdr.workflow import configure_standby_defaults
+        return self._call(lambda: configure_standby_defaults(self.coordinator, request))
 
     def configure_protection(self, request: ConfigureProtectionRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.configure_protection(request))

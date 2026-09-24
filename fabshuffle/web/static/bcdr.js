@@ -111,6 +111,11 @@ function bcdrResolve(schema, root) {
 }
 
 function bcdrResourceChoices(name) {
+  if (name === "target_capacity_id" && bcdr.standbyTargets) {
+    return bcdr.standbyTargets.map((entry) => ({
+      id: entry.id, label: [entry.displayName || "Configured recovery capacity", entry.region].filter(Boolean).join(" - "),
+    }));
+  }
   if (name === "warehouse_id" || name === "control_warehouse_id") {
     const choices = bcdr.warehouseChoices.map((entry) => ({ id: entry.id, label: entry.displayName }));
     if (bcdr.savedSetup?.warehouseId && !choices.some((entry) => entry.id === bcdr.savedSetup.warehouseId)) {
@@ -203,12 +208,15 @@ function bcdrCapacitySelect(name, id, required) {
       select.appendChild(missing);
     }
     select.value = selected;
-    const error = name === "source_capacity_id" ? bcdr.discovered.source?.errors?.capacities :
+    const error = name === "target_capacity_id" && bcdr.standbyTargets ? "" :
+      name === "source_capacity_id" ? bcdr.discovered.source?.errors?.capacities :
       bcdr.discovered.recovery?.errors?.capacityMapping || bcdr.discovered.recovery?.errors?.capacities;
     hint.textContent = error ? `Discovery incomplete: ${error}. Resolve access and retry discovery.` :
       selected && !available.has(selected) ? "This selection is no longer available. Choose again; it has not been replaced." :
       name === "catalog_capacity_id" ? "Choose one of the dedicated recovery capacities selected above." :
       name === "source_capacity_id" ? "Discover setup choices to load source capacity names." :
+      name === "target_capacity_id" && bcdr.standbyTargets ?
+        "Choose an already authorized recovery capacity. Existing source routes stay unchanged." :
       "Azure resources are matched by name and region, not by a shared ID. Review the subscription and resource group.";
   };
   select.addEventListener("change", () => {
@@ -227,7 +235,8 @@ function bcdrCapacitySelect(name, id, required) {
     read: () => {
       if (!select.value && !required) return undefined;
       const errors = name === "source_capacity_id" ? bcdr.discovered.source?.errors : bcdr.discovered.recovery?.errors;
-      if (errors?.capacities || (name !== "source_capacity_id" && errors?.capacityMapping)) {
+      if (!(name === "target_capacity_id" && bcdr.standbyTargets) &&
+        (errors?.capacities || (name !== "source_capacity_id" && errors?.capacityMapping))) {
         throw new Error("Refresh capacity discovery successfully before submitting this selection.");
       }
       if (!available.has(select.value)) throw new Error(`Choose an available ${bcdrLabel(name).toLowerCase()} by name.`);
@@ -1299,6 +1308,7 @@ async function bcdrSubmit(command, body, button) {
       bcdrRenderScheduleGuide(feedback.warnings, result.details.schedule_guide);
       feedback.warnings.hidden = false;
     }
+    return result;
   } catch (error) {
     if (bcdrCurrentSession(sessionId)) {
       for (const entry of error.details || []) {
@@ -1522,6 +1532,8 @@ $("#bcdr-open").addEventListener("click", async () => {
     bcdr.warehouseChoices = [];
     bcdrRenderForms(response.commands);
     bcdr.forms = response.commands;
+    if (bcdr.journey === "setup" && bcdr.journeyStage === "select") bcdrLoadStandbyScope(true);
+    if (bcdr.journey === "settings" && bcdr.journeyStage === "routing") bcdrLoadStandbyScope(false);
     $("#bcdr-progress").textContent = "Choose setup, a DR Test, or incident recovery. No operation has started.";
   } catch (error) {
     if (bcdrCurrentSession(sessionId)) {
@@ -1544,6 +1556,8 @@ $("#sign-out").addEventListener("click", () => {
   bcdr.recoveryRows = new Map();
   bcdr.savedSetup = null;
   bcdr.warehouseChoices = [];
+  bcdr.scope = null;
+  bcdr.standbyTargets = null;
   $("#bcdr-content").replaceChildren();
   $("#bcdr-progress").textContent = "";
   bcdrError("");

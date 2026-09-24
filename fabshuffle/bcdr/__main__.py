@@ -32,6 +32,8 @@ from fabshuffle.bcdr.service import (
     ScheduleGuideRequest,
     ServiceResult,
     SetupRequest,
+    StandbyDefaultsRequest,
+    StandbySelectionRequest,
     StartDrTestRequest,
     SyncRequest,
     create_service,
@@ -43,6 +45,9 @@ from fabshuffle.fabric.client import FabricApiError, FabricError
 from fabshuffle.lifecycle import safe_text
 
 REQUESTS = {
+    "preview-standby": StandbySelectionRequest,
+    "create-standby": StandbySelectionRequest,
+    "configure-standby-defaults": StandbyDefaultsRequest,
     "start-dr-test": StartDrTestRequest,
     "continue-dr-test": ContinueDrTestRequest,
     "end-dr-test": EndDrTestRequest,
@@ -66,6 +71,7 @@ CONSEQUENTIAL = frozenset({
     "cutover", "execute-failback", "cutback", "rearm", "reconcile-operation", "configure-replica",
     "scheduled-sync",
     "start-dr-test", "continue-dr-test", "end-dr-test", "schedule-guide",
+    "create-standby", "configure-standby-defaults",
 })
 
 
@@ -122,6 +128,12 @@ def dispatch(service: BcdrService, command: str, text: str) -> ServiceResult:
     """Explicit typed calls; unsupported commands cannot reach a dynamic service member."""
     if command == "status":
         return service.status()
+    if command == "preview-standby":
+        return service.preview_standby_selection(StandbySelectionRequest.model_validate_json(text))
+    if command == "create-standby":
+        return service.create_standby(StandbySelectionRequest.model_validate_json(text))
+    if command == "configure-standby-defaults":
+        return service.configure_standby_defaults(StandbyDefaultsRequest.model_validate_json(text))
     if command == "start-dr-test":
         return service.start_dr_test(StartDrTestRequest.model_validate_json(text))
     if command == "continue-dr-test":
@@ -211,7 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.bootstrap, target_tokens=tokens,
                 source_tokens=tokens if (
                     (isinstance(request, SyncRequest) and request.capture)
-                    or isinstance(request, FailbackRequest)
+                    or isinstance(request, (FailbackRequest, StandbySelectionRequest))
                 ) else None,
             )
             try:

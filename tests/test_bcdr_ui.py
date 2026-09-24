@@ -36,6 +36,15 @@ import pytest
     "initial_metadata_sync_offers_schedule_despite_data_gaps",
     "test_state_blocks_setup_and_incident_controls_without_claiming_production",
     "schedule_handoff_is_downloadable_not_a_deployment_claim",
+    "normal_standby_setup_only_selects_workspace_scope",
+    "standby_name_rule_invalidates_stale_selection_preview",
+    "standby_prerequisites_belong_in_settings_not_the_selection_form",
+    "late_workspace_choices_do_not_populate_an_incident",
+    "destination_settings_load_without_source_discovery",
+    "settings_load_is_not_lost_behind_pending_workspace_discovery",
+    "ambiguous_workspace_names_are_not_selected_by_guessing",
+    "scope_loading_errors_never_leave_an_enabled_noop_review_button",
+    "late_settings_error_does_not_disable_a_loaded_workspace_selection",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

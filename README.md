@@ -288,6 +288,8 @@ operations. Captured metadata and restored definitions are not proof of applicat
 readiness; inspect partial group outcomes and optional-data protection warnings.
 
 The standby UI separates **Set up standby**, **DR Test**, and **I'm currently down**.
+Normal setup only selects workspace names or a case-insensitive name-contains rule;
+recovery infrastructure is configured once under **Settings** and reused.
 Initial metadata synchronization leads to a guided scheduled-sync handoff, not automatic
 job creation. DR Test uses the existing standby with recovery owners, holds synchronization,
 and never cuts over production; incident recovery uses saved state without primary discovery.

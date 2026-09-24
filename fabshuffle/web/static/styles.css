@@ -96,6 +96,14 @@ body {
 .bcdr-schedule-guide li + li { margin-top: 0.6rem; }
 .bcdr-schedule-guide a { display: inline-block; margin: 0.8rem 1rem 0 0; color: var(--accent); }
 .bcdr-test-summary { border-top: 1px solid var(--border); margin-top: 1.5rem; padding-top: 0.5rem; }
+.bcdr-scope { margin-top: 1rem; }
+.bcdr-scope > label { display: block; margin: 1rem 0; }
+.bcdr-scope > label select, .bcdr-scope > label input { margin-top: 0.4rem; }
+.bcdr-scope-list { max-height: 22rem; overflow-y: auto; }
+.bcdr-scope-list .bcdr-check { margin: 0.6rem 0; }
+.bcdr-scope-preview { margin: 1.25rem 0; }
+.bcdr-scope .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.bcdr-scope > .link-button { margin-top: 0.6rem; }
 .bcdr :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .bcdr-results { margin: 1rem 0; padding-left: 1.25rem; }
 .bcdr-results li + li { margin-top: 0.75rem; }

@@ -681,8 +681,11 @@ class RecoveryCoordinator:
             expected_current=previous_id,
         )
 
-    def synchronize(self, request: SyncRequest, *, standby_only: bool = False) -> ServiceResult:
+    def synchronize(
+        self, request: SyncRequest, *, standby_only: bool = False, scheduled: bool | None = None,
+    ) -> ServiceResult:
         self._wake()
+        is_scheduled = standby_only if scheduled is None else scheduled
         modes = {RecoveryMode.STANDBY} if standby_only else {RecoveryMode.STANDBY, RecoveryMode.SYNCING}
         with self.runtime.controller(modes):
             if self.runtime.mode == RecoveryMode.STANDBY:
@@ -711,10 +714,10 @@ class RecoveryCoordinator:
                 "generation_id": generation.snapshot.generation_id, "completed_at": now().isoformat(),
                 "metadata_ready": bool(groups) and len(prepared) == len(groups),
                 "data_gap_groups": [group.group_id for group in groups if not group.data_ready],
-                "kind": "scheduled" if standby_only else "manual",
+                "kind": "scheduled" if is_scheduled else "manual",
             }
             self.runtime.put("lifecycle", "last-sync", summary)
-            if standby_only:
+            if is_scheduled:
                 self.runtime.put("lifecycle", "last-scheduled-sync", summary)
             self.runtime.transition(RecoveryMode.STANDBY)
             result = ServiceResult(
