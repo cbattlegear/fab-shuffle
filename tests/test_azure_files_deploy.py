@@ -41,6 +41,12 @@ def _one(template: dict[str, Any], resource_type: str) -> dict[str, Any]:
     return matches[0]
 
 
+def _base_environment(template: dict[str, Any]) -> list[dict[str, str]]:
+    container = _one(template, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
+    assert container["env"].startswith("[concat(variables('containerEnvironment'), if(")
+    return template["variables"]["containerEnvironment"]
+
+
 def test_template_schema_and_content_version_untouched() -> None:
     template = _load_template()
     expected_schema = "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#"
@@ -48,8 +54,8 @@ def test_template_schema_and_content_version_untouched() -> None:
     assert template["contentVersion"] == "1.0.0.0"
 
 
-def test_no_unmanaged_infrastructure_beyond_storage_account_share_and_env_storage() -> None:
-    """Six resources total: the three pre-existing ones, plus exactly three storage ones."""
+def test_only_controller_storage_authentication_and_lock_resources_are_provisioned() -> None:
+    """No second metadata archive or broad-scope authorization is provisioned."""
     template = _load_template()
     types = sorted(r["type"] for r in template["resources"])
     assert types == sorted(
@@ -60,6 +66,9 @@ def test_no_unmanaged_infrastructure_beyond_storage_account_share_and_env_storag
             "Microsoft.Storage/storageAccounts",
             "Microsoft.Storage/storageAccounts/fileServices/shares",
             "Microsoft.App/managedEnvironments/storages",
+            "Microsoft.App/containerApps/authConfigs",
+            "Microsoft.Storage/storageAccounts/blobServices/containers",
+            "Microsoft.Authorization/roleAssignments",
         ]
     )
 
@@ -158,12 +167,18 @@ def test_storage_account_key_never_becomes_a_parameter_output_or_container_env_v
     serialized = json.dumps(template["outputs"])
     assert "listKeys" not in serialized
     assert "accountKey" not in serialized
-    container_app = _one(template, "Microsoft.App/containerApps")
-    container = container_app["properties"]["template"]["containers"][0]
-    for env_entry in container.get("env", []):
+    for env_entry in _base_environment(template):
         assert "listKeys" not in json.dumps(env_entry)
         assert env_entry["name"] != "accountKey"
-    assert set(template["outputs"].keys()) == {"url", "ingressIsPublic"}
+    container = _one(template, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
+    assert "listKeys" not in container["env"]
+    assert set(template["outputs"]) == {
+        "url", "easyAuthCallbackUrl", "containerAppsEnvironmentName", "storageMountName",
+        "controllerBootstrapPath", "bcdrLeaseBlobUrl", "bcdrLeaseContainerResourceId",
+        "managedIdentityResourceId", "managedIdentityClientId", "managedIdentityPrincipalId",
+        "managedIdentityTenantId", "verifyAuthenticationCommand", "activateApplicationCommand",
+        "enablePublicIngressCommand", "readPublicFqdnCommand",
+    }
 
 
 def test_storage_account_security_settings() -> None:
@@ -184,13 +199,13 @@ def test_storage_account_security_settings() -> None:
     assert props["largeFileSharesState"] == "Enabled"
 
 
-def test_container_app_has_no_managed_identity() -> None:
-    """listKeys() is a template-evaluation-time function; nothing here needs the running
-    container app to carry a system- or user-assigned identity to reach the share.
-    """
+def test_share_mount_does_not_depend_on_optional_runtime_managed_identity() -> None:
+    """SMB still uses the deployment-resolved account key, not runtime identity credentials."""
     template = _load_template()
-    container_app = _one(template, "Microsoft.App/containerApps")
-    assert "identity" not in container_app
+    storage = _one(template, "Microsoft.App/managedEnvironments/storages")
+    assert "condition" not in storage
+    assert "identity" not in json.dumps(storage).lower()
+    assert "listKeys" in storage["properties"]["azureFile"]["accountKey"]
 
 
 def test_scratch_mount_path_and_env_var_agree_with_the_container_image_default() -> None:
@@ -206,7 +221,7 @@ def test_scratch_mount_path_and_env_var_agree_with_the_container_image_default()
     # variable and the mount below cannot drift apart from each other.
     assert template["variables"]["scratchMountPath"] == "/app/local"
 
-    scratch_env = next(e for e in container["env"] if e["name"] == "FAB_SHUFFLE_SCRATCH")
+    scratch_env = next(e for e in _base_environment(template) if e["name"] == "FAB_SHUFFLE_SCRATCH")
     assert scratch_env["value"] == "[variables('scratchMountPath')]"
 
     [mount] = container["volumeMounts"]
@@ -274,17 +289,18 @@ def test_replica_limit_and_activation_mode_unchanged() -> None:
     assert container_app["properties"]["configuration"]["activeRevisionsMode"] == "Single"
 
 
-def test_ingress_and_ip_restriction_settings_unchanged() -> None:
+def test_https_sticky_ingress_stays_internal_until_authentication_is_verified() -> None:
     template = _load_template()
     container_app = _one(template, "Microsoft.App/containerApps")
     ingress = container_app["properties"]["configuration"]["ingress"]
-    assert ingress["external"] is True
+    assert ingress["external"] is False
     assert ingress["targetPort"] == 8080
     assert ingress["allowInsecure"] is False
     assert ingress["stickySessions"] == {"affinity": "sticky"}
-    assert ingress["ipSecurityRestrictions"] == (
-        "[if(variables('restrictIngress'), variables('ipRestrictions'), createArray())]"
-    )
+    assert "ipSecurityRestrictions" not in ingress
+    assert "allowedClientIpAddress" not in json.dumps(template)
+    assert "restrictIngress" not in json.dumps(template)
+    assert "ipRestrictions" not in json.dumps(template)
 
 
 def test_existing_sizing_and_image_defaults_unchanged() -> None:
@@ -336,7 +352,8 @@ def test_every_deployed_name_uses_the_resolved_app_name_including_storage() -> N
     assert variables["logAnalyticsName"] == "[concat(variables('appName'), '-logs')]"
     assert _one(template, "Microsoft.App/containerApps")["name"] == "[variables('appName')]"
     assert "resourceGroup().id, variables('appName')" in variables["storageAccountName"]
-    assert "resourceId('Microsoft.App/containerApps', variables('appName'))" in (
+    assert "variables('appName'), '.'" in template["outputs"]["url"]["value"]
+    assert "resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))" in (
         template["outputs"]["url"]["value"]
     )
     # Leaving a raw parameter reference behind would create empty resource names or a
@@ -365,8 +382,7 @@ def test_disk_memory_and_share_capacity_are_independent_parameters() -> None:
     for key in ("maxDiskStagingGiB", "maxMemoryMiB"):
         assert params[key]["type"] == "int"
         assert params[key]["minValue"] > 0
-    container = _one(template, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
-    env = {entry["name"]: entry["value"] for entry in container["env"]}
+    env = {entry["name"]: entry["value"] for entry in _base_environment(template)}
     assert env["FAB_SHUFFLE_MAX_DISK_STAGING_BYTES"] == (
         "[string(mul(parameters('maxDiskStagingGiB'), 1073741824))]"
     )
