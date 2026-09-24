@@ -104,6 +104,21 @@ body {
 .bcdr-scope-preview { margin: 1.25rem 0; }
 .bcdr-scope .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; }
 .bcdr-scope > .link-button { margin-top: 0.6rem; }
+.bcdr .bcdr-feedback { flex-basis: 100%; min-width: 0; }
+.bcdr-activity { margin: 0.6rem 0 1rem; }
+.bcdr-activity .hint { margin: 0.35rem 0; }
+.bcdr-activity ul { margin: 0.5rem 0; padding-left: 1.25rem; }
+.bcdr-activity li p { margin: 0.2rem 0 0.5rem; font-size: 0.9rem; }
+.bcdr-recovery { margin: 1rem 0; padding: 1rem 0; border-top: 1px solid var(--border); }
+button[aria-busy="true"]::before, .bcdr [data-loading="true"]::before {
+  content: ""; display: inline-block; width: 0.9em; height: 0.9em;
+  margin-right: 0.55em; border: 2px solid currentColor; border-right-color: transparent;
+  border-radius: 50%; vertical-align: -0.1em; animation: bcdr-spin 0.85s linear infinite;
+}
+@keyframes bcdr-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button[aria-busy="true"]::before, .bcdr [data-loading="true"]::before { animation: none; }
+}
 .bcdr :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .bcdr-results { margin: 1rem 0; padding-left: 1.25rem; }
 .bcdr-results li + li { margin-top: 0.75rem; }

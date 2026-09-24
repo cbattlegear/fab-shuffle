@@ -160,6 +160,33 @@ Each operation form shows validation errors, service errors, progress and return
 beside its action button. Messages retain service error codes and actionable guidance;
 an error in one form does not clear another form's feedback or send you to the page top.
 
+Loading buttons and reads show indeterminate activity indicators rather than invented
+percentages. **Activity and recent requests** is separate from **Load recovery status**:
+the activity endpoint observes this web process without opening SQL, taking a deployment
+lock, resuming capacity or contacting Fabric. It identifies a local request's phase,
+elapsed time, lock ownership and terminal error. It cannot prove that a different process
+or pre-restart worker has stopped. Catalog status remains the authoritative read.
+
+### Resume an interrupted standby sync
+
+- New sync requests are retained before source capture. When no worker owner or mutation
+  receipt remains, **Retry saved sync** reuses that exact request and owned target mappings.
+- Older failures may have no recorded request. In that case, review the workspaces or
+  name rule again and explicitly choose **Resume standby setup**. An earlier successful
+  selection is not silently assumed to be the failed request.
+- A retained catalog owner is different from the live deployment lock. Stop and fence
+  the previous worker, then use **Reconcile interrupted sync ownership** with its pinned
+  controller/epoch and evidence. This is allowed only without pending mutation receipts;
+  it neither starts a sync nor changes the recovery mode.
+- Pending/ambiguous mutation receipts still require their existing exact-operation
+  reconciliation path. Never delete bootstrap/lock files, clear an owner with raw SQL,
+  or start an overlapping create merely to escape the message.
+
+The recorded failure preserves the service message and code. For example, a required
+Spark metadata 404 is not treated as an empty pool list. Capture skips workspace Spark
+configuration only when the complete inventory contains exclusively known non-Spark
+item types; Spark and unknown workloads retain strict required reads.
+
 Discovery logs include a correlation ID, resource names and exact workspace/capacity IDs.
 Confirmed setup logs record the selected workspace, source capacities and recovery
 Fabric/ARM identifiers. Use restricted server logs for identity troubleshooting, not
@@ -452,6 +479,7 @@ to adopt a different tenant/application/recovery principal.
 Commands are `setup`, `status`, `reconcile-operation`, `plan`, `synchronize`, `scheduled-sync`,
 `schedule-guide`, `start-dr-test`, `continue-dr-test`, `end-dr-test`,
 `preview-standby`, `create-standby`, `configure-standby-defaults`,
+`retry-standby`, `reconcile-sync-owner`,
 `configure-protection`, `configure-replica`, `enable-recovery`,
 `cutover`, `plan-failback`, `execute-failback`, `cutback`, and `rearm`. Supply typed JSON through standard input or
 `--request /controller/request.json`. Generate the actual request schema without

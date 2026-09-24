@@ -17,6 +17,7 @@ from fabshuffle.bcdr.service import (
     StandbySelectionRequest,
     SyncRequest,
 )
+from fabshuffle.bcdr.sync_recovery import sync_recovery_state
 from fabshuffle.fabric import workspaces
 from fabshuffle.lifecycle import safe_text
 
@@ -26,8 +27,14 @@ logger = logging.getLogger(__name__)
 def _standby_configuration(coordinator):
     coordinator._wake()
     state = coordinator.catalog.state()
-    if state.mode != RecoveryMode.STANDBY or state.controller_id or coordinator.catalog.pending_operations():
-        raise RecoveryBlocked("Finish active work or reconcile interrupted operations before changing scope.")
+    recovery = sync_recovery_state(coordinator, state)
+    if (
+        state.mode not in {RecoveryMode.STANDBY, RecoveryMode.SYNCING}
+        or state.controller_id or recovery["pending_operation_count"]
+    ):
+        raise RecoveryBlocked(recovery["message"])
+    if state.mode == RecoveryMode.SYNCING and recovery["can_retry"]:
+        raise RecoveryBlocked("Use Retry saved sync before changing the original selection.")
     saved = (
         coordinator.runtime.get("plans", state.current_generation_id) if state.current_generation_id else None
     )
@@ -52,6 +59,17 @@ def _scope_workspaces(coordinator):
 
 
 def standby_scope_options(coordinator, *, include_workspaces: bool) -> ServiceResult:
+    coordinator._wake()
+    state = coordinator.catalog.state()
+    recovery = sync_recovery_state(coordinator, state)
+    if recovery["interrupted"] and (
+        recovery["controller_id"] or recovery["pending_operation_count"]
+        or (state.mode == RecoveryMode.SYNCING and not recovery["requires_selection"])
+    ):
+        return ServiceResult(mode=state.mode, details={"sync_recovery": recovery, "standby_scope": {
+            "workspaces": [], "target_capacities": [], "saved_selection": None,
+            "resume_required": True, "message": recovery["message"],
+        }})
     state, previous, fallback = _standby_configuration(coordinator)
     entries = _scope_workspaces(coordinator) if include_workspaces else []
     allowed_targets = set(coordinator.recovery_set.target_capacity_ids)
@@ -72,11 +90,14 @@ def standby_scope_options(coordinator, *, include_workspaces: bool) -> ServiceRe
         and not previous.exclude_workspace_ids and not previous.approved_addition_ids
     ):
         saved_selection = {"selection_mode": "pattern", "name_pattern": previous.keywords[0]}
-    return ServiceResult(mode=state.mode, details={"standby_scope": {
+    if recovery["requires_selection"]:
+        saved_selection = None
+    return ServiceResult(mode=state.mode, details={"sync_recovery": recovery, "standby_scope": {
         "workspaces": [{key: entry.get(key) for key in ("id", "displayName", "description", "capacityRegion")}
                        for entry in entries],
         "target_capacities": targets, "default_target_id": fallback, "saved_selection": saved_selection,
         "message": "Choose workspaces in the configured source scope; reuse saved recovery settings.",
+        "legacy_resume": recovery["requires_selection"],
     }})
 
 
@@ -118,6 +139,7 @@ def _selection_recipe(coordinator, request: StandbySelectionRequest):
     )
     fingerprint = digest(canonical_json({
         "recovery_set": coordinator.recovery_set.recovery_set_id, "request": sync.model_dump(mode="json"),
+        "resume_interrupted": state.mode == RecoveryMode.SYNCING,
     }))
     return state, sync, selected, fingerprint
 
@@ -135,14 +157,21 @@ def preview_standby_selection(coordinator, request: StandbySelectionRequest) -> 
         "route_count": len(sync.capacity_routes),
         "target_capacity_ids": sorted({route.target_capacity_id for route in sync.capacity_routes}),
         "message": "Saved settings will be reused. The sync prepares stopped standby resources; no cutover.",
+        "resume_interrupted": state.mode == RecoveryMode.SYNCING,
     }})
 
 
 def create_standby(coordinator, request: StandbySelectionRequest) -> ServiceResult:
-    _, sync, _, fingerprint = _selection_recipe(coordinator, request)
-    if request.expected_configuration != fingerprint:
+    state, sync, selected, fingerprint = _selection_recipe(coordinator, request)
+    if (
+        request.expected_configuration != fingerprint
+        or request.resume_interrupted != (state.mode == RecoveryMode.SYNCING)
+    ):
         raise RecoveryBlocked("The selection or settings changed. Review the matching workspaces again.")
-    return coordinator.synchronize(sync, standby_only=True, scheduled=False)
+    return coordinator.synchronize(
+        sync, standby_only=not request.resume_interrupted, scheduled=False,
+        scope_names=[entry.get("displayName") or "Unnamed workspace" for entry in selected],
+    )
 
 
 def configure_standby_defaults(coordinator, request: StandbyDefaultsRequest) -> ServiceResult:
@@ -213,6 +242,7 @@ def workflow_summary(coordinator, generation=None) -> dict:
         "last_sync": last_sync,
         "last_scheduled_sync": coordinator.runtime.get("lifecycle", "last-scheduled-sync"),
         "test": test,
+        "sync_recovery": sync_recovery_state(coordinator, state),
         "schedule_eligible": idle and baseline,
         "test_eligible": idle and bool(testable),
         "test_eligible_group_ids": testable,
@@ -228,6 +258,7 @@ def workflow_summary(coordinator, generation=None) -> dict:
                 RecoveryMode.ENABLING_RECOVERY, RecoveryMode.ACTIVE_RECOVERY,
                 RecoveryMode.FAILING_BACK, RecoveryMode.REARMING,
             } else "reconcile" if pending or state.controller_id else
+            "retry_sync" if state.mode == RecoveryMode.SYNCING else
             "schedule" if baseline else "initial_sync"
         ),
     }

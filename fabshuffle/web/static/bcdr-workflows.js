@@ -101,6 +101,10 @@ function bcdrBuildJourneyShell(content, commands) {
   const help = bcdrElement("section", undefined, "bcdr-journey-help");
   help.id = "bcdr-journey-help";
   content.appendChild(help);
+  const recovery = bcdrElement("section", undefined, "bcdr-recovery");
+  recovery.id = "bcdr-sync-recovery";
+  recovery.hidden = true;
+  content.appendChild(recovery);
   content.appendChild(bcdrBuildStandbyScope());
 }
 
@@ -273,6 +277,7 @@ function bcdrRefreshJourney() {
     }
   }
   if (state.workflow?.pending_operations || state.workflow?.controller_busy) visible.push("reconcile-operation");
+  if (bcdr.syncRecovery?.can_reconcile_owner) visible.push("reconcile-sync-owner");
   for (const [name, section] of bcdr.commandSections || []) {
     section.hidden = !visible.includes(name);
     section.open = visible.length === 1 || ["setup", "synchronize", "schedule-guide", "start-dr-test", "continue-dr-test", "end-dr-test", "enable-recovery"].includes(name);
@@ -283,9 +288,124 @@ function bcdrRefreshJourney() {
   const scope = $("#bcdr-standby-scope");
   if (scope) scope.hidden = bcdr.journey !== "setup" || bcdr.journeyStage !== "select" ||
     state.testActive || state.incidentActive;
-  if (bcdr.scope) bcdr.scope.start.textContent = state.baseline ? "Update standby" : "Create standby";
+  if (bcdr.scope) bcdr.scope.start.textContent = bcdr.scope.reviewed?.request.resume_interrupted ?
+    "Resume standby setup" : state.baseline ? "Update standby" : "Create standby";
   const result = $("#bcdr-result");
   if (result) result.hidden = bcdr.resultJourney !== bcdr.journey;
+  bcdrRenderSyncRecovery();
+}
+
+function bcdrLoading(element, loading) {
+  if (!element) return;
+  element.dataset.loading = String(loading);
+  if (element.tagName.toLowerCase() === "button") element.setAttribute("aria-busy", String(loading));
+  if (loading) bcdrWatchActivity();
+}
+
+function bcdrStopActivity() {
+  ++bcdr.activityVersion;
+  if (bcdr.activityTimer) clearTimeout(bcdr.activityTimer);
+  bcdr.activityTimer = null;
+  bcdr.activityFetching = false;
+  bcdr.activity = null;
+  const list = $("#bcdr-activity-list");
+  if (list) list.replaceChildren();
+  const status = $("#bcdr-activity-status");
+  if (status) {
+    status.textContent = "Observe local requests without taking the deployment lock or resuming capacity.";
+    status.dataset.loading = "false";
+  }
+}
+
+async function bcdrWatchActivity(open = false) {
+  if (!bcdrCurrentSession(state.sessionId) || $("#bcdr-panel").hidden || bcdr.activityFetching) return;
+  if (bcdr.activityTimer) clearTimeout(bcdr.activityTimer);
+  bcdr.activityTimer = null;
+  const version = bcdr.activityVersion;
+  const session = state.sessionId;
+  bcdr.activityFetching = true;
+  try {
+    const snapshot = await api("/api/bcdr/activity");
+    if (version !== bcdr.activityVersion || !bcdrCurrentSession(session)) return;
+    if (!Array.isArray(snapshot.active) || !Array.isArray(snapshot.recent)) throw new Error("Activity response is incomplete");
+    bcdr.activity = snapshot;
+    const status = $("#bcdr-activity-status");
+    status.dataset.loading = String(snapshot.active.length > 0);
+    const message = snapshot.active.length ?
+      "A local request is still executing. Leaving the page does not cancel its server-side work." :
+      "No local request is executing. Other processes and pre-restart work are not observed here.";
+    if (status.textContent !== message) status.textContent = message;
+    const list = $("#bcdr-activity-list");
+    list.replaceChildren();
+    const entries = snapshot.active.length ? snapshot.active : snapshot.recent.slice(0, 1);
+    const items = bcdrElement("ul");
+    for (const entry of entries) {
+      const item = bcdrElement("li");
+      item.appendChild(bcdrElement("strong", `${entry.action}: ${bcdrLabel(entry.status)}`));
+      item.appendChild(bcdrElement("p", `${entry.phase}${entry.detail ? ` - ${entry.detail}` : ""}. ` +
+        `${entry.elapsed_seconds}s elapsed${entry.owns_deployment ? "; holds the deployment lock" : ""}.`));
+      if (entry.error) item.appendChild(bcdrElement("p", entry.error, "alert"));
+      items.appendChild(item);
+    }
+    list.appendChild(items);
+    if (open || snapshot.active.length || snapshot.recent[0]?.status === "failed") $("#bcdr-activity").open = true;
+  } catch (error) {
+    if (version === bcdr.activityVersion && bcdrCurrentSession(session)) {
+      bcdr.activity = null;
+      $("#bcdr-activity-status").dataset.loading = "false";
+      $("#bcdr-activity-status").textContent = `Activity unavailable: ${error.message}. This does not prove the worker stopped.`;
+    }
+  } finally {
+    if (version === bcdr.activityVersion) {
+      bcdr.activityFetching = false;
+      const loading = Array.from($("#bcdr-panel").querySelectorAll("button, p, section"))
+        .some((element) => !element.closest(".bcdr-activity") && element.dataset.loading === "true");
+      if (bcdrCurrentSession(session) && !$("#bcdr-panel").hidden &&
+        (bcdr.pending || loading || bcdr.activity?.active?.length)) {
+        bcdr.activityTimer = setTimeout(() => bcdrWatchActivity(), 2000);
+      }
+    }
+  }
+}
+
+function bcdrRenderSyncRecovery() {
+  const container = $("#bcdr-sync-recovery");
+  if (!container) return;
+  const recovery = bcdr.syncRecovery;
+  container.replaceChildren();
+  container.hidden = !recovery || !recovery.interrupted;
+  if (container.hidden) return;
+  container.appendChild(bcdrElement("h4", "Interrupted standby sync"));
+  container.appendChild(bcdrElement("p", recovery.message));
+  if (recovery.phase) container.appendChild(bcdrElement("p", `Last recorded phase: ${recovery.phase}`, "hint"));
+  if (recovery.scope) {
+    const scope = recovery.scope;
+    const label = scope.name_rules?.length ? `Name rule: ${scope.name_rules.join(", ")}` :
+      scope.workspace_names?.length ? scope.workspace_names.join(", ") :
+      scope.all_in_scope ? "All eligible workspaces in the configured source scope" :
+      `${scope.exact_workspace_count} explicitly selected workspace(s)`;
+    container.appendChild(bcdrElement("p", `Saved selection: ${label}.`));
+  }
+  if (recovery.error) container.appendChild(bcdrElement("p", recovery.error, "alert"));
+  if (recovery.can_retry) {
+    const command = bcdr.journeyCommands?.find((entry) => entry.name === "retry-standby");
+    if (command) {
+      const retry = bcdrElement("button", "Retry saved sync", "primary");
+      retry.type = "button";
+      retry.addEventListener("click", () => bcdrSubmit(command,
+        { expected_attempt_id: recovery.attempt_id }, retry));
+      container.appendChild(retry);
+    }
+  } else if (recovery.requires_selection) {
+    bcdrJourneyButton(container, "Review selection and resume", "setup", "select", true);
+  } else if (recovery.can_reconcile_owner) {
+    container.appendChild(bcdrElement("p",
+      "Stop and fence the previous worker first, then use Reconcile interrupted sync ownership below. This does not cancel it.", "hint"));
+  }
+  const observe = bcdrElement("button", "Check current activity", "secondary");
+  observe.type = "button";
+  observe.addEventListener("click", () => bcdrWatchActivity(true));
+  container.appendChild(observe);
 }
 
 function bcdrBuildStandbyScope() {
@@ -394,6 +514,7 @@ async function bcdrLoadStandbyScope(includeWorkspaces) {
   if (stateFacts.testActive || stateFacts.incidentActive) return;
   const session = state.sessionId;
   scope.loading = true;
+  bcdrLoading(scope.reload, true);
   scope.review.disabled = true;
   scope.start.disabled = true;
   if (includeWorkspaces) {
@@ -437,6 +558,24 @@ async function bcdrLoadStandbyScope(includeWorkspaces) {
     const data = result.details?.standby_scope;
     if (!data || !Array.isArray(data.target_capacities) || !Array.isArray(data.workspaces)) {
       throw new Error("The saved configuration response is incomplete");
+    }
+    if (result.details?.sync_recovery) {
+      bcdr.syncRecovery = result.details.sync_recovery;
+      bcdr.bindings.forEach((refresh) => refresh("discovery"));
+      bcdrRefreshJourney();
+    }
+    if (data.resume_required) {
+      scope.loaded = false;
+      scope.reviewed = null;
+      scope.start.hidden = true;
+      scope.mode.parentElement.hidden = true;
+      scope.entries.hidden = true;
+      scope.patternLabel.hidden = true;
+      scope.preview.hidden = true;
+      scope.review.hidden = true;
+      scope.reload.textContent = "Refresh recovery state";
+      status(data.message);
+      return;
     }
     bcdr.standbyTargets = data.target_capacities;
     bcdr.bindings.forEach((refresh) => refresh("discovery"));
@@ -498,6 +637,8 @@ async function bcdrLoadStandbyScope(includeWorkspaces) {
   } finally {
     if (scope === bcdr.scope) {
       scope.loading = false;
+      bcdrLoading(scope.reload, false);
+      bcdrWatchActivity();
       scope.reload.disabled = false;
       scope.start.disabled = false;
       scope.review.disabled = !scope.loaded || !!scope.reviewing;
@@ -527,6 +668,7 @@ async function bcdrReviewStandbyScope() {
   const session = state.sessionId;
   scope.review.disabled = true;
   scope.reviewing = true;
+  bcdrLoading(scope.review, true);
   scope.reviewed = null;
   scope.start.hidden = true;
   bcdrError("", scope.review);
@@ -537,7 +679,10 @@ async function bcdrReviewStandbyScope() {
       bcdr.journey !== "setup" || bcdr.journeyStage !== "select") return;
     const preview = result.details?.standby_preview;
     if (!preview?.configuration || !Array.isArray(preview.workspaces)) throw new Error("Selection preview is incomplete");
-    scope.reviewed = { request, configuration: preview.configuration };
+    scope.reviewed = {
+      request: { ...request, resume_interrupted: preview.resume_interrupted === true },
+      configuration: preview.configuration,
+    };
     scope.review.className = "secondary";
     scope.preview.replaceChildren();
     scope.preview.appendChild(bcdrElement("h4",
@@ -552,6 +697,8 @@ async function bcdrReviewStandbyScope() {
     if (request.selection_mode === "pattern") scope.preview.appendChild(bcdrElement("p",
       "Future matching workspaces in the configured source scope are included on subsequent syncs.", "hint"));
     scope.start.hidden = false;
+    scope.start.textContent = preview.resume_interrupted ? "Resume standby setup" :
+      bcdrWorkflowFacts().baseline ? "Update standby" : "Create standby";
   } catch (error) {
     if (bcdrCurrentSession(session) && scope === bcdr.scope && revision === scope.revision) {
       scope.preview.replaceChildren();
@@ -561,6 +708,8 @@ async function bcdrReviewStandbyScope() {
     if (scope === bcdr.scope) {
       scope.review.disabled = false;
       scope.reviewing = false;
+      bcdrLoading(scope.review, false);
+      bcdrWatchActivity();
       if (!scope.reviewed && scope.preview.textContent === "Checking the matching workspaces and saved routing...") {
         scope.preview.textContent = "Review the current selection before creating standby.";
       }

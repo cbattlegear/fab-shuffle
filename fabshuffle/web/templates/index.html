@@ -45,6 +45,14 @@
       </div>
       <p id="bcdr-error" class="alert" role="alert" hidden></p>
       <p id="bcdr-progress" class="hint" role="status" aria-live="polite"></p>
+      <details id="bcdr-activity" class="bcdr-activity">
+        <summary>Activity and recent requests</summary>
+        <button id="bcdr-activity-refresh" type="button" class="link-button">Check activity</button>
+        <p id="bcdr-activity-status" class="hint" role="status" aria-live="polite">
+          Observe local requests without taking the deployment lock or resuming capacity.
+        </p>
+        <div id="bcdr-activity-list"></div>
+      </details>
       <div id="bcdr-content"></div>
     </section>
 

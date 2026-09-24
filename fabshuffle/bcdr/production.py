@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4, uuid5
 
 from fabshuffle.auth import TokenProvider
+from fabshuffle.bcdr.activity import report_activity
 from fabshuffle.bcdr.backend import DurableRuntime, RecoveryBlocked, now
 from fabshuffle.bcdr.bootstrap import (
     BootstrapDescriptor,
@@ -66,6 +67,7 @@ class ProductionCapacities:
         self.lock: DeploymentLock | None = None
 
     def _open_catalog(self, descriptor: BootstrapDescriptor) -> None:
+        report_activity("Opening the metadata Warehouse")
         if not descriptor.tds_host or not descriptor.tds_catalog:
             raise RecoveryBlocked("Complete control Warehouse setup before opening a recovery service")
         self.catalog = WarehouseCatalog.open_from_endpoint(
@@ -78,6 +80,7 @@ class ProductionCapacities:
         self.catalog.state()
 
     def _reconcile(self, descriptor: BootstrapDescriptor) -> None:
+        report_activity("Reading saved recovery state")
         if self.catalog is None:
             raise RecoveryBlocked("The control Warehouse did not become readable after capacity resume")
         state = self.catalog.state()
@@ -141,6 +144,7 @@ class ProductionCapacities:
         self.catalog.release_controller(lease)
 
     def resume_catalog(self) -> None:
+        report_activity("Resuming or checking the metadata capacity")
         self.driver.resume_catalog(wait_sql=self._open_catalog, reconcile=self._reconcile)
 
     def resume_business(self, runtime: DurableRuntime) -> None:

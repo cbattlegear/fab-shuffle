@@ -45,6 +45,10 @@ import pytest
     "ambiguous_workspace_names_are_not_selected_by_guessing",
     "scope_loading_errors_never_leave_an_enabled_noop_review_button",
     "late_settings_error_does_not_disable_a_loaded_workspace_selection",
+    "activity_observation_identifies_the_local_worker_without_catalog_requests",
+    "workspace_loading_and_preview_show_and_clear_activity_indicators",
+    "retry_saved_sync_is_offered_without_rebuilding_its_selection",
+    "legacy_resume_requires_review_and_sends_an_explicit_resume_flag",
 ])
 def test_bcdr_ui(scenario):
     node = shutil.which("node")

@@ -84,6 +84,7 @@ function goTo(stage) {
 }
 
 function busy(button, isBusy, labelWhenBusy) {
+  button.setAttribute("aria-busy", String(isBusy));
   if (isBusy) {
     button.dataset.label = button.textContent;
     button.textContent = labelWhenBusy;

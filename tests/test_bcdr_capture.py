@@ -189,6 +189,38 @@ def test_complete_generation_retains_identity_roles_config_and_connections():
     assert result.payloads[0].data == b"# no source dependencies"
 
 
+def test_mirrored_only_workspace_does_not_require_unrelated_spark_configuration():
+    client = SourceClient("MirroredDatabase", [part("mirroring.json", {"properties": {}})])
+    original = client.request
+
+    def request(method, path, **kwargs):
+        assert "/spark/" not in path, "Non-Spark inventory must not be blocked by unrelated Spark endpoints"
+        return original(method, path, **kwargs)
+
+    client.request = request
+    captured = capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+    captured.snapshot.require_publishable(recovery_set())
+    properties = captured.snapshot.workspaces[0].properties["bcdr"]
+    assert properties["spark_capture_state"] == "not_applicable_to_items"
+    assert captured.snapshot.items[0].item_type == "MirroredDatabase"
+
+
+def test_required_spark_404_is_not_silently_captured_as_empty():
+    client = SourceClient("Notebook")
+    original = client.request
+
+    def request(method, path, **kwargs):
+        if path.endswith("/spark/pools"):
+            raise FabricApiError(
+                "GET", path, 404, '{"errorCode":"NotFound","message":"Spark metadata missing"}',
+            )
+        return original(method, path, **kwargs)
+
+    client.request = request
+    with pytest.raises(FabricApiError, match="NotFound"):
+        capture_workspaces(client, recovery_set(), tokens=object(), readers=Readers())
+
+
 def test_semantic_models_use_tmsl_and_never_skip_former_defaults():
     client = SourceClient("SemanticModel", [part("model.bim", {"model": {"roles": [], "tables": []}})])
     captured = capture_item(client, IDENTITY, "SemanticModel", readers=Readers())

@@ -29,6 +29,8 @@ from fabshuffle.bcdr.service import (
     PlanRequest,
     RearmRequest,
     ReconcileOperationRequest,
+    ReconcileSyncOwnerRequest,
+    RetryStandbyRequest,
     ScheduleGuideRequest,
     ServiceResult,
     SetupRequest,
@@ -45,6 +47,8 @@ from fabshuffle.fabric.client import FabricApiError, FabricError
 from fabshuffle.lifecycle import safe_text
 
 REQUESTS = {
+    "retry-standby": RetryStandbyRequest,
+    "reconcile-sync-owner": ReconcileSyncOwnerRequest,
     "preview-standby": StandbySelectionRequest,
     "create-standby": StandbySelectionRequest,
     "configure-standby-defaults": StandbyDefaultsRequest,
@@ -72,6 +76,7 @@ CONSEQUENTIAL = frozenset({
     "scheduled-sync",
     "start-dr-test", "continue-dr-test", "end-dr-test", "schedule-guide",
     "create-standby", "configure-standby-defaults",
+    "retry-standby", "reconcile-sync-owner",
 })
 
 
@@ -128,6 +133,10 @@ def dispatch(service: BcdrService, command: str, text: str) -> ServiceResult:
     """Explicit typed calls; unsupported commands cannot reach a dynamic service member."""
     if command == "status":
         return service.status()
+    if command == "retry-standby":
+        return service.retry_standby(RetryStandbyRequest.model_validate_json(text))
+    if command == "reconcile-sync-owner":
+        return service.reconcile_sync_owner(ReconcileSyncOwnerRequest.model_validate_json(text))
     if command == "preview-standby":
         return service.preview_standby_selection(StandbySelectionRequest.model_validate_json(text))
     if command == "create-standby":
@@ -223,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.bootstrap, target_tokens=tokens,
                 source_tokens=tokens if (
                     (isinstance(request, SyncRequest) and request.capture)
-                    or isinstance(request, (FailbackRequest, StandbySelectionRequest))
+                    or isinstance(request, (FailbackRequest, StandbySelectionRequest, RetryStandbyRequest))
                 ) else None,
             )
             try:

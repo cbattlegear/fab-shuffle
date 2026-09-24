@@ -16,6 +16,11 @@ const bcdr = {
   recoveryRows: new Map(),
   savedSetup: null,
   warehouseChoices: [],
+  activityTimer: null,
+  activityFetching: false,
+  activityVersion: 0,
+  activity: null,
+  syncRecovery: null,
 };
 
 function bcdrElement(tag, text, className) {
@@ -40,6 +45,7 @@ function bcdrLabel(name) {
     test_id: "Recorded DR Test",
     schedule_utc: "Recurring schedule (five-field UTC cron)",
     approve_scope: "I approve this scope for recurring fresh capture and safe parking",
+    expected_attempt_id: "Recorded sync attempt",
     source_capacity_ids: "Source capacities",
     source_capacity_id: "Source capacity",
     target_capacity_ids: "Dedicated recovery capacities",
@@ -430,6 +436,7 @@ function bcdrWarehouseSetup(workspaceId, schema) {
   const reset = () => {
     ++sequence;
     loading = false;
+    bcdrLoading(load, false);
     loadedWorkspace = null;
     bcdr.warehouseChoices = [];
     select.replaceChildren();
@@ -450,6 +457,7 @@ function bcdrWarehouseSetup(workspaceId, schema) {
     const previous = select.value;
     loading = true;
     loadedWorkspace = null;
+    bcdrLoading(load, true);
     load.disabled = true;
     status.textContent = "Reading Warehouses in the selected metadata workspace...";
     try {
@@ -486,6 +494,8 @@ function bcdrWarehouseSetup(workspaceId, schema) {
     } finally {
       if (version === sequence) {
         loading = false;
+        bcdrLoading(load, false);
+        bcdrWatchActivity();
         load.disabled = !workspaceId();
       }
     }
@@ -676,7 +686,7 @@ function bcdrField(name, source, root, required = false, context = []) {
       },
     };
   }
-  if (["generation_id", "plan_id", "test_id", "expected_epoch", "writer_epoch", "tenant_id", "expected_controller_id"].includes(name)) {
+  if (["generation_id", "plan_id", "test_id", "expected_attempt_id", "expected_epoch", "writer_epoch", "tenant_id", "expected_controller_id"].includes(name)) {
     const label = bcdrElement("label", title);
     const input = bcdrElement("input");
     input.type = "text";
@@ -685,16 +695,18 @@ function bcdrField(name, source, root, required = false, context = []) {
     label.htmlFor = id;
     input.placeholder = name === "plan_id" ? "Create a failback plan first" : "Read status or preview first";
     label.appendChild(input);
-    const namedPin = ["generation_id", "test_id", "plan_id"].includes(name) ? bcdrElement("span", "", "hint") : null;
+    const namedPin = ["generation_id", "test_id", "plan_id", "expected_attempt_id"].includes(name) ? bcdrElement("span", "", "hint") : null;
     if (namedPin) {
       input.type = "hidden";
       label.appendChild(namedPin);
     }
     const refresh = () => {
-      input.value = String(name === "test_id" ?
+      input.value = String(name === "expected_attempt_id" ? bcdr.syncRecovery?.attempt_id || "" :
+        name === "test_id" ?
         bcdr.latest.details?.dr_test?.test_id || bcdr.latest.details?.workflow?.test?.test_id || "" :
-        name === "expected_controller_id" ? bcdr.latest.details?.controller_id || "" :
-        controllerEpoch ? bcdr.latest.details?.controller_epoch ?? "" :
+        name === "expected_controller_id" ? (bcdr.syncRecovery ?
+          bcdr.syncRecovery.controller_id || "" : bcdr.latest.details?.controller_id || "") :
+        controllerEpoch ? bcdr.syncRecovery?.controller_epoch ?? bcdr.latest.details?.controller_epoch ?? "" :
         name === "writer_epoch" ? bcdr.latest.details?.readiness_context?.writer_epoch ?? "" :
         name === "generation_id" && context.includes("readiness") ?
           bcdr.latest.details?.readiness_context?.generation_id || "" :
@@ -703,6 +715,7 @@ function bcdrField(name, source, root, required = false, context = []) {
       if (namedPin) {
         const test = bcdr.latest.details?.dr_test || bcdr.latest.details?.workflow?.test;
         namedPin.textContent = !input.value ? input.placeholder :
+          name === "expected_attempt_id" ? "The original saved sync request is pinned; its scope will not be changed." :
           name === "generation_id" ? "Current saved recovery point; exact identity is pinned in the request." :
           name === "test_id" ? `Recorded owners-only test${test?.started_at ? ` started ${test.started_at}` : ""}.` :
           "Recorded return-to-primary plan; exact identity is pinned in the request.";
@@ -1067,6 +1080,9 @@ function bcdrError(message, trigger) {
 }
 
 function bcdrRenderResult(result) {
+  const recovery = result.details?.sync_recovery || result.details?.workflow?.sync_recovery;
+  if (recovery) bcdr.syncRecovery = recovery;
+  else if (result.details?.sync_summary) bcdr.syncRecovery = null;
   bcdr.resultJourney = bcdr.journey || "overview";
   if (result.details?.setup_phase === "catalog_ready") {
     bcdr.savedSetup = { ...bcdr.savedSetup, workspaceId: result.details.control_workspace_id,
@@ -1272,16 +1288,19 @@ async function bcdrSubmit(command, body, button) {
   feedback.warnings.hidden = true;
   $("#bcdr-progress").textContent = "Progress, errors and warnings are shown beside the selected action.";
   const panel = $("#bcdr-panel");
-  panel.setAttribute("aria-busy", "true");
+  const busyRegion = button.closest("form") || button.parentElement;
+  busyRegion.setAttribute("aria-busy", "true");
   const controls = Array.from(panel.querySelectorAll("button, input, select, textarea"));
-  const disabled = controls.map((control) => control.disabled);
+  const operationControls = controls.filter((control) => !control.closest(".bcdr-activity"));
+  const disabled = operationControls.map((control) => control.disabled);
   const actionControls = Array.from((button.closest("form") || button.parentElement)
     .querySelectorAll("input, select, textarea"));
   actionControls.forEach((control) => {
     control.setAttribute("aria-invalid", "false");
     control.setAttribute("aria-errormessage", "");
   });
-  controls.forEach((control) => { control.disabled = true; });
+  operationControls.forEach((control) => { control.disabled = true; });
+  bcdrLoading(button, true);
   feedback.progress.textContent =
     `${command.label} is in progress. Closing this view does not cancel server-side work.`;
   try {
@@ -1323,8 +1342,10 @@ async function bcdrSubmit(command, body, button) {
     }
   } finally {
     bcdr.pending = false;
-    panel.setAttribute("aria-busy", "false");
-    controls.forEach((control, index) => { control.disabled = disabled[index]; });
+    busyRegion.setAttribute("aria-busy", "false");
+    operationControls.forEach((control, index) => { control.disabled = disabled[index]; });
+    bcdrLoading(button, false);
+    bcdrWatchActivity();
     if (bcdrCurrentSession(sessionId)) {
       const target = button.closest("details")?.hidden ? $("#bcdr-journey-title") : button;
       target.focus({ preventScroll: true });
@@ -1398,6 +1419,7 @@ function bcdrRenderForms(commands) {
     const sequence = ++bcdr.discoverySequence;
     bcdr.discovering = true;
     busy(discover, true, "Discovering choices...");
+    bcdrLoading(discover, true);
     discoveryStatus.textContent = "Reading source and recovery workspace and capacity names. No setup is being saved.";
     bcdrError("");
     try {
@@ -1447,6 +1469,8 @@ function bcdrRenderForms(commands) {
       if (sequence === bcdr.discoverySequence) {
         bcdr.discovering = false;
         busy(discover, false);
+        bcdrLoading(discover, false);
+        bcdrWatchActivity();
       }
     }
   });
@@ -1512,7 +1536,10 @@ $("#bcdr-open").addEventListener("click", async () => {
   goTo("bcdr");
   $(".wizard-nav").hidden = true;
   $("#bcdr-title").focus();
-  if (bcdr.sessionId === state.sessionId && bcdr.forms) return;
+  if (bcdr.sessionId === state.sessionId && bcdr.forms) {
+    bcdrWatchActivity();
+    return;
+  }
   bcdr.sessionId = state.sessionId;
   bcdr.forms = null;
   bcdr.latest = {};
@@ -1523,6 +1550,7 @@ $("#bcdr-open").addEventListener("click", async () => {
   $("#bcdr-content").replaceChildren();
   bcdrError("");
   $("#bcdr-progress").textContent = "Loading operation forms. Recovery is not being enabled.";
+  bcdrLoading($("#bcdr-progress"), true);
   const sessionId = state.sessionId;
   try {
     const response = await api("/api/bcdr/forms");
@@ -1539,6 +1567,11 @@ $("#bcdr-open").addEventListener("click", async () => {
     if (bcdrCurrentSession(sessionId)) {
       bcdrError(error.message);
       $("#bcdr-progress").textContent = "The recovery forms could not be loaded.";
+    }
+  } finally {
+    if (bcdrCurrentSession(sessionId)) {
+      bcdrLoading($("#bcdr-progress"), false);
+      bcdrWatchActivity();
     }
   }
 });
@@ -1558,6 +1591,8 @@ $("#sign-out").addEventListener("click", () => {
   bcdr.warehouseChoices = [];
   bcdr.scope = null;
   bcdr.standbyTargets = null;
+  bcdr.syncRecovery = null;
+  bcdrStopActivity();
   $("#bcdr-content").replaceChildren();
   $("#bcdr-progress").textContent = "";
   bcdrError("");
@@ -1565,6 +1600,7 @@ $("#sign-out").addEventListener("click", () => {
 });
 
 $("#bcdr-back").addEventListener("click", async () => {
+  bcdrStopActivity();
   $("#bcdr-open").hidden = false;
   if (globalThis.history && globalThis.location?.hash.startsWith("#bcdr/")) {
     globalThis.history.replaceState(null, "", globalThis.location.pathname + globalThis.location.search);
@@ -1586,6 +1622,8 @@ $("#bcdr-back").addEventListener("click", async () => {
         }).catch((error) => {
           if (bcdrCurrentSession(sessionId)) showError(error.message);
         });
+
+        $("#bcdr-activity-refresh").addEventListener("click", () => bcdrWatchActivity(true));
       }
     } catch (error) {
       if (bcdrCurrentSession(sessionId)) showError(error.message);

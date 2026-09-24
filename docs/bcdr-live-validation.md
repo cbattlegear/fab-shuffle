@@ -370,6 +370,19 @@ while shortcuts remain.
 
 ## Gate 8: safety failures and controlled interruption
 
+While an explicit sync owns the deployment lock, use **Check activity** and confirm it
+returns promptly with the active local request and phase without any new Fabric/SQL
+requests or capacity effects. Verify loading indicators start, stop on success/failure,
+and respect reduced motion. A status lookup may still wait for/require the authoritative
+catalog; observation must not steal its lock.
+
+Inject a required capture failure before generation publication. Confirm the original
+sync request and sanitized service error are retained, and Retry saved sync does not
+change selection or duplicate created resources. For a legacy SYNCING record without a
+request, require reviewed selection and the explicit Resume action. A recorded owner or
+pending mutation must not be bypassed by retry; takeover requires fencing evidence and
+exact controller/epoch checks, and pending receipts remain fenced.
+
 Run one fault at a time after happy paths pass; disable scheduling first.
 
 | Fault | Required result |

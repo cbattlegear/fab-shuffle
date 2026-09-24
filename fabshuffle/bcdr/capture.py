@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from fabshuffle.auth import TokenProvider
+from fabshuffle.bcdr.activity import report_activity
 from fabshuffle.bcdr.capture_sources import (
     MAX_METADATA_BYTES,
     MetadataReaders,
@@ -90,6 +91,10 @@ SYSTEM_ITEM_TYPES = {
     "monitoring kql database": "KQLDatabase",
     "monitoring_eventstream": "Eventstream",
 }
+NON_SPARK_WORKSPACE_ITEMS = frozenset({
+    "MirroredDatabase", "Warehouse", "SQLDatabase", "CosmosDBDatabase", "KQLDatabase", "Eventhouse",
+    "SemanticModel", "Report", "Dashboard", "PaginatedReport", "SQLAnalyticsEndpoint",
+})
 
 
 def capture_json(
@@ -883,6 +888,7 @@ def capture_workspaces(
         identity = WorkspaceIdentity(tenant_id=recovery_set.tenant_id, workspace_id=candidate["id"])
         root = f"workspaces/{identity.workspace_id}"
         workspace = capture_json(client, root)
+        report_activity(detail=f"Reading source workspace '{workspace.get('displayName', 'unnamed')}'")
         if canonical_id(workspace["id"]) != identity.workspace_id:
             raise FabricError("Workspace metadata returned a different source identity")
         if not workspace.get("capacityId") and selected is None:
@@ -898,20 +904,30 @@ def capture_workspaces(
         acls, gaps = _role_assignments(roles, workspace=identity)
         desired.extend(acls)
         unresolved.extend(gaps)
+        inventory = capture_list(client, f"{root}/items")
+        # Only skip Spark reads when the complete inventory is exclusively non-Spark.
+        # Spark/unknown workloads keep strict reads: a 404 is never an empty-pool claim.
+        # https://learn.microsoft.com/fabric/data-engineering/workspace-admin-settings
+        spark_required = not inventory or any(
+            row.get("type") not in NON_SPARK_WORKSPACE_ITEMS for row in inventory
+        )
+        spark_pools = capture_list(client, f"{root}/spark/pools") if spark_required else []
+        spark_settings = capture_json(client, f"{root}/spark/settings") if spark_required else {}
         properties = {
             **workspace,
             "bcdr": {
                 "control_workspace": recovery_set.control_workspace.model_dump(mode="json"),
                 "folders": capture_list(client, f"{root}/folders"),
-                "spark_pools": capture_list(client, f"{root}/spark/pools"),
-                "spark_settings": capture_json(client, f"{root}/spark/settings"),
+                "spark_pools": spark_pools,
+                "spark_settings": spark_settings,
+                "spark_capture_state": "captured" if spark_required else "not_applicable_to_items",
                 "role_assignments": roles,
             },
         }
         workspace_captures, managed, derived, gaps = _workspace_inventory(
             client,
             identity,
-            capture_list(client, f"{root}/items"),
+            inventory,
             readers,
         )
         properties["bcdr"]["system_items"] = managed

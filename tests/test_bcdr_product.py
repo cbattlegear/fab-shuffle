@@ -116,6 +116,10 @@ LAKEHOUSE = {
     },
 }
 LIFECYCLE_REQUESTS = [
+    ("reconcile-sync-owner", {
+        "expected_controller_id": SPN, "expected_epoch": 1, "previous_controller_stopped": True,
+        "fencing_evidence": "Previous worker stopped",
+    }),
     ("configure-standby-defaults", {"target_capacity_id": TARGET_CAPACITY}),
     ("start-dr-test", {"generation_id": GENERATION, "group_ids": ["sales"]}),
     ("continue-dr-test", {"test_id": GENERATION}),
@@ -185,6 +189,14 @@ class Service:
 
     def configure_standby_defaults(self, request):
         self.calls.append(("configure-standby-defaults", request))
+        return self.result
+
+    def retry_standby(self, request):
+        self.calls.append(("retry-standby", request))
+        return self.result
+
+    def reconcile_sync_owner(self, request):
+        self.calls.append(("reconcile-sync-owner", request))
         return self.result
 
     def plan(self, request):

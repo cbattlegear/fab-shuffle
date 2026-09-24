@@ -135,6 +135,7 @@ class StandbySelectionRequest(Record):
     workspace_ids: tuple[Guid, ...] = ()
     name_pattern: str = Field(default="", max_length=256, pattern=r"^[^\r\n\x00]*$")
     expected_configuration: Digest | None = None
+    resume_interrupted: StrictBool = False
 
     @model_validator(mode="after")
     def explicit_selection(self) -> StandbySelectionRequest:
@@ -150,6 +151,17 @@ class StandbySelectionRequest(Record):
 
 class StandbyDefaultsRequest(Record):
     target_capacity_id: Guid
+
+
+class RetryStandbyRequest(Record):
+    expected_attempt_id: Guid
+
+
+class ReconcileSyncOwnerRequest(Record):
+    expected_controller_id: Guid
+    expected_epoch: int = Field(ge=1)
+    previous_controller_stopped: Literal[True]
+    fencing_evidence: Nonempty
 
 
 class ItemReadiness(Record):
@@ -377,6 +389,14 @@ class BcdrService:
     def configure_standby_defaults(self, request: StandbyDefaultsRequest) -> ServiceResult:
         from fabshuffle.bcdr.workflow import configure_standby_defaults
         return self._call(lambda: configure_standby_defaults(self.coordinator, request))
+
+    def retry_standby(self, request: RetryStandbyRequest) -> ServiceResult:
+        from fabshuffle.bcdr.sync_recovery import retry_saved_sync
+        return self._call(lambda: retry_saved_sync(self.coordinator, request))
+
+    def reconcile_sync_owner(self, request: ReconcileSyncOwnerRequest) -> ServiceResult:
+        from fabshuffle.bcdr.sync_recovery import reconcile_sync_owner
+        return self._call(lambda: reconcile_sync_owner(self.coordinator, request))
 
     def configure_protection(self, request: ConfigureProtectionRequest) -> ServiceResult:
         return self._call(lambda: self.coordinator.configure_protection(request))

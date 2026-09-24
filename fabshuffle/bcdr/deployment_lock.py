@@ -23,6 +23,7 @@ from xml.etree import ElementTree
 import httpx
 
 from fabshuffle.auth import TokenProvider
+from fabshuffle.bcdr.activity import report_activity
 from fabshuffle.bcdr.backend import RecoveryBlocked
 from fabshuffle.lifecycle import safe_text
 
@@ -228,6 +229,8 @@ class DeploymentLock:
 
         self.remote: BlobLease | None = None
         self.fd: int | None = None
+        self.acquired = False
+        report_activity("Acquiring deployment ownership")
         url = os.environ.get(LEASE_ENV)
         if url is not None:
             validate_blob_url(url)
@@ -245,6 +248,8 @@ class DeploymentLock:
                 lock_path = path.with_suffix(path.suffix + ".controller.lock")
             self.fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.acquired = True
+            report_activity(detail="Exclusive deployment lock acquired", owns_deployment=True)
         except BaseException as error:
             self.close()
             if isinstance(error, BlockingIOError):
@@ -267,6 +272,9 @@ class DeploymentLock:
             if self.fd is not None:
                 os.close(self.fd)
                 self.fd = None
+                if self.acquired:
+                    self.acquired = False
+                    report_activity(detail="Deployment lock released", owns_deployment=False)
 
 
 class GuardedTokens(TokenProvider):

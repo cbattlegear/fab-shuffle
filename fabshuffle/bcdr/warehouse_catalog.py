@@ -24,6 +24,7 @@ import pyodbc
 from pydantic import BaseModel, ValidationError
 
 from fabshuffle.auth import TokenProvider
+from fabshuffle.bcdr.activity import report_activity
 from fabshuffle.bcdr.catalog import (
     AmbiguousCommit,
     CapturedGeneration,
@@ -233,7 +234,10 @@ class WarehouseCatalog(RecoveryCatalog):
         _validate_endpoint(server, database)
         if canonical_id(tokens.principal.tenant_id) != recovery_set.tenant_id:
             raise ValueError("The SQL token provider belongs to a different recovery tenant")
-        return cls(lambda: connect(server, database, tokens), recovery_set, guard=guard)
+        return cls(lambda: connect(
+            server, database, tokens,
+            on_progress=lambda _: report_activity(detail="Waiting for the metadata SQL endpoint"),
+        ), recovery_set, guard=guard)
 
     @classmethod
     def open_from_endpoint(
@@ -250,7 +254,10 @@ class WarehouseCatalog(RecoveryCatalog):
         expected_recovery_set_id = canonical_id(expected_recovery_set_id)
         if guard is not None:
             guard()
-        connection = connect(server, warehouse_id, tokens)
+        connection = connect(
+            server, warehouse_id, tokens,
+            on_progress=lambda _: report_activity(detail="Waiting for the metadata SQL endpoint"),
+        )
         try:
             if guard is not None:
                 guard()

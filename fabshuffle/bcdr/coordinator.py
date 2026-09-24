@@ -18,6 +18,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from fabshuffle.auth import TokenProvider
 from fabshuffle.bcdr.access import AccessController, FabricAccess, remap_acl
+from fabshuffle.bcdr.activity import report_activity
 from fabshuffle.bcdr.adapters import (
     adapter_capabilities,
     apply_captured_item,
@@ -683,17 +684,25 @@ class RecoveryCoordinator:
 
     def synchronize(
         self, request: SyncRequest, *, standby_only: bool = False, scheduled: bool | None = None,
+        scope_names: Sequence[str] = (),
     ) -> ServiceResult:
+        from fabshuffle.bcdr.sync_recovery import sync_phase, track_sync_attempt
+
         self._wake()
         is_scheduled = standby_only if scheduled is None else scheduled
         modes = {RecoveryMode.STANDBY} if standby_only else {RecoveryMode.STANDBY, RecoveryMode.SYNCING}
-        with self.runtime.controller(modes):
+        with self.runtime.controller(modes), track_sync_attempt(
+            self, request, scheduled=is_scheduled, scope_names=scope_names,
+        ) as attempt:
             if self.runtime.mode == RecoveryMode.STANDBY:
                 self.runtime.transition(RecoveryMode.SYNCING)
+            sync_phase(self, attempt, "Preparing recovery capacity")
             self.capacities.resume_business(self.runtime)
+            sync_phase(self, attempt, "Capturing source metadata")
             generation = (
                 self._capture() if request.capture else self.catalog.load_generation(request.generation_id)
             )
+            sync_phase(self, attempt, "Planning the selected standby scope")
             plan = self._plan(generation, request)
             self.runtime.put("plans", generation.snapshot.generation_id, request.model_dump(mode="json"))
             for route in request.connection_mappings:
@@ -706,6 +715,7 @@ class RecoveryCoordinator:
                         "evidence": route.evidence,
                     },
                 )
+            sync_phase(self, attempt, "Applying stopped standby metadata")
             groups, warnings = self._apply_plan(generation, plan, request.suffix)
             from fabshuffle.bcdr.workflow import prepared_metadata_groups
 
@@ -719,6 +729,7 @@ class RecoveryCoordinator:
             self.runtime.put("lifecycle", "last-sync", summary)
             if is_scheduled:
                 self.runtime.put("lifecycle", "last-scheduled-sync", summary)
+            sync_phase(self, attempt, "Metadata synchronization completed", metadata_complete=True)
             self.runtime.transition(RecoveryMode.STANDBY)
             result = ServiceResult(
                 mode=RecoveryMode.STANDBY,
@@ -727,7 +738,9 @@ class RecoveryCoordinator:
                 warnings=warnings,
             )
             if request.park:
+                sync_phase(self, attempt, "Parking recovery capacity", metadata_complete=True)
                 self.capacities.park(self.runtime, tuple(self.workspace_mappings().values()))
+            report_activity("Synchronization request completed")
             return result.model_copy(
                 update={
                     "mode": self.runtime.mode,

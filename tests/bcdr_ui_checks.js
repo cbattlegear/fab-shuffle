@@ -9,7 +9,7 @@ function setup() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "fabshuffle", "web", "static",
     "bcdr-workflows.js"), "utf8"), f.context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "fabshuffle", "web", "static", "bcdr.js"), "utf8") + `
-    globalThis.product = { bcdr, bcdrField, bcdrRenderForms, bcdrRenderResult, bcdrSubmit, bcdrConfirm, bcdrJourney };
+    globalThis.product = { bcdr, bcdrField, bcdrRenderForms, bcdrRenderResult, bcdrSubmit, bcdrConfirm, bcdrJourney, bcdrWatchActivity };
   `, f.context);
   f.product = f.context.product;
   Object.assign(f.ui.state, { sessionId: "same-tenant-session" });
@@ -108,6 +108,85 @@ function discoverButton(f) {
 }
 
 const scenarios = {
+  async activity_observation_identifies_the_local_worker_without_catalog_requests(f) {
+    f.get("bcdr-panel").hidden = false;
+    f.observations.response = { active: [{
+      id: "local-request", action: "Create standby", phase: "Capturing source metadata",
+      detail: "Reading source workspace", status: "running", elapsed_seconds: 75, owns_deployment: true,
+    }], recent: [] };
+    await f.product.bcdrWatchActivity(true);
+    assert.match(f.get("bcdr-activity-list").textContent, /Create standby.*Capturing source metadata/s);
+    assert.match(f.get("bcdr-activity-list").textContent, /holds the deployment lock/);
+    assert.equal(f.get("bcdr-activity-status").dataset.loading, "true");
+    assert.equal(f.requests.length, 0);
+    assert.equal(f.observations.requests[0].url, "/api/bcdr/activity");
+    f.observations.response = { active: [], recent: [{
+      action: "Create standby", phase: "Capturing source metadata", status: "failed",
+      elapsed_seconds: 80, error: "NotFound: required metadata unavailable",
+    }] };
+    await f.product.bcdrWatchActivity();
+    assert.equal(f.get("bcdr-activity-status").dataset.loading, "false");
+    assert.match(f.get("bcdr-activity-list").textContent, /NotFound/);
+    assert.match(f.get("bcdr-activity-status").textContent, /Other processes/);
+  },
+  async workspace_loading_and_preview_show_and_clear_activity_indicators(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    const scope = f.product.bcdr.scope;
+    assert.equal(scope.reload.dataset.loading, "true");
+    await f.reply(0, simpleScope);
+    assert.equal(scope.reload.dataset.loading, "false");
+    const checkbox = scope.entries.querySelector("input");
+    checkbox.checked = true;
+    checkbox.handlers.change();
+    scope.review.click();
+    assert.equal(scope.review.dataset.loading, "true");
+    await f.reply(1, { detail: "NotFound: source unavailable" }, 404);
+    assert.equal(scope.review.dataset.loading, "false");
+    assert.match(scope.section.textContent, /NotFound/);
+  },
+  async retry_saved_sync_is_offered_without_rebuilding_its_selection(f) {
+    const retry = { ...command, name: "retry-standby", path: "/api/bcdr/retry-standby", label: "Retry saved sync" };
+    f.product.bcdrRenderForms([command, retry]);
+    f.product.bcdrJourney("setup");
+    await f.reply(0, { mode: "syncing", details: {
+      sync_recovery: { interrupted: true, can_retry: true, attempt_id: "saved-attempt",
+        phase: "Capturing source metadata", error: "NotFound: original error", message: "Retry the recorded selection",
+        scope: { workspace_names: ["Mirror workspace"] } },
+      standby_scope: { workspaces: [], target_capacities: [], resume_required: true,
+        message: "Retry the recorded selection" },
+    } });
+    assert.equal(f.product.bcdr.scope.review.hidden, true);
+    const recovery = f.get("bcdr-sync-recovery");
+    assert.match(recovery.textContent, /Mirror workspace.*NotFound/s);
+    recovery.querySelectorAll("button").find((button) => button.textContent === "Retry saved sync").click();
+    const payload = JSON.parse(f.requests[1].options.body);
+    assert.equal(payload.confirmation, "retry-standby");
+    assert.deepEqual(payload.request, { expected_attempt_id: "saved-attempt" });
+    await f.reply(1, { ...result, details: { sync_summary: { metadata_ready: true } } });
+    assert.equal(f.get("bcdr-sync-recovery").hidden, true);
+  },
+  async legacy_resume_requires_review_and_sends_an_explicit_resume_flag(f) {
+    f.product.bcdrRenderForms([command]);
+    f.product.bcdrJourney("setup");
+    await f.reply(0, { ...simpleScope, details: { ...simpleScope.details,
+      sync_recovery: { interrupted: true, requires_selection: true, mode: "syncing",
+        message: "The prior version did not retain the selection. Review it to resume." },
+    } });
+    const scope = f.product.bcdr.scope;
+    const checkbox = scope.entries.querySelector("input");
+    checkbox.checked = true;
+    checkbox.handlers.change();
+    scope.review.click();
+    await f.reply(1, { details: { standby_preview: {
+      configuration: "a".repeat(64), workspaces: simpleScope.details.standby_scope.workspaces,
+      resume_interrupted: true, message: "Resume with this reviewed selection",
+    } } });
+    assert.equal(scope.start.textContent, "Resume standby setup");
+    scope.start.click();
+    assert.equal(JSON.parse(f.requests[2].options.body).request.resume_interrupted, true);
+    await f.reply(2, result);
+  },
   async normal_standby_setup_only_selects_workspace_scope(f) {
     f.product.bcdrRenderForms([warehouseSetupCommand, command]);
     f.product.bcdrJourney("setup", "select");
@@ -860,10 +939,12 @@ const scenarios = {
     const button = form.querySelector("button");
     const pending = f.product.bcdrSubmit(command, { generation_id: "pinned" }, button);
     assert.equal(button.disabled, true);
+    assert.equal(button["aria-busy"], "true");
     assert.match(form.querySelector(".bcdr-action-progress").textContent, /does not cancel/);
     await f.reply(0, { detail: "CapacityNotActive: resume failed; retry the recorded operation." }, 409);
     await pending;
     assert.equal(button.disabled, false);
+    assert.equal(button["aria-busy"], "false");
     assert.equal(f.get("bcdr-error").hidden, true);
     assert.match(form.querySelector(".bcdr-action-error").textContent, /CapacityNotActive/);
     assert.equal(f.document.activeElement, button);

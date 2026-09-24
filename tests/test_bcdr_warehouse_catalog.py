@@ -389,7 +389,7 @@ def test_open_existing_catalog_loads_configuration_from_sql_not_bootstrap(catalo
     tokens = Mock()
     tokens.principal.tenant_id = catalog.recovery_set.tenant_id
     connector = Mock(side_effect=harness.connect)
-    monkeypatch.setattr("fabshuffle.bcdr.warehouse_catalog.connect", lambda *_args: connector())
+    monkeypatch.setattr("fabshuffle.bcdr.warehouse_catalog.connect", lambda *_args, **_kwargs: connector())
     opened = WarehouseCatalog.open_from_endpoint(
         "control.datawarehouse.fabric.microsoft.com", catalog.recovery_set.control_warehouse.item_id,
         tokens, expected_recovery_set_id=catalog.recovery_set.recovery_set_id,

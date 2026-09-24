@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
+from fabshuffle.bcdr.activity import ACTIVITY, CURRENT_ACTION
 from fabshuffle.bcdr.backend import RecoveryBlocked
 from fabshuffle.bcdr.bootstrap import BootstrapError, BootstrapStore, canonical_arm_id
 from fabshuffle.bcdr.capacity import ArmCapacityClient, CapacityError
@@ -41,6 +42,8 @@ from fabshuffle.bcdr.service import (
     PlanRequest,
     RearmRequest,
     ReconcileOperationRequest,
+    ReconcileSyncOwnerRequest,
+    RetryStandbyRequest,
     ScheduleGuideRequest,
     ServiceResult,
     SetupRequest,
@@ -77,6 +80,7 @@ class BcdrRoute(APIRoute):
         original = super().get_route_handler()
 
         async def handle(request):
+            token = CURRENT_ACTION.set(self.name.replace("_", "-"))
             try:
                 return await original(request)
             except RequestValidationError as error:
@@ -86,6 +90,8 @@ class BcdrRoute(APIRoute):
                     {"loc": entry["loc"], "msg": entry["msg"], "type": entry["type"]}
                     for entry in error.errors()
                 ]})
+            finally:
+                CURRENT_ACTION.reset(token)
 
         return handle
 
@@ -97,7 +103,25 @@ def bootstrap_path() -> Path:
     )).resolve()
 
 
+def _activity_key(session: Session):
+    principal = session.destination_tokens.principal
+    path = os.environ.get(
+        "FAB_SHUFFLE_BCDR_BOOTSTRAP", str(SETTINGS.scratch_root / "bcdr" / "bootstrap.json"),
+    )
+    return (principal.tenant_id.casefold(), principal.client_id.casefold(), path)
+
+
 COMMANDS = (
+    ("retry-standby", "Retry saved sync", RetryStandbyRequest,
+     "Continue the recorded workspace/rule selection after the previous request has stopped. "
+     "No lock or mutation receipt is cleared.",
+     "Retry the same saved synchronization request, preserving owned targets and receipts. "
+     "A worker owner or pending mutation still blocks this action."),
+    ("reconcile-sync-owner", "Reconcile interrupted sync ownership", ReconcileSyncOwnerRequest,
+     "Use only after stopping/fencing the previous worker and only when no mutation receipts are pending. "
+     "This releases catalog ownership without changing the sync mode or starting work.",
+     "Confirm the previous worker is stopped and fenced. Reconcile only the recorded controller epoch. "
+     "This does not cancel a running worker, delete lock files or discard operation receipts."),
     ("configure-standby-defaults", "Save default recovery capacity", StandbyDefaultsRequest,
      "One-time routing default for sources without an existing approved route. "
      "Choose an already authorized recovery capacity; existing routes remain unchanged.",
@@ -323,7 +347,16 @@ def create_router(
     async def execute(session, work):
         # A disconnected request must not abandon a mutating worker or close its
         # clients underneath it. Service operations settle before cancellation exits.
-        task = asyncio.create_task(run_fabric(work))
+        action = CURRENT_ACTION.get()
+        labels = {name: label for name, label, *_ in COMMANDS}
+        labels.update({
+            "forms": "Load workflow forms", "status": "Load recovery status",
+            "standby-scope": "Load workspace choices", "preview-standby": "Review workspace selection",
+            "create-standby": "Create or update standby", "warehouse-choices": "List metadata Warehouses",
+        })
+        task = asyncio.create_task(run_fabric(
+            lambda: ACTIVITY.run(_activity_key(session), labels.get(action, action), work)
+        ))
         try:
             return await asyncio.shield(task)
         except (RecoveryBlocked, CatalogConflict) as error:
@@ -345,6 +378,10 @@ def create_router(
                 status_code=409, detail=f"Review the consequences and explicitly confirm '{action}'."
             )
         return body.request
+
+    @router.get("/activity")
+    async def activity(session=Depends(require_session)):
+        return ACTIVITY.snapshot(_activity_key(session))
 
     @router.get("/forms")
     async def forms(session=Depends(require_session)):
@@ -517,6 +554,22 @@ def create_router(
         request = confirmed(body, "create-standby")
         return await execute(session, lambda: _service_call(
             session, lambda service: service.create_standby(request), source_access=True,
+        ))
+
+    @router.post("/retry-standby", response_model=ServiceResult)
+    async def retry_standby(body: ConfirmedRequest[RetryStandbyRequest], session=Depends(require_session)):
+        request = confirmed(body, "retry-standby")
+        return await execute(session, lambda: _service_call(
+            session, lambda service: service.retry_standby(request), source_access=True,
+        ))
+
+    @router.post("/reconcile-sync-owner", response_model=ServiceResult)
+    async def reconcile_sync_owner(
+        body: ConfirmedRequest[ReconcileSyncOwnerRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "reconcile-sync-owner")
+        return await execute(session, lambda: _service_call(
+            session, lambda service: service.reconcile_sync_owner(request),
         ))
 
     @router.post("/configure-standby-defaults", response_model=ServiceResult)
