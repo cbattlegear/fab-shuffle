@@ -61,6 +61,7 @@ from fabshuffle.bcdr.protection_lakehouse import (
     LakehouseProtection,
     restore_lakehouse,
     validate_lakehouse,
+    verify_lakehouse_copy,
 )
 from fabshuffle.bcdr.protection_sql import SqlProtection, restore_sql
 from fabshuffle.fabric import cosmosdb, sqldatabases
@@ -703,7 +704,107 @@ class ProviderDataRecovery:
             f"{generation.snapshot.generation_id}:{item.identity.key}:"
             f"{target.key}:{record.artifact_reference}"
         )
+        if is_lakehouse:
+            current_preparation = runtime.get(
+                "data-prepared", f"{generation.snapshot.generation_id}/{item.identity.key}",
+            )
+            retained = [
+                row.document for row in runtime.catalog.list_records("data-prepared")
+                if row.document.get("source") == item.identity.model_dump(mode="json")
+                and row.document.get("target") == target.model_dump(mode="json")
+            ]
+            verified = None
+            owned_copy = False
+            retained.sort(
+                key=lambda candidate: candidate.get("generation_id") != generation.snapshot.generation_id
+            )
+            for candidate in retained:
+                operation = next(
+                    (row for row in runtime.catalog.operations()
+                     if row.operation_id == candidate.get("operation_id")), None,
+                )
+                if (
+                    operation is None or operation.state != OperationState.SUCCEEDED
+                    or operation.kind not in {"data-restore", "lakehouse-copy-verify"}
+                    or operation.source != item.identity or operation.target != target
+                ):
+                    continue
+                prior = _RestoreResult.model_validate_json(operation.message)
+                if (prior.source != item.identity or prior.target != target or prior.preparation is None
+                        or prior.preparation_operation_id != operation.operation_id
+                        or operation.generation_id != candidate.get("generation_id")
+                        or candidate.get("configuration_digest") != prior.configuration_digest):
+                    raise ProtectionError("Retained copy receipt does not match its recorded ownership.")
+                owned_copy = True
+                if prior.configuration_digest == record.sha256:
+                    verified = prior
+                    break
+            if verified is not None:
+                try:
+                    self._lakehouse_target(target, configuration.descriptor, runtime)
+                    receipt = verify_lakehouse_copy(
+                        configuration.descriptor, source=_data_identity(item.identity),
+                        target=_data_identity(target), tokens=self.tokens, target_client=self.client,
+                        max_age=timedelta(seconds=configuration.max_age_seconds),
+                        limits=self.limits, cancel=fence,
+                    )
+                except _PROVIDER_ERRORS as error:
+                    existing = runtime.get(
+                        "data-prepared", f"{generation.snapshot.generation_id}/{item.identity.key}",
+                    )
+                    if existing:
+                        runtime.put(
+                            "data-prepared", f"{generation.snapshot.generation_id}/{item.identity.key}",
+                            {**existing, "invalidated": True, "invalidation_reason": safe_text(str(error))},
+                        )
+                    return False, (
+                        f"{item.display_name}: retained copy validation failed: {safe_text(str(error))}. "
+                        "No data was written; reconcile the changed target before retrying.",
+                    )
+                if (
+                    current_preparation
+                    and current_preparation.get("operation_id") == verified.preparation_operation_id
+                    and current_preparation.get("configuration_digest") == record.sha256
+                    and not current_preparation.get("invalidated")
+                ):
+                    return False, receipt.warnings
+
+                def observe_copy():
+                    return _RestoreResult(
+                        configuration_digest=record.sha256, source=item.identity, target=target,
+                        state="restored_stopped", data_ready=False, preparation=receipt,
+                        preparation_operation_id=runtime.current_operation.operation_id,
+                        warnings=receipt.warnings,
+                    ).model_dump(mode="json")
+
+                verify_key = f"{key}/{runtime.require_lease().epoch}" if (
+                    current_preparation and current_preparation.get("invalidated")
+                ) else key
+                result = _RestoreResult.model_validate(runtime.effect(
+                    "lakehouse-copy-verify", verify_key, observe_copy,
+                    generation_id=generation.snapshot.generation_id, source=item.identity, target=target,
+                ))
+                if (
+                    result.source != item.identity or result.target != target
+                    or result.configuration_digest != record.sha256 or result.preparation is None
+                    or result.preparation_operation_id is None
+                ):
+                    raise ProtectionError("Copy verification does not match the pinned target/input.")
+                _save_preparation(runtime, generation, item, record, result)
+                return False, result.warnings
+            if retained:
+                if not owned_copy:
+                    raise ProtectionError("Retained copy metadata has no successful ownership receipt.")
+                return False, (
+                    f"{item.display_name}: this target has a copy from another protected input. "
+                    "Use a fresh owned target or an approved refresh plan; snapshots were not merged.",
+                )
         executed = False
+        lakehouse_write_attempted = False
+
+        def before_lakehouse_write():
+            nonlocal lakehouse_write_attempted
+            lakehouse_write_attempted = True
 
         def action() -> dict[str, JsonValue]:
             nonlocal executed
@@ -723,6 +824,7 @@ class ProviderDataRecovery:
                         target_client=self.client,
                         limits=self.limits,
                         cancel=fence,
+                        on_write=before_lakehouse_write,
                     )
                     runtime.fence()
                     operation = runtime.current_operation
@@ -785,21 +887,25 @@ class ProviderDataRecovery:
                 # A source-offline import may have written part of the destination.
                 # A definitive service rejection is not proof the composite action was atomic.
                 runtime.fence()
+                read_only_failure = is_lakehouse and not lakehouse_write_attempted
                 runtime.catalog.record_operation(
                     runtime.require_lease(),
                     operation.model_copy(
                         update={
-                            "state": OperationState.AMBIGUOUS,
+                            "state": OperationState.FAILED if read_only_failure else OperationState.AMBIGUOUS,
                             "recorded_at": datetime.now(UTC),
                             "error_code": safe_text(str(getattr(error, "error_code", "") or "")) or None,
                             "message": message,
                         }
                     ),
                 )
-                raise ProviderRestoreFailed(
-                    f"{item.display_name}: {message}. Keep the target unready and reconcile the recorded "
-                    "partial restore before retrying; do not merge data with blind upserts."
-                ) from None
+                action = (
+                    "No data write was attempted. Correct the preflight problem before retrying."
+                    if read_only_failure else
+                    "Keep the target unready and reconcile the recorded partial restore before retrying; "
+                    "do not merge data with blind upserts."
+                )
+                raise ProviderRestoreFailed(f"{item.display_name}: {message}. {action}") from None
 
         try:
             result = _RestoreResult.model_validate(
@@ -837,19 +943,16 @@ class ProviderDataRecovery:
                 raise ProtectionError(
                     "Stored preparation receipt is not a complete Lakehouse copy observation."
                 )
-            runtime.put(
-                "data-prepared",
-                f"{generation.snapshot.generation_id}/{item.identity.key}",
-                {
-                    "target": target.model_dump(mode="json"),
-                    "source": item.identity.model_dump(mode="json"),
-                    "generation_id": generation.snapshot.generation_id,
-                    "configuration_digest": record.sha256,
-                    "operation_id": result.preparation_operation_id,
-                    **result.preparation.model_dump(mode="json"),
-                },
-            )
+            _save_preparation(runtime, generation, item, record, result)
         return result.data_ready and result.state == "restored_stopped", result.warnings
+
+
+def _save_preparation(runtime, generation, item, record, result):
+    runtime.put("data-prepared", f"{generation.snapshot.generation_id}/{item.identity.key}", {
+        "target": result.target.model_dump(mode="json"), "source": item.identity.model_dump(mode="json"),
+        "generation_id": generation.snapshot.generation_id, "configuration_digest": record.sha256,
+        "operation_id": result.preparation_operation_id, **result.preparation.model_dump(mode="json"),
+    })
 
 
 def build_data_recovery(

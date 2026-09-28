@@ -439,8 +439,21 @@ class CaptureSnapshot(Record):
                     [{"id": item.identity.item_id, "type": item.item_type, "displayName": item.display_name}],
                     force_rebuild=True, require_stopped=True,
                 )
+                subtype_unsupported = False
+                classification = item.properties["bcdr"].get("dataflow_classification")
+                if item.item_type == "Dataflow" and isinstance(classification, dict):
+                    from fabshuffle.fabric.analytics import classify_dataflow_definition
+
+                    if classification.get("error_code") == "OperationNotSupportedForItem":
+                        subtype_unsupported = True
+                    elif isinstance(classification.get("definition"), dict):
+                        _, reason = classify_dataflow_definition(
+                            classification["definition"], {"displayName": item.display_name}, strict=True,
+                        )
+                        subtype_unsupported = reason is not None
                 if (
-                    not assessment.unsupported or item.capture_complete or item.unresolved or item.payload_ids
+                    (not assessment.unsupported and not subtype_unsupported)
+                    or item.capture_complete or item.unresolved or item.payload_ids
                     or not item.properties["bcdr"].get("unsupported_reason")
                 ):
                     raise ValueError(f"Invalid unsupported-inventory record for '{item.display_name}'")

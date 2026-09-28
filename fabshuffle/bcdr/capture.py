@@ -52,8 +52,8 @@ from fabshuffle.bcdr.contracts import (
 )
 from fabshuffle.bcdr.payloads import CapturedPayload, chunk_count
 from fabshuffle.bcdr.registry import TYPE_REGISTRY
-from fabshuffle.fabric import analytics, special_items
-from fabshuffle.fabric.client import FabricClient, FabricError
+from fabshuffle.fabric import analytics, migration_refs, special_items
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.fabric.definitions import decode_json_part, find_part, is_text_part, part
 from fabshuffle.fabric.items import get_item_definition, is_system_item
 from fabshuffle.fabric.support import assess_workspace, is_derived_type
@@ -299,6 +299,26 @@ def _sql_coordinates(item_type: str, name: str, properties: Mapping[str, Any]) -
     return properties.get("connectionString") or properties.get("connectionInfo", ""), name
 
 
+def _excluded_capture(identity, item_type, listed, captured_at, reason, *, evidence=None):
+    name = listed.get("displayName") or identity.item_id
+    logger.warning("BCDR inventory-only item: id=%s type=%s name=%r reason=%s",
+                   identity.item_id, item_type, safe_text(str(name)), reason)
+    properties = {"bcdr": {
+        "raw_item": listed, "inventory_only": True, "unsupported_reason": reason,
+        "dependency_evidence": "not_captured",
+        "dependency_action": (
+            "This item is excluded by the shared migration policy; replace dependencies explicitly."
+        ),
+    }}
+    if evidence is not None:
+        properties["bcdr"]["dataflow_classification"] = evidence
+    reject_embedded_secrets(canonical_json(properties))
+    return ItemCapture(ItemRecord(
+        identity=identity, item_type=item_type, display_name=name, captured_at=captured_at,
+        api_version="v1", properties=properties, capture_complete=False, activation="unknown",
+    ), ())
+
+
 def capture_item(
     client: FabricClient,
     identity: ItemIdentity,
@@ -319,24 +339,9 @@ def capture_item(
     assessment = assess_workspace((listed,), force_rebuild=True, require_stopped=True)
     if assessment.unsupported:
         unsupported = assessment.unsupported[0]
-        logger.warning(
-            "BCDR inventory-only item: id=%s type=%s name=%r reason=%s",
-            identity.item_id, item_type, safe_text(unsupported.name), unsupported.reason,
+        return _excluded_capture(
+            identity, item_type, listed, captured_at, unsupported.reason,
         )
-        properties = {"bcdr": {
-            "raw_item": listed, "inventory_only": True,
-            "unsupported_reason": unsupported.reason,
-            "dependency_evidence": "not_captured",
-            "dependency_action": (
-                "This item is excluded by the shared rebuild policy; replace dependencies explicitly."
-            ),
-        }}
-        reject_embedded_secrets(canonical_json(properties))
-        return ItemCapture(ItemRecord(
-            identity=identity, item_type=item_type, display_name=unsupported.name,
-            captured_at=captured_at, api_version="v1", properties=properties,
-            capture_complete=False, activation="unknown",
-        ), ())
     if not assessment.migrated:
         raise FabricError("Derived items require their owning item's inventory path, not independent capture")
     contract = TYPE_REGISTRY.get(item_type)
@@ -348,6 +353,28 @@ def capture_item(
     logger.info("BCDR capturing item: id=%s type=%s name=%r",
                 identity.item_id, item_type, safe_text(str(listed.get("displayName") or "")))
     report_activity(detail=f"Reading {item_type} '{listed.get('displayName') or identity.item_id}'")
+    definition = None
+    if item_type == "Dataflow":
+        try:
+            definition = get_item_definition(client, identity.workspace_id, identity.item_id)
+        except FabricApiError as error:
+            # The endpoint documents this code as a definite unsupported item operation.
+            # Authentication failures and an arbitrary 400/404 remain required-read failures.
+            # https://learn.microsoft.com/rest/api/fabric/dataflow/items/get-dataflow-definition
+            if error.error_code != "OperationNotSupportedForItem":
+                raise
+            _, reason = analytics.classify_dataflow_definition(None, listed)
+            return _excluded_capture(
+                identity, item_type, listed, captured_at, f"{safe_text(str(error))}. {reason}",
+                evidence={"error_code": error.error_code},
+            )
+        _, reason = analytics.classify_dataflow_definition(definition, listed, strict=True)
+        if reason:
+            marker = find_part(definition["parts"], analytics.QUERY_METADATA_PART)
+            return _excluded_capture(
+                identity, item_type, listed, captured_at, reason,
+                evidence={"definition": {"parts": [marker] if marker else []}},
+            )
     raw = item_document(client, identity, item_type)
     name = raw["displayName"]
     properties = dict(raw.get("properties") or {})
@@ -361,7 +388,9 @@ def capture_item(
     payloads: list[CapturedPayload] = []
     fmt = definition_format(item_type)
     if item_type not in NO_DEFINITION:
-        definition = get_item_definition(client, identity.workspace_id, identity.item_id, fmt=fmt)
+        definition = definition if definition is not None else get_item_definition(
+            client, identity.workspace_id, identity.item_id, fmt=fmt,
+        )
         if definition.get("format") and fmt and definition["format"] != fmt:
             raise FabricError(f"'{name}' returned '{definition['format']}' instead of requested '{fmt}'")
         fmt = fmt or definition.get("format")
@@ -387,11 +416,6 @@ def capture_item(
                 unresolved.append(f"'{name}' needs its Cosmos container/partition-key metadata captured.")
             metadata["containers"] = body.get("containers")
             metadata["consistency_evidence"] = "Unknown; qualify the logical export's consistency separately."
-        elif item_type == "Dataflow":
-            candidate = find_part(parts, analytics.QUERY_METADATA_PART)
-            body = decode_json_part(candidate["payload"]) if candidate else {}
-            if str(body.get("formatVersion", "")) != analytics.CICD_DATAFLOW_FORMAT_VERSION:
-                unresolved.append(f"Upgrade '{name}' to Dataflow Gen2 (CI/CD), then capture its definition.")
 
     if contract and contract.migration_rebuild:
         # Use the strict REST endpoint, not preview helpers that replace read failures with [].
@@ -745,6 +769,7 @@ def _workspace_inventory(
 def _dependencies(
     captures: Sequence[ItemCapture],
     managed_items: Sequence[dict[str, Any]] = (),
+    workspace_names: Mapping[str, str] | None = None,
 ) -> tuple[DependencyEdge, ...]:
     """Known literal evidence, never a claim that arbitrary executable code was analyzed."""
     edges: list[DependencyEdge] = []
@@ -774,6 +799,32 @@ def _dependencies(
                 text = json.dumps(json.loads(text), ensure_ascii=False)
             texts.append(text)
         text = ("\n".join(texts) + canonical_json(dependency_metadata).decode("utf-8")).casefold()
+        if item.item_type == "Report":
+            try:
+                model = analytics.report_model_source(
+                    parts, [
+                        {"id": row.record.identity.item_id, "workspaceId": row.record.identity.workspace_id,
+                         "type": row.record.item_type, "displayName": row.record.display_name}
+                        for row in captures
+                    ], item.identity.workspace_id,
+                )
+            except FabricError as error:
+                edges.append(DependencyEdge(
+                    edge_id=str(uuid4()), consumer=item.identity,
+                    external_reference=f"report-model:{item.identity.key}", phase="bind",
+                    qualification=Qualification.UNVERIFIED, provenance="captured PBIR model binding",
+                    detail=str(error),
+                ))
+            else:
+                if model:
+                    edges.append(DependencyEdge(
+                        edge_id=str(uuid4()), consumer=item.identity,
+                        prerequisite=ItemIdentity(tenant_id=item.identity.tenant_id,
+                                                  workspace_id=model["workspaceId"], item_id=model["id"]),
+                        phase="bind", qualification=Qualification.DOCUMENTED,
+                        provenance="captured PBIR model binding",
+                        detail=f"Map semantic model '{model['displayName']}' before restoring this report.",
+                    ))
         for other in captures:
             if other.record.identity == item.identity:
                 continue
@@ -785,6 +836,12 @@ def _dependencies(
                     },
                 }
             )
+            identifiers.update(migration_refs.onelake_aliases(
+                other.record.identity.workspace_id,
+                (workspace_names or {}).get(other.record.identity.workspace_id, ""),
+                {"id": other.record.identity.item_id, "type": other.record.item_type,
+                 "displayName": other.record.display_name},
+            ))
             if any(identifier.casefold() in text for identifier in identifiers):
                 edges.append(
                     DependencyEdge(
@@ -1024,7 +1081,9 @@ def capture_workspaces(
         workspaces=tuple(workspaces),
         items=tuple(capture.record for capture in captures),
         payloads=tuple(p.descriptor for p in payloads),
-        dependencies=_dependencies(captures, managed_items),
+        dependencies=_dependencies(
+            captures, managed_items, {row.identity.workspace_id: row.display_name for row in workspaces},
+        ),
         desired_acls=tuple(desired),
         protections=protections,
         inventory_complete=True,

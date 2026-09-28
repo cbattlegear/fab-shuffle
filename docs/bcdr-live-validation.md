@@ -414,6 +414,24 @@ After the core path, test classic/schema-enabled/empty/Files-only Lakehouses, du
 names, both Direct Lake modes, Import refresh, explicit connection routes, CI/CD Dataflows
 and every adapter family required by the intended customer estate.
 
+### Migration-process parity checks
+
+Use disposable, explicitly approved fixtures to exercise capture, planning and application
+together, not only definitions supplied with already-complete mapping dictionaries.
+
+| Fixture | Required observation |
+| --- | --- |
+| Notebook with named and GUID OneLake paths, including HTTP and ABFSS | Stored target definition references the mapped destination only. An unqualified/ambiguous root blocks creation. |
+| KQL consumer with query/ingestion URI references | Destination item IDs and service-observed URI mappings reach the consumer; no source endpoint remains. |
+| Custom Spark pool, workspace settings and an environment using it | Pool/settings preparation precedes environment staging. A repeat sync reuses the exact owned pool; changed configuration blocks reuse rather than creating a duplicate. No environment is published. |
+| Classic/non-CI/CD Dataflow beside supported items | Named inventory-only exclusion; unrelated items synchronize. Permission or inconclusive definition failures still stop capture with their service error. |
+| Report bound by `../Name.SemanticModel` | Captured graph orders the exact model before the report, regardless of inventory/ID ordering. Ambiguous names remain blocked. |
+| Protected Lakehouse: test, end test, sync a new generation, test again with unchanged protection | Existing owned bytes are freshly verified without source reads or writes. New generation-bound readiness evidence is required. Changed bytes invalidate preparation; a changed protected input is not merged into the target. |
+
+These have credential-free regression coverage in `tests/test_bcdr_migration_reuse.py`
+and the protection-provider suites. Passing those tests is not a recorded live Fabric
+qualification; retain service observations and actual reader/query results for this runbook.
+
 Current limitations to classify honestly:
 
 - MirroredDatabase, populated Eventstream, Apache Airflow, SnowflakeDatabase and

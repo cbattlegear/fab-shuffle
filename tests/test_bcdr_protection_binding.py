@@ -68,6 +68,14 @@ class Catalog:
         self.check()
         return self.records.get((namespace, key))
 
+    def list_records(self, namespace):
+        self.check()
+        return [row for (kind, _), row in self.records.items() if kind == namespace]
+
+    def operations(self):
+        self.check()
+        return tuple(self.journal.values())
+
     def put_record(self, lease, namespace, key, document, *, expected_revision):
         self.check()
         previous = self.records.get((namespace, key))
@@ -81,7 +89,8 @@ class Catalog:
 
     def pending_operations(self):
         self.check()
-        return [op for op in self.journal.values() if op.state != OperationState.SUCCEEDED]
+        return [op for op in self.journal.values()
+                if op.state in {OperationState.INTENT, OperationState.RUNNING, OperationState.AMBIGUOUS}]
 
     def record_operation(self, lease, operation):
         self.check()
@@ -108,6 +117,10 @@ class Runtime:
 
     def require_lease(self):
         return self.lease
+
+    def get(self, namespace, key):
+        record = self.catalog.get_record(namespace, key)
+        return record.document if record else None
 
     def effect(self, kind, key, action, *, generation_id, source, target):
         self.fence()

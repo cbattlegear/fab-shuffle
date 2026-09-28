@@ -85,6 +85,7 @@ from fabshuffle.bcdr.service import (
     ServiceResult,
     SyncRequest,
 )
+from fabshuffle.fabric import migration_refs
 from fabshuffle.fabric.client import FabricClient
 from fabshuffle.fabric.support import assess_workspace
 from fabshuffle.fabric.workspaces import create_workspace
@@ -318,7 +319,10 @@ class RecoveryCoordinator:
                         is_store=cap.is_store,
                         provenance=cap.reason or "Qualified destination-only capture adapter",
                     ),
-                    eligible=not item.tombstone and item.identity.key in rebuildable,
+                    eligible=(
+                        not item.tombstone and item.identity.key in rebuildable
+                        and item.properties.get("bcdr", {}).get("inventory_only") is not True
+                    ),
                     data_required=needs_data(item),
                     protection_available=any(
                         p.item == item.identity and p.outcome == RecoveryOutcome.PROTECTED
@@ -460,14 +464,24 @@ class RecoveryCoordinator:
         applied: Mapping[str, AppliedItem],
     ) -> tuple[tuple[EndpointIdentity, str], ...]:
         pairs = []
+        pools = {row.key: row.document for row in self.catalog.list_records("spark-pools")}
         for item in generation.snapshot.items:
+            if item.item_type == "Environment":
+                pool = item.properties.get("bcdr", {}).get("environment", {}).get(
+                    "staging_compute", {},
+                ).get("instancePool", {})
+                source_pool = str(pool.get("id") or "").lower()
+                mapped = pools.get(f"{item.identity.tenant_id}/{item.identity.workspace_id}/{source_pool}")
+                if mapped:
+                    pairs.append((EndpointIdentity(
+                        item=item.identity, endpoint_kind="spark_pool_id", endpoint_id=source_pool,
+                    ), mapped["target_id"]))
             target = applied.get(item.identity.key)
             if target is None:
                 continue
             source = item.properties
-            if not any(
-                source.get(key) for key in ("sqlEndpointProperties", "serverFqdn", "connectionString")
-            ):
+            source_values = migration_refs.endpoint_values({"properties": source})
+            if not source_values:
                 continue
             observed = item_document(self.destination, target.target, item.item_type).get("properties", {})
             old_sql = source.get("sqlEndpointProperties") or {}
@@ -476,14 +490,9 @@ class RecoveryCoordinator:
                 raise RecoveryBlocked(
                     f"Wait for the destination SQL endpoint of '{item.display_name}' to report Success"
                 )
-            values = (
-                ("sql_endpoint_id", old_sql.get("id"), new_sql.get("id")),
-                ("sql_endpoint_server", old_sql.get("connectionString"), new_sql.get("connectionString")),
-                ("sql_server", source.get("serverFqdn"), observed.get("serverFqdn")),
-                ("sql_connection", source.get("connectionString"), observed.get("connectionString")),
-                ("sql_database_name", source.get("databaseName"), observed.get("databaseName")),
-            )
-            for kind, old, new in values:
+            target_values = migration_refs.endpoint_values({"properties": observed})
+            for kind, old in source_values.items():
+                new = target_values.get(kind)
                 if old:
                     if not isinstance(old, str) or not isinstance(new, str) or not new:
                         raise RecoveryBlocked(
@@ -761,6 +770,8 @@ class RecoveryCoordinator:
         plan: OperationPlan,
         suffix: str,
     ) -> tuple[tuple[GroupStatus, ...], tuple[str, ...]]:
+        from fabshuffle.bcdr.workspace_preparation import apply_default_environment, prepare_spark
+
         snapshot = generation.snapshot
         generation_id = snapshot.generation_id
         items = {item_key(row.identity): row for row in snapshot.items}
@@ -836,6 +847,7 @@ class RecoveryCoordinator:
                     ],
                     {grant.principal.key for grant in self.recovery_set.access_policy.workspace_grants()},
                 )
+                warnings.extend(prepare_spark(self, generation, workspace, target))
                 completed.add(key)
             elif op.kind in {"store_create", "item_create"}:
                 item = items[op.subject]
@@ -943,6 +955,9 @@ class RecoveryCoordinator:
                         workspace_mappings={
                             tuple(key.split("/")): value for key, value in workspaces.items()
                         },
+                        source_workspace_names={
+                            workspace_key(row.identity): row.display_name for row in snapshot.workspaces
+                        },
                         target_id=old.target.item_id if old else None,
                         tokens=self.tokens,
                         shell_only=shell,
@@ -1015,6 +1030,19 @@ class RecoveryCoordinator:
                     f"'{item.display_name}' was deleted at the source; "
                     "tombstone retained, standby not deleted"
                 )
+        for source_key, workspace in source_workspaces.items():
+            target = workspaces.get(workspace.identity.key)
+            if target is None or source_key not in {placement.source for placement in plan.placements}:
+                continue
+            try:
+                apply_default_environment(self, generation, workspace, target, applied)
+            except RecoveryBlocked as error:
+                if self.catalog.pending_operations():
+                    raise
+                warnings.append(str(error))
+                for item in snapshot.items:
+                    if workspace_key(item.identity) == source_key:
+                        blockers.setdefault(item.identity.key, []).append(str(error))
         groups = self._build_groups(generation, plan, applied, blockers)
         for group in groups:
             self._save_group(generation_id, group, metadata_blockers=group.blockers)
@@ -1578,6 +1606,9 @@ class RecoveryCoordinator:
                     for key, value in self.workspace_mappings().items()
                     if key in workspaces
                 },
+                source_workspace_names={
+                    workspace_key(row.identity): row.display_name for row in generation.snapshot.workspaces
+                },
                 endpoint_mappings=self._endpoint_pairs(generation, mappings),
                 connection_mappings=tuple((row.source, row.target) for row in plan.connection_mappings),
                 verified_external_connections=tuple(
@@ -1628,6 +1659,10 @@ class RecoveryCoordinator:
         record = self.runtime.get("data-prepared", f"{generation.snapshot.generation_id}/{item.identity.key}")
         if record is None:
             return None
+        if record.get("invalidated"):
+            raise RecoveryBlocked(
+                f"Revalidate the retained data copy before admission: {record.get('invalidation_reason')}"
+            )
         protection = [
             row
             for row in generation.snapshot.protections
@@ -1830,6 +1865,9 @@ class RecoveryCoordinator:
                 tokens=self.tokens,
                 item_mappings={item_key(row.source): row.target for row in applied.values()},
                 workspace_mappings={tuple(key.split("/")): value for key, value in workspaces.items()},
+                source_workspace_names={
+                    workspace_key(row.identity): row.display_name for row in generation.snapshot.workspaces
+                },
                 endpoint_mappings=self._endpoint_pairs(generation, applied),
                 connection_mappings=connection_pairs,
                 verified_external_connections=tuple(

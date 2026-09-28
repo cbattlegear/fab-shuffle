@@ -43,12 +43,21 @@ from fabshuffle.bcdr.contracts import (
 )
 from fabshuffle.bcdr.payloads import CapturedPayload
 from fabshuffle.bcdr.registry import TYPE_REGISTRY
-from fabshuffle.fabric import analytics, data_stores, eventhouses, special_items, sqldatabases
+from fabshuffle.fabric import (
+    analytics,
+    data_stores,
+    eventhouses,
+    migration_refs,
+    spark,
+    special_items,
+    sqldatabases,
+)
 from fabshuffle.fabric.client import FabricClient, FabricError
 from fabshuffle.fabric.definitions import (
     decode_json_part,
     decode_payload,
     find_part,
+    is_text_part,
     part,
     replace_part,
     rewrite_parts,
@@ -180,6 +189,7 @@ def _mapping(
     connection_mappings: Sequence[tuple[ConnectionIdentity, ConnectionIdentity]],
     target_id: str | None,
     verified_external_connections: Sequence[ConnectionIdentity] = (),
+    source_workspace_names: Mapping[WorkspaceKey, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
     if item.identity.tenant_id != target_workspace.tenant_id:
         raise FabricError("BCDR adapters require same-tenant recovery identities")
@@ -211,6 +221,7 @@ def _mapping(
             "id": row.identity.item_id,
             "type": row.item_type,
             "displayName": row.display_name,
+            "workspaceId": row.identity.workspace_id,
             "properties": {k: v for k, v in row.properties.items() if k != "bcdr"},
         }
         references[row.identity.workspace_id] = {
@@ -218,6 +229,12 @@ def _mapping(
             "type": "source workspace",
             "displayName": row.identity.workspace_id,
         }
+        for root in migration_refs.onelake_aliases(
+            row.identity.workspace_id,
+            (source_workspace_names or {}).get((row.identity.tenant_id, row.identity.workspace_id), ""),
+            references[row.identity.item_id],
+        ):
+            references[root] = references[row.identity.item_id]
     for raw_key, target in workspace_mappings.items():
         key = tuple(canonical_id(value) for value in raw_key)
         if len(key) != 2 or key[0] != target.tenant_id or key not in source_workspaces:
@@ -237,6 +254,11 @@ def _mapping(
         if expected_workspace != target.workspace_id:
             raise FabricError("Item mapping disagrees with its qualified workspace mapping")
         add(key[2], target.item_id)
+        for old, new in migration_refs.onelake_aliases(
+            key[1], (source_workspace_names or {}).get(key[:2], ""), references[key[2]],
+            target.workspace_id, target.item_id,
+        ).items():
+            add(old, new)
     if target_id:
         add(item.identity.item_id, canonical_id(target_id))
     for source, target in endpoint_mappings:
@@ -502,6 +524,19 @@ def _strict_references(
     )
     if remaining:
         raise analytics.StrandedReference(remaining)
+    allowed_roots = {
+        value.casefold() for key, value in replacements.items()
+        if migration_refs.referenced_onelake_roots(key)
+    }
+    for entry in rewritten:
+        if is_text_part(entry["path"]):
+            text = decode_payload(entry["payload"]).decode("utf-8")
+            roots = migration_refs.referenced_onelake_roots(text)
+            if any(root.casefold() not in allowed_roots for root in roots):
+                raise FabricError(
+                    "Map the complete OneLake item root using captured workspace/item identities and names; "
+                    "an unqualified named or external OneLake path cannot be retained."
+                )
     target_workspaces = {
         replacements[key].casefold()
         for key, value in references.items()
@@ -534,36 +569,26 @@ def _report_binding(
 ) -> None:
     if item.item_type != "Report":
         return
-    candidate = find_part(parts, "definition.pbir")
-    if not candidate:
-        raise FabricError("Capture definition.pbir before restoring a report/model binding")
-    document = decode_json_part(candidate["payload"])
-    reference = document.get("datasetReference") if isinstance(document, dict) else None
-    if not isinstance(reference, dict):
-        raise FabricError("Capture an inspectable report datasetReference")
-    if reference.get("byPath"):
-        path = reference["byPath"].get("path", "")
-        match = re.fullmatch(r"\.\./([^/\\]+)\.SemanticModel", path)
-        if not match:
-            raise FabricError("Resolve the report's nonstandard byPath model reference before restoring it")
-        models = [
-            row
+    model = analytics.report_model_source(
+        parts, [
+            {"id": row.identity.item_id, "workspaceId": row.identity.workspace_id,
+             "type": row.item_type, "displayName": row.display_name}
             for row in source_items
-            if row.item_type == "SemanticModel"
-            and row.display_name == match[1]
-            and row.identity.workspace_id == item.identity.workspace_id
-        ]
+        ], item.identity.workspace_id,
+    )
+    candidate = find_part(parts, "definition.pbir")
+    reference = decode_json_part(candidate["payload"])["datasetReference"]
+    if reference.get("byPath"):
         normalized = {tuple(canonical_id(value) for value in key): target for key, target in mappings.items()}
-        if len(models) != 1 or _key(models[0].identity) not in normalized:
+        key = (item.identity.tenant_id, model["workspaceId"], model["id"])
+        if key not in normalized:
             raise FabricError(
-                f"Map the exact captured semantic model '{match[1]}' before restoring this report"
+                f"Map the exact captured semantic model '{model['displayName']}' before restoring this report"
             )
-        target = normalized[_key(models[0].identity)]
+        target = normalized[key]
         current = item_document(client, target, "SemanticModel")
-        if current.get("displayName") != match[1]:
+        if current.get("displayName") != model["displayName"]:
             raise FabricError("The mapped report model was renamed; supply an explicit byConnection binding")
-    elif not reference.get("byConnection"):
-        raise FabricError("Resolve the report's missing model binding before restoring it")
 
 
 def _apply_sql_schema(
@@ -731,7 +756,9 @@ def _environment_preflight(
         raise FabricError("Review new Environment compute fields before including them in a standby request")
     compute["customLivePoolSupport"] = "Disabled"
     pool = compute.get("instancePool")
-    if isinstance(pool, dict) and pool.get("id"):
+    if isinstance(pool, dict) and pool.get("name") == spark.STARTER_POOL:
+        compute["instancePool"] = {"name": spark.STARTER_POOL, "type": spark.WORKSPACE_POOL_TYPE}
+    elif isinstance(pool, dict) and pool.get("id"):
         target_pool = replacements.get(str(pool["id"]).casefold())
         if not target_pool:
             raise FabricError("Map the Environment's captured custom Spark pool before staging its settings")
@@ -810,6 +837,7 @@ def apply_captured_item(
     source_items: Sequence[ItemRecord],
     item_mappings: Mapping[ItemKey, ItemIdentity],
     workspace_mappings: Mapping[WorkspaceKey, WorkspaceIdentity],
+    source_workspace_names: Mapping[WorkspaceKey, str] | None = None,
     endpoint_mappings: Sequence[tuple[EndpointIdentity, str]] = (),
     connection_mappings: Sequence[tuple[ConnectionIdentity, ConnectionIdentity]] = (),
     target_id: str | None = None,
@@ -872,6 +900,7 @@ def apply_captured_item(
             connection_mappings,
             target_id,
             verified_external_connections,
+            source_workspace_names,
         )
         target = ItemIdentity(
             tenant_id=target_workspace.tenant_id,
@@ -918,6 +947,7 @@ def apply_captured_item(
             connection_mappings,
             target_id,
             verified_external_connections,
+            source_workspace_names,
         )
         for connection in verified_external_connections:
             observed_connection = capture_json(client, f"connections/{connection.connection_id}")

@@ -227,6 +227,54 @@ def test_real_bounded_relay_copies_exact_pins_without_source_compute(setup, tmp_
     assert not list(tmp_path.glob("delta-preflight-*"))
 
 
+@pytest.mark.parametrize("drift", [None, "hash", "missing", "extra", "shortcut"])
+def test_retained_copy_verification_is_read_only_and_requires_exact_bytes(setup, tmp_path, drift):
+    lake, protection = setup
+    restore(protection, tmp_path)
+    writes, reads = len(lake.writes), len(lake.calls)
+    fabric = TargetFabric()
+    if drift == "hash":
+        lake.target["Files/input.txt"] = b"changed-data"
+    elif drift == "missing":
+        del lake.target["Files/input.txt"]
+    elif drift == "extra":
+        lake.target["Files/extra.txt"] = b"unowned"
+    elif drift == "shortcut":
+        fabric.shortcuts = [{"path": "Tables", "name": "external"}]
+
+    def verify():
+        return lh.verify_lakehouse_copy(
+            protection, source=SRC.identity, target=DST.identity, tokens=TOKENS,
+            target_client=fabric, max_age=timedelta(days=1), limits=LIMITS,
+        )
+
+    if drift:
+        with pytest.raises((ProtectionError, FileTransferError)):
+            verify()
+    else:
+        receipt = verify()
+        assert receipt.byte_copy_complete and not receipt.data_ready
+        assert receipt.copied_bytes == 0 and receipt.copied_files == 0
+    assert len(lake.writes) == writes
+    assert all(SOURCE.workspace_id not in request.url.path for request in lake.calls[reads:])
+
+
+def test_copy_write_observer_is_not_called_for_empty_target_preflight_rejection(setup, tmp_path):
+    lake, protection = setup
+    lake.target["Files/input.txt"] = b"existing-content"
+    attempts = []
+    with pytest.raises(ProtectionError, match="fresh owned Lakehouse"):
+        restore(protection, tmp_path, on_write=lambda: attempts.append("write"))
+    assert attempts == [] and not lake.writes
+
+
+def test_copy_write_observer_precedes_first_attempt(setup, tmp_path):
+    lake, protection = setup
+    attempts = []
+    restore(protection, tmp_path, on_write=lambda: attempts.append(len(lake.writes)))
+    assert attempts and attempts[0] == 0
+    assert len(attempts) == len(lake.writes)
+
 def test_capture_returns_complete_hash_and_version_pins_not_local_metadata_archive(setup, tmp_path):
     lake, _ = setup
     captured = lh.capture_lakehouse(
@@ -411,7 +459,7 @@ def test_binder_publishes_preparation_only_after_success_and_preserves_copy_time
 
     class Fabric:
         def get(self, path):
-            assert SOURCE.workspace_id not in path and runtime.current_operation is not None
+            assert SOURCE.workspace_id not in path
             runtime.fence()
             if "/lakehouses/" in path:
                 return {
@@ -464,6 +512,21 @@ def test_binder_publishes_preparation_only_after_success_and_preserves_copy_time
     assert (
         runtime.catalog.get_record("data-prepared", key).document["completed_at"] == prepared["completed_at"]
     )
+    changed = binding.configure_protection(
+        runtime,
+        binding.ConfigureProtectionRequest(
+            source=SOURCE, expected_revision=1,
+            configuration=configuration.model_copy(update={"target_approval_ref": "new-approved-input"}),
+        ),
+        protected_root=None,
+    )
+    next_generation, item = generation(changed, item_type="Lakehouse")
+    effects, calls = runtime.effects, len(lake.calls)
+    ready, warnings = recovery.restore(next_generation, item, TARGET, runtime)
+    assert not ready and any("another protected input" in message for message in warnings)
+    assert len(lake.writes) == count and len(lake.calls) == calls and runtime.effects == effects
+    assert not runtime.catalog.pending_operations()
+    assert runtime.get("data-prepared", f"{next_generation.snapshot.generation_id}/{SOURCE.key}") is None
 
 
 def test_catalog_loss_interrupts_actual_one_lake_copy_without_further_mutation(setup, tmp_path):

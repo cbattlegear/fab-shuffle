@@ -206,6 +206,7 @@ class _PinnedClient(httpx.Client):
         self.owned_directories: set[str] = set()
         self.writes_allowed = False
         self.before_first_write: Callable[[], None] | None = None
+        self.on_write: Callable[[], None] | None = None
 
     def send(self, request: httpx.Request, *, stream=False, **kwargs) -> httpx.Response:
         check_cancelled(self.cancel)
@@ -275,6 +276,8 @@ class _PinnedClient(httpx.Client):
                 "close",
             }:
                 raise ProtectionError("Only appending/flushing created OneLake data is permitted.")
+        if not source_side and request.method not in ("GET", "HEAD") and self.on_write:
+            self.on_write()
         kwargs["follow_redirects"] = False
         response = super().send(request, stream=True, **kwargs)
         retained = False
@@ -435,6 +438,55 @@ def _scaffold_versions(
     return versions
 
 
+def _verify_target_bytes(client, protection, target, tokens, limits, cancel):
+    restored, directories = _inventory(client, target, tokens, limits, cancel)
+    if (
+        set(restored) != {entry.path for entry in protection.files}
+        or directories != set(protection.directories)
+    ):
+        raise ProtectionError("Destination inventory differs from the pinned copy; keep recovery disabled.")
+    versions = {}
+    for expected in protection.files:
+        checksum, size, etag = _hash_file(client, target, restored[expected.path], tokens, limits, cancel)
+        if (checksum, size) != (expected.sha256, expected.size_bytes):
+            raise ProtectionError("Destination OneLake checksum/size differs; keep the target unready.")
+        versions[expected.path] = (size, etag)
+    final, final_dirs = _inventory(client, target, tokens, limits, cancel)
+    if set(final) != set(restored) or final_dirs != directories:
+        raise ProtectionError("Destination inventory changed during verification; keep recovery disabled.")
+    for path, (size, etag) in versions.items():
+        observed = files._file_properties(
+            client, f"{_root(target)}/{quote(path, safe='/')}", final[path], tokens,
+        )
+        if observed != (size, etag):
+            raise ProtectionError("Destination file changed during verification; keep recovery disabled.")
+
+
+def verify_lakehouse_copy(
+    protection: LakehouseProtection, *, source: DataIdentity, target: DataIdentity,
+    tokens: TokenProvider, target_client: FabricClient, max_age: timedelta,
+    limits: ProtectionLimits = ProtectionLimits(), cancel: Cancel = None,
+) -> LakehouseCopyReceipt:
+    """Revalidate a caller-proven owned copy without source reads or data writes."""
+    validate_lakehouse(protection, source=source, max_age=max_age, limits=limits)
+    if target.tenant_id != source.tenant_id or target.workspace_id == source.workspace_id:
+        raise ProtectionError("An existing independent copy must be in a distinct same-tenant workspace.")
+    cancel = operation_cancel(limits, cancel)
+    schema = _target_schema_mode(target_client, target, cancel)
+    with _PinnedClient(protection, target, limits, cancel) as client:
+        _verify_target_bytes(client, protection, target, tokens, limits, cancel)
+    if _target_schema_mode(target_client, target, cancel) != schema:
+        raise ProtectionError("Target schema mode changed during copy verification.")
+    return LakehouseCopyReceipt(
+        completed_at=datetime.now(UTC), copied_files=0, copied_bytes=0,
+        warnings=(
+            "Reused the recorded owned copy after rechecking its complete inventory and byte hashes. "
+            "No source data was read and no destination data was written.",
+            "Supply fresh generation-bound data, reference and access evidence before recovery admission.",
+        ),
+    )
+
+
 def restore_lakehouse(
     protection: LakehouseProtection,
     *,
@@ -447,6 +499,7 @@ def restore_lakehouse(
     target_client: FabricClient,
     limits: ProtectionLimits = ProtectionLimits(),
     cancel: Cancel = None,
+    on_write: Callable[[], None] | None = None,
 ) -> LakehouseCopyReceipt:
     """Copy exact verified bytes into a fresh destination, never assert engine readiness."""
     evidence_ref(target_approval_ref)
@@ -463,6 +516,7 @@ def restore_lakehouse(
     check_cancelled(cancel)
     schema_mode = _target_schema_mode(target_client, target, cancel)
     with _PinnedClient(protection, target, limits, cancel) as client:
+        client.on_write = on_write
         source_files, source_dirs = _inventory(client, source, tokens, limits, cancel)
         if set(source_files) != {f.path for f in protection.files} or source_dirs != set(
             protection.directories
@@ -535,19 +589,9 @@ def restore_lakehouse(
                     path[len(root) + 1 :] for path in schema_scaffold if path.startswith(root + "/")
                 ),
             )
-        restored, restored_dirs = _inventory(client, target, tokens, limits, cancel)
-        if set(restored) != set(source_files) or restored_dirs != source_dirs:
-            raise ProtectionError("Destination file inventory differs after copying; keep recovery disabled.")
+        _verify_target_bytes(client, protection, target, tokens, limits, cancel)
         if _target_schema_mode(target_client, target, cancel) != schema_mode:
             raise ProtectionError("Target schema mode changed during copy; keep recovery disabled.")
-        for expected in protection.files:
-            checksum, size, _etag = _hash_file(
-                client, target, restored[expected.path], tokens, limits, cancel
-            )
-            if (checksum, size) != (expected.sha256, expected.size_bytes):
-                raise ProtectionError(
-                    "Destination OneLake checksum/size differs; keep the partial target unready."
-                )
         final_files, final_dirs = _inventory(client, source, tokens, limits, cancel)
         if set(final_files) != set(source_files) or final_dirs != source_dirs:
             raise ProtectionError(

@@ -1928,9 +1928,10 @@ def _migrate_eventhouses(ctx: _Context) -> None:
 
         source_properties = eventhouse.get("properties") or {}
         target_properties = new_eventhouse.get("properties") or {}
-        for key in ("queryServiceUri", "ingestionServiceUri"):
-            if source_properties.get(key) and target_properties.get(key):
-                ctx.map_alias(source_properties[key], target_properties[key], eventhouse["id"])
+        target_endpoints = migration_refs.endpoint_values(new_eventhouse)
+        for kind, value in migration_refs.endpoint_values(eventhouse).items():
+            if target_endpoints.get(kind):
+                ctx.map_alias(value, target_endpoints[kind], eventhouse["id"])
 
         # Creating an eventhouse also creates a child KQL database named after it, so the
         # target already holds a database that the source is about to ask us to create.

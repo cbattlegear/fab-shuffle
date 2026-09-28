@@ -206,6 +206,40 @@ Inventory-only exclusion records require a compatible controller/job build. They
 existing document tables, not a SQL schema migration; older application readers may reject
 them. Do not mix or downgrade controller/job versions without checking record compatibility.
 
+Dataflow subtypes use migration's shared `classify_dataflow_definition` after the required
+definition read. A definite unsupported format or the documented
+`OperationNotSupportedForItem` response becomes an inventory-only exclusion, not a failed
+generation. Upgrade the named Dataflow to Gen2 (CI/CD), or provide an explicit replacement
+for its consumers. Malformed metadata, permission failures and arbitrary 400/404 responses
+still fail capture with the service's error; they do not establish an unsupported subtype.
+
+### Shared mapping and workspace preparation
+
+BCDR supplies captured source metadata and observed destination identities to the migration
+helpers; it does not read source metadata while recovering an outage. `migration_refs`
+constructs complete OneLake name/GUID aliases and inventories SQL/KQL endpoint values.
+The coordinator supplies these mappings to normal apply, deferred metadata completion and
+operation reconciliation. Unknown or ambiguous OneLake roots are refused before item
+creation, never left pointing at the source. Use qualified captured item mappings rather
+than global workspace-name replacement.
+
+Report dependencies use the shared `report_model_source` resolver, including standard PBIR
+`../Name.SemanticModel` paths. The captured dependency graph orders the mapped model before
+its report; ambiguous names or missing bindings require an explicit resolution.
+
+Workspace Spark preparation runs before dependent items, using captured pools with
+`spark.copy_pools` and the shared settings-payload builder. Each custom pool has an exact
+creation receipt and mapping. Later syncs verify its destination identity and configuration
+before reuse; a changed source configuration, missing pool or destination drift must be
+reconciled rather than adopted by name or overwritten. Settings failures preserve the
+service error. The default environment is applied only after its mapped environment exists;
+preparation does not publish environments or start workloads. Folder restoration is not
+implemented by this preparation stage.
+
+Spark-pool ownership and retained-copy records use the existing catalog document tables,
+not new SQL tables. Keep web and scheduled-job builds aligned; there is still no automatic
+catalog-record downgrade or schema-migration framework.
+
 Discovery logs include a correlation ID, resource names and exact workspace/capacity IDs.
 Confirmed setup logs record the selected workspace, source capacities and recovery
 Fabric/ARM identifiers. Use restricted server logs for identity troubleshooting, not
@@ -403,6 +437,22 @@ destination Lakehouse and records byte-copy results. Copied bytes are **not** pr
 consistency, endpoint availability, consumer bindings or readiness. Metadata and fresh target
 data/engine/access evidence are still required before cutover. It is distinct from a retained-source
 shortcut: consumers must ultimately use the owned materialized destination, not the original.
+
+Ending a DR test retains the owned copy. A later test or generation can reuse it only when
+the recorded successful operation proves the same source, target and immutable protection
+configuration. Reuse rechecks the complete destination file/directory inventory, every file's
+size/hash, stable file versions, schema mode and absence of shortcuts, without source reads
+or data writes. It records generation-bound copy evidence, not engine or application readiness;
+supply fresh readiness evidence for the new generation. Within one generation, successful
+revalidation preserves the preparation timestamp so it does not invalidate otherwise fresh
+readiness evidence on every continuation.
+
+Destination drift invalidates preparation and blocks admission until it is corrected and
+revalidated; then collect fresh readiness evidence. A different protected input requires a
+fresh owned target or a separately approved refresh plan. Automatic refresh/merge into the
+retained target is not implemented. A read-only preflight rejection is a failed observation,
+not an ambiguous write; failures after a destination write attempt still require exact-operation
+reconciliation. None of these paths deletes data or clears ownership records to allow retry.
 
 **Fabric SQL native backups restore within the same workspace only, and have no
 geo-replicated backup copy.** They are not cross-region recovery inputs. See the
