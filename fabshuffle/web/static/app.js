@@ -20,6 +20,7 @@ const state = {
   resumeRunId: null,
   resumeReturnStage: "capacity",
   forceRebuild: false,
+  managedIdentityAvailable: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -28,7 +29,7 @@ const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 // ------------------------------------------------------------------ plumbing
 
 async function api(path, { method = "GET", body, signal, download = false } = {}) {
-  const headers = { "Content-Type": "application/json" };
+  const headers = { "Content-Type": "application/json", "X-Fab-Shuffle-Request": "1" };
   if (state.sessionId) headers["X-Fab-Shuffle-Session"] = state.sessionId;
 
   const response = await fetch(path, {
@@ -38,15 +39,25 @@ async function api(path, { method = "GET", body, signal, download = false } = {}
     signal,
   });
 
+  if (response.redirected) {
+    throw new Error("Azure sign-in has expired. Reload this page to sign in again.");
+  }
   if (download && response.ok) return response.blob();
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : {};
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch (_) {
+    throw new Error(`The server returned an unreadable response (HTTP ${response.status}). Reload and retry.`);
+  }
   if (!response.ok) {
     const detail = payload.detail;
     const message = typeof detail === "string" ? detail
       : Array.isArray(detail) ? detail.map((entry) => `${(entry.loc || []).join(".")}: ${entry.msg}`).join("; ")
       : detail?.message;
-    throw new Error(message || `Request failed with HTTP ${response.status}`);
+    const error = new Error(message || `Request failed with HTTP ${response.status}`);
+    error.details = Array.isArray(detail) ? detail : [];
+    throw error;
   }
   return payload;
 }
@@ -59,6 +70,7 @@ function showError(message) {
 }
 
 function goTo(stage) {
+  $(".wizard-nav").hidden = stage === "bcdr";
   $$(".panel").forEach((panel) => {
     panel.hidden = panel.dataset.stage !== stage;
   });
@@ -72,6 +84,7 @@ function goTo(stage) {
 }
 
 function busy(button, isBusy, labelWhenBusy) {
+  button.setAttribute("aria-busy", String(isBusy));
   if (isBusy) {
     button.dataset.label = button.textContent;
     button.textContent = labelWhenBusy;
@@ -112,6 +125,18 @@ function renderChoices(container, entries, onSelect) {
 // --------------------------------------------------------------------- login
 
 function updateLoginMode() {
+  const managed = $("#fabric-auth-mode").value === "managed_identity";
+  const standby = $("#login-workflow").value === "bcdr";
+  $("#source-credentials").hidden = managed;
+  $("#source-credentials").disabled = managed;
+  $("#tenant-mode").hidden = managed || standby;
+  $("#tenant-mode").disabled = managed || standby;
+  $("#managed-identity-context").hidden = !managed;
+  $("#another-tenant").disabled = managed || standby;
+  if (managed || standby) {
+    $("#another-tenant").checked = false;
+    $("#destination-credentials").querySelectorAll("input").forEach((input) => { input.value = ""; });
+  }
   const paired = $("#another-tenant").checked;
   $("#destination-credentials").hidden = !paired;
   $("#destination-credentials").disabled = !paired;
@@ -119,11 +144,14 @@ function updateLoginMode() {
 }
 
 $("#another-tenant").addEventListener("change", updateLoginMode);
+$("#fabric-auth-mode").addEventListener("change", updateLoginMode);
+$("#login-workflow").addEventListener("change", updateLoginMode);
 
 function loginBody(form) {
+  if ($("#fabric-auth-mode").value === "managed_identity") return {};
   const data = Object.fromEntries(new FormData(form).entries());
   const body = { tenant_id: data.tenant_id, client_id: data.client_id, client_secret: data.client_secret };
-  if ($("#another-tenant").checked) {
+  if ($("#login-workflow").value !== "bcdr" && $("#another-tenant").checked) {
     body.destination = {
       tenant_id: data.destination_tenant_id,
       client_id: data.destination_client_id,
@@ -138,10 +166,17 @@ $("#login-form").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   const button = form.querySelector("button");
   const data = loginBody(form);
+  const workflow = $("#login-workflow").value;
+  const managed = $("#fabric-auth-mode").value === "managed_identity";
 
   busy(button, true, "Signing in…");
   try {
-    const result = await api("/api/login", { method: "POST", body: data });
+    if (managed && !state.managedIdentityAvailable) {
+      throw new Error("Managed identity is not available for this deployment and operator.");
+    }
+    const result = await api(managed ? "/api/login/managed-identity" : "/api/login", {
+      method: "POST", body: data,
+    });
     invalidateSavedRunActions();
     state.sessionId = result.sessionId;
     state.identity = result;
@@ -164,6 +199,15 @@ $("#login-form").addEventListener("submit", async (event) => {
     updateLoginMode();
     renderIdentity();
     $("#sign-out").hidden = false;
+    if (workflow === "bcdr") {
+      if (state.crossTenant) {
+        goTo("capacity");
+        showError("Standby & recovery requires credentials in the same tenant. Sign out to change credentials.");
+      } else {
+        $("#bcdr-open").click();
+      }
+      return;
+    }
     await loadCapacities();
     if (!state.paired) loadLeftovers();
     loadResumable();
@@ -194,12 +238,14 @@ $("#sign-out").addEventListener("click", async () => {
     resumeRunId: null, forceRebuild: false,
   });
   $("#sign-out").hidden = true;
+  $("#bcdr-open").hidden = true;
   $("#opt-start-mirrors").checked = false;
   goTo("login");
 });
 
 function renderIdentity() {
   const identity = state.identity;
+  $("#bcdr-open").hidden = !state.sessionId || state.crossTenant;
   $("#restore-access-tool").hidden = state.paired;
   $("#leftovers").hidden = true;
   $("#destination-context").hidden = !state.paired;

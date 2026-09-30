@@ -43,11 +43,42 @@
         "description": "Memory in GiB. Must be exactly double the vCPU count for the consumption workload profile."
       }
     },
-    "allowedClientIpAddress": {
+    "easyAuthTenantId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "metadata": {
+        "description": "Directory (tenant) GUID of the existing single-tenant Entra WEB app registration used for operator sign-in. This is separate from the Fabric runtime service principal or managed identity."
+      }
+    },
+    "easyAuthClientId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "metadata": {
+        "description": "Application (client) GUID of that existing Entra WEB registration. Before deployment, enable ID tokens for hybrid sign-in and set its Application ID URI to api://<client-id>. After deployment, add the exact easyAuthCallbackUrl output as a Web redirect URI."
+      }
+    },
+    "easyAuthClientSecret": {
+      "type": "securestring",
+      "minLength": 1,
+      "metadata": {
+        "description": "Required client secret VALUE for the Entra WEB registration, not its secret ID or a Fabric runtime credential. Stored only as a Container Apps secret for EasyAuth hybrid flow. Rotate before expiration."
+      }
+    },
+    "allowedOperatorObjectIds": {
+      "type": "array",
+      "minLength": 1,
+      "maxLength": 100,
+      "metadata": {
+        "description": "Required nonempty array of individual operator USER object-ID GUIDs in easyAuthTenantId. No group IDs, application/client IDs, wildcard or tenant-wide default. EasyAuth and the application both enforce this allowlist."
+      }
+    },
+    "managedIdentityResourceId": {
       "type": "string",
       "defaultValue": "",
       "metadata": {
-        "description": "Your public IP address or CIDR range, for example 203.0.113.4/32. Strongly recommended: Fab Shuffle has no sign-in of its own, so leaving this empty publishes the wizard to the whole internet."
+        "description": "Optional full resource ID of an EXISTING user-assigned managed identity. Leave blank to keep runtime service-principal sign-in. Use the same stable identity for the controller and scheduled sync job; grant Fabric/SQL/OneLake and capacity permissions separately."
       }
     },
     "shareQuotaGiB": {
@@ -83,16 +114,45 @@
     "location": "[if(empty(parameters('location')), resourceGroup().location, parameters('location'))]",
     "environmentName": "[concat(variables('appName'), '-env')]",
     "logAnalyticsName": "[concat(variables('appName'), '-logs')]",
-    "restrictIngress": "[not(empty(parameters('allowedClientIpAddress')))]",
-    "ipRestrictions": [
+    "useManagedIdentity": "[not(empty(parameters('managedIdentityResourceId')))]",
+    "easyAuthSecretName": "fab-shuffle-easyauth",
+    "containerEnvironment": [
       {
-        "name": "allow-operator",
-        "action": "Allow",
-        "ipAddressRange": "[parameters('allowedClientIpAddress')]",
-        "description": "The only address allowed to reach the wizard."
+        "name": "FAB_SHUFFLE_SCRATCH",
+        "value": "[variables('scratchMountPath')]"
+      },
+      {
+        "name": "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES",
+        "value": "[string(mul(parameters('maxDiskStagingGiB'), 1073741824))]"
+      },
+      {
+        "name": "FAB_SHUFFLE_MAX_MEMORY_BYTES",
+        "value": "[string(mul(parameters('maxMemoryMiB'), 1048576))]"
+      },
+      {
+        "name": "FAB_SHUFFLE_EASYAUTH_ENABLED",
+        "value": "true"
+      },
+      {
+        "name": "FAB_SHUFFLE_EASYAUTH_READY",
+        "value": "false"
+      },
+      {
+        "name": "FAB_SHUFFLE_EASYAUTH_TENANT_ID",
+        "value": "[parameters('easyAuthTenantId')]"
+      },
+      {
+        "name": "FAB_SHUFFLE_EASYAUTH_ALLOWED_OBJECT_IDS",
+        "value": "[join(parameters('allowedOperatorObjectIds'), ',')]"
+      },
+      {
+        "name": "FAB_SHUFFLE_BCDR_LEASE_BLOB_URL",
+        "value": "[variables('bcdrLeaseBlobUrl')]"
       }
     ],
     "storageAccountName": "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, variables('appName'))))]",
+    "bcdrLeaseContainerName": "fab-shuffle-locks",
+    "bcdrLeaseBlobUrl": "[concat('https://', variables('storageAccountName'), '.blob.core.windows.net/', variables('bcdrLeaseContainerName'), '/deployment.lock')]",
     "fileShareName": "fab-shuffle-share",
     "storageMountName": "fab-shuffle-storage",
     "scratchVolumeName": "fab-shuffle-scratch",
@@ -142,7 +202,39 @@
         "largeFileSharesState": "Enabled"
       },
       "metadata": {
-        "description": "Persistent SMB storage authenticated with an account key. Large file shares are explicitly enabled because the shares API still documents that gate for quotas above 5120 GiB, even though newer guidance calls it a legacy setting. The authenticated public storage endpoint is not restricted by the wizard's ingress rule; see README for private-network requirements and key rotation."
+        "description": "Persistent SMB storage authenticated with an account key. Large file shares are explicitly enabled because the shares API still documents that gate for quotas above 5120 GiB, even though newer guidance calls it a legacy setting. EasyAuth protects the wizard, not this authenticated public storage endpoint; see README for private-network requirements and key rotation."
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}/default/{1}', variables('storageAccountName'), variables('bcdrLeaseContainerName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "properties": {
+        "publicAccess": "None"
+      },
+      "metadata": {
+        "description": "Private coordination container only. The runtime conditionally creates one empty lease blob; recovery metadata remains in the central Warehouse. Do not remove or change this lock while a controller operation is running."
+      }
+    },
+    {
+      "condition": "[variables('useManagedIdentity')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', variables('bcdrLeaseContainerName')), parameters('managedIdentityResourceId'), 'Storage Blob Data Contributor')]",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', variables('bcdrLeaseContainerName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', variables('bcdrLeaseContainerName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+        "principalId": "[if(variables('useManagedIdentity'), reference(parameters('managedIdentityResourceId'), '2023-01-31').principalId, '')]",
+        "principalType": "ServicePrincipal"
+      },
+      "metadata": {
+        "description": "Storage Blob Data Contributor at the dedicated lock CONTAINER only, never the storage account, resource group or subscription. The deployer needs roleAssignments/write here. Does not authorize Fabric, SQL, OneLake or capacity power management."
       }
     },
     {
@@ -180,6 +272,7 @@
       "apiVersion": "2024-03-01",
       "name": "[variables('appName')]",
       "location": "[variables('location')]",
+      "identity": "[if(variables('useManagedIdentity'), createObject('type', 'UserAssigned', 'userAssignedIdentities', createObject(parameters('managedIdentityResourceId'), createObject())), createObject('type', 'None'))]",
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
         "[resourceId('Microsoft.App/managedEnvironments/storages', variables('environmentName'), variables('storageMountName'))]"
@@ -188,13 +281,18 @@
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
         "configuration": {
           "activeRevisionsMode": "Single",
+          "secrets": [
+            {
+              "name": "[variables('easyAuthSecretName')]",
+              "value": "[parameters('easyAuthClientSecret')]"
+            }
+          ],
           "ingress": {
-            "external": true,
+            "external": false,
             "targetPort": 8080,
             "transport": "auto",
             "allowInsecure": false,
-            "stickySessions": { "affinity": "sticky" },
-            "ipSecurityRestrictions": "[if(variables('restrictIngress'), variables('ipRestrictions'), createArray())]"
+            "stickySessions": { "affinity": "sticky" }
           }
         },
         "template": {
@@ -206,20 +304,7 @@
                 "cpu": "[json(parameters('cpuCores'))]",
                 "memory": "[concat(parameters('memoryGb'), 'Gi')]"
               },
-              "env": [
-                {
-                  "name": "FAB_SHUFFLE_SCRATCH",
-                  "value": "[variables('scratchMountPath')]"
-                },
-                {
-                  "name": "FAB_SHUFFLE_MAX_DISK_STAGING_BYTES",
-                  "value": "[string(mul(parameters('maxDiskStagingGiB'), 1073741824))]"
-                },
-                {
-                  "name": "FAB_SHUFFLE_MAX_MEMORY_BYTES",
-                  "value": "[string(mul(parameters('maxMemoryMiB'), 1048576))]"
-                }
-              ],
+              "env": "[concat(variables('containerEnvironment'), if(variables('useManagedIdentity'), createArray(createObject('name', 'FAB_SHUFFLE_MANAGED_IDENTITY_CLIENT_ID', 'value', reference(parameters('managedIdentityResourceId'), '2023-01-31').clientId), createObject('name', 'FAB_SHUFFLE_MANAGED_IDENTITY_TENANT_ID', 'value', reference(parameters('managedIdentityResourceId'), '2023-01-31').tenantId)), createArray()))]",
               "volumeMounts": [
                 {
                   "volumeName": "[variables('scratchVolumeName')]",
@@ -256,18 +341,117 @@
           }
         }
       }
+    },
+    {
+      "type": "Microsoft.App/containerApps/authConfigs",
+      "apiVersion": "2024-03-01",
+      "name": "[concat(variables('appName'), '/current')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('appName'))]"
+      ],
+      "properties": {
+        "platform": { "enabled": true },
+        "httpSettings": { "requireHttps": true },
+        "login": { "tokenStore": { "enabled": false } },
+        "globalValidation": {
+          "unauthenticatedClientAction": "RedirectToLoginPage",
+          "redirectToProvider": "azureActiveDirectory",
+          "excludedPaths": ["/api/health"]
+        },
+        "identityProviders": {
+          "azureActiveDirectory": {
+            "enabled": true,
+            "isAutoProvisioned": false,
+            "registration": {
+              "clientId": "[parameters('easyAuthClientId')]",
+              "clientSecretSettingName": "[variables('easyAuthSecretName')]",
+              "openIdIssuer": "[concat('https://login.microsoftonline.com/', parameters('easyAuthTenantId'), '/v2.0')]"
+            },
+            "validation": {
+              "allowedAudiences": [
+                "[parameters('easyAuthClientId')]",
+                "[concat('api://', parameters('easyAuthClientId'))]"
+              ],
+              "defaultAuthorizationPolicy": {
+                "allowedPrincipals": {
+                  "identities": "[parameters('allowedOperatorObjectIds')]"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "outputs": {
     "url": {
       "type": "string",
-      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', variables('appName')), '2024-03-01').configuration.ingress.fqdn)]",
-      "metadata": { "description": "Open this to start the wizard." }
+      "value": "[concat('https://', variables('appName'), '.', reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)]",
+      "metadata": { "description": "EXTERNAL wizard URL after final activation, built from Azure's reported environment domain. Deployment remains internal and application-ready=false. Verify auth, enable ingress while still not ready, read the actual FQDN/register its callback, then activate the application LAST." }
     },
-    "ingressIsPublic": {
-      "type": "bool",
-      "value": "[not(variables('restrictIngress'))]",
-      "metadata": { "description": "True when no IP restriction was given, so anyone with the URL can reach the wizard." }
+    "easyAuthCallbackUrl": {
+      "type": "string",
+      "value": "[concat('https://', variables('appName'), '.', reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain, '/.auth/login/aad/callback')]",
+      "metadata": { "description": "The external hostname's callback, not the temporary .internal. hostname. Add this exact URI to the EXISTING single-tenant Entra application's Web redirect URIs; verify the reported FQDN after enabling ingress. ARM does not create or update that registration." }
+    },
+    "verifyAuthenticationCommand": {
+      "type": "string",
+      "value": "[format('az containerapp auth show --subscription \"{0}\" --resource-group \"{1}\" --name \"{2}\" --output json', subscription().subscriptionId, resourceGroup().name, variables('appName'))]",
+      "metadata": { "description": "FIRST inspect the deployed auth config: enabled platform/AAD, RedirectToLoginPage, tenant-v2 issuer, app audiences, nonempty exact operator identities, only /api/health excluded, and fab-shuffle-easyauth secret reference. Do not activate if deployment/auth validation failed." }
+    },
+    "activateApplicationCommand": {
+      "type": "string",
+      "value": "[format('az containerapp update --subscription \"{0}\" --resource-group \"{1}\" --name \"{2}\" --set-env-vars FAB_SHUFFLE_EASYAUTH_READY=true --only-show-errors --output none', subscription().subscriptionId, resourceGroup().name, variables('appName'))]",
+      "metadata": { "description": "LAST, only after successful deployment, auth verification, ingress enablement, actual-FQDN verification and Web callback registration. Sets only readiness and creates a new revision. Wait for completion, then verify allowed/disallowed sign-ins. Other env, mounts, image and identity are not replaced." }
+    },
+    "enablePublicIngressCommand": {
+      "type": "string",
+      "value": "[format('az containerapp ingress enable --subscription \"{0}\" --resource-group \"{1}\" --name \"{2}\" --type external --target-port 8080 --transport auto --only-show-errors --output none', subscription().subscriptionId, resourceGroup().name, variables('appName'))]",
+      "metadata": { "description": "AFTER successful deployment and verifyAuthenticationCommand, WHILE application-ready=false. Enables external HTTPS ingress without replacing the app template. Then readPublicFqdnCommand, configure callback, and activateApplicationCommand LAST. Every ARM redeploy closes ingress and resets readiness." }
+    },
+    "readPublicFqdnCommand": {
+      "type": "string",
+      "value": "[format('az containerapp show --subscription \"{0}\" --resource-group \"{1}\" --name \"{2}\" --query properties.configuration.ingress.fqdn --output tsv', subscription().subscriptionId, resourceGroup().name, variables('appName'))]",
+      "metadata": { "description": "After enabling ingress while application-ready=false, read the actual external hostname. Add https://<this-fqdn>/.auth/login/aad/callback as the registration's Web redirect URI; it must agree with easyAuthCallbackUrl. Only then activate the application." }
+    },
+    "containerAppsEnvironmentName": {
+      "type": "string",
+      "value": "[variables('environmentName')]",
+      "metadata": { "description": "Reuse this environment in the scheduled-sync job deployment, in this same resource group and location." }
+    },
+    "storageMountName": {
+      "type": "string",
+      "value": "[variables('storageMountName')]"
+    },
+    "controllerBootstrapPath": {
+      "type": "string",
+      "value": "/app/local/bcdr/bootstrap.json"
+    },
+    "bcdrLeaseBlobUrl": {
+      "type": "string",
+      "value": "[variables('bcdrLeaseBlobUrl')]",
+      "metadata": { "description": "Reuse this EXACT non-secret lease URL in the scheduled job. OAuth only; never add a SAS. An SP-mode BCDR controller also needs Storage Blob Data Contributor on bcdrLeaseContainerResourceId, granted separately." }
+    },
+    "bcdrLeaseContainerResourceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', variables('bcdrLeaseContainerName'))]"
+    },
+    "managedIdentityResourceId": {
+      "type": "string",
+      "value": "[parameters('managedIdentityResourceId')]"
+    },
+    "managedIdentityClientId": {
+      "type": "string",
+      "value": "[if(variables('useManagedIdentity'), reference(parameters('managedIdentityResourceId'), '2023-01-31').clientId, '')]"
+    },
+    "managedIdentityPrincipalId": {
+      "type": "string",
+      "value": "[if(variables('useManagedIdentity'), reference(parameters('managedIdentityResourceId'), '2023-01-31').principalId, '')]",
+      "metadata": { "description": "Object ID for explicit Fabric and Azure role grants. Attaching the identity grants no Fabric, SQL, OneLake or Azure capacity permissions." }
+    },
+    "managedIdentityTenantId": {
+      "type": "string",
+      "value": "[if(variables('useManagedIdentity'), reference(parameters('managedIdentityResourceId'), '2023-01-31').tenantId, '')]"
     }
   }
 }

@@ -20,6 +20,45 @@ The final/default Dockerfile target is `production`; it excludes test sources, N
 PowerShell and Python test dependencies. The `test` target derives from the same runtime
 and adds the locked validation tools.
 
+## Azure deployment contracts
+
+Changes to [`deploy/azuredeploy.json`](../deploy/azuredeploy.json) and
+[`deploy/azuredeploy-sync-job.json`](../deploy/azuredeploy-sync-job.json) must preserve the
+explicit boundary between browser operator EasyAuth and Fabric runtime identity. Consult
+the versioned resource schemas, not a similarly named App Service resource:
+[Container Apps authConfigs 2024-03-01](https://learn.microsoft.com/en-us/azure/templates/microsoft.app/2024-03-01/containerapps/authconfigs)
+and [jobs 2024-03-01](https://learn.microsoft.com/en-us/azure/templates/microsoft.app/2024-03-01/jobs).
+`globalValidation.unauthenticatedClientAction` expresses required authentication in that
+auth schema; there is no `requireAuthentication` property. Nonempty individual operator
+object IDs and the application guard must remain mandatory, including without a UAMI.
+Initial/redeployed ingress is internal and `FAB_SHUFFLE_EASYAUTH_READY=false`; header
+validation alone cannot defend a caller before the auth sidecar is configured. Final
+activation is explicitly ordered: verify the deployed auth config, enable external ingress
+while still not ready, read the actual external FQDN and register its callback, then set
+readiness true with the targeted CLI environment update. Never substitute a partial ARM
+app PUT that could discard identity, other environment variables or mounted storage.
+
+The scheduled job is a coordinated worker of the existing recovery deployment: same
+UAMI/bootstrap, shared Azure Files and exact remote Blob lease URL, one central Warehouse.
+Its command is a direct argument array, never an arbitrary shell command. ARM must not
+initialize, replace or export over the persisted bootstrap/request, and `parallelism=1`
+must not be described as cross-execution exclusion. The only automatically assigned
+runtime data role is on the dedicated lock container, not an entire account/subscription.
+
+Validate these changes in the Linux test image without live mounts, credentials or network:
+
+```text
+docker build --platform linux/amd64 --target test -t fab-shuffle:azure-deploy-test .
+docker run --rm --platform linux/amd64 --network none fab-shuffle:azure-deploy-test tests/test_azure_files_deploy.py tests/test_azure_auth_and_sync_deploy.py
+```
+
+The standard entrypoint also checks tools, dependency locks, runtime smoke and Ruff.
+Template tests are static contract/regression checks, **not an Azure ARM deployment
+validation**. Before release, separately qualify real single-tenant callback/hybrid login,
+sidecar tenant/object claims, denial of non-allowlisted users, UAMI/Fabric authorization,
+cross-container Blob lease exclusion, scheduled results and timeout/reconciliation in a
+disposable Azure environment. Never use production recovery state for validation.
+
 ## Deliberate release upgrades
 
 Review dependency and tool updates at least monthly, and promptly for security fixes.
