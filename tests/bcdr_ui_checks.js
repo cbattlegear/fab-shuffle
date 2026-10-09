@@ -405,7 +405,8 @@ const scenarios = {
       template_url: "https://github.com/cbattlegear/fab-shuffle/blob/main/deploy/azuredeploy-sync-job.json",
     } } });
     const section = f.get("bcdr-result").querySelector(".bcdr-schedule-guide");
-    assert.match(section.textContent, /Job deployment is not verified/);
+    assert.match(section.textContent, /Scope prepared/);
+    assert.doesNotMatch(section.textContent, /deployed and verified/);
     assert.match(section.textContent, /shared remote lease is not configured/);
     const link = section.querySelectorAll("a").find((entry) => entry.download);
     assert.equal(link.download, "scheduled-sync-request.json");

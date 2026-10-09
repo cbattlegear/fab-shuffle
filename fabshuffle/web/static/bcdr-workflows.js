@@ -128,7 +128,8 @@ function bcdrRefreshJourney() {
   const scheduling = bcdr.journey === "setup" && bcdr.journeyStage === "schedule";
   $("#bcdr-journey-title").textContent = scheduling ? "Schedule standby sync" : current.title;
   $("#bcdr-journey-description").textContent = scheduling ?
-    "Prepare scheduling instructions for the reviewed scope. No job is created or enabled here." : current.description;
+    "Review the recurring scope and UTC cron, then explicitly confirm the live Container Apps Job." :
+    current.description;
   for (const button of document.querySelectorAll(".bcdr-journey-nav button")) {
     button.setAttribute("aria-current", button.dataset.journey === bcdr.journey ? "page" : "false");
   }
@@ -146,7 +147,12 @@ function bcdrRefreshJourney() {
         bcdr.latest.groups?.filter((group) => !group.data_ready).length ?? 0} group(s) with unresolved data readiness; inspect evidence` :
       "Not yet checked"],
     ["Automatic sync", state.testActive ? "On hold - DR Test active" : state.incidentActive ?
-      "On hold - incident recovery active" : "Deployment not verified; inspect the last scheduled result"],
+      "On hold - incident recovery active" :
+      state.workflow?.scheduler_deployment?.status === "deployed" ?
+        `${state.workflow.scheduler_deployment.schedule_utc} UTC; ` +
+        `${state.workflow.scheduler_deployment.provisioning_state || "state not reported"}` :
+        state.workflow?.scheduler_deployment?.message ||
+        "Deployment not verified; inspect scheduler status"],
     ["Last scheduled metadata sync", state.workflow?.last_scheduled_sync?.completed_at || "No completed scheduled run observed"],
   ]) {
     list.appendChild(bcdrElement("dt", label));
@@ -185,7 +191,7 @@ function bcdrRefreshJourney() {
     bcdrJourneyButton(help, "Run a DR Test", "test", "review");
     bcdrJourneyButton(help, "I'm currently down", "incident", "assess");
   } else if (bcdr.journey === "setup") {
-    visible = bcdr.journeyStage === "schedule" ? ["schedule-guide"] : [];
+    visible = bcdr.journeyStage === "schedule" ? ["schedule-guide", "configure-schedule"] : [];
     if (state.testActive || state.incidentActive) {
       help.appendChild(bcdrElement("p", "Setup and source synchronization are unavailable during a test or incident. Return to that workflow.", "alert"));
       visible = [];
@@ -280,7 +286,7 @@ function bcdrRefreshJourney() {
   if (bcdr.syncRecovery?.can_reconcile_owner) visible.push("reconcile-sync-owner");
   for (const [name, section] of bcdr.commandSections || []) {
     section.hidden = !visible.includes(name);
-    section.open = visible.length === 1 || ["setup", "synchronize", "schedule-guide", "start-dr-test", "continue-dr-test", "end-dr-test", "enable-recovery"].includes(name);
+    section.open = visible.length === 1 || ["setup", "synchronize", "schedule-guide", "configure-schedule", "start-dr-test", "continue-dr-test", "end-dr-test", "enable-recovery"].includes(name);
   }
   const preparation = $("#bcdr-preparation");
   if (preparation) preparation.hidden = bcdr.journey !== "settings" || !["environment", "advanced"].includes(bcdr.journeyStage) ||
@@ -500,7 +506,9 @@ function bcdrBuildStandbyScope() {
     start.hidden = true;
     review.className = result?.details?.sync_summary?.metadata_ready ? "secondary" : "primary";
     const next = result?.details?.sync_summary?.metadata_ready ?
-      scope.section.querySelectorAll("button").find((button) => button.textContent === "Set up scheduled sync") : review;
+      Array.from(scope.section.querySelectorAll("button")).find(
+        (button) => button.textContent === "Set up scheduled sync",
+      ) : review;
     next?.focus({ preventScroll: true });
   });
   return section;
@@ -727,8 +735,11 @@ function bcdrGroupName(groupOrId) {
 
 function bcdrRenderScheduleGuide(container, guide) {
   const section = bcdrElement("section", undefined, "bcdr-schedule-guide");
-  section.appendChild(bcdrElement("h4", "Scheduled sync: deployment handoff"));
-  section.appendChild(bcdrElement("p", "Instructions prepared. Job deployment is not verified.", "bcdr-status"));
+  section.appendChild(bcdrElement("h4", "Scheduled sync review"));
+  section.appendChild(bcdrElement("p",
+    guide.deployment_status === "deployed" ? "The reviewed schedule is deployed and verified." :
+      "Scope prepared. Use Create or update scheduled sync only after reviewing this result.",
+    "bcdr-status"));
   section.appendChild(bcdrElement("p", `Reviewed workspaces: ${(guide.workspace_names || []).join(", ") || "See approved scope"}.`));
   if (!guide.remote_lease_configured) section.appendChild(bcdrElement("p",
     "A shared remote lease is not configured here. Configure it on both controller and scheduler before unattended execution.", "alert"));
@@ -741,11 +752,9 @@ function bcdrRenderScheduleGuide(container, guide) {
   download.download = guide.request_filename;
   download.href = `data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(guide.request, null, 2))}`;
   section.appendChild(download);
-  const reference = bcdrElement("a", "Open scheduler deployment reference");
-  reference.href = guide.template_url;
-  reference.target = "_blank";
-  reference.rel = "noopener noreferrer";
-  section.appendChild(reference);
+  if (!guide.automation_configured) section.appendChild(bcdrElement("p",
+    "This controller predates scheduling automation metadata. Redeploy this reviewed release, then retry. " +
+    "The existing request download remains available for the documented manual boundary.", "alert"));
   container.appendChild(section);
 }
 

@@ -25,6 +25,7 @@ from fabshuffle.bcdr.catalog import CatalogConflict, CatalogError
 from fabshuffle.bcdr.contracts import RecoveryMode
 from fabshuffle.bcdr.service import (
     ConfigureReplicaRequest,
+    ConfigureScheduleRequest,
     ReconcileOperationRequest,
     ServiceResult,
     SetupRequest,
@@ -302,6 +303,7 @@ def test_forms_do_not_resume_capacity_or_read_catalog(product):
     assert commands["setup"]["schema"] == SetupRequest.model_json_schema()
     assert commands["reconcile-operation"]["schema"] == ReconcileOperationRequest.model_json_schema()
     assert commands["configure-replica"]["schema"] == ConfigureReplicaRequest.model_json_schema()
+    assert commands["configure-schedule"]["schema"] == ConfigureScheduleRequest.model_json_schema()
     assert response.json()["identity"] == {"tenant_id": TENANT, "client_id": CLIENT, "object_id": SPN}
     assert "NOT Enable" in commands["synchronize"]["confirmation"]
     assert "control workspace" in commands["enable-recovery"]["confirmation"]

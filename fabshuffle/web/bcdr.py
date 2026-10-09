@@ -32,6 +32,7 @@ from fabshuffle.bcdr.protection_binding import ConfigureProtectionRequest
 from fabshuffle.bcdr.service import (
     BcdrService,
     ConfigureReplicaRequest,
+    ConfigureScheduleRequest,
     ContinueDrTestRequest,
     CutbackRequest,
     CutoverRequest,
@@ -146,6 +147,11 @@ COMMANDS = (
      "Data-recovery gaps stay visible. No Azure job is created or enabled.",
      "Approve this scope for fresh metadata capture and safe parking in recurring runs. "
      "This only prepares a configuration download and deployment instructions."),
+    ("configure-schedule", "Create or update scheduled sync", ConfigureScheduleRequest,
+     "Persist the reviewed non-secret request on shared Azure Files and create or update the "
+     "Container Apps Job using the live controller's environment, identity, lease and image.",
+     "Approve this exact scope and UTC cron as a live schedule. The controller disables scheduled "
+     "triggers before replacing the request and only re-enables the job after verification."),
     ("setup", "Set up the control Warehouse", SetupRequest,
      "Create a control workspace or choose an existing one where the recovery principal has Admin access. "
      "Additional members and owner-role differences produce warnings; existing grants stay unchanged. "
@@ -270,6 +276,66 @@ def _service_call(
             logger.info("BCDR observed capacity: fabric_capacity=%s arm_resource=%s state=%s",
                         capacity.get("capacity_id"), capacity.get("arm_resource_id"), capacity.get("state"))
         return result
+    finally:
+        service.close()
+
+
+def _status_with_scheduler(session: Session) -> ServiceResult:
+    from fabshuffle.bcdr.scheduler import SchedulerClient, SchedulerError
+
+    _same_tenant(session)
+    service = create_service(
+        bootstrap_path(), target_tokens=session.destination_tokens, source_tokens=None,
+    )
+    try:
+        result = service.status()
+        try:
+            with SchedulerClient(session.destination_tokens) as scheduler:
+                scheduler_state = scheduler.observe()
+        except SchedulerError as error:
+            scheduler_state = {"status": "unavailable", "message": safe_text(str(error))}
+        workflow = {
+            **dict(result.details.get("workflow") or {}),
+            "scheduler_deployment": scheduler_state,
+        }
+        return result.model_copy(update={
+            "details": {**result.details, "workflow": workflow},
+        })
+    finally:
+        service.close()
+
+
+def _configure_schedule(session: Session, request: ConfigureScheduleRequest) -> ServiceResult:
+    from fabshuffle.bcdr.scheduler import SchedulerClient
+
+    _same_tenant(session)
+    service = create_service(
+        bootstrap_path(), target_tokens=session.destination_tokens, source_tokens=None,
+    )
+    try:
+        guide = service.schedule_guide(ScheduleGuideRequest(
+            generation_id=request.generation_id,
+            approve_scope=request.approve_scope,
+            schedule_utc=request.schedule_utc,
+        ))
+        approved = SyncRequest.model_validate(guide.details["schedule_guide"]["request"])
+        with SchedulerClient(session.destination_tokens) as scheduler:
+            scheduler_state = scheduler.configure(approved, request.schedule_utc)
+        return guide.model_copy(update={
+            "warnings": (
+                "Scheduled metadata synchronization is configured. It does not activate recovery "
+                "resources, enable access, cut over, fail back or rearm.",
+                "Observe a successful execution before relying on the schedule.",
+            ),
+            "details": {
+                **guide.details,
+                "schedule_guide": {
+                    **guide.details["schedule_guide"],
+                    "deployment_status": scheduler_state["status"],
+                },
+                "scheduler": scheduler_state,
+            },
+        })
     finally:
         service.close()
 
@@ -521,7 +587,7 @@ def create_router(
 
     @router.get("/status", response_model=ServiceResult)
     async def status(session=Depends(require_session)):
-        return await execute(session, lambda: _service_call(session, lambda service: service.status()))
+        return await execute(session, lambda: _status_with_scheduler(session))
 
     @router.get("/standby-scope")
     async def standby_scope(include_workspaces: bool = True, session=Depends(require_session)):
@@ -632,6 +698,13 @@ def create_router(
         return await execute(
             session, lambda: _service_call(session, lambda service: service.schedule_guide(request)),
         )
+
+    @router.post("/configure-schedule", response_model=ServiceResult)
+    async def configure_schedule(
+        body: ConfirmedRequest[ConfigureScheduleRequest], session=Depends(require_session),
+    ):
+        request = confirmed(body, "configure-schedule")
+        return await execute(session, lambda: _configure_schedule(session, request))
 
     @router.post("/enable-recovery", response_model=ServiceResult)
     async def enable_recovery(

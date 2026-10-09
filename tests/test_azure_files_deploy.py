@@ -173,11 +173,11 @@ def test_storage_account_key_never_becomes_a_parameter_output_or_container_env_v
     container = _one(template, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
     assert "listKeys" not in container["env"]
     assert set(template["outputs"]) == {
-        "url", "easyAuthCallbackUrl", "containerAppsEnvironmentName", "storageMountName",
-        "controllerBootstrapPath", "bcdrLeaseBlobUrl", "bcdrLeaseContainerResourceId",
-        "managedIdentityResourceId", "managedIdentityClientId", "managedIdentityPrincipalId",
-        "managedIdentityTenantId", "verifyAuthenticationCommand", "activateApplicationCommand",
-        "enablePublicIngressCommand", "readPublicFqdnCommand",
+        "url", "easyAuthCallbackUrl", "containerAppsEnvironmentName", "scheduledJobResourceId",
+        "storageMountName", "controllerBootstrapPath", "bcdrLeaseBlobUrl",
+        "bcdrLeaseContainerResourceId", "managedIdentityResourceId", "managedIdentityClientId",
+        "managedIdentityPrincipalId", "managedIdentityTenantId", "verifyAuthenticationCommand",
+        "activateApplicationCommand", "enablePublicIngressCommand", "readPublicFqdnCommand",
     }
 
 
