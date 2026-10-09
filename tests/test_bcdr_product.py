@@ -790,6 +790,33 @@ def test_cli_validation_redacts_input_and_does_not_open_service(cli_service, mon
     assert not factories
 
 
+def test_cli_service_error_preserves_service_words_and_redacts_echoed_secrets(
+    cli_service, monkeypatch, capsys,
+):
+    service, _ = cli_service
+
+    def fail():
+        raise FabricApiError(
+            "GET",
+            "https://api.fabric.microsoft.com/v1/items",
+            403,
+            json.dumps({
+                "errorCode": "InsufficientPrivileges",
+                "message": "Grant access to the control Warehouse",
+                "client_secret": "echoed-secret",
+            }),
+        )
+
+    monkeypatch.setattr(service, "status", fail)
+    assert cli.main(["status", "--bootstrap", "/controller/bootstrap.json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert "InsufficientPrivileges" in error
+    assert "Grant access to the control Warehouse" in error
+    assert "echoed-secret" not in error
+    assert "[redacted]" in error
+    assert service.closed
+
+
 def test_cli_secret_file_is_external_and_exclusive(tmp_path):
     secret = tmp_path / "secret"
     secret.write_text("file-secret\n", encoding="utf-8")

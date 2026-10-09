@@ -254,7 +254,7 @@ def test_job_cannot_interpolate_a_shell_command_or_select_an_activation_action(j
     assert set(job["parameters"]) == {
         "jobName", "containerAppsEnvironmentName", "location", "containerImage",
         "managedIdentityResourceId", "bcdrLeaseBlobUrl", "scheduleUtc",
-        "replicaTimeoutSeconds", "cpuCores", "memoryGb", "maxDiskStagingGiB", "maxMemoryMiB",
+        "replicaTimeoutSeconds", "cpuCores", "maxDiskStagingGiB", "maxMemoryMiB",
     }
 
 
@@ -301,6 +301,15 @@ def test_job_schedule_has_bounded_duration_no_retries_and_one_replica_per_execut
     assert "per execution, not a global overlap lock" in cron["metadata"]["description"]
 
 
+def test_job_derives_the_only_valid_consumption_memory_from_cpu(job) -> None:
+    assert "memoryGb" not in job["parameters"]
+    resources = _container(job, "Microsoft.App/jobs")["resources"]
+    assert resources == {
+        "cpu": "[json(parameters('cpuCores'))]",
+        "memory": "[concat(string(mul(int(parameters('cpuCores')), 2)), 'Gi')]",
+    }
+
+
 def test_job_uses_the_controller_mount_and_budgets_without_mutating_persisted_files(web, job) -> None:
     for name in ("storageMountName", "scratchMountPath", "scratchVolumeName"):
         assert job["variables"][name] == web["variables"][name]
@@ -310,7 +319,7 @@ def test_job_uses_the_controller_mount_and_budgets_without_mutating_persisted_fi
     assert job_template["containers"][0]["volumeMounts"] == web_template["containers"][0]["volumeMounts"]
     assert job["variables"]["bootstrapPath"] == web["outputs"]["controllerBootstrapPath"]["value"]
     assert "nobrl" not in json.dumps(job_template["volumes"])
-    for parameter in ("containerImage", "cpuCores", "memoryGb", "maxDiskStagingGiB", "maxMemoryMiB"):
+    for parameter in ("containerImage", "cpuCores", "maxDiskStagingGiB", "maxMemoryMiB"):
         assert job["parameters"][parameter]["defaultValue"] == web["parameters"][parameter]["defaultValue"]
     env = {entry["name"]: entry["value"] for entry in job_template["containers"][0]["env"]}
     assert env["FAB_SHUFFLE_SCRATCH"] == "[variables('scratchMountPath')]"

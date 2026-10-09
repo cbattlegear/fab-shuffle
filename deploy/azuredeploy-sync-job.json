@@ -74,14 +74,6 @@
         "description": "vCPU allocation for the sync container."
       }
     },
-    "memoryGb": {
-      "type": "string",
-      "defaultValue": "4",
-      "allowedValues": ["2", "4", "8"],
-      "metadata": {
-        "description": "Memory in GiB. Must be exactly double cpuCores for this consumption sizing."
-      }
-    },
     "maxDiskStagingGiB": {
       "type": "int",
       "defaultValue": 10,
@@ -153,7 +145,7 @@
               ],
               "resources": {
                 "cpu": "[json(parameters('cpuCores'))]",
-                "memory": "[concat(parameters('memoryGb'), 'Gi')]"
+                "memory": "[concat(string(mul(int(parameters('cpuCores')), 2)), 'Gi')]"
               },
               "env": [
                 {

@@ -161,6 +161,23 @@ def test_sql_tool_failure_retains_service_words_not_token(endpoint, monkeypatch)
     assert token not in str(failure.value)
 
 
+def test_sql_tool_failure_retains_the_diagnostic_tail_after_redaction(endpoint, monkeypatch):
+    token = provider().sql_token()
+    service_words = "SqlPackageError: destination rejected the schema deployment"
+    monkeypatch.setattr(sqlschema.subprocess, "run", Mock(return_value=subprocess.CompletedProcess(
+        args=[],
+        returncode=1,
+        stdout="",
+        stderr=f"old beginning marker {'discarded preamble ' * 300}{service_words} /AccessToken:{token}",
+    )))
+    with pytest.raises(sqlschema.SchemaTransferError) as failure:
+        sqlschema._run(["sqlpackage", f"/AccessToken:{token}"], what="publish")
+    detail = str(failure.value)
+    assert service_words in detail
+    assert "old beginning marker" not in detail
+    assert token not in detail
+
+
 def test_odbc_and_bcp_use_sql_token_without_identity_secret(endpoint, monkeypatch):
     tokens = provider()
     connect = Mock()
