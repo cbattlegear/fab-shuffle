@@ -130,6 +130,10 @@ class ScheduleGuideRequest(Record):
                               pattern=r"^[0-9*/,\-]+(?: [0-9*/,\-]+){4}$")
 
 
+class ConfigureScheduleRequest(ScheduleGuideRequest):
+    approve_live_schedule: Literal[True]
+
+
 class StandbySelectionRequest(Record):
     selection_mode: Literal["workspaces", "pattern"] = "workspaces"
     workspace_ids: tuple[Guid, ...] = ()

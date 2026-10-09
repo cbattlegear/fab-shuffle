@@ -45,6 +45,7 @@ function bcdrLabel(name) {
     test_id: "Recorded DR Test",
     schedule_utc: "Recurring schedule (five-field UTC cron)",
     approve_scope: "I approve this scope for recurring fresh capture and safe parking",
+    approve_live_schedule: "I approve creating or changing this live schedule",
     expected_attempt_id: "Recorded sync attempt",
     source_capacity_ids: "Source capacities",
     source_capacity_id: "Source capacity",
@@ -1128,6 +1129,25 @@ function bcdrRenderResult(result) {
   }
   if (result.details?.configuration_sha256) {
     output.appendChild(bcdrElement("p", `Configuration hash: ${result.details.configuration_sha256}`, "hint"));
+  }
+  if (result.details?.scheduler) {
+    const scheduler = result.details.scheduler;
+    output.appendChild(bcdrElement("h4", "Observed scheduled job"));
+    const list = bcdrElement("dl", undefined, "bcdr-facts");
+    for (const [label, value] of [
+      ["Deployment", scheduler.status],
+      ["UTC cron", scheduler.schedule_utc || "Disabled"],
+      ["Provisioning", scheduler.provisioning_state || "Not reported"],
+      ["Runtime matches controller", scheduler.runtime_matches_controller ? "Yes" : "No"],
+      ["Approved request", scheduler.request_sha256 || "Not present"],
+      ["Latest execution", scheduler.latest_execution ?
+        `${scheduler.latest_execution.status || "Unknown"} at ${scheduler.latest_execution.start_time || "unknown time"}` :
+        "No execution observed"],
+    ]) {
+      list.appendChild(bcdrElement("dt", label));
+      list.appendChild(bcdrElement("dd", value, "v"));
+    }
+    output.appendChild(list);
   }
   if (result.details?.temporary_configurations?.length) {
     const section = bcdrElement("details");

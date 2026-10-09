@@ -266,9 +266,20 @@ def workflow_summary(coordinator, generation=None) -> dict:
 
 def schedule_guide(coordinator, request: ScheduleGuideRequest) -> ServiceResult:
     from fabshuffle.bcdr.scheduled import MAX_REQUEST_BYTES, validate_request
+    from fabshuffle.bcdr.scheduler import (
+        CONTROLLER_RESOURCE_ENV,
+        ENVIRONMENT_RESOURCE_ENV,
+        IDENTITY_RESOURCE_ENV,
+        JOB_RESOURCE_ENV,
+        validate_cron,
+    )
 
     coordinator._wake()
     with coordinator.runtime.controller({RecoveryMode.STANDBY}):
+        try:
+            validate_cron(request.schedule_utc)
+        except ValueError as error:
+            raise RecoveryBlocked(str(error)) from error
         state = coordinator.catalog.state()
         groups = coordinator._groups(state.current_generation_id) if state.current_generation_id else ()
         generation = (
@@ -297,7 +308,8 @@ def schedule_guide(coordinator, request: ScheduleGuideRequest) -> ServiceResult:
         return ServiceResult(
             mode=state.mode, generation_id=request.generation_id,
             warnings=(
-                "Instructions prepared only. No scheduled job was created or enabled.",
+                "Scope reviewed. Creating or changing the live schedule still requires the separate "
+                "explicit deployment confirmation.",
                 "Metadata sync does not establish data readiness; review the remaining workload gaps.",
             ),
             details={"schedule_guide": {
@@ -309,21 +321,20 @@ def schedule_guide(coordinator, request: ScheduleGuideRequest) -> ServiceResult:
                 "request": sync.model_dump(mode="json"), "schedule_utc": request.schedule_utc,
                 "deployment_status": "not_verified",
                 "remote_lease_configured": bool(os.environ.get(LEASE_ENV)),
+                "automation_configured": all(os.environ.get(name) for name in (
+                    CONTROLLER_RESOURCE_ENV, ENVIRONMENT_RESOURCE_ENV,
+                    IDENTITY_RESOURCE_ENV, JOB_RESOURCE_ENV,
+                )),
                 "command": (
                     "python -m fabshuffle.bcdr scheduled-sync --bootstrap /app/local/bcdr/bootstrap.json "
                     "--request /app/local/bcdr/scheduled-sync-request.json --confirm scheduled-sync"
                 ),
-                "template_url": "https://github.com/cbattlegear/fab-shuffle/blob/main/deploy/azuredeploy-sync-job.json",
-                "guide_url": "https://github.com/cbattlegear/fab-shuffle/blob/main/docs/bcdr.md",
                 "steps": [
-                    "Review and download this scope. Recurring runs capture fresh metadata and park safely.",
-                    "Place the request beside bootstrap on shared storage; never overwrite bootstrap.",
-                    "Use the same recovery identity and exact remote lease URL on controller and scheduler.",
-                    "Use the sync-job template from the SAME reviewed release, not an older main/latest.",
-                    "Use the web deployment's environment, identity, lease outputs "
-                    "and production image digest.",
-                    "Review the UTC cron. Prepare storage, identity and lease prerequisites "
-                    "before deployment.",
+                    "Review this exact scope and UTC cron before confirming the live schedule.",
+                    "The controller first disables scheduled triggers, atomically writes the approved "
+                    "request beside bootstrap, then enables the reviewed cron.",
+                    "The job reuses the same live controller environment, Azure Files mount, managed "
+                    "identity, remote lease URL, production image and resource sizing.",
                     "Observe a completed scheduled execution before treating automatic sync as operational.",
                 ],
             }},

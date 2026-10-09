@@ -113,6 +113,7 @@
     "appName": "[if(empty(parameters('appName')), concat('fab-shuffle-', uniqueString(resourceGroup().id)), parameters('appName'))]",
     "location": "[if(empty(parameters('location')), resourceGroup().location, parameters('location'))]",
     "environmentName": "[concat(variables('appName'), '-env')]",
+    "scheduledJobName": "[concat('fab-shuffle-sync-', uniqueString(resourceGroup().id, variables('environmentName')))]",
     "logAnalyticsName": "[concat(variables('appName'), '-logs')]",
     "useManagedIdentity": "[not(empty(parameters('managedIdentityResourceId')))]",
     "easyAuthSecretName": "fab-shuffle-easyauth",
@@ -148,6 +149,26 @@
       {
         "name": "FAB_SHUFFLE_BCDR_LEASE_BLOB_URL",
         "value": "[variables('bcdrLeaseBlobUrl')]"
+      },
+      {
+        "name": "FAB_SHUFFLE_BCDR_BOOTSTRAP",
+        "value": "/app/local/bcdr/bootstrap.json"
+      },
+      {
+        "name": "FAB_SHUFFLE_CONTROLLER_RESOURCE_ID",
+        "value": "[resourceId('Microsoft.App/containerApps', variables('appName'))]"
+      },
+      {
+        "name": "FAB_SHUFFLE_CONTAINER_APPS_ENVIRONMENT_ID",
+        "value": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+      },
+      {
+        "name": "FAB_SHUFFLE_CONTROLLER_UAMI_RESOURCE_ID",
+        "value": "[parameters('managedIdentityResourceId')]"
+      },
+      {
+        "name": "FAB_SHUFFLE_BCDR_JOB_RESOURCE_ID",
+        "value": "[resourceId('Microsoft.App/jobs', variables('scheduledJobName'))]"
       }
     ],
     "storageAccountName": "[toLower(concat('fabshuffle', uniqueString(resourceGroup().id, variables('appName'))))]",
@@ -418,6 +439,11 @@
       "type": "string",
       "value": "[variables('environmentName')]",
       "metadata": { "description": "Reuse this environment in the scheduled-sync job deployment, in this same resource group and location." }
+    },
+    "scheduledJobResourceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.App/jobs', variables('scheduledJobName'))]",
+      "metadata": { "description": "Stable job resource targeted by the controller scheduling workflow. It is not created until an operator explicitly reviews and confirms a live schedule." }
     },
     "storageMountName": {
       "type": "string",

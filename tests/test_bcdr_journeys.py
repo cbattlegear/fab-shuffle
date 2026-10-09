@@ -32,7 +32,7 @@ def start(system):
     return system.service.start_dr_test(request)
 
 
-def test_metadata_baseline_and_guided_schedule_are_durable_and_do_not_deploy(system, tmp_path):
+def test_metadata_baseline_and_guided_schedule_are_durable_and_require_separate_deploy(system, tmp_path):
     assert not system.service.status().details["workflow"]["metadata_baseline_ready"]
     sync = system.service.synchronize(system.request)
     status = system.service.status().details["workflow"]
@@ -54,6 +54,16 @@ def test_metadata_baseline_and_guided_schedule_are_durable_and_do_not_deploy(sys
     assert "same" in " ".join(document["steps"]).lower()
     with pytest.raises(RecoveryBlocked, match="current generation"):
         system.service.schedule_guide(ScheduleGuideRequest(generation_id=guid(), approve_scope=True))
+
+
+def test_schedule_guide_rejects_impossible_cron_before_persist_or_deploy(system):
+    sync = system.service.synchronize(system.request)
+    with pytest.raises(RecoveryBlocked, match="outside the supported"):
+        system.service.schedule_guide(ScheduleGuideRequest(
+            generation_id=sync.generation_id,
+            approve_scope=True,
+            schedule_utc="99 99 99 99 99",
+        ))
 
 
 def test_dr_test_owner_evidence_never_enables_production_and_ends_without_deletion(system):

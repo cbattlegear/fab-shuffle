@@ -621,7 +621,43 @@ incident. The simple web template uses `Standard_LRS`; that alone does not prote
 controller from loss of its own region. A Fabric notebook scheduled on the paused/source
 capacity is not the controller scheduler.
 
-Before using the [separate job deployment](../deploy/azuredeploy-sync-job.json):
+The normal path is now **Set up standby > Scheduled sync** in the web controller:
+
+1. Choose **Prepare scheduled-sync instructions** to review the exact workspace scope,
+   non-secret request and numeric five-field UTC cron. Impossible field ranges are rejected;
+   for example, `99 99 99 99 99` is not accepted.
+2. Separately choose **Create or update scheduled sync** and confirm the live-schedule
+   consequence. The controller verifies its live Container App through ARM, including the
+   exact UAMI, environment, production image, remote lease URL, bootstrap path and
+   `fab-shuffle-storage` mount.
+3. For an update, the controller first changes the job to a manual trigger so an old schedule
+   cannot start against a newly approved request. It then atomically writes
+   `/app/local/bcdr/scheduled-sync-request.json`, applies the reviewed cron and reads the job
+   and recent execution history back from Azure. If the final update fails, the job remains
+   disabled rather than restoring a schedule whose request may no longer match.
+4. Read the observed provisioning state, cron, runtime match and latest execution. Do not
+   treat deployment alone as proof that metadata synchronization completed.
+
+The controller identity needs ARM access to its own app and the one stable job resource.
+Use a custom role at the controller resource group containing only
+`Microsoft.App/containerApps/read`, `Microsoft.App/jobs/read`,
+`Microsoft.App/jobs/write`, `Microsoft.App/jobs/executions/read`,
+`Microsoft.App/managedEnvironments/read` and
+`Microsoft.App/managedEnvironments/join/action`. The documented **Container Apps Jobs
+Contributor** role also creates and updates jobs, but includes delete and deployment
+permissions; prefer the narrower custom role. Initial role assignment remains an Azure
+administrator boundary because the controller must not grant itself permission. An ARM
+authorization failure reports Azure's `errorCode`, message and request ID with this exact
+remediation.
+
+Controllers deployed before this automation metadata was added must be redeployed from the
+reviewed release. This adds non-secret resource IDs to the controller environment; it does
+not create or enable a job. The fallback
+[separate job deployment](../deploy/azuredeploy-sync-job.json) remains available when policy
+does not allow the controller identity to write jobs. Use the template from the same reviewed
+release, never a mutable `main` link.
+
+Before scheduling:
 
 1. Attach the existing UAMI to the web controller and grant its Fabric tenant, source/control
    workspace, destination capacity, connection, SQL and OneLake access as required. Grant
@@ -631,11 +667,10 @@ Before using the [separate job deployment](../deploy/azuredeploy-sync-job.json):
    the web deployment's client/tenant/principal outputs with the bootstrap's recorded
    recovery identity; a different identity must not silently take over.
 2. Keep the existing descriptor at `/app/local/bcdr/bootstrap.json` on the web template's
-   `fab-shuffle-storage` Azure Files mount. Save the reviewed request as
-   `/app/local/bcdr/scheduled-sync-request.json` on **that same share** with restricted write
-   access. Do not replace the bootstrap, copy results over it or include credentials in the
-   request. Stop active operations before changing a request. The template has no arbitrary
-   mount, file-path or shell-command parameter and never writes either file.
+   `fab-shuffle-storage` Azure Files mount. The automated path writes only the reviewed
+   non-secret request to `/app/local/bcdr/scheduled-sync-request.json` on **that same share**.
+   It never replaces bootstrap. The fallback template has no arbitrary mount, file-path or
+   shell-command parameter and never writes either file.
 3. Verify that both web and job use the **exact** `bcdrLeaseBlobUrl` from the web deployment.
    The private `fab-shuffle-locks` container holds one empty `deployment.lock` coordination
    blob, not metadata or data exports. The runtime conditionally creates it. OAuth authorizes
@@ -643,18 +678,18 @@ Before using the [separate job deployment](../deploy/azuredeploy-sync-job.json):
    the UAMI **Storage Blob Data Contributor at that container only**. Do not broaden this to
    subscription Contributor. An SP-mode controller needs the same container data grant
    explicitly; browser EasyAuth does not grant it.
-4. Deploy the job in the web controller's **existing resource group and environment
-   location**, supplying its `containerAppsEnvironmentName`, the same `managedIdentityResourceId`,
-   and `bcdrLeaseBlobUrl` outputs. Use the same published production image **digest** on both.
+4. The automated path deploys the job in the web controller's **existing resource group and
+   environment location**, using the observed live `managedIdentityResourceId`,
+   `bcdrLeaseBlobUrl` and published production image **digest**.
    This is an existing environment/storage deployment: it does not create a second catalog,
    environment, file share or controller bootstrap. The Azure Files environment mount still
    uses its deployment-held account key; the runtime identity is for service access and the
    Blob lease, not an automatic conversion of SMB authentication to OAuth.
 5. Choose `scheduleUtc` (five cron fields, **UTC**, not local time), allowing more than the
    worst-case sync duration between executions. The default is `0 2 * * *` (daily 02:00 UTC).
-   `replicaTimeoutSeconds` defaults to four hours and is bounded by the template to one day;
-   set it from measured work, not a promised duration. The schedule becomes active on
-   deployment, so prepare files, grants and storage before deploying it.
+   `replicaTimeoutSeconds` is four hours in the automated path and bounded by the fallback
+   template to one day. The web workflow keeps the schedule disabled until its request has
+   been persisted and the final reviewed configuration is applied.
 
 The job runs the exact `scheduled-sync` argument list above without a shell, has no ingress
 or EasyAuth configuration, and injects no client secret. It uses the same single controller's

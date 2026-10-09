@@ -216,6 +216,20 @@ def test_private_blob_lock_is_not_a_metadata_archive_or_a_broad_role_assignment(
     )
     env = {entry["name"]: entry["value"] for entry in web["variables"]["containerEnvironment"]}
     assert env["FAB_SHUFFLE_BCDR_LEASE_BLOB_URL"] == "[variables('bcdrLeaseBlobUrl')]"
+    assert env["FAB_SHUFFLE_BCDR_BOOTSTRAP"] == "/app/local/bcdr/bootstrap.json"
+    assert env["FAB_SHUFFLE_CONTROLLER_RESOURCE_ID"] == (
+        "[resourceId('Microsoft.App/containerApps', variables('appName'))]"
+    )
+    assert env["FAB_SHUFFLE_CONTAINER_APPS_ENVIRONMENT_ID"] == (
+        "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+    )
+    assert env["FAB_SHUFFLE_CONTROLLER_UAMI_RESOURCE_ID"] == (
+        "[parameters('managedIdentityResourceId')]"
+    )
+    assert env["FAB_SHUFFLE_BCDR_JOB_RESOURCE_ID"] == (
+        "[resourceId('Microsoft.App/jobs', variables('scheduledJobName'))]"
+    )
+    assert web["outputs"]["scheduledJobResourceId"]["value"] == env["FAB_SHUFFLE_BCDR_JOB_RESOURCE_ID"]
     assert web["outputs"]["bcdrLeaseBlobUrl"]["value"] == "[variables('bcdrLeaseBlobUrl')]"
     assert web["outputs"]["bcdrLeaseContainerResourceId"]["value"] == LOCK_SCOPE
     assert not any(r["type"] == "Microsoft.Resources/deploymentScripts" for r in web["resources"])
