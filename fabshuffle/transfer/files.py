@@ -10,13 +10,14 @@ import logging
 import shutil
 import subprocess
 from collections.abc import Callable, Collection, Iterator
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
-from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.auth import AuthPrincipal, ManagedIdentity, ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.lifecycle import CopyOutcome
 from fabshuffle.transfer.common import (
@@ -53,9 +54,9 @@ def copy_files(
     *,
     source_files_path: str,
     target_files_path: str,
-    principal: ServicePrincipal,
+    principal: AuthPrincipal,
     scratch_dir: Path,
-    target_principal: ServicePrincipal | None = None,
+    target_principal: AuthPrincipal | None = None,
     target_tokens: TokenProvider | None = None,
     tokens: TokenProvider | None = None,
     max_staging_bytes: int | None = None,
@@ -66,11 +67,18 @@ def copy_files(
     on_progress: Callable[[str], None] | None = None,
 ) -> CopyOutcome:
     """Stage ``Files/`` from the source lakehouse locally, then upload to the target."""
-    if target_principal is not None or target_tokens is not None:
+    if isinstance(principal, ManagedIdentity) or target_principal is not None or target_tokens is not None:
+        # AzCopy's documented MSI path targets VMs, not ACA's identity endpoint.
+        # Keep token acquisition in our SDK and reuse the bounded, ETag-pinned relay.
+        # https://learn.microsoft.com/azure/storage/common/storage-use-azcopy-authorize-managed-identity
+        source_tokens = tokens or TokenProvider(principal)
+        destination_tokens = target_tokens or (
+            TokenProvider(target_principal) if target_principal is not None else source_tokens
+        )
         return copy_tree_streaming(
             source_path=source_files_path, target_path=target_files_path,
-            tokens=tokens or TokenProvider(principal),
-            target_tokens=target_tokens or TokenProvider(target_principal),
+            tokens=source_tokens, target_tokens=destination_tokens,
+            scratch_dir=scratch_dir,
             max_staging_bytes=max_staging_bytes,
             max_memory_bytes=max_memory_bytes,
             max_disk_staging_bytes=max_disk_staging_bytes,
@@ -293,6 +301,8 @@ def copy_tree_streaming(
     on_progress: Callable[[str], None] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    transport_client: httpx.Client | None = None,
+    existing_target_directories: Collection[str] = (),
 ) -> CopyOutcome:
     """Relay a frozen OneLake tree through bounded RAM and bounded checkpoint disk.
 
@@ -313,6 +323,11 @@ def copy_tree_streaming(
     Source writes must remain frozen.
     ``scratch_dir`` defaults to the working directory; private checkpoint staging is always removed.
     A successful byte copy does not establish destination SQL catalog readiness.
+    ``transport_client`` lets a recovery caller enforce pinned input/no-overwrite policies;
+    its lifetime belongs to that caller. Ordinary transfers retain the default client.
+    ``existing_target_directories`` contains exact root-relative directories whose
+    empty, local destination scaffolding the caller already verified. Only their
+    directory PUT is skipped; files are never skipped or treated as successful copies.
     The destination must be fresh, or a retry of the same operator-frozen source snapshot.
     On retry each file is recreated before appending; no uncertain append is retried alone.
 
@@ -338,6 +353,14 @@ def copy_tree_streaming(
     excluded = {value.strip("/") for value in exclude_paths}
     count = 0
     copied_metadata: set[str] = set()
+    existing_directories = set(existing_target_directories)
+    for value in existing_directories:
+        if (
+            not value or "\\" in value or "%" in value or ":" in value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise FileTransferError("Existing target directories must be exact root-relative paths.")
 
     def is_excluded(name: str) -> bool:
         local = name[len(source_root) + 1:]
@@ -355,18 +378,22 @@ def copy_tree_streaming(
                 continue
             target = f"{target_fs}/{quote(target_root + '/' + local, safe='/')}"
             if str(entry.get("isDirectory", False)).lower() == "true":
-                response = client.put(
-                    target, params={"resource": "directory"}, headers=_headers(target_tokens), content=b"",
-                )
-                if not response.is_success:
-                    try:
-                        code = response.json().get("error", {}).get("code")
-                    except ValueError:
-                        code = None
-                    if response.status_code != 409 or code != "PathAlreadyExists":
-                        raise _error(response)
+                if local not in existing_directories:
+                    response = client.put(
+                        target, params={"resource": "directory"},
+                        headers=_headers(target_tokens), content=b"",
+                    )
+                    if not response.is_success:
+                        try:
+                            code = response.json().get("error", {}).get("code")
+                        except ValueError:
+                            code = None
+                        if response.status_code != 409 or code != "PathAlreadyExists":
+                            raise _error(response)
                 visit(client, local)
             else:
+                if local in existing_directories:
+                    raise FileTransferError("A verified destination directory conflicts with a source file.")
                 entry = snapshot.pin(entry)
                 if on_progress:
                     on_progress(f"Copying OneLake {local}")
@@ -378,7 +405,11 @@ def copy_tree_streaming(
                 if name in snapshot.files:
                     copied_metadata.add(name)
 
-    with httpx.Client(timeout=120, follow_redirects=False) as client:
+    transport = (
+        nullcontext(transport_client) if transport_client is not None
+        else httpx.Client(timeout=120, follow_redirects=False)
+    )
+    with transport as client:
         from fabshuffle.transfer.delta import preflight
 
         snapshot = preflight(

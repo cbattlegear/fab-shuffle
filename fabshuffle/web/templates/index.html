@@ -15,7 +15,11 @@
         <p>Move a Microsoft Fabric workspace to another region or tenant</p>
       </div>
     </div>
-    <button id="sign-out" class="link-button" hidden>Sign out</button>
+    <div class="masthead-actions">
+      <button id="bcdr-open" class="secondary" type="button" hidden>Standby &amp; recovery</button>
+      <button id="sign-out" class="link-button" hidden>Sign out</button>
+      <a id="azure-sign-out" class="link-button" href="/.auth/logout" hidden>Sign out of Azure</a>
+    </div>
   </header>
 
   <nav class="wizard-nav" aria-label="Migration steps">
@@ -31,19 +35,57 @@
   <main>
     <div id="alert" class="alert" role="alert" hidden></div>
 
+    <section id="bcdr-panel" class="panel bcdr" data-stage="bcdr" hidden aria-labelledby="bcdr-title">
+      <div class="bcdr-heading">
+        <div>
+          <h2 id="bcdr-title" tabindex="-1">Standby &amp; recovery</h2>
+          <p class="hint">Same-tenant recovery across workspaces. Migration remains a separate workflow.</p>
+        </div>
+        <button id="bcdr-back" class="secondary" type="button">Back to migration</button>
+      </div>
+      <p id="bcdr-error" class="alert" role="alert" hidden></p>
+      <p id="bcdr-progress" class="hint" role="status" aria-live="polite"></p>
+      <details id="bcdr-activity" class="bcdr-activity">
+        <summary>Activity and recent requests</summary>
+        <button id="bcdr-activity-refresh" type="button" class="link-button">Check activity</button>
+        <p id="bcdr-activity-status" class="hint" role="status" aria-live="polite">
+          Observe local requests without taking the deployment lock or resuming capacity.
+        </p>
+        <div id="bcdr-activity-list"></div>
+      </details>
+      <div id="bcdr-content"></div>
+    </section>
+
     <!-- 1. Sign in -->
     <section class="panel" data-stage="login">
-      <h2>Sign in with a service principal</h2>
+      <h2>Connect to Fabric</h2>
       <p class="hint">
-        Credentials stay in this container's memory and are never written to disk.
-        Use a source principal with workspace access and a destination principal with access to the target capacity.
+        Choose the identity Fab Shuffle uses for workspace access. Service-principal credentials stay in
+        this container's memory. In Azure, an authorized operator can use the deployment's managed identity.
       </p>
+      <p id="operator-context" class="hint identity-context" hidden></p>
+      <p id="auth-options-status" class="hint" role="status" aria-live="polite"></p>
       <form id="login-form" class="form">
-        <fieldset class="options login-mode">
+        <label>Fabric authentication
+          <select id="fabric-auth-mode">
+            <option value="service_principal">Service principal with a client secret</option>
+            <option id="managed-identity-option" value="managed_identity" disabled hidden>
+              Azure managed identity
+            </option>
+          </select>
+        </label>
+        <p id="managed-identity-context" class="hint identity-context" hidden></p>
+        <label>Workflow
+          <select id="login-workflow">
+            <option value="migration">Move a workspace</option>
+            <option value="bcdr">Operate standby &amp; recovery (same tenant)</option>
+          </select>
+        </label>
+        <fieldset id="tenant-mode" class="options login-mode">
           <legend>Destination</legend>
           <label><input type="checkbox" id="another-tenant" /> Another tenant</label>
         </fieldset>
-        <fieldset class="credentials">
+        <fieldset id="source-credentials" class="credentials">
         <legend id="source-credentials-label">Service principal</legend>
         <label>Tenant ID
           <input name="tenant_id" autocomplete="off" spellcheck="false" required
@@ -365,5 +407,8 @@
   </main>
 
   <script src="/static/app.js"></script>
+  <script src="/static/bcdr-workflows.js"></script>
+  <script src="/static/bcdr.js"></script>
+  <script src="/static/auth.js"></script>
 </body>
 </html>

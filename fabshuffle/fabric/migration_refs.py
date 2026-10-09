@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import quote
@@ -18,10 +19,37 @@ _DETAIL_ROUTES = {
     "MirroredDatabase": "mirroredDatabases",
     "CosmosDBDatabase": "cosmosDbDatabases",
 }
-_ENDPOINT_KEYS = (
-    "connectionString", "connectionInfo", "serverFqdn", "queryServiceUri",
-    "ingestionServiceUri", "databaseName",
-)
+_ENDPOINT_KINDS = {
+    "connectionString": "sql_connection", "connectionInfo": "sql_connection_info",
+    "serverFqdn": "sql_server", "queryServiceUri": "kql_query_uri",
+    "ingestionServiceUri": "kql_ingestion_uri", "databaseName": "sql_database_name",
+}
+
+
+def endpoint_values(item: Mapping[str, Any]) -> dict[str, str]:
+    """Pure endpoint inventory shared by live migration and captured recovery."""
+    properties = item.get("properties") or {}
+    result = {
+        kind: value for key, kind in _ENDPOINT_KINDS.items()
+        if isinstance(value := properties.get(key), str) and value
+    }
+    endpoint = properties.get("sqlEndpointProperties") or {}
+    for key, kind in (("id", "sql_endpoint_id"), ("connectionString", "sql_endpoint_server")):
+        if isinstance(value := endpoint.get(key), str) and value:
+            result[kind] = value
+    return result
+
+
+def referenced_onelake_roots(text: str) -> set[str]:
+    """Complete named or GUID roots, including both HTTP and ABFS spellings."""
+    return {
+        match.group(0).rstrip("/") + "/"
+        for pattern in (
+            r"https://onelake\.(?:dfs|blob)\.fabric\.microsoft\.com/[^/\r\n\"'?#]+/[^/\r\n\"'?#]+/?",
+            r"abfss?://[^@/\r\n\"'?#]+@onelake\.dfs\.fabric\.microsoft\.com/[^/\r\n\"'?#]+/?",
+        )
+        for match in re.finditer(pattern, text, re.IGNORECASE)
+    }
 
 
 def onelake_aliases(
@@ -100,16 +128,9 @@ def resolve(
         bind(source_id, target_id)
         for old_path, new_path in onelake_aliases(source_ws, "", old, target_ws, target_id).items():
             bind(old_path, new_path)
-        old_properties = old.get("properties") or {}
-        new_properties = new.get("properties") or {}
-        for key in _ENDPOINT_KEYS:
-            left, right = old_properties.get(key), new_properties.get(key)
-            if isinstance(left, str) and isinstance(right, str):
-                bind(left, right)
-        old_sql = old_properties.get("sqlEndpointProperties") or {}
-        new_sql = new_properties.get("sqlEndpointProperties") or {}
-        for key in ("id", "connectionString"):
-            bind(str(old_sql.get(key) or ""), str(new_sql.get(key) or ""))
+        target_endpoints = endpoint_values(new)
+        for kind, value in endpoint_values(old).items():
+            bind(value, target_endpoints.get(kind, ""))
         source_items[source_id] = old
         source_items[source_ws] = {
             "id": source_ws, "displayName": source_ws, "type": "Workspace",

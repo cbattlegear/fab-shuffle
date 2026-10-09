@@ -22,7 +22,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from fabshuffle import __version__, journal, recovery
-from fabshuffle.auth import AuthError, ServicePrincipal, TokenProvider
+from fabshuffle.auth import (
+    AuthError,
+    AuthPrincipal,
+    ServicePrincipal,
+    TokenProvider,
+    managed_identity_principal,
+)
 from fabshuffle.config import SETTINGS
 from fabshuffle.fabric import (
     analytics,
@@ -56,6 +62,7 @@ from fabshuffle.orchestrator import (
     run_migration,
 )
 from fabshuffle.run import REGISTRY, MigrationRun, RunConflict, RunStatus
+from fabshuffle.web.operators import OperatorMiddleware, OperatorPolicy, operator_key
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +81,12 @@ class Session:
     """Immutable source and optional destination sign-ins, pinned for each attempt."""
 
     id: str
-    principal: ServicePrincipal
+    principal: AuthPrincipal
     tokens: TokenProvider
     target_tokens: TokenProvider | None = None
     source_tenant_id: str = ""
     target_tenant_id: str = ""
+    operator_id: str | None = None
 
     @property
     def destination_tokens(self) -> TokenProvider:
@@ -99,8 +107,9 @@ class SessionStore:
         self._lock = threading.Lock()
 
     def create(
-        self, principal: ServicePrincipal, tokens: TokenProvider, *,
+        self, principal: AuthPrincipal, tokens: TokenProvider, *,
         target_tokens: TokenProvider | None = None,
+        operator_id: str | None = None,
     ) -> Session:
         source_tenant_id = target_tenant_id = ""
         if target_tokens is not None:
@@ -110,6 +119,7 @@ class SessionStore:
             id=secrets.token_urlsafe(32), principal=principal, tokens=tokens,
             target_tokens=target_tokens, source_tenant_id=source_tenant_id,
             target_tenant_id=target_tenant_id,
+            operator_id=operator_id,
         )
         with self._lock:
             self._sessions[session.id] = session
@@ -137,12 +147,22 @@ def _endpoint_tenant_id(tokens: TokenProvider, side: str) -> str:
 
 
 def require_session(
+    request: Request,
     session_id: str | None = Header(default=None, alias=SESSION_HEADER),
 ) -> Session:
     session = SESSIONS.get(session_id)
     if not session:
-        raise HTTPException(status_code=401, detail="Sign in with a service principal first")
+        raise HTTPException(status_code=401, detail="Sign in and connect a Fabric identity first.")
+    _require_session_owner(session, request)
     return session
+
+
+def _require_session_owner(session: Session, request: Request) -> None:
+    if session.operator_id != operator_key(request):
+        raise HTTPException(
+            status_code=403,
+            detail="This Fabric session belongs to another operator. Connect your own session.",
+        )
 
 
 def require_execution_session(session: Session = Depends(require_session)) -> Session:
@@ -266,6 +286,10 @@ class LoginRequest(PrincipalCredentials):
     destination: PrincipalCredentials | None = None
 
 
+class ManagedIdentityLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class RestoreAccessRequest(BaseModel):
     """Copy the admins of one workspace onto another."""
 
@@ -358,8 +382,14 @@ class ResumeRunRequest(BaseModel):
 
 
 def create_app() -> FastAPI:
+    from fabshuffle.web.bcdr import create_router
+
     app = FastAPI(title="Fab Shuffle", version=__version__, docs_url="/api/docs")
+    policy = OperatorPolicy.from_environment()
+    app.state.operator_policy = policy
+    app.add_middleware(OperatorMiddleware, policy=policy)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(create_router(require_session, _run_fabric))
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -371,8 +401,26 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------------------ login
 
+    @app.get("/api/auth/options")
+    async def authentication_options(request: Request) -> dict[str, Any]:
+        operator = getattr(request.state, "operator", None)
+        principal = None
+        if policy.enabled and operator is not None:
+            try:
+                principal = managed_identity_principal()
+            except AuthError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+        return {
+            "easyAuth": policy.enabled,
+            "operator": (
+                {"tenantId": operator.tenant_id, "objectId": operator.object_id} if operator else None
+            ),
+            "managedIdentity": principal.redacted() if principal else None,
+            "servicePrincipal": True,
+        }
+
     @app.post("/api/login")
-    async def login(body: LoginRequest) -> dict[str, Any]:
+    async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
         principal = body.principal()
         tokens = TokenProvider(principal)
         try:
@@ -391,6 +439,7 @@ def create_app() -> FastAPI:
         try:
             session = await asyncio.to_thread(
                 SESSIONS.create, principal, tokens, target_tokens=target_tokens,
+                operator_id=operator_key(request),
             )
         except AuthError as error:
             raise HTTPException(status_code=401, detail=str(error)) from error
@@ -402,6 +451,32 @@ def create_app() -> FastAPI:
                 paired=True, crossTenant=session.cross_tenant,
             )
         return result
+
+    @app.post("/api/login/managed-identity")
+    async def login_managed_identity(
+        body: ManagedIdentityLoginRequest, request: Request,
+    ) -> dict[str, Any]:
+        if not policy.enabled or operator_key(request) is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Managed identity requires an authorized Azure EasyAuth operator.",
+            )
+        try:
+            principal = managed_identity_principal()
+            if principal is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This deployment has no configured managed identity. Use a service principal.",
+                )
+            tokens = TokenProvider(principal)
+            await asyncio.to_thread(tokens.verify)
+            session = SESSIONS.create(principal, tokens, operator_id=operator_key(request))
+        except AuthError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        return {
+            "sessionId": session.id, "principal": principal.redacted(),
+            "managedIdentity": True, "paired": False, "crossTenant": False,
+        }
 
     @app.post("/api/logout")
     async def logout(session: Session = Depends(require_session)) -> dict[str, bool]:
@@ -827,7 +902,8 @@ def create_app() -> FastAPI:
         """Server-sent events feed. EventSource cannot set headers, so the id comes as a query."""
         session = SESSIONS.get(session_id)
         if not session:
-            raise HTTPException(status_code=401, detail="Sign in with a service principal first")
+            raise HTTPException(status_code=401, detail="Sign in and connect a Fabric identity first.")
+        _require_session_owner(session, request)
         run = _require_run(run_id, session)
 
         async def stream():

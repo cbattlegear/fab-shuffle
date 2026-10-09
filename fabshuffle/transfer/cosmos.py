@@ -48,8 +48,8 @@ class CosmosTransferError(RuntimeError):
     """Documents could not be copied."""
 
 
-class _MsalCredential:
-    """Adapts our MSAL token provider to the credential azure-core expects.
+class _TokenCredential:
+    """Adapts our explicit token provider to the credential azure-core expects.
 
     The SDK derives the scope from the account endpoint and falls back to a generic Cosmos
     scope if that is refused, so whatever it asks for is passed straight through rather than
@@ -66,8 +66,8 @@ class _MsalCredential:
 
         scope = scopes[0] if scopes else "https://cosmos.azure.com/.default"
         token = self._tokens.token(scope)
-        # azure-core needs an expiry to decide when to refresh. MSAL caches for us, so a
-        # slightly early expiry only costs a cache hit.
+        # azure-core needs an expiry to decide when to refresh. The selected credential
+        # caches for us, so a slightly early expiry only costs a cache hit.
         expires_on = int(token_claim(token, "exp") or 0)
         return AccessToken(token, expires_on)
 
@@ -85,7 +85,7 @@ def _client(endpoint: str, tokens: TokenProvider) -> Any:
             "installed in this image."
         ) from error
     # Gateway is the SDK default and the only mode Fabric's endpoint supports.
-    return CosmosClient(endpoint, credential=_MsalCredential(tokens))
+    return CosmosClient(endpoint, credential=_TokenCredential(tokens))
 
 
 def container_names(endpoint: str, database: str, tokens: TokenProvider) -> list[str]:

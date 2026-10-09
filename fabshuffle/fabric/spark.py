@@ -14,7 +14,7 @@ import logging
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,12 @@ def list_pools(client: FabricClient, workspace_id: str) -> list[dict[str, Any]]:
 
 
 def create_pool(client: FabricClient, workspace_id: str, pool: Mapping[str, Any]) -> dict[str, Any]:
-    payload = {field: pool[field] for field in _POOL_FIELDS if pool.get(field) is not None}
+    payload = pool_configuration(pool)
     return client.post(f"workspaces/{workspace_id}/spark/pools", json=payload)
+
+
+def pool_configuration(pool: Mapping[str, Any]) -> dict[str, Any]:
+    return {field: pool[field] for field in _POOL_FIELDS if pool.get(field) is not None}
 
 
 def get_settings(client: FabricClient, workspace_id: str) -> dict[str, Any] | None:
@@ -72,6 +76,7 @@ def copy_pools(
     on_mapped: Callable[[str, str], None] | None = None,
     on_missing: Callable[[str], None] | None = None,
     target_client: FabricClient | None = None,
+    strict: bool = False,
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """Recreate the source workspace's custom pools.
 
@@ -121,11 +126,15 @@ def copy_pools(
         try:
             new_pool = create_pool(destination, target_workspace_id, pool)
         except FabricApiError as error:
+            if strict:
+                raise
             warnings.append(
                 f"Spark pool '{name}' could not be recreated: {error}. "
                 "Resolve the service error and retry before running items that use this pool."
             )
             continue
+        if strict and (not source_id or not new_pool.get("id")):
+            raise FabricError("Spark pool creation did not return an exact source/target mapping")
 
         if pool.get("id") and new_pool.get("id"):
             id_map[pool["id"]] = new_pool["id"]

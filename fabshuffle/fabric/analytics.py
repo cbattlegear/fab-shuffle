@@ -129,20 +129,35 @@ def classify_dataflow(
 
     Returns ``(parts, None)`` when it can move, or ``(None, reason)`` when it cannot.
     """
+    definition = try_get_item_definition(client, workspace_id, item["id"])
+    return classify_dataflow_definition(definition, item)
+
+
+def classify_dataflow_definition(
+    definition: Mapping[str, Any] | None, item: Mapping[str, Any],
+    *, strict: bool = False,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Classify already-read metadata without making live calls or hiding read failures."""
     name = item.get("displayName") or item.get("id")
     upgrade = (
         "Upgrade it to a Dataflow Gen2 (CI/CD) first, with the upgrade wizard or Save As, "
         "then migrate again"
     )
 
-    definition = try_get_item_definition(client, workspace_id, item["id"])
     if definition is None:
         return None, (
             f"Dataflow '{name}' does not support the definition APIs, so it is a Gen1 "
             f"dataflow or a classic Gen2. {upgrade}."
         )
 
-    parts = list(definition.get("parts") or [])
+    raw_parts = definition.get("parts")
+    if strict and (
+        not isinstance(raw_parts, list)
+        or any(not isinstance(entry, Mapping) or not entry.get("path") or not entry.get("payload")
+               for entry in raw_parts)
+    ):
+        raise FabricError(f"Dataflow '{name}' returned incomplete definition parts; capture is not complete")
+    parts = list(raw_parts or [])
     metadata_part = find_part(parts, QUERY_METADATA_PART)
     if metadata_part is None:
         return None, (
@@ -152,7 +167,13 @@ def classify_dataflow(
 
     try:
         metadata = decode_json_part(metadata_part["payload"])
-    except (ValueError, KeyError):
+    except (ValueError, KeyError) as error:
+        if strict:
+            raise FabricError(f"Dataflow '{name}' returned unreadable query metadata") from error
+        return None, f"Dataflow '{name}' has unreadable metadata, so it was left behind."
+    if not isinstance(metadata, Mapping):
+        if strict:
+            raise FabricError(f"Dataflow '{name}' returned non-object query metadata")
         return None, f"Dataflow '{name}' has unreadable metadata, so it was left behind."
 
     version = str(metadata.get("formatVersion") or "")
@@ -163,6 +184,54 @@ def classify_dataflow(
         )
 
     return parts, None
+
+
+def report_model_source(
+    parts: Iterable[Mapping[str, Any]], source_items: Iterable[Mapping[str, Any]],
+    source_workspace_id: str,
+) -> Mapping[str, Any] | None:
+    """Resolve an inspectable report's captured model, including name-based PBIR paths."""
+    candidate = find_part(parts, PBIR_PART)
+    if not candidate:
+        raise FabricError("Capture definition.pbir before resolving the report's model binding")
+    document = decode_json_part(candidate["payload"])
+    reference = document.get("datasetReference") if isinstance(document, Mapping) else None
+    if not isinstance(reference, Mapping):
+        raise FabricError("Capture an inspectable report datasetReference")
+    models = {
+        (
+            str(row.get("workspaceId") or source_workspace_id).casefold(), str(row.get("id") or "").casefold()
+        ): row
+        for row in source_items if row.get("type") == SEMANTIC_MODEL
+    }
+    by_path = reference.get("byPath")
+    if by_path is not None:
+        if not isinstance(by_path, Mapping) or reference.get("byConnection") is not None:
+            raise FabricError(
+                "Resolve the report's malformed or competing model bindings before restoring it"
+            )
+        path = by_path.get("path")
+        match = re.fullmatch(r"\.\./([^/\\]+)\.SemanticModel", path) if isinstance(path, str) else None
+        if not match:
+            raise FabricError("Resolve the report's nonstandard byPath model reference before restoring it")
+        matches = [
+            row for (workspace, _), row in models.items()
+            if workspace == source_workspace_id.casefold() and row.get("displayName") == match[1]
+        ]
+        if len(matches) != 1:
+            raise FabricError(f"Resolve the exact captured semantic model '{match[1]}' for this report")
+        return matches[0]
+    connection = reference.get("byConnection")
+    if not isinstance(connection, Mapping):
+        raise FabricError("Resolve the report's missing model binding before restoring it")
+    identifier = _semantic_model_id(str(connection.get("connectionString") or ""))
+    matches = (
+        [row for (_, item_id), row in models.items() if item_id == identifier.casefold()]
+        if identifier else []
+    )
+    if len(matches) > 1:
+        raise FabricError("The report model identity is ambiguous across captured workspaces")
+    return matches[0] if matches else None
 
 
 def environment_warnings(
@@ -736,6 +805,10 @@ def migrate_definition_item(
     if exclude_identity and not strict:
         membership_warnings.extend(validate_cross_tenant_identities(parts, item_type=item_type))
     with lifecycle.operation("rebind", "Known source references rewritten.") if lifecycle else nullcontext():
+        if strict and item_type == REPORT and source_items:
+            model = report_model_source(parts, source_items.values(), source_workspace_id)
+            if model and not any(str(key).casefold() == str(model["id"]).casefold() for key in id_map):
+                raise StrandedReference([f"SemanticModel '{model.get('displayName') or model['id']}'"])
         references = with_connection_references(parts, source_items) if strict else source_items or {}
         needed = dangling_references(
             parts, id_map, references, ignore=(item.get("id", ""),)

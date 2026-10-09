@@ -28,12 +28,14 @@ function fixture() {
       else this[name] = value;
     }
     matches(selector) {
+      if (selector.includes(",")) return selector.split(",").some((part) => this.matches(part.trim()));
       if (selector.startsWith("#")) return this.id === selector.slice(1);
       if (selector.startsWith(".")) return this.className.split(" ").includes(selector.slice(1));
       return this.tagName === selector;
     }
     closest(selector) { return this.matches(selector) ? this : this.parentElement?.closest(selector); }
     querySelectorAll(selector) {
+      if (selector.includes(",")) return [...new Set(selector.split(",").flatMap((part) => this.querySelectorAll(part.trim())))];
       const parts = selector.split(" "), results = [];
       const visit = (element) => element.children.forEach((child) => {
         if (child.matches(parts.at(-1)) && (parts.length === 1 || child.parentElement.closest(parts[0]))) results.push(child);
@@ -43,11 +45,19 @@ function fixture() {
       return results;
     }
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-    addEventListener(type, handler) { this.handlers[type] = handler; }
+    addEventListener(type, handler) {
+      const prior = this.handlers[type];
+      this.handlers[type] = prior ? (event) => {
+        const first = prior(event), second = handler(event);
+        return second === undefined ? first : second;
+      } : handler;
+    }
     focus() { document.activeElement = this; }
     showModal() { this.open = true; }
     close() { this.open = false; }
     scrollIntoView() {}
+    reportValidity() { return true; }
+    checkValidity() { return true; }
     remove() { this.parentElement.children = this.parentElement.children.filter((child) => child !== this); }
     click() { return this.handlers.click?.({ target: this, currentTarget: this }); }
     reset() {
@@ -69,10 +79,12 @@ function fixture() {
   }
   const document = new Element("document");
   document.createElement = (tag) => new Element(tag);
+  document.createDocumentFragment = () => new Element("fragment");
   const root = path.join(__dirname, "..", "fabshuffle", "web");
   parse(fs.readFileSync(path.join(root, "templates", "index.html"), "utf8"), document);
   document.body = document.querySelector("body");
   document.activeElement = document.body;
+  const observations = { requests: [], response: { active: [], recent: [] } };
   const context = vm.createContext({
     document, console, URLSearchParams, AbortController,
     setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
@@ -85,6 +97,10 @@ function fixture() {
       close() { this.closed = true; }
     },
     fetch(url, options) {
+      if (url === "/api/bcdr/activity") {
+        observations.requests.push({ url, options });
+        return Promise.resolve({ ok: true, status: 200, text: async () => JSON.stringify(observations.response) });
+      }
       return new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
     },
   });
@@ -114,10 +130,37 @@ function fixture() {
     ui.renderReview();
     ui.setStartEnabled(true);
   }
-  return { get, ui, document, requests, streams, reply, flush, paired };
+  return { get, ui, document, requests, streams, reply, flush, paired, context, observations };
 }
 
 const scenarios = {
+  async standby_login_hides_other_tenant(f) {
+    const workflow = f.get("login-workflow");
+    const another = f.get("another-tenant");
+    another.checked = true;
+    f.ui.updateLoginMode();
+    f.get("destination-credentials").querySelectorAll("input").forEach((input) => { input.value = "stale"; });
+    workflow.value = "bcdr";
+    workflow.handlers.change();
+    assert.equal(f.get("tenant-mode").hidden, true);
+    assert.equal(f.get("tenant-mode").disabled, true);
+    assert.equal(another.disabled, true);
+    assert.equal(another.checked, false);
+    assert.equal(f.get("destination-credentials").hidden, true);
+    assert.ok(f.get("destination-credentials").querySelectorAll("input").every((input) => input.value === ""));
+    assert.equal(f.ui.loginBody(f.get("login-form")).destination, undefined);
+    another.checked = true;
+    assert.equal(f.ui.loginBody(f.get("login-form")).destination, undefined, "Standby payload ignores stale pairing");
+    another.checked = false;
+    workflow.value = "migration";
+    workflow.handlers.change();
+    assert.equal(f.get("tenant-mode").hidden, false);
+    assert.equal(another.disabled, false);
+    assert.equal(another.checked, false);
+    another.checked = true;
+    another.handlers.change();
+    assert.equal(f.get("destination-credentials").hidden, false);
+  },
   async login(f) {
     f.ui.state.forceRebuild = true;
     const form = f.get("login-form");
