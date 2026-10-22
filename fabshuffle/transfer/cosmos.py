@@ -3,7 +3,7 @@
 The Fabric item definition carries the container metadata, so the containers themselves
 arrive with the item. Documents do not: there is no Fabric API that reads or writes them, so
 they go over the Cosmos NoSQL data plane with the ``azure-cosmos`` SDK, the same way OneLake
-files go through azcopy and warehouse schema goes through sqlpackage.
+files are streamed over the OneLake API and warehouse schema goes through sqlpackage.
 
 Two things are worth knowing before changing anything here.
 

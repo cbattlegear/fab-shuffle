@@ -250,13 +250,19 @@ class MigrationPlan:
                 "Separate source and destination credentials recreate the workspace; "
                 "they never reassign it."
             )
-        if (
-            self.paired and (self.include_data or self.include_files)
-            and not self.write_freeze_confirmed
-        ):
+        if self.paired and (self.include_data or self.include_files) and not self.write_freeze_confirmed:
             return (
                 "Stop writes to the source and confirm the write freeze before copying data or "
                 "files with separate credentials. Keep the freeze in place through final reconciliation."
+            )
+        if (
+            not self.paired and self.strategy is Strategy.REBUILD
+            and self.include_files and not self.write_freeze_confirmed
+        ):
+            return (
+                "Stop writes to the source lakehouse Files and confirm the write freeze before copying "
+                "files. Files are streamed and verified against the version first read, so a file "
+                "changed mid-copy fails the transfer. Keep the freeze in place until the copy completes."
             )
         return None
 
@@ -397,7 +403,7 @@ class _Context:
     def already_copied(self, item_id: str, kind: str, key: str = "") -> bool:
         """Whether an earlier attempt finished moving this data.
 
-        Copy Jobs overwrite, KQL replaces, Cosmos upserts, azcopy overwrites and bcp now
+        Copy Jobs overwrite, KQL replaces, Cosmos upserts, file streaming overwrites and bcp now
         clears first, so doing any of it twice is *correct*. It is only slow. This is what
         keeps a resume from spending another six hours being correct.
         """
@@ -2618,11 +2624,10 @@ def _copy_all_lakehouse_files(
     step: str,
     pairs: list[tuple[dict[str, Any], dict[str, Any], bool]],
 ) -> list[str]:
-    """Copy every lakehouse's ``Files/``, a couple at a time.
+    """Copy every lakehouse's ``Files/``, one lakehouse at a time.
 
-    Bounded tightly. Each copy stages the whole directory through local disk on the way past,
-    and azcopy already tunes its own parallelism, so more of them at once mostly means more
-    of them competing for the same disk.
+    Files within a lakehouse are already copied in parallel by the streaming copier, whose
+    memory budget is split between its workers, so lakehouses do not also run side by side.
     """
     jobs = [
         concurrency.Job(
@@ -2633,7 +2638,7 @@ def _copy_all_lakehouse_files(
     ]
     return concurrency.run_bounded(
         jobs,
-        limit=1 if ctx.plan.paired else SETTINGS.file_transfer_concurrency,
+        limit=1,
         on_progress=lambda message: ctx.run.update_step(step, f"Copying files: {message}"),
         noun="file copy",
     )
@@ -2660,24 +2665,16 @@ def _lakehouse_file_job(
         ctx.run.raise_if_cancelled()
         ctx.evidence(lakehouse["id"]).step("files", EvidenceState.UNKNOWN, "File copy has not completed.")
         try:
-            if ctx.plan.paired:
-                result = file_transfer.copy_tree_streaming(
-                    source_path=source_files, target_path=target_files,
-                    tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
-                    max_memory_bytes=SETTINGS.max_memory_bytes,
-                    max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
-                    exclude_paths=_shortcut_exclusions(ctx, lakehouse["id"], "Files"),
-                    scratch_dir=ctx.scratch_dir / f"delta-files-{lakehouse['id']}",
-                    cancel_requested=lambda: ctx.run.cancelled,
-                    on_progress=_bulk_copy_progress(ctx, "lakehouses", name),
-                )
-            else:
-                result = file_transfer.copy_files(
-                    source_files_path=source_files,
-                    target_files_path=target_files,
-                    principal=ctx.principal,
-                    scratch_dir=ctx.scratch_dir / f"lakehouse-{lakehouse['id']}",
-                )
+            result = file_transfer.copy_tree_streaming(
+                source_path=source_files, target_path=target_files,
+                tokens=ctx.tokens, target_tokens=ctx.destination_tokens,
+                max_memory_bytes=SETTINGS.max_memory_bytes,
+                max_disk_staging_bytes=SETTINGS.max_disk_staging_bytes,
+                exclude_paths=_shortcut_exclusions(ctx, lakehouse["id"], "Files"),
+                scratch_dir=ctx.scratch_dir / f"delta-files-{lakehouse['id']}",
+                cancel_requested=lambda: ctx.run.cancelled,
+                on_progress=_bulk_copy_progress(ctx, "lakehouses", name),
+            )
             ctx.data_copied(lakehouse["id"], "files", outcome=result)
             return []
         except file_transfer.FileTransferError as error:

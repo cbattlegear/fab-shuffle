@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -42,21 +41,6 @@ def install_apt(pins: dict, architecture: str) -> None:
         )
 
 
-def install_azcopy(pins: dict, architecture: str) -> None:
-    with tempfile.TemporaryDirectory(prefix="fab-shuffle-azcopy-") as temporary:
-        archive = Path(temporary) / "azcopy.tar.gz"
-        download(pins["azcopy"]["artifacts"][architecture], archive)
-        with tarfile.open(archive, "r:gz") as tar:
-            binaries = [
-                member for member in tar.getmembers() if member.isfile() and member.name.endswith("/azcopy")
-            ]
-            if len(binaries) != 1:
-                raise RuntimeError(f"Expected one azcopy binary, found {len(binaries)}")
-            with tar.extractfile(binaries[0]) as source, Path("/usr/local/bin/azcopy").open("wb") as target:
-                shutil.copyfileobj(source, target)
-        Path("/usr/local/bin/azcopy").chmod(0o755)
-
-
 def install_nuget(pins: dict, source: str) -> None:
     # Clearing inherited sources preserves the single-feed corporate proxy override.
     with tempfile.TemporaryDirectory(prefix="fab-shuffle-nuget-") as temporary:
@@ -85,14 +69,12 @@ def install_nuget(pins: dict, source: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("component", choices=("apt", "azcopy", "nuget"))
+    parser.add_argument("component", choices=("apt", "nuget"))
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     args = parser.parse_args()
     pins = json.loads((ROOT / "tools.lock.json").read_text(encoding="utf-8"))
     if args.component == "apt":
         install_apt(pins, args.architecture)
-    elif args.component == "azcopy":
-        install_azcopy(pins, args.architecture)
     else:
         install_nuget(pins, os.environ["NUGET_SOURCE"])
 

@@ -20,7 +20,7 @@ def ctx(tmp_path):
         plan=orchestrator.MigrationPlan(
             capacity_id="cap", capacity_name="F64", capacity_region="westus",
             source_workspace_id="source-ws", source_workspace_name="Source",
-            target_workspace_name="Target",
+            target_workspace_name="Target", write_freeze_confirmed=True,
         ),
         run=MigrationRun(source_workspace_name="Source", capacity_name="F64"),
         scratch_dir=tmp_path, target_workspace_id="target-ws",
@@ -105,7 +105,8 @@ def test_file_copy_empty_and_missing_paths_are_different(ctx, monkeypatch):
     ctx.resolve_or_create(source(), "Lakehouse", lambda: {"id": "target"})
     orchestrator._lakehouse_file_job(ctx, source(), {"id": "target"})()
     assert ctx.run.lifecycle.snapshot()["source-item"].steps["files"].state == EvidenceState.UNKNOWN
-    monkeypatch.setattr(files, "copy_files", lambda **kwargs: CopyOutcome("files", empty=True))
+    monkeypatch.setattr(files, "copy_tree_streaming", lambda **kwargs: CopyOutcome("files", empty=True))
+    monkeypatch.setattr(orchestrator, "_shortcut_exclusions", lambda *a, **k: [])
     src = {**source(), "properties": {"oneLakeFilesPath": "source-path"}}
     target = {"id": "target", "properties": {"oneLakeFilesPath": "target-path"}}
     orchestrator._lakehouse_file_job(ctx, src, target)()
@@ -113,15 +114,6 @@ def test_file_copy_empty_and_missing_paths_are_different(ctx, monkeypatch):
     assert evidence.state == EvidenceState.SUCCEEDED and "No copyable" in evidence.reason
     replay = journal.read(ctx.journal.path)
     assert replay.data_targets[("source-item", "files", "")] == "target"
-
-
-def test_file_transfer_reports_an_observed_empty_download(tmp_path, monkeypatch):
-    monkeypatch.setattr(files, "_azcopy", lambda *args: None)
-    result = files.copy_files(
-        source_files_path="source", target_files_path="target",
-        principal=ServicePrincipal("tenant", "client", "secret"), scratch_dir=tmp_path,
-    )
-    assert result == CopyOutcome("files", empty=True)
 
 
 class DefinitionClient:

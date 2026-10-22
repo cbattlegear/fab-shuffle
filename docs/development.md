@@ -50,8 +50,8 @@ docker run --rm -it --mount "type=bind,source=<absolute-checkout-path>,target=/w
    `Filename`/`SHA256` stanza from both Microsoft package indexes, including the SDK's
    Microsoft runtime/host/targeting-pack dependency closure. For NuGet, download the exact
    `.nupkg` from the official flat-container feed, compare its SHA-512 with the catalog,
-   and record its SHA-256. Use the versioned AzCopy release assets and their published
-   `digest` values, never an evergreen download link. Verify both architectures' downloads
+   and record its SHA-256. Use the versioned release assets and their published
+   digests, never an evergreen download link. Verify both architectures' downloads
    and hashes before changing pins. Resolve the Python image's multi-architecture digest
    with `docker buildx imagetools inspect python:VERSION-bookworm`. Check Microsoft Learn
    per-tool pages for supported architectures and runtime changes. Review the validation

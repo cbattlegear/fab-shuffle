@@ -808,9 +808,16 @@ async function settleAssessment(request, version = state.assessmentVersion) {
   setStartEnabled(state.preview.blockers.length === 0);
 }
 
+// Paired runs freeze for data and files; single-principal rebuilds only for files, which are streamed.
+function freezeApplies() {
+  if (state.preview?.strategy === "reassign") return false;
+  return state.paired || $("#opt-files").checked;
+}
+
 function setStartEnabled(enabled) {
+  $("#write-freeze").hidden = !freezeApplies();
   const start = $("#start-run");
-  const freezeMissing = state.paired && ($("#opt-data").checked || $("#opt-files").checked) &&
+  const freezeMissing = freezeApplies() && (!state.paired || $("#opt-data").checked || $("#opt-files").checked) &&
     !$("#opt-write-freeze").checked;
   const mappingBlocked = state.paired && (!state.mappingsChecked || state.preview?.mappingBlockers?.length);
   start.disabled = !enabled || state.assessmentPending || freezeMissing || !!mappingBlocked;
@@ -1211,7 +1218,7 @@ function renderReview() {
   $("#target-name").disabled = resuming;
   ["#opt-data", "#opt-files", "#opt-cleanup"].forEach((id) => { $(id).disabled = resuming; });
   $("#destination-mappings").hidden = !state.paired || reassign;
-  $("#write-freeze").hidden = !state.paired;
+  $("#write-freeze").hidden = reassign || !freezeApplies();
   $("#opt-permissions").disabled = state.paired || resuming;
   if (state.paired) $("#opt-permissions").checked = false;
   $("#opt-permissions").title = state.paired ? "Grant access to the destination workspace separately." : "";

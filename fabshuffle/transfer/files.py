@@ -1,24 +1,27 @@
 """OneLake Files transfer with separate source/destination identities.
 
-The legacy path uses AzCopy with local staging; paired transfers relay bounded byte ranges.
+Transfers relay bounded byte ranges from source to destination OneLake, in parallel across
+files, without staging file content on local disk.
 Managed Tables undergo bounded Delta log/checkpoint reference validation before any uploads.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
+import threading
+import time
 from collections.abc import Callable, Collection, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
-from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.auth import TokenProvider
 from fabshuffle.config import SETTINGS
 from fabshuffle.lifecycle import CopyOutcome
+from fabshuffle.run import CancelledError
 from fabshuffle.transfer.common import (
     check_cancelled,
     resolve_transfer_budgets,
@@ -26,7 +29,7 @@ from fabshuffle.transfer.common import (
 
 logger = logging.getLogger(__name__)
 
-TRUSTED_SUFFIXES = "onelake.dfs.fabric.microsoft.com"
+_THROTTLE_RETRIES = 4
 
 
 class FileTransferError(RuntimeError):
@@ -35,95 +38,6 @@ class FileTransferError(RuntimeError):
 
 class DeltaValidationRequired(FileTransferError):
     """A raw byte relay cannot prove Delta log/checkpoint references are self-contained."""
-
-
-def _azcopy_env(principal: ServicePrincipal) -> dict[str, str]:
-    import os
-
-    return {
-        **os.environ,
-        "AZCOPY_AUTO_LOGIN_TYPE": "SPN",
-        "AZCOPY_SPA_APPLICATION_ID": principal.client_id,
-        "AZCOPY_SPA_CLIENT_SECRET": principal.client_secret,
-        "AZCOPY_TENANT_ID": principal.tenant_id,
-    }
-
-
-def copy_files(
-    *,
-    source_files_path: str,
-    target_files_path: str,
-    principal: ServicePrincipal,
-    scratch_dir: Path,
-    target_principal: ServicePrincipal | None = None,
-    target_tokens: TokenProvider | None = None,
-    tokens: TokenProvider | None = None,
-    max_staging_bytes: int | None = None,
-    max_memory_bytes: int | None = None,
-    max_disk_staging_bytes: int | None = None,
-    cancel_requested: Callable[[], bool] | None = None,
-    on_complete: Callable[[CopyOutcome], None] | None = None,
-    on_progress: Callable[[str], None] | None = None,
-) -> CopyOutcome:
-    """Stage ``Files/`` from the source lakehouse locally, then upload to the target."""
-    if target_principal is not None or target_tokens is not None:
-        return copy_tree_streaming(
-            source_path=source_files_path, target_path=target_files_path,
-            tokens=tokens or TokenProvider(principal),
-            target_tokens=target_tokens or TokenProvider(target_principal),
-            max_staging_bytes=max_staging_bytes,
-            max_memory_bytes=max_memory_bytes,
-            max_disk_staging_bytes=max_disk_staging_bytes,
-            cancel_requested=cancel_requested,
-            on_progress=on_progress, on_complete=on_complete,
-        )
-    check_cancelled(cancel_requested)
-    staging = scratch_dir / "files"
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if on_progress:
-            on_progress("Downloading OneLake files")
-        _azcopy(["copy", f"{source_files_path.rstrip('/')}/*", str(staging), "--recursive"], principal)
-        check_cancelled(cancel_requested)
-
-        if not any(staging.iterdir()):
-            if on_progress:
-                on_progress("No files to transfer")
-            outcome = CopyOutcome("files", empty=True)
-            if on_complete:
-                on_complete(outcome)
-            return outcome
-
-        if on_progress:
-            on_progress("Uploading OneLake files")
-        check_cancelled(cancel_requested)
-        _azcopy(["copy", f"{staging}/*", target_files_path, "--recursive"], principal)
-        check_cancelled(cancel_requested)
-        outcome = CopyOutcome("files", empty=False)
-        if on_complete:
-            on_complete(outcome)
-        return outcome
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-def _azcopy(args: list[str], principal: ServicePrincipal) -> None:
-    command = [SETTINGS.azcopy_path, *args, f"--trusted-microsoft-suffixes={TRUSTED_SUFFIXES}"]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=False, env=_azcopy_env(principal)
-        )
-    except FileNotFoundError as error:
-        raise FileTransferError(
-            f"OneLake file transfer needs azcopy, but '{SETTINGS.azcopy_path}' is not installed "
-            "in this runtime. Run the Fab Shuffle Docker image, which includes azcopy."
-        ) from error
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[-1500:]
-        raise FileTransferError(f"azcopy {args[0]} failed with exit code {result.returncode}: {detail}")
 
 
 def _tree_location(path: str) -> tuple[str, str]:
@@ -163,6 +77,17 @@ def _request(
     client: httpx.Client, method: str, url: str, tokens: TokenProvider, **kwargs: Any,
 ) -> httpx.Response:
     response = client.request(method, url, headers=_headers(tokens), **kwargs)
+    # Throttling is the service asking us to slow down; honour its Retry-After a bounded number
+    # of times and, if it persists, surface its own error below rather than a guess of ours.
+    for attempt in range(_THROTTLE_RETRIES):
+        if response.status_code not in {429, 503}:
+            break
+        try:
+            delay = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            delay = 2.0 ** attempt
+        time.sleep(min(max(delay, 0.0), 30.0))
+        response = client.request(method, url, headers=_headers(tokens), **kwargs)
     if not response.is_success:
         raise _error(response)
     return response
@@ -293,6 +218,7 @@ def copy_tree_streaming(
     on_progress: Callable[[str], None] | None = None,
     on_complete: Callable[[CopyOutcome], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    workers: int | None = None,
 ) -> CopyOutcome:
     """Relay a frozen OneLake tree through bounded RAM and bounded checkpoint disk.
 
@@ -333,21 +259,58 @@ def copy_tree_streaming(
     strict_tables = kind == "lakehouse" or any(
         root.split("/", 2)[1] == "Tables" for root in (source_root, target_root)
     )
-    # Leave room for the bytearray and immutable HTTP request payload simultaneously.
-    chunk_size = max(1, min(4 * 1024 * 1024, budgets.max_memory_bytes // 2))
+    worker_count = max(1, workers if workers is not None else SETTINGS.file_transfer_workers)
+    # Each worker holds a bytearray and the immutable HTTP request payload at once, so the
+    # memory budget is split between them rather than multiplied by them.
+    chunk_size = max(1, min(4 * 1024 * 1024, budgets.max_memory_bytes // (2 * worker_count)))
     excluded = {value.strip("/") for value in exclude_paths}
     count = 0
     copied_metadata: set[str] = set()
+    state_lock = threading.Lock()
+    failed = threading.Event()
+    first_error: list[BaseException] = []
 
     def is_excluded(name: str) -> bool:
         local = name[len(source_root) + 1:]
         candidates = {local, name, name.split("/", 1)[-1]}
         return any(value == ex or value.startswith(ex + "/") for ex in excluded for value in candidates)
 
-    def visit(client: httpx.Client, relative: str = "") -> None:
+    def stop_requested() -> bool:
+        # Siblings stop between chunks once any file has failed.
+        return failed.is_set() or bool(cancel_requested and cancel_requested())
+
+    def record_failure(error: BaseException) -> None:
+        with state_lock:
+            # A sibling aborted because of someone else's failure is not the cause.
+            if not first_error and not (isinstance(error, CancelledError) and failed.is_set()):
+                first_error.append(error)
+            failed.set()
+
+    def copy_one(client: httpx.Client, name: str, local: str, entry: dict[str, Any], target: str) -> None:
+        try:
+            if on_progress:
+                with state_lock:
+                    on_progress(f"Copying OneLake {local}")
+            _copy_file_streaming(
+                client, f"{source_fs}/{quote(name, safe='/')}", target, entry,
+                tokens, target_tokens, chunk_size, stop_requested,
+            )
+        except Exception as error:
+            record_failure(error)
+            return
         nonlocal count
+        with state_lock:
+            count += 1
+            if name in snapshot.files:
+                copied_metadata.add(name)
+
+    def visit(
+        client: httpx.Client, pool: ThreadPoolExecutor, pending: set[Future[None]], relative: str = "",
+    ) -> None:
         directory = source_root + (f"/{relative}" if relative else "")
         for entry in _listed_paths(client, source_fs, directory, tokens, cancel_requested):
+            if failed.is_set():
+                return
             check_cancelled(cancel_requested)
             name = str(entry["name"])
             local = name[len(source_root) + 1:]
@@ -355,6 +318,7 @@ def copy_tree_streaming(
                 continue
             target = f"{target_fs}/{quote(target_root + '/' + local, safe='/')}"
             if str(entry.get("isDirectory", False)).lower() == "true":
+                # Created here, in listing order, so a file is never submitted before its parents.
                 response = client.put(
                     target, params={"resource": "directory"}, headers=_headers(target_tokens), content=b"",
                 )
@@ -365,18 +329,14 @@ def copy_tree_streaming(
                         code = None
                     if response.status_code != 409 or code != "PathAlreadyExists":
                         raise _error(response)
-                visit(client, local)
+                visit(client, pool, pending, local)
             else:
                 entry = snapshot.pin(entry)
-                if on_progress:
-                    on_progress(f"Copying OneLake {local}")
-                _copy_file_streaming(
-                    client, f"{source_fs}/{quote(name, safe='/')}", target, entry,
-                    tokens, target_tokens, chunk_size, cancel_requested,
-                )
-                count += 1
-                if name in snapshot.files:
-                    copied_metadata.add(name)
+                # Bounded in-flight work, so a huge tree is never queued all at once.
+                while len(pending) >= worker_count * 2 and not failed.is_set():
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    pending.difference_update(done)
+                pending.add(pool.submit(copy_one, client, name, local, entry, target))
 
     with httpx.Client(timeout=120, follow_redirects=False) as client:
         from fabshuffle.transfer.delta import preflight
@@ -388,7 +348,16 @@ def copy_tree_streaming(
             scratch_dir=scratch_dir, is_excluded=is_excluded, on_progress=on_progress,
             cancel_requested=cancel_requested, strict=strict_tables,
         )
-        visit(client)
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="onelake-copy") as pool:
+            pending: set[Future[None]] = set()
+            try:
+                visit(client, pool, pending)
+            except Exception as error:
+                record_failure(error)
+            # In-flight files finish or abort at their next chunk before the pool exits.
+            wait(pending)
+        if first_error:
+            raise first_error[0]
     if copied_metadata != snapshot.files.keys():
         raise DeltaValidationRequired(
             "Delta metadata disappeared after preflight; keep source writes frozen and retry."
@@ -400,4 +369,4 @@ def copy_tree_streaming(
     return outcome
 
 
-__all__ = ["DeltaValidationRequired", "FileTransferError", "copy_files", "copy_tree_streaming"]
+__all__ = ["DeltaValidationRequired", "FileTransferError", "copy_tree_streaming"]

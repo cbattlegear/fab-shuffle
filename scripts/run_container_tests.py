@@ -16,7 +16,7 @@ def require_runtime() -> None:
         raise RuntimeError("Run validation with the Dockerfile test target, not host Python.")
     if platform.machine().lower() not in ("x86_64", "amd64"):
         raise RuntimeError("Use --platform linux/amd64 for production-runtime validation.")
-    missing = [tool for tool in ("node", "pwsh", "sqlpackage", "unpackdacpac", "azcopy", "bcp")
+    missing = [tool for tool in ("node", "pwsh", "sqlpackage", "unpackdacpac", "bcp")
                if shutil.which(tool) is None]
     if missing:
         raise RuntimeError(

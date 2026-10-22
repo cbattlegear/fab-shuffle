@@ -111,11 +111,11 @@ def install_onelake(monkeypatch, service):
         files.httpx, "Client",
         lambda **kwargs: client(transport=httpx.MockTransport(service.handle), **kwargs),
     )
-    monkeypatch.setattr(files, "_azcopy", lambda *a, **k: pytest.fail("Native copy must not bridge tenants"))
 
 
 def relay_files(**kwargs):
     root = kwargs.pop("root", "Files")
+    kwargs.setdefault("workers", 1)
     return files.copy_tree_streaming(
         source_path=f"https://onelake.dfs.fabric.microsoft.com/source/lake/{root}",
         target_path=f"https://onelake.dfs.fabric.microsoft.com/target/lake/{root}",

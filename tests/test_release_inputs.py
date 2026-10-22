@@ -214,7 +214,7 @@ def test_both_architectures_have_hashed_external_artifacts():
         assert set(artifacts) == set(pins["apt_packages"])
         for name, artifact in artifacts.items():
             assert pins["apt_packages"][name] in artifact["url"]
-        for artifact in [*artifacts.values(), pins["azcopy"]["artifacts"][architecture]]:
+        for artifact in artifacts.values():
             assert re.fullmatch(r"[a-f0-9]{64}", artifact["sha256"])
             assert artifact["url"].startswith("https://")
             assert "aka.ms" not in artifact["url"]

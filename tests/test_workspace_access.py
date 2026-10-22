@@ -127,6 +127,7 @@ def test_admins_are_granted_before_any_content_is_migrated(fabric):
         source_workspace_name="MirrorGeoTest",
         target_workspace_name="MirrorGeoTest-westus",
         strategy=Strategy.REBUILD,
+        write_freeze_confirmed=True,
     )
     orchestrator.run_migration(run, PRINCIPAL, plan, cleanup=False)
 
@@ -149,6 +150,7 @@ def test_created_workspaces_say_where_they_came_from(fabric):
         source_workspace_name="MirrorGeoTest",
         target_workspace_name="MirrorGeoTest-westus",
         strategy=Strategy.REBUILD,
+        write_freeze_confirmed=True,
     )
     orchestrator.run_migration(run, PRINCIPAL, plan, cleanup=False)
 

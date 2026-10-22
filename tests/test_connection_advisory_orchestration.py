@@ -67,7 +67,7 @@ def fabric(monkeypatch):
     monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda c, w: [])
     monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
     monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
-    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_tree_streaming", lambda **k: None)
     monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
     return fake
 

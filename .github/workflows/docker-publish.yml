@@ -102,8 +102,8 @@ jobs:
         with:
           context: .
           target: production
-          # The README offers this image on both architectures, and the Dockerfile picks an
-          # azcopy tarball to match. A pull request only needs to prove the build still works,
+          # The README offers this image on both architectures, and the Dockerfile picks
+          # architecture-specific packages to match. A pull request only needs to prove the build still works,
           # so it stays on amd64 rather than paying for emulation.
           platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
