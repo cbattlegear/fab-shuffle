@@ -101,10 +101,10 @@ class Settings:
 
     # External tooling that has no REST equivalent yet.
     # Both of these are bounded low on purpose. sqlpackage is a .NET process of a few hundred
-    # megabytes; azcopy tunes its own concurrency and stages whole directories through local
-    # disk. Several at once compete for the same memory and disk rather than going faster.
+    # megabytes, and several at once compete for the same memory rather than going faster.
     schema_transfer_concurrency: int = _env_int("FAB_SHUFFLE_SCHEMA_CONCURRENCY", 2)
-    file_transfer_concurrency: int = _env_int("FAB_SHUFFLE_FILE_CONCURRENCY", 2)
+    # Files copied at once within one lakehouse; 1 is serial. Multiplies with the setting above.
+    file_transfer_workers: int = _env_int("FAB_SHUFFLE_FILE_TRANSFER_WORKERS", 4)
     max_memory_bytes: int | None = field(
         default_factory=lambda: _positive_env_int("FAB_SHUFFLE_MAX_MEMORY_BYTES")
     )
@@ -115,7 +115,6 @@ class Settings:
     max_staging_bytes: int | None = field(default_factory=_legacy_staging_budget)
     sqlpackage_path: str = os.environ.get("FAB_SHUFFLE_SQLPACKAGE", "sqlpackage")
     unpackdacpac_path: str = os.environ.get("FAB_SHUFFLE_UNPACKDACPAC", "unpackdacpac")
-    azcopy_path: str = os.environ.get("FAB_SHUFFLE_AZCOPY", "azcopy")
     bcp_path: str = os.environ.get("FAB_SHUFFLE_BCP", "bcp")
 
     def __post_init__(self) -> None:

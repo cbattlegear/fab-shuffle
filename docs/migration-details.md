@@ -13,7 +13,7 @@ always rebuild; single-principal runs can reassign Power BI-only workspaces or r
 | Work | Single-principal rebuild | Paired rebuild |
 | --- | --- | --- |
 | Lakehouse tables | Native Fabric Copy Jobs | OneLake file streaming with Delta metadata preflight |
-| Lakehouse Files | AzCopy download to disk, then upload | OneLake streaming, excluding shortcuts; Delta checks for unmanaged tables too |
+| Lakehouse Files | OneLake streaming through RAM, in parallel, excluding shortcuts | OneLake streaming, excluding shortcuts; Delta checks for unmanaged tables too |
 | Warehouse schema | SqlPackage extract, UnpackDacPac script, TDS execution | Destination-aware DacFx script with security exclusions |
 | Warehouse rows | Native Fabric Copy Jobs | Independently authenticated SQL row streaming |
 | Fabric SQL database schema | Export/apply item definition | Destination-aware SQL schema transfer with security exclusions |
@@ -106,8 +106,8 @@ SQL schema jobs use private staging for DACPACs, generated scripts, tool tempora
 and logs, then remove it on exit. Schema disk usage is monitored; an external process can
 overshoot between checks. Script reading, SQLCMD expansion, reference rewriting and batch
 materialization have separate memory checks. Neither budget is an OS-level aggregate quota.
-Legacy single-principal AzCopy Files staging and bcp native exports remain outside this disk
-budget; see [storage sizing](../README.md#choosing-the-azure-files-size).
+Legacy single-principal bcp native exports remain outside this disk
+budget (Files are streamed and never staged); see [storage sizing](../README.md#choosing-the-azure-files-size).
 
 ## Item-specific history and constraints
 

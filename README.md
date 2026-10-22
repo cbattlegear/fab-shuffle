@@ -42,7 +42,7 @@ principal, and destination-capacity access for the destination principal.
 ## Run it
 
 Choose a local Docker container or Azure Container Apps. **Run and test through the Docker
-image, not a host Python preview.** It includes the required AzCopy, SqlPackage,
+image, not a host Python preview.** It includes the required SqlPackage,
 UnpackDacPac, bcp and ODBC tools. SQL authentication uses service-principal access tokens,
 not your desktop identity.
 
@@ -192,7 +192,9 @@ policies require destination configuration; encrypted report/model labels can pr
 The freeze must cover scheduled jobs, ingestion, maintenance and expiration processes, and
 must remain in place through reconciliation and any retries. If the source changes, start a
 fresh migration rather than treating old checkpoints as a new snapshot. Metadata-only
-migrations can omit data and files without this confirmation.
+migrations can omit data and files without this confirmation. With a single service principal
+the freeze is required only for lakehouse Files, which are now streamed and verified against
+the version first read, so a file that changes mid-copy fails the transfer.
 
 On the review screen, map source connection IDs to connections configured in the destination.
 For dependencies outside the migrating workspace, provide both source and destination
@@ -218,8 +220,8 @@ budget. These are per-operation application checks, not aggregate RAM/filesystem
 Schema tools can briefly overshoot between checks and are stopped when excess is detected.
 SQL schema transfers use private, disk-budgeted staging in both credential modes and remove
 those artifacts after the transfer; script processing keeps its separate memory budget.
-The older single-principal AzCopy/bcp disk-staging paths remain uncapped by these settings;
-size the share for their complete staging workload.
+The older single-principal bcp disk-staging path remains uncapped by these settings;
+size the share for its complete staging workload. Lakehouse Files no longer stage on disk.
 Delta preflight checks managed Tables and unmanaged Delta tables under Files for unsafe
 references; it does not rewrite logs to conceal dependencies. Unsupported features and
 budget failures are reported with corrective actions. See
@@ -279,7 +281,7 @@ unresolved dependencies; the review screen and per-item results report those sep
 
 | Item or feature | Single-principal rebuild | Paired rebuild | Limits / operator work |
 | --- | --- | --- | --- |
-| Lakehouse | Schema; tables via Copy Jobs; Files via AzCopy | Schema; tables and Files via OneLake streaming | Schema-enabled lakehouses supported; shortcuts excluded from table-data copy |
+| Lakehouse | Schema; tables via Copy Jobs; Files via OneLake streaming | Schema; tables and Files via OneLake streaming | Schema-enabled lakehouses supported; shortcuts excluded from table-data copy |
 | Lakehouse SQL analytics endpoint | Refresh and schema transfer | Refresh and schema transfer | Views, procedures and functions; catalog readiness is separate from byte-copy success |
 | Warehouse | T-SQL schema and Copy Job data | T-SQL schema and streamed rows | Collation preserved; paired transfer excludes source security assignments |
 | Fabric SQL database | Definition schema and bcp rows | T-SQL schema and streamed rows | Native bcp stages one table export at a time; paired schema excludes source security assignments |
@@ -606,7 +608,7 @@ loopback to check HTTP health and packaged UI assets without tenant credentials.
 names x64 only. Use `--platform linux/amd64` for vendor-supported SqlPackage use. Neither
 architecture's version/import/health smoke checks exercise a live database or Fabric tenant.
 
-For exact .NET, ODBC, SQL-tool and AzCopy versions, use [tools.lock.json](tools.lock.json)
+For exact .NET, ODBC and SQL-tool versions, use [tools.lock.json](tools.lock.json)
 rather than a second version list in this README.
 
 Two build args exist for networks that block the public package feeds:
@@ -623,7 +625,7 @@ docker build \
   -t fab-shuffle .
 ```
 
-If `sqlpackage`, `unpackdacpac`, or `azcopy` are missing at runtime, the affected item is
+If `sqlpackage`, or `unpackdacpac` are missing at runtime, the affected item is
 reported as a warning and the rest of the migration continues.
 
 Python mirrors must serve the locked wheels unchanged: installs enforce hashes and refuse
@@ -643,8 +645,8 @@ Every setting has a sensible default; override with environment variables when n
 | `FAB_SHUFFLE_HOST` | `0.0.0.0` | Bind address |
 | `FAB_SHUFFLE_SCRATCH` | `/app/local` | Local staging directory |
 | `FAB_SHUFFLE_MAX_MEMORY_BYTES` | `1073741824` (1 GiB) | Per-operation in-memory processing budget; not a container RAM cap |
-| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota or legacy AzCopy/bcp cap |
-| `FAB_SHUFFLE_FILE_CONCURRENCY` | `2` | Concurrent file transfers; include their combined staging in share sizing |
+| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota or legacy bcp cap |
+| `FAB_SHUFFLE_FILE_TRANSFER_WORKERS` | `4` | Files copied at once within a lakehouse (`1` is serial). `FAB_SHUFFLE_MAX_MEMORY_BYTES` is split between workers; no disk is used |
 | `FAB_SHUFFLE_SCHEMA_CONCURRENCY` | `2` | Concurrent schema transfers |
 | `FAB_SHUFFLE_MAX_RETRIES` | `6` | Retries for throttled/transient Fabric calls |
 | `FAB_SHUFFLE_COPY_JOB_TIMEOUT_SECONDS` | `43200` | Copy Job budget |
@@ -667,7 +669,7 @@ API integration. The [support matrix](fabshuffle/fabric/support.py) and
 
 **Use Docker for application execution, tests and lint, on every host OS.** The validation
 target extends the same pinned Debian/Python runtime as the production image, including
-AzCopy, SqlPackage, UnpackDacPac, bcp and ODBC. It adds hash-locked development dependencies
+SqlPackage, UnpackDacPac, bcp and ODBC. It adds hash-locked development dependencies
 and digest-pinned Node and PowerShell for the JavaScript UI and generated-script tests.
 
 ```bash

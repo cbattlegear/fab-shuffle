@@ -3,7 +3,6 @@
   "sources": [
     "https://packages.microsoft.com/debian/12/prod/dists/bookworm/main/binary-amd64/Packages",
     "https://packages.microsoft.com/debian/12/prod/dists/bookworm/main/binary-arm64/Packages",
-    "https://api.github.com/repos/Azure/azure-storage-azcopy/releases/tags/v10.32.8",
     "https://api.nuget.org/v3/catalog0/data/2026.08.25.17.38.28/microsoft.sqlpackage.170.5.76.json",
     "https://api.nuget.org/v3/catalog0/data/2026.07.15.08.32.27/unpackdacpac.2026.7.15.390.json"
   ],
@@ -125,23 +124,9 @@
       "sha256": "664cb566efcbf1fe596c35cff3ef3b0a11d85c420dfc0b06d65598597973ba43"
     }
   },
-  "azcopy": {
-    "version": "10.32.8",
-    "artifacts": {
-      "amd64": {
-        "url": "https://github.com/Azure/azure-storage-azcopy/releases/download/v10.32.8/azcopy_linux_amd64_10.32.8.tar.gz",
-        "sha256": "a95277dbc265912cefdddbaf251aa99ec648cb18ba657e8788066357a9022dc3"
-      },
-      "arm64": {
-        "url": "https://github.com/Azure/azure-storage-azcopy/releases/download/v10.32.8/azcopy_linux_arm64_10.32.8.tar.gz",
-        "sha256": "50e6e58a109f2afd64376b5b003973ff213fbfdec795fe81a95b208982061d9b"
-      }
-    }
-  },
   "version_commands": [
     [["sqlpackage", "/Version"], "170.5.76"],
     [["unpackdacpac", "--version"], "2026.7.15.390"],
-    [["azcopy", "--version"], "10.32.8"],
     [["bcp", "-v"], "18.6.0002.1"]
   ]
 }

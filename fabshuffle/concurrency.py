@@ -2,13 +2,13 @@
 
 Most of a migration is waiting on HTTP, and that is handled by submitting work and polling
 it in one loop rather than by threads. A few things cannot be: sqlpackage and unpackdacpac
-are subprocesses, the schema deploy is a batch at a time over ODBC, and azcopy stages files
+are subprocesses, the schema deploy is a batch at a time over ODBC, and bcp stages rows
 through local disk. Those genuinely block a thread, so they get a pool.
 
 Two rules make that safe to read afterwards.
 
 **The limit is small and deliberate.** sqlpackage is a .NET process of a few hundred
-megabytes, and azcopy tunes its own concurrency and stages whole directories locally, so
+megabytes, and bcp stages whole tables locally, so
 several at once compete for the same memory and disk rather than going faster.
 
 **Output does not depend on timing.** Warnings are collected per job and sorted by a stable

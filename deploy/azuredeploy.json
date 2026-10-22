@@ -65,7 +65,7 @@
       "minValue": 1,
       "maxValue": 102400,
       "metadata": {
-        "description": "Disk budget per bounded schema/checkpoint operation, in GiB. Does not reserve space or resize the Azure Files share. Legacy single-principal AzCopy/bcp exports are not capped by this setting; size the share for their full staging requirements."
+        "description": "Disk budget per bounded schema/checkpoint operation, in GiB. Does not reserve space or resize the Azure Files share. Legacy single-principal bcp exports are not capped by this setting; size the share for their full staging requirements."
       }
     },
     "maxMemoryMiB": {

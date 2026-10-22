@@ -2,7 +2,7 @@
 
 Most of a migration waits on HTTP and is handled by polling in one loop. This covers the
 parts that genuinely block a thread: sqlpackage and unpackdacpac subprocesses, the schema
-deploy over ODBC, and azcopy staging files through local disk.
+deploy over ODBC, and bcp staging rows through local disk.
 """
 
 from __future__ import annotations

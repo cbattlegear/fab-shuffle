@@ -31,6 +31,7 @@ PLAN = MigrationPlan(
     source_workspace_id="ws-1",
     source_workspace_name="Sales",
     target_workspace_name="Sales-westeurope",
+    write_freeze_confirmed=True,
 )
 
 
@@ -183,6 +184,7 @@ def write_journal(*, finished=False, plan=True, target="ws-target"):
                 "capacity_id": "cap-1",
                 "capacity_name": "F64",
                 "capacity_region": "westeurope",
+                "write_freeze_confirmed": True,
             },
             cleanup=True,
         )

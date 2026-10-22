@@ -257,6 +257,8 @@ const scenarios = {
     const recheckRequest = f.requests.length - 1;
     assert.equal(new URL(f.requests[recheckRequest].url, "http://fixture").searchParams.get("strategy"), "rebuild");
     await f.reply(recheckRequest, { blockers: [], dependencies: [], connectionAccess: null });
+    f.get("opt-write-freeze").checked = true;
+    f.get("opt-write-freeze").handlers.change();
     f.get("start-run").click();
     const startRequest = f.requests.length - 1;
     assert.equal(f.requests[startRequest].url, "/api/runs");

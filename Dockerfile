@@ -23,8 +23,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # mssql-tools18 installs outside the default PATH.
 ENV PATH="/opt/mssql-tools18/bin:${PATH}"
 
-RUN python scripts/install_tools.py azcopy --architecture "${TARGETARCH}"
-
 # Override when nuget.org is unreachable, for example behind a corporate feed proxy:
 #   docker build --build-arg NUGET_SOURCE=https://internal.example/nuget/v3/index.json .
 ARG NUGET_SOURCE=https://api.nuget.org/v3/index.json

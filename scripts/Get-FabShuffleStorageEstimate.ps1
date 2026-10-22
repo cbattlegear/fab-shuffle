@@ -16,7 +16,7 @@ estimated largest native bcp table-export size. Fabric item/OneLake metadata doe
 give this size. Database storage size can understate an uncompressed export.
 .PARAMETER DiskStagingGiB
 Match FAB_SHUFFLE_MAX_DISK_STAGING_BYTES, in GiB (default 10). This reserves active
-schema/checkpoint staging, not a cap on legacy AzCopy/bcp exports.
+schema/checkpoint staging, not a cap on legacy bcp exports.
 .PARAMETER ExistingStagingGiB
 Space already used by journals or retained files on the share. Default assumes a new share.
 .EXAMPLE

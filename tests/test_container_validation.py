@@ -20,7 +20,7 @@ def test_validation_refuses_linux_host_without_docker_marker(monkeypatch):
         runner.require_runtime()
 
 
-@pytest.mark.parametrize("missing", ["node", "pwsh", "sqlpackage", "unpackdacpac", "azcopy", "bcp"])
+@pytest.mark.parametrize("missing", ["node", "pwsh", "sqlpackage", "unpackdacpac", "bcp"])
 def test_required_tool_absence_fails_before_pytest_can_skip(monkeypatch, missing):
     monkeypatch.setattr(runner.sys, "platform", "linux")
     monkeypatch.setattr(runner.Path, "is_file", lambda _: True)

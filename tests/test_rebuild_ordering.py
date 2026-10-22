@@ -202,7 +202,7 @@ def fabric(monkeypatch) -> FakeFabric:
     monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda c, w: [])
     monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
     monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
-    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_tree_streaming", lambda **k: None)
     monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
     return fake
 
@@ -216,6 +216,7 @@ def make_plan() -> orchestrator.MigrationPlan:
         source_workspace_name="bronze-ws",
         target_workspace_name="bronze-ws-westeurope",
         strategy=Strategy.REBUILD,
+        write_freeze_confirmed=True,
     )
 
 
@@ -367,7 +368,7 @@ def record_data_copies(monkeypatch):
         return [], []
 
     monkeypatch.setattr(orchestrator.copyjobs, "run_copy_jobs", copy_jobs)
-    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: files.append(k))
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_tree_streaming", lambda **k: files.append(k))
     return tables, files
 
 
@@ -721,7 +722,7 @@ def test_a_composite_model_is_created_after_the_model_it_reads(monkeypatch):
     monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda c, w: [])
     monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
     monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
-    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_tree_streaming", lambda **k: None)
     monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
     monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", StubPowerBi())
 
@@ -787,7 +788,7 @@ def test_pipelines_are_rebound_and_their_connections_checked(monkeypatch):
     monkeypatch.setattr(orchestrator.workspaces, "list_role_assignments", lambda c, w: [])
     monkeypatch.setattr(orchestrator.workspaces, "copy_role_assignments", lambda *a, **k: [])
     monkeypatch.setattr(orchestrator.shortcuts, "copy_shortcuts", lambda *a, **k: (0, []))
-    monkeypatch.setattr(orchestrator.file_transfer, "copy_files", lambda **k: None)
+    monkeypatch.setattr(orchestrator.file_transfer, "copy_tree_streaming", lambda **k: None)
     monkeypatch.setattr(orchestrator.sqlschema, "transfer_schema", lambda **k: [])
 
     migration = run(fabric)
