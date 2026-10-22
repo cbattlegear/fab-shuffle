@@ -397,6 +397,36 @@ const scenarios = {
     assert.match(f.get("readiness-items").textContent, /Unknown/);
     assert.match(f.get("readiness-items").textContent, /Verify this item/);
   },
+  async next_steps_are_not_failures(f) {
+    const hostile = "<img src=x onerror=alert(1)>";
+    const mirror = item(0, {
+      name: "Orders mirror", itemType: "MirroredDatabase", state: "next_steps",
+      reasons: ["activation: Not started."], actions: ["Start the mirror."],
+    });
+    const nextSteps = [{
+      sourceId: "source-0", name: "Orders mirror", itemType: "MirroredDatabase", step: "activation",
+      reason: "Automatic start was not selected.", action: "Start the mirror.", errorCode: "", message: "",
+      waiting: [{ sourceId: "lh", name: hostile, step: "shortcut:Tables/A", errorCode: "BadRequest", message: "Nope." }],
+    }];
+    f.begin();
+    await f.tick(500);
+    await f.reply(0, report("one", [mirror, item(3, { state: "ready" })], {
+      schemaVersion: 2, state: "next_steps", nextSteps,
+    }));
+    assert.equal(f.get("readiness-next-steps").hidden, false);
+    const list = f.get("readiness-next-steps-list");
+    assert.equal(list.children.length, 1);
+    assert.match(list.textContent, /Start the mirror\./);
+    assert.match(list.textContent, /BadRequest/);
+    assert.match(list.textContent, /Nope\./);
+    assert.equal(list.querySelector("img"), null);
+    assert.equal(f.get("readiness-overall").textContent, "Next steps");
+    assert.match(f.get("readiness-counts").textContent, /1 with next steps · 0 need attention/);
+    assert.match(f.get("readiness-items").children[0].textContent, /Next steps/);
+    await f.tick(1000);
+    f.ui.observeReadiness({ status: "running", readinessRevision: 9 });
+    assert.equal(f.get("readiness-next-steps").hidden, true);
+  },
   async connection_advisories_render(f) {
     f.begin();
     await f.tick(500);

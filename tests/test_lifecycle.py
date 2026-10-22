@@ -78,13 +78,15 @@ def test_required_evidence_truth_table(states):
         expected = "needs_attention"
     elif EvidenceState.UNKNOWN in states:
         expected = "unknown"
+    elif EvidenceState.PLANNED in states:
+        expected = "next_steps"
     else:
         expected = "ready"
 
     result = report(lifecycle)
     assert result["state"] == result["items"][0]["state"] == expected
     assert result["counts"] == {
-        state: int(state == expected) for state in ("ready", "unknown", "needs_attention")
+        state: int(state == expected) for state in ("ready", "next_steps", "unknown", "needs_attention")
     }
     assert result["runStatus"] == "succeeded"
 
@@ -112,7 +114,7 @@ def test_known_empty_inventory_is_distinct_from_unmeasured_inventory(complete, e
     assert result["state"] == expected
     assert result["inventoryComplete"] is complete
     assert result["items"] == []
-    assert result["counts"] == {"ready": 0, "unknown": 0, "needs_attention": 0}
+    assert result["counts"] == {"ready": 0, "next_steps": 0, "unknown": 0, "needs_attention": 0}
     assert bool(any("inventory" in limit.lower() for limit in result["limits"])) is not complete
 
 

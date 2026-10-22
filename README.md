@@ -367,8 +367,22 @@ or is interrupted. They remain hidden while a run is pending or running.
 | State | Meaning |
 | --- | --- |
 | Ready | Every required migration step has recorded success for this target incarnation. |
-| Needs attention | Recorded failures, skipped work, unresolved dependencies or manual activation remain. |
+| Next steps | Only planned follow-up remains, e.g. a destination mirror you chose not to start. Not a failure. |
+| Needs attention | Recorded failures, skipped work or unresolved dependencies remain. |
 | Unknown | Evidence is missing, stale or insufficient, including legacy journals. |
+
+**Planned next steps.** If a database mirror is left stopped because automatic start was not
+selected, the report lists one **Next steps** entry for that mirror, with the shortcuts that
+were refused while it was stopped nested under it (service `errorCode` and message kept
+verbatim). Those shortcuts are *planned*, not failed: start the mirror, then retry the
+migration so they are recreated. Other items that merely depend on the lakehouse are **not**
+marked broken, because a dependency does not show an item reads the waiting shortcut; the
+report does not trace that. A requested mirror start that fails, shortcut failures without a
+planned mirror, and unmeasured checks still need attention. The link is made from the mirror's
+own recorded evidence, never from error-string matching, and expires if the mirror is later
+started or its target is recreated (the evidence then becomes Unknown). The JSON export is
+`schemaVersion` 2 and adds `nextSteps`; the "mirror not started" run warning is replaced by
+this entry.
 
 Filter or search the per-item report to see source/target identities, created/adopted/refreshed
 dispositions, step evidence and operator actions. Data and file options skipped at admission

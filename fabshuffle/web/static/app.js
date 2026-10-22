@@ -1368,7 +1368,9 @@ function renderRun(run) {
 
 // ---------------------------------------------------------- cutover readiness
 
-const READINESS_LABELS = { ready: "Ready", needs_attention: "Needs attention", unknown: "Unknown" };
+const READINESS_LABELS = {
+  ready: "Ready", next_steps: "Next steps", needs_attention: "Needs attention", unknown: "Unknown",
+};
 const READINESS_PAGE_SIZE = 25;
 const READINESS_REFRESH_MS = 500;
 
@@ -1399,6 +1401,8 @@ function resetReadiness(runId = null) {
   $("#readiness-filter").value = "all";
   $("#readiness-search").value = "";
   $("#readiness-items").replaceChildren();
+  $("#readiness-next-steps-list").replaceChildren();
+  $("#readiness-next-steps").hidden = true;
   $("#readiness-limits").replaceChildren();
   $("#readiness-controls").hidden = true;
   $("#readiness-pagination").hidden = true;
@@ -1466,11 +1470,12 @@ async function fetchReadiness(current) {
       signal: current.controller.signal,
     });
     if (state.readiness !== current || version !== current.version) return;
-    if (report.schemaVersion !== 1 || report.runId !== current.runId || !Array.isArray(report.items)) {
+    if (![1, 2].includes(report.schemaVersion) || report.runId !== current.runId || !Array.isArray(report.items)) {
       throw new Error("The readiness report has an unsupported format. Reload the application and retry.");
     }
     current.report = report;
     renderReadinessItems();
+    renderReadinessNextSteps(report);
     $("#readiness-limits").replaceChildren();
     (report.limits || []).forEach((limit) => {
       $("#readiness-limits").appendChild(readinessElement("li", limit));
@@ -1508,7 +1513,8 @@ function renderReadinessStatus() {
   overall.className = `readiness-state ${reportedState}`;
   $("#readiness-jump").textContent = `Cutover readiness: ${report || current.error ? label : "loading…"}`;
   $("#readiness-counts").textContent = report
-    ? `${report.counts?.ready ?? 0} ready · ${report.counts?.needs_attention ?? 0} need attention · ` +
+    ? `${report.counts?.ready ?? 0} ready · ${report.counts?.next_steps ?? 0} with next steps · ` +
+      `${report.counts?.needs_attention ?? 0} need attention · ` +
       `${report.counts?.unknown ?? 0} unknown${current.error ? " (last loaded snapshot)" : ""}`
     : "";
   $("#readiness-status").textContent = current.error
@@ -1545,6 +1551,34 @@ function readinessTextList(parent, heading, entries) {
   parent.appendChild(list);
 }
 
+function renderReadinessNextSteps(report) {
+  const steps = Array.isArray(report?.nextSteps) ? report.nextSteps : [];
+  const section = $("#readiness-next-steps");
+  const list = $("#readiness-next-steps-list");
+  list.replaceChildren();
+  section.hidden = !steps.length;
+  steps.forEach((step) => {
+    const row = readinessElement("li", null, "readiness-next-step");
+    row.appendChild(readinessElement("strong", `${step.name || step.sourceId || "Unnamed item"} · ${step.itemType || "Unknown type"}`));
+    row.appendChild(readinessElement("p", step.reason));
+    if (step.action) row.appendChild(readinessElement("p", `Next: ${step.action}`, "hint"));
+    const waiting = Array.isArray(step.waiting) ? step.waiting : [];
+    if (waiting.length) {
+      const details = readinessElement("details", null, "readiness-evidence");
+      details.appendChild(readinessElement("summary", `${waiting.length} waiting shortcut(s)`));
+      const items = readinessElement("ul", null, "readiness-text-list");
+      waiting.forEach((entry) => {
+        const text = [`${entry.name || entry.sourceId} (${entry.step})`, entry.errorCode, entry.message]
+          .filter(Boolean).join(" · ");
+        items.appendChild(readinessElement("li", text));
+      });
+      details.appendChild(items);
+      row.appendChild(details);
+    }
+    list.appendChild(row);
+  });
+}
+
 function readinessItem(item, key, open) {
   const itemState = readinessState(item.state);
   const row = readinessElement("li", null, "readiness-item");
@@ -1561,6 +1595,7 @@ function readinessItem(item, key, open) {
   row.appendChild(header);
   const fallback = {
     ready: "Recorded checks passed. Review the report scope before cutover.",
+    next_steps: "Planned follow-up work is still owed. This is not a failure.",
     needs_attention: "Outstanding work needs review before cutover.",
     unknown: "Readiness has not been established for this item.",
   };
@@ -1586,7 +1621,10 @@ function readinessItem(item, key, open) {
   const steps = readinessElement("ul", null, "readiness-evidence-steps");
   (item.steps || []).forEach((step) => {
     const entry = readinessElement("li");
-    const labels = { succeeded: "Succeeded", failed: "Failed", skipped: "Skipped", unknown: "Unknown" };
+    const labels = {
+      succeeded: "Succeeded", failed: "Failed", skipped: "Skipped", unknown: "Unknown",
+      planned: "Planned next step",
+    };
     const stepState = Object.hasOwn(labels, step.state) ? labels[step.state] : labels.unknown;
     entry.appendChild(readinessElement("strong", `${step.step || "Unspecified step"} · ${stepState}`));
     [

@@ -165,8 +165,9 @@ def configure(context, states, enabled=False):
 def test_off_by_default_only_reads_destination_status(context):
     destination, warnings, outcome = configure(context, ["Stopped"])
     assert destination.starts == 0
-    assert outcome.steps["activation"].state == EvidenceState.SKIPPED
-    assert "Stopped" in warnings[0]
+    assert outcome.steps["activation"].state == EvidenceState.PLANNED
+    assert not warnings
+    assert "Stopped" in outcome.steps["activation"].reason
     assert "Stopped" in context.dormant["source-db"]
 
 

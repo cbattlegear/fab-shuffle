@@ -501,7 +501,9 @@ class _ShortcutEvidence:
         self.dependencies: set[str] = set()
         self.unresolved: list[str] = []
         self.failures: dict[str, str] = {}
+        self.deferred: dict[str, str] = {}
         self.last_error: FabricApiError | None = None
+        self.last_deferred_error: FabricApiError | None = None
         self.previous_failures: set[str] = set()
         self.total = 0
         self.created = 0
@@ -595,11 +597,56 @@ class _ShortcutEvidence:
                 error=self.last_error,
             )
 
+    def refused(
+        self, shortcut: Mapping[str, Any], source_id: str, dormant_reason: str | None,
+        message: str, error: FabricApiError,
+        source_items: Mapping[str, Mapping[str, Any]] | None, warnings: list[str],
+    ) -> None:
+        """Record a create the service did not accept.
+
+        When the shortcut points at a destination mirror whose own evidence says its start was
+        deliberately not requested, the refusal is a waiting follow-up, not a separate failure:
+        it is recorded as planned evidence with the service's words intact and added to no
+        warning. The service did not say why it refused, so this records what was observed
+        (a stopped mirror target) and not a proven cause; a retry after the mirror starts
+        settles it, and if the mirror start was requested the evidence stays a failure.
+        """
+        if dormant_reason and self._mirror_start_deferred(source_id):
+            name = str(shortcut.get("name"))
+            key = f"shortcut:{shortcut.get('path') or ''}/{name}"
+            self.deferred[key] = name
+            self.last_deferred_error = error
+            mirror = _describe_item(source_id, source_items)
+            self.lifecycle.step(
+                key, EvidenceState.PLANNED,
+                f"Not created yet: it points at {mirror}, whose start was not requested by this "
+                f"migration. {message}",
+                action=f"Start {mirror} in the destination, then retry the migration to recreate "
+                f"shortcut '{name}'.",
+                error=error, waits_on=source_id,
+            )
+            return
+        warnings.append(message)
+        self.failed(
+            shortcut, message,
+            f"{message} Resolve the reported error, then recreate this shortcut.", error,
+        )
+
+    def _mirror_start_deferred(self, source_id: str) -> bool:
+        if not self.lifecycle or not source_id:
+            return False
+        try:
+            gate = self.lifecycle.owner.get(source_id)
+        except KeyError:
+            return False
+        step = gate.steps.get("activation")
+        return bool(step and step.state == EvidenceState.PLANNED and step.targetId == gate.targetId)
+
     def finish(self) -> None:
         if not self.lifecycle:
             return
         self.lifecycle.references(self.dependencies, self.unresolved, scope="shortcuts")
-        for key in self.previous_failures - self.failures.keys():
+        for key in self.previous_failures - self.failures.keys() - self.deferred.keys():
             self.lifecycle.step(
                 key, EvidenceState.SUCCEEDED,
                 "This previous shortcut failure was not observed in the completed retry.",
@@ -623,6 +670,19 @@ class _ShortcutEvidence:
                 if not self.reused
                 else f"Completed {completed} of {self.total} enumerated shortcuts."
             )
+            if not self.failures:
+                waiting = ", ".join(f"'{name}'" for name in self.deferred.values())
+                self.lifecycle.step(
+                    "shortcuts", EvidenceState.PLANNED,
+                    f"{reason} Waiting on a planned follow-up: {waiting}.",
+                    action="Complete the planned follow-up, then retry the migration to recreate "
+                    f"these shortcuts: {waiting}.",
+                    error=self.last_deferred_error,
+                )
+                return
+            if self.deferred:
+                waiting = ", ".join(f"'{name}'" for name in self.deferred.values())
+                reason = f"{reason} {len(self.deferred)} more are waiting on a planned follow-up: {waiting}."
             self.lifecycle.step(
                 "shortcuts", EvidenceState.FAILED,
                 reason,
@@ -790,10 +850,8 @@ def copy_shortcuts(
                         location=_shortcut_location(remapped),
                     )
                 )
-                warnings.append(message)
-                evidence.failed(
-                    shortcut, message,
-                    f"{message} Resolve the reported error, then recreate this shortcut.", error,
+                evidence.refused(
+                    shortcut, source_id, reason, message, error, source_items, warnings,
                 )
                 continue
 
@@ -847,10 +905,8 @@ def copy_shortcuts(
                         location=_shortcut_location(remapped),
                     )
                 )
-                warnings.append(message)
-                evidence.failed(
-                    shortcut, message,
-                    f"{message} Resolve the reported error, then recreate this shortcut.", error,
+                evidence.refused(
+                    shortcut, source_id, reason, message, error, source_items, warnings,
                 )
         evidence.created = created
         evidence.reused = reused
@@ -1032,10 +1088,8 @@ def copy_table_shortcuts(
                         location=_shortcut_location(desired, table=True),
                     )
                 )
-                warnings.append(message)
-                evidence.failed(
-                    shortcut, message,
-                    f"{message} Resolve the reported error, then recreate this shortcut.", error,
+                evidence.refused(
+                    shortcut, source_id, reason, message, error, source_items, warnings,
                 )
                 continue
 
@@ -1093,10 +1147,8 @@ def copy_table_shortcuts(
                         location=_shortcut_location(desired, table=True),
                     )
                 )
-                warnings.append(message)
-                evidence.failed(
-                    shortcut, message,
-                    f"{message} Resolve the reported error, then recreate this shortcut.", error,
+                evidence.refused(
+                    shortcut, source_id, reason, message, error, source_items, warnings,
                 )
         evidence.created = created
         evidence.reused = reused
