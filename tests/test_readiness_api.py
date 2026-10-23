@@ -112,11 +112,11 @@ def test_authenticated_readiness_returns_the_full_json_report(client, session_id
     else:
         assert "content-disposition" not in response.headers
     body = response.json()
-    assert body["schemaVersion"] == 1
+    assert body["schemaVersion"] == 2
     assert body["runId"] == body["lineageId"] == run.id
     assert body["runStatus"] == "succeeded"
     assert body["state"] == "needs_attention"
-    assert body["counts"] == {"ready": 1, "unknown": 0, "needs_attention": 1}
+    assert body["counts"] == {"ready": 1, "next_steps": 0, "unknown": 0, "needs_attention": 1}
     assert {item["sourceId"] for item in body["items"]} == {"notebook", "warehouse-copy"}
     assert all(item["steps"] and item["reasons"] for item in body["items"])
     assert body["limits"]
@@ -231,7 +231,7 @@ def test_legacy_item_data_and_mapping_checkpoints_are_not_success_evidence(
     assert body["state"] == "unknown"
     assert body["runStatus"] == "succeeded"
     assert body["inventoryComplete"] is inventory_complete
-    assert body["counts"] == {"ready": 0, "unknown": 1, "needs_attention": 0}
+    assert body["counts"] == {"ready": 0, "next_steps": 0, "unknown": 1, "needs_attention": 0}
     assert len(body["items"]) == 1
     outcome = body["items"][0]
     assert outcome["name"] == "Orders"

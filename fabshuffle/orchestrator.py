@@ -3529,8 +3529,9 @@ def _configure_database_mirror(
         )
     else:
         evidence.step(
-            "activation", EvidenceState.SKIPPED,
-            f"Automatic start was not selected. Destination reports {state}.",
+            "activation", EvidenceState.PLANNED,
+            f"Automatic start was not selected, so this migration did not start the destination "
+            f"mirror. Destination reports {state}. This is a planned next step, not a failed migration.",
             action="Start mirroring in the destination when ready, or select "
             "Start destination database mirrors on retry. This can create a second active replica.",
         )
@@ -3538,10 +3539,8 @@ def _configure_database_mirror(
             f"reports mirroring status {state} in the destination; replicated table availability "
             "has not been verified. Check mirroring and the target table in the new workspace."
         )
-        warnings.append(
-            f"Mirrored database '{result.name}' reports {state}; no start was requested. "
-            "Start it in the destination when ready, or select the mirror-start option on retry."
-        )
+        # Not a warning: leaving the mirror stopped was the operator's choice and is reported
+        # once, as a next step, in the readiness report.
 
 
 def _migrate_snowflake_databases(

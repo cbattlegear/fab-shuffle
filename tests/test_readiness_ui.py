@@ -32,6 +32,7 @@ NODE = shutil.which("node")
         "hidden_until_halted",
         "active_again",
         "target_is_not_spinner",
+        "next_steps_are_not_failures",
     ],
 )
 def test_readiness_ui(scenario: str) -> None:

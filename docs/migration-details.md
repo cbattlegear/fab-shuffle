@@ -182,6 +182,8 @@ Resume can update mappings and explicitly opt into destination mirror starts for
 attempt; it does not change the tenant/application pair, source workspace or destination.
 Readiness is a recorded snapshot at `GET /api/runs/{run_id}/readiness`, with
 `?download=true` for a JSON attachment. Reading or exporting it performs no activation.
+The report is `schemaVersion` 2: a mirror left stopped by choice appears in `nextSteps` (with
+its waiting shortcuts) and gives items the `next_steps` state instead of `needs_attention`.
 
 This implementation reference does not imply live two-tenant qualification, Azure
 deployment qualification, or permission to delete a source after a successful run.

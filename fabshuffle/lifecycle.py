@@ -22,6 +22,10 @@ class EvidenceState(StrEnum):
     FAILED = "failed"
     SKIPPED = "skipped"
     UNKNOWN = "unknown"
+    # An operator-chosen deferral that is not a failure and not done: the work is still owed
+    # and is reported as a next step, never as success. Journals written before this state
+    # existed simply never contain it.
+    PLANNED = "planned"
 
 
 class Disposition(StrEnum):
@@ -92,6 +96,8 @@ class Evidence:
     message: str = ""
     attemptId: str = ""
     targetId: str = ""
+    # For PLANNED evidence: the source id of the item whose own planned follow-up this waits on.
+    waitsOn: str = ""
 
 
 @dataclass
@@ -149,7 +155,7 @@ class ItemOutcome:
             safe_text(str(key)): Evidence(
                 state=EvidenceState(value.get("state", "unknown")),
                 **{field: safe_text(str(value.get(field) or "")) for field in (
-                    "reason", "action", "errorCode", "message", "attemptId", "targetId"
+                    "reason", "action", "errorCode", "message", "attemptId", "targetId", "waitsOn"
                 )},
             )
             for key, value in (record.get("steps") or {}).items()
@@ -311,7 +317,7 @@ class ItemLifecycle:
 
     def step(
         self, step: str, state: EvidenceState, reason: str, *, action: str = "",
-        error: Exception | None = None, required: bool = True,
+        error: Exception | None = None, required: bool = True, waits_on: str = "",
     ) -> None:
         with self.owner._lock:
             item = self.owner._items[self.source_id]
@@ -321,7 +327,7 @@ class ItemLifecycle:
                 state, self.owner._text(reason), self.owner._text(action),
                 self.owner._text(str(getattr(error, "error_code", "") or "")),
                 self.owner._text(str(getattr(error, "detail", "") or error or "")),
-                self.owner.attempt_id, item.targetId,
+                self.owner.attempt_id, item.targetId, self.owner._text(waits_on),
             )
             self.owner._save(item)
 
@@ -370,7 +376,31 @@ LIMITS = [
     "Fab Shuffle after that observation are not detected until recovery checks run.",
     "Unmeasured work and legacy journals remain unknown. Empty enumerations mean no copyable "
     "objects were found, not proof of zero rows or byte-for-byte equality.",
+    "Planned follow-ups (for example a destination mirror left stopped on purpose) are listed once "
+    "under next steps. Item dependencies are recorded per item, so this report does not trace which "
+    "reports, models or notebooks read a specific waiting shortcut; verify those after the follow-up.",
 ]
+
+
+def _planned_current(
+    outcomes: Mapping[str, ItemOutcome], outcome: ItemOutcome, key: str, evidence: Evidence,
+) -> bool:
+    """A planned follow-up is only meaningful while the planned item still says so."""
+    if key == "shortcuts":
+        return any(
+            _planned_current(outcomes, outcome, other, step)
+            for other, step in outcome.steps.items()
+            if other.startswith("shortcut:") and step.state == EvidenceState.PLANNED
+            and step.targetId == outcome.targetId
+        )
+    if not evidence.waitsOn:
+        return True
+    gate = outcomes.get(evidence.waitsOn)
+    gate_step = gate.steps.get("activation") if gate else None
+    return bool(
+        gate and gate_step and gate_step.state == EvidenceState.PLANNED
+        and gate_step.targetId == gate.targetId
+    )
 
 
 def readiness_report(
@@ -379,7 +409,9 @@ def readiness_report(
     inventory_complete: bool = False,
 ) -> dict[str, Any]:
     items: dict[str, dict[str, Any]] = {}
-    ranks = {"ready": 0, "unknown": 1, "needs_attention": 2}
+    ranks = {"ready": 0, "next_steps": 1, "unknown": 2, "needs_attention": 3}
+    next_steps: dict[tuple[str, str], dict[str, Any]] = {}
+    waiting: list[tuple[str, dict[str, Any]]] = []
     for source, outcome in outcomes.items():
         steps = {**outcome.steps, **{
             key: outcome.steps.get(key, Evidence()) for key in outcome.required
@@ -397,16 +429,37 @@ def readiness_report(
                 steps[key] = evidence
             if key not in outcome.required:
                 continue
+            if evidence.state == EvidenceState.PLANNED and not _planned_current(
+                outcomes, outcome, key, evidence
+            ):
+                evidence = replace(
+                    evidence, state=EvidenceState.UNKNOWN,
+                    reason="The planned follow-up this depended on has changed since it was recorded.",
+                    action="Retry this item to refresh the work that was waiting.",
+                )
+                steps[key] = evidence
             current = evidence.state
             if current in (EvidenceState.FAILED, EvidenceState.SKIPPED):
                 state = "needs_attention"
-            elif current == EvidenceState.UNKNOWN and state == "ready":
+            elif current == EvidenceState.UNKNOWN and ranks[state] < ranks["unknown"]:
                 state = "unknown"
+            elif current == EvidenceState.PLANNED and state == "ready":
+                state = "next_steps"
+            if current == EvidenceState.PLANNED and key != "shortcuts":
+                entry = {
+                    "sourceId": source, "name": outcome.name, "itemType": outcome.itemType,
+                    "step": key, "reason": evidence.reason, "action": evidence.action,
+                    "errorCode": evidence.errorCode, "message": evidence.message,
+                }
+                if evidence.waitsOn:
+                    waiting.append((evidence.waitsOn, entry))
+                else:
+                    next_steps[(source, key)] = {**entry, "waiting": []}
             if current != EvidenceState.SUCCEEDED:
                 reasons.append(f"{key}: {evidence.reason}")
                 if evidence.action:
                     actions.append(evidence.action)
-        if not outcome.targetId and state == "ready":
+        if not outcome.targetId and ranks[state] < ranks["unknown"]:
             state = "unknown"
             reasons.append("No target identity recorded.")
         if outcome.unresolvedReferences:
@@ -430,26 +483,45 @@ def readiness_report(
         dependency = pending.pop()
         state = items.get(dependency, {}).get("state", "unknown")
         for source in dependents.get(dependency, ()):
-            if ranks[state] > ranks[items[source]["state"]]:
+            # A planned follow-up is owed by the item itself; depending on it does not show that
+            # a dependent touches the waiting work, so it is not propagated.
+            if state != "next_steps" and ranks[state] > ranks[items[source]["state"]]:
                 items[source]["state"] = state
                 pending.append(source)
     for source, outcome in outcomes.items():
         for dependency in outcome.dependencies:
             depended = items.get(dependency)
-            if not depended or depended["state"] != "ready":
+            if not depended or depended["state"] not in ("ready", "next_steps"):
                 name = depended["name"] if depended else dependency
                 items[source]["reasons"].append(f"Dependency '{name}' is not ready.")
                 items[source]["actions"].append(f"Review readiness for '{name}' before cutover.")
         if not items[source]["reasons"]:
             items[source]["reasons"] = ["All required migration work has recorded success."]
+    for gate, entry in waiting:
+        owner = next_steps.get((gate, "activation"))
+        if owner is not None:
+            owner["waiting"].append(entry)
+    for entry in next_steps.values():
+        entry["waiting"].sort(key=lambda value: (
+            value["name"].casefold(), value["sourceId"], value["step"]
+        ))
+        if entry["waiting"]:
+            entry["action"] = (
+                f"{entry['action']} Then retry the migration so the {len(entry['waiting'])} "
+                "waiting shortcut(s) are recreated."
+            ).strip()
     counts = {state: sum(item["state"] == state for item in items.values()) for state in ranks}
     state = (
         "needs_attention" if counts["needs_attention"] else
-        "unknown" if counts["unknown"] or not inventory_complete else "ready"
+        "unknown" if counts["unknown"] or not inventory_complete else
+        "next_steps" if counts["next_steps"] else "ready"
     )
     return {
-        "schemaVersion": 1, "runId": run_id, "lineageId": lineage_id, "runStatus": run_status,
+        "schemaVersion": 2, "runId": run_id, "lineageId": lineage_id, "runStatus": run_status,
         "state": state, "counts": counts, "inventoryComplete": inventory_complete,
+        "nextSteps": sorted(next_steps.values(), key=lambda entry: (
+            entry["name"].casefold(), entry["sourceId"], entry["step"]
+        )),
         "limits": [*LIMITS, *([] if inventory_complete else [
             "Source inventory was not recorded completely; the report may omit items."
         ])],

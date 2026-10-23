@@ -302,12 +302,18 @@
           <summary>What this report does and does not check</summary>
           <ul id="readiness-limits"></ul>
         </details>
+        <section id="readiness-next-steps" class="readiness-next-steps" aria-labelledby="readiness-next-steps-title" hidden>
+          <h4 id="readiness-next-steps-title">Next steps</h4>
+          <p class="hint">Planned follow-up work you chose to leave for later. These are not failed migrations and are listed once here rather than on every item.</p>
+          <ul id="readiness-next-steps-list" class="readiness-items"></ul>
+        </section>
         <div id="readiness-controls" class="readiness-controls" hidden>
           <label for="readiness-filter">Readiness state
             <select id="readiness-filter">
               <option value="all">All states</option>
               <option value="needs_attention">Needs attention</option>
               <option value="unknown">Unknown</option>
+              <option value="next_steps">Next steps</option>
               <option value="ready">Ready</option>
             </select>
           </label>
