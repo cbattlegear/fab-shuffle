@@ -102,9 +102,9 @@ Neither resizes the share nor changes the container's RAM allocation.
 #### Choosing the Azure Files size
 
 Size for **peak concurrent staging plus retained files and headroom**, not simply the largest
-data store. Single-principal lakehouse copies stage whole `Files/` areas; bcp stages one SQL
-table export at a time. Paired-credential transfers stream data and primarily need schema
-and Delta-checkpoint staging instead.
+data store. Both credential modes stream lakehouse `Files/` content rather than staging whole
+directories. Delta checkpoint inspection can still use bounded disk staging; single-principal
+SQL database copies stage one native bcp table export at a time.
 
 Run [`Get-FabShuffleStorageEstimate.ps1`](scripts/Get-FabShuffleStorageEstimate.ps1) in
 PowerShell 7+ with **Az.Accounts** and **Az.Storage**, using your user account with access
@@ -115,10 +115,17 @@ to every source item and file:
 ```
 
 Use `-Mode Paired` for two-principal migrations, even within one tenant. The script reports
-`SuggestedShareQuotaGiB` using paged Files metadata, staging allowances and **25% headroom**;
-it downloads no file contents and changes no resources. Match `-FileConcurrency`,
-`-SchemaConcurrency` and `-DiskStagingGiB` to the run, use `-SkipFiles`/`-SkipData` as needed,
-and add `-ExistingStagingGiB` for a reused share.
+`SuggestedShareQuotaGiB` using staging allowances and **25% headroom**; it downloads no file
+contents and changes no resources. Match `-SchemaConcurrency` and `-DiskStagingGiB` to the
+run, use `-SkipFiles`/`-SkipData` when those parts of the migration are skipped, and add
+`-ExistingStagingGiB` for a reused share.
+
+For single-principal runs, the estimator still enumerates `Files/` and includes whole
+directories as a conservative legacy staging allowance. This can overestimate the share or
+return **Incomplete** when file enumeration fails or a source file exceeds 4 TiB, even though
+Files content is now streamed. Its `-FileConcurrency` controls that old allowance, not the
+`FAB_SHUFFLE_FILE_TRANSFER_WORKERS` setting. If the estimate is incomplete, size the required
+SQL exports, schema and checkpoint staging, retained files and headroom independently.
 
 If a single-principal run includes SQLDatabase data, supply `-LargestBcpTableGiB`: the
 largest measured or conservatively estimated native table export, **not compressed database
