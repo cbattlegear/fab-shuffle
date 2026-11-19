@@ -17,7 +17,7 @@ always rebuild; single-principal runs can reassign Power BI-only workspaces or r
 | Warehouse schema | SqlPackage extract, UnpackDacPac script, TDS execution | Destination-aware DacFx script with security exclusions |
 | Warehouse rows | Native Fabric Copy Jobs | Independently authenticated SQL row streaming |
 | Fabric SQL database schema | Export/apply item definition | Destination-aware SQL schema transfer with security exclusions |
-| Fabric SQL database rows | One native bcp table export/import at a time | Independently authenticated SQL row streaming |
+| Fabric SQL database rows | SQL Server Copy Jobs with explicit connections | Independently authenticated SQL row streaming |
 | KQL rows | Cross-cluster `.set-or-replace` | Source query streaming and destination ingestion; target update policies disabled |
 | Cosmos DB documents | SDK reads and upserts | SDK reads/upserts with separate source and destination credentials |
 
@@ -26,10 +26,32 @@ do not use that workspace or native cross-tenant Copy Jobs as transport. Both mo
 local staging where needed, independently of whether that filesystem is a Docker volume or
 an Azure Files mount.
 
-The bcp path writes a SQL access token to an owner-only temporary file (mode `0600`,
-UTF-16LE without a BOM) and removes it in `finally`. This is not a saved session credential
-or recovery-journal entry. A hard process termination can bypass normal cleanup; protect
-the container filesystem and do not reuse temporary token files.
+For each single-principal SQL database, supply the source item ID and source/destination
+SQL Server connection IDs on review or resume. The destination database must be created
+before its connection can be configured. Grant the migration principal access to both
+connections and CONTROL on the destination database. Pause writes to both databases and
+keep connection definitions unchanged throughout copying.
+
+The Copy Job uses the supplied SQL Server Append shape. Before submission Fab Shuffle checks
+the connection paths and verifies destination tables are empty; enabled row-level security
+prevents that proof. A confirmed failed job may leave partial rows: on retry, Fab Shuffle
+**truncates the destination tables**, in one transaction if they are not already empty,
+before checking again and starting a new job. It only does this for the same verified target
+and transfer definition.
+If truncation fails (for example, because of foreign keys or permissions), resolve the SQL
+error or manually clear the tables before retrying. Truncation resets identity counters and
+deletes mirrored OneLake data for the affected tables. A created but unsubmitted job may be
+submitted once; an unresolved submitted job is polled, never resubmitted. Keep writes paused
+until copying and final reconciliation finish; the freeze is an operator commitment, not a
+database lock. Validate row values, identity columns, constraints and application behavior
+before cutover.
+
+The user supplied a working SQL Server connection definition for Fabric SQL databases, but
+this implementation has not been live-verified. Microsoft's
+[SQL Server connector overview](https://learn.microsoft.com/fabric/data-factory/connector-sql-server-database-overview)
+states that service principal authentication applies only to SQL Server on Azure VMs.
+The Copy Job definition and Fabric SQL connection behavior have not been independently
+live-verified.
 
 ## Dependency order
 
@@ -106,8 +128,8 @@ SQL schema jobs use private staging for DACPACs, generated scripts, tool tempora
 and logs, then remove it on exit. Schema disk usage is monitored; an external process can
 overshoot between checks. Script reading, SQLCMD expansion, reference rewriting and batch
 materialization have separate memory checks. Neither budget is an OS-level aggregate quota.
-Legacy single-principal bcp native exports remain outside this disk
-budget (Files are streamed and never staged); see [storage sizing](../README.md#choosing-the-azure-files-size).
+Files are streamed and SQL Copy Jobs do not stage their rows locally; see
+[storage sizing](../README.md#choosing-the-azure-files-size).
 
 ## Item-specific history and constraints
 

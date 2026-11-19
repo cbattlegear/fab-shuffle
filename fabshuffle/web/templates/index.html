@@ -249,9 +249,20 @@
         <p id="mapping-status" class="hint" role="status">Re-check after editing mappings.</p>
         <button id="recheck-mappings" type="button" class="secondary">Re-check destination mappings</button>
       </section>
+      <section id="sql-copy-mappings" class="mapping-controls" hidden>
+        <h3>SQL database Copy Jobs</h3>
+        <p class="hint">Supply SQL Server connection IDs for each source SQL database.
+          The destination database must exist before its connection can be created: start the
+          migration, create that connection, then resume with its ID. Stop writes to both
+          databases while copying. Append requires empty destination tables. After a confirmed
+          failed job, retry truncates its destination tables before copying; unresolved jobs are
+          reconciled first. Truncation deletes all rows and may fail for constrained tables.</p>
+        <div id="sql-copy-mapping-rows"></div>
+        <button id="add-sql-copy-mapping" type="button" class="secondary">Add SQL database connections</button>
+      </section>
       <fieldset id="write-freeze" class="options write-freeze" hidden>
         <legend>Source write freeze</legend>
-        <label><input type="checkbox" id="opt-write-freeze" /> I have paused source writes and will keep them paused until copying finishes.</label>
+        <label><input type="checkbox" id="opt-write-freeze" /> I have paused source writes, and SQL Copy Job destination writes, and will keep them paused until copying finishes.</label>
         <p class="hint">Required when files are copied, and when separate destination credentials are used to
           copy table data, even within one tenant. Otherwise turn off the copy options.
           This confirmation does not establish cutover readiness.</p>

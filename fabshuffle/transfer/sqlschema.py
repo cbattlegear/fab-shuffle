@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -127,6 +127,65 @@ class SchemaStagingError(SchemaTransferError, StagingBudgetError):
 
 class SchemaMemoryError(SchemaTransferError, StagingBudgetError):
     """A schema script cannot be processed safely inside the configured memory budget."""
+
+
+class NonEmptyTables(SchemaTransferError):
+    """A destination table contains rows."""
+
+
+def _check_table_visibility(cursor: pyodbc.Cursor) -> None:
+    if cursor.execute("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL')").fetchval() != 1:
+        raise SchemaTransferError("Checking for existing rows requires CONTROL on the destination database.")
+    if cursor.execute("SELECT TOP (1) 1 FROM sys.security_policies WHERE is_enabled = 1").fetchone():
+        raise SchemaTransferError("An enabled row-level security policy prevents proving tables are empty.")
+
+
+def _quoted_table(schema: str, table: str) -> str:
+    return f"[{schema.replace(']', ']]')}].[{table.replace(']', ']]')}]"
+
+
+def _check_tables_empty(cursor: pyodbc.Cursor, tables: Iterable[tuple[str, str]]) -> None:
+    for schema, table in tables:
+        name = _quoted_table(schema, table)
+        if cursor.execute(f"SELECT TOP (1) 1 FROM {name}").fetchone():
+            raise NonEmptyTables(f"Destination table {name} is not empty.")
+
+
+def require_empty_tables(
+    server: str, database: str, tokens: TokenProvider, tables: Iterable[tuple[str, str]],
+) -> None:
+    """Prove the target tables are empty before an append-only copy."""
+    try:
+        with connect(server, database, tokens) as connection:
+            cursor = connection.cursor()
+            _check_table_visibility(cursor)
+            _check_tables_empty(cursor, tables)
+    except pyodbc.Error as error:
+        raise SchemaTransferError(f"Could not verify destination tables are empty: {error}") from error
+
+
+def truncate_tables(
+    server: str, database: str, tokens: TokenProvider, tables: Iterable[tuple[str, str]],
+) -> None:
+    """Clear a confirmed failed copy's tables together, or roll back the transaction."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        tables = list(tables)
+        for schema, table in tables:
+            cursor.execute(f"TRUNCATE TABLE {_quoted_table(schema, table)}")
+        _check_tables_empty(cursor, tables)
+        connection.commit()
+    except (pyodbc.Error, SchemaTransferError) as error:
+        detail = str(error)
+        try:
+            connection.rollback()
+        except pyodbc.Error as rollback_error:
+            detail += f"; rollback also failed: {rollback_error}"
+        raise SchemaTransferError(f"Could not truncate destination tables: {detail}") from error
+    finally:
+        connection.close()
 
 
 def _driver() -> str:

@@ -297,6 +297,24 @@ class StartRunRequest(BaseModel):
     start_database_mirrors: StrictBool = False
     connection_mappings: dict[str, str] = Field(default_factory=dict, max_length=1000)
     reference_mappings: list[dict[str, str]] = Field(default_factory=list, max_length=1000)
+    sql_copy_connections: dict[str, dict[str, Any]] = Field(default_factory=dict, max_length=1000)
+
+    @field_validator("sql_copy_connections")
+    @classmethod
+    def sql_connection_ids(cls, value: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        result = {}
+        for item, pair in value.items():
+            if set(pair) != {"source", "destination"}:
+                raise ValueError("SQL Copy Job mappings require source and destination connection IDs.")
+            try:
+                item_id = str(UUID(item))
+                normalized_pair = {key: str(UUID(pair[key])) for key in ("source", "destination")}
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ValueError("SQL Copy Job mappings require item and connection GUIDs.") from error
+            if item_id in result and result[item_id] != normalized_pair:
+                raise ValueError(f"SQL database '{item_id}' has conflicting connection pairs.")
+            result[item_id] = normalized_pair
+        return result
 
     @field_validator("connection_mappings")
     @classmethod
@@ -339,6 +357,13 @@ class ResumeRunRequest(BaseModel):
     start_database_mirrors: StrictBool = False
     connection_mappings: dict[str, str] | None = Field(default=None, max_length=1000)
     reference_mappings: list[dict[str, str]] | None = Field(default=None, max_length=1000)
+    sql_copy_connections: dict[str, dict[str, Any]] | None = Field(default=None, max_length=1000)
+    write_freeze_confirmed: StrictBool | None = None
+
+    @field_validator("sql_copy_connections")
+    @classmethod
+    def sql_connection_ids(cls, value: dict[str, dict[str, Any]] | None) -> dict[str, dict[str, Any]] | None:
+        return StartRunRequest.sql_connection_ids(value) if value is not None else None
 
     @field_validator("connection_mappings")
     @classmethod
@@ -351,7 +376,10 @@ class ResumeRunRequest(BaseModel):
         return StartRunRequest.item_ids(value) if value is not None else None
 
     def apply(self, plan: MigrationPlan) -> MigrationPlan:
-        return replace(plan, **self.model_dump(exclude_none=True))
+        options = self.model_dump(exclude_none=True)
+        if self.sql_copy_connections and self.write_freeze_confirmed is None:
+            options["write_freeze_confirmed"] = False
+        return replace(plan, **options)
 
 
 # ------------------------------------------------------------------------- app
@@ -1054,6 +1082,7 @@ def _plan_dict(plan: MigrationPlan) -> dict[str, Any]:
         "startDatabaseMirrors": plan.start_database_mirrors,
         "connectionMappings": plan.connection_mappings,
         "referenceMappings": plan.reference_mappings,
+        "sqlCopyConnections": plan.sql_copy_connections,
     }
 
 

@@ -180,21 +180,16 @@ def test_completed_definition_does_not_assert_semantic_model_data_readiness(ctx)
     assert report(ctx)["items"][0]["state"] == "unknown"
 
 
-def test_completed_sql_copy_requires_callbacks_for_every_table(ctx, monkeypatch):
+def test_missing_sql_connections_do_not_claim_data_readiness(ctx, monkeypatch):
     item = source("SQLDatabase")
     ctx.resolve_or_create(item, "SQLDatabase", lambda: {"id": "target"})
     monkeypatch.setattr(orchestrator.sqldatabases, "server_fqdn", lambda item: "server")
     monkeypatch.setattr(orchestrator.sqldatabases, "database_name", lambda item: "catalog")
     monkeypatch.setattr(orchestrator.sqlschema, "list_base_tables",
                         lambda *args: [("dbo", "A"), ("dbo", "B")])
-    def partial_copy(**kwargs):
-        kwargs["on_copied"]("dbo.A")
-        return []
-    monkeypatch.setattr(orchestrator.bulkcopy, "copy_tables", partial_copy)
     orchestrator._copy_sql_database_tables(ctx, "sql", [(item, {"id": "target"})])
     evidence = ctx.run.lifecycle.snapshot()["source-item"].steps["data"]
-    assert evidence.state == "failed" and "dbo.B" in evidence.reason and "dbo.A" not in evidence.reason
-    assert journal.read(ctx.journal.path).data_targets[("source-item", "table", "dbo.A")] == "target"
+    assert evidence.state == "failed" and "connection" in evidence.reason.lower()
 
 
 def test_copy_checkpoint_after_recreation_cannot_reuse_old_data(ctx):

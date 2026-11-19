@@ -118,6 +118,25 @@ function fixture() {
 }
 
 const scenarios = {
+  async single_sql_connections(f) {
+    f.paired();
+    f.ui.state.paired = false;
+    f.get("opt-data").checked = true;
+    f.get("opt-files").checked = false;
+    f.ui.renderReview();
+    assert.equal(f.get("sql-copy-mappings").hidden, false);
+    const row = f.ui.addMappingRow("sql-copy");
+    const inputs = row.querySelectorAll("input");
+    ["source-item", "source-connection", "target-connection"].forEach((value, i) => { inputs[i].value = value; });
+    assert.equal(f.get("write-freeze").hidden, false);
+    assert.equal(f.get("start-run").disabled, true);
+    f.get("opt-write-freeze").checked = true;
+    f.get("opt-write-freeze").handlers.change();
+    assert.equal(f.get("start-run").disabled, false);
+    assert.deepEqual(JSON.parse(JSON.stringify(f.ui.migrationBody().sql_copy_connections)), {
+      "source-item": { source: "source-connection", destination: "target-connection" },
+    });
+  },
   async login(f) {
     f.ui.state.forceRebuild = true;
     const form = f.get("login-form");
