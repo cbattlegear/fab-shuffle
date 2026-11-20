@@ -37,21 +37,6 @@ TARGET_ITEM = {
     "properties": {"databaseName": "RegionBounceTest-2222", "serverFqdn": TARGET_SERVER},
 }
 
-SUPPORTED_SQL = {
-    "type": "SQL",
-    "supportedCredentialTypes": ["ServicePrincipal", "Basic"],
-    "creationMethods": [
-        {
-            "name": "SQL",
-            "parameters": [
-                {"name": "server", "dataType": "Text", "required": True},
-                {"name": "database", "dataType": "Text", "required": True},
-            ],
-        }
-    ],
-}
-
-
 class FakeClient:
     def __init__(self, **overrides) -> None:
         self.posts: list[tuple[str, dict]] = []
@@ -213,7 +198,7 @@ def test_submission_checks_connections_and_empty_target(monkeypatch):
     assert checked == [(TARGET_SERVER, "RegionBounceTest-2222", ctx.tokens, [("dbo", "Orders")])]
 
 
-def test_submission_rejects_mismatched_destination_and_missing_freeze(monkeypatch):
+def test_submission_rejects_mismatched_destination_without_freeze_gate(monkeypatch):
     class Client(FakeClient):
         def get(self, path, params=None):
             if path.startswith("connections/"):
@@ -227,9 +212,6 @@ def test_submission_rejects_mismatched_destination_and_missing_freeze(monkeypatc
     orchestrator._migrate_sql_databases(ctx)
     spec, preflight = client.bulk_copies[0]
     ctx.plan.write_freeze_confirmed = False
-    with pytest.raises(orchestrator.sqlschema.SchemaTransferError, match="freeze"):
-        preflight(spec)
-    ctx.plan.write_freeze_confirmed = True
     with pytest.raises(orchestrator.sqlschema.SchemaTransferError, match="dst-conn"):
         preflight(spec)
 
@@ -250,7 +232,7 @@ def test_only_confirmed_matching_failed_job_can_truncate(monkeypatch, recorded_t
 
     client = Client()
     ctx = make_ctx(client, monkeypatch)
-    ctx.plan.write_freeze_confirmed = True
+    ctx.plan.write_freeze_confirmed = False
     orchestrator._migrate_sql_databases(ctx)
     spec, preflight = client.bulk_copies[0]
     key = (SOURCE_DB, "sql_retry", spec.fingerprint)
@@ -321,14 +303,21 @@ def test_a_failed_schema_stops_the_row_copy(monkeypatch):
     assert client.bulk_copies == []
 
 
-def test_automatic_connections_require_write_freeze(monkeypatch):
+def test_automatic_connections_do_not_require_sql_write_freeze(monkeypatch):
     client = FakeClient()
-    ctx = make_ctx(client, monkeypatch, provision=True)
+    ctx = make_ctx(client, monkeypatch)
     ctx.plan.write_freeze_confirmed = False
     orchestrator._migrate_sql_databases(ctx)
 
-    assert any("confirm the write freeze" in w for w in step_of(ctx)["warnings"])
-    assert not client.bulk_copies
+    spec, preflight = client.bulk_copies[0]
+    monkeypatch.setattr(orchestrator.sql_connections, "matches_endpoint", lambda *args: True)
+    monkeypatch.setattr(orchestrator.sqlschema, "require_empty_tables", lambda *args: None)
+    original_get = client.get
+    def get(path, **kwargs):
+        return {} if path.startswith("connections/") else original_get(path, **kwargs)
+
+    client.get = get
+    preflight(spec)
 
 
 def test_unfinished_legacy_job_refuses_without_adopting_old_plan_connections(monkeypatch):
@@ -355,8 +344,6 @@ def test_automatically_provisions_both_connections_and_reuses_them(monkeypatch, 
             self.created = {}
 
         def list_all(self, path, **kwargs):
-            if path == "connections/supportedConnectionTypes":
-                return [SUPPORTED_SQL]
             if path == "connections":
                 return list(self.created.values())
             return super().list_all(path, **kwargs)
@@ -388,7 +375,7 @@ def test_automatically_provisions_both_connections_and_reuses_them(monkeypatch, 
     client = Client()
     ctx = make_ctx(client, monkeypatch, provision=True)
     ctx.journal = journal.Journal(tmp_path / "run.jsonl")
-    ctx.plan.write_freeze_confirmed = True
+    ctx.plan.write_freeze_confirmed = False
     orchestrator._migrate_sql_databases(ctx)
     spec, preflight = client.bulk_copies[0]
     monkeypatch.setattr(orchestrator.sqlschema, "require_empty_tables", lambda *args: None)

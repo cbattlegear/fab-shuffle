@@ -556,8 +556,6 @@ async function prepareResume(runId, button, returnStage = "progress") {
     state.preview = {
       ...plan, blockers: [], unsupportedSummary: [], dependencies: [],
       counts: [], migratedTotal: 0, largeSemanticModels: [],
-      hasSqlDatabase: saved.items.some(({ type }) => type === "SQLDatabase"),
-      inventoryIncomplete: saved.inventoryComplete === false,
       targetWorkspaceId: saved.targetWorkspaceId,
     };
     resetMappings();
@@ -810,19 +808,12 @@ async function settleAssessment(request, version = state.assessmentVersion) {
   setStartEnabled(state.preview.blockers.length === 0);
 }
 
-function copiesSqlRows() {
-  return !state.paired && $("#opt-data").checked &&
-    (state.preview?.hasSqlDatabase || state.preview?.counts?.some(({ type }) => type === "SQLDatabase"));
-}
-
 function freezeApplies() {
   if (state.preview?.strategy === "reassign") return false;
-  return state.paired || $("#opt-files").checked || copiesSqlRows() ||
-    (state.preview?.inventoryIncomplete && $("#opt-data").checked);
+  return state.paired || $("#opt-files").checked;
 }
 
 function setStartEnabled(enabled) {
-  $("#sql-copy-info").hidden = state.preview?.strategy === "reassign" || !copiesSqlRows();
   $("#write-freeze").hidden = !freezeApplies();
   const start = $("#start-run");
   const freezeMissing = freezeApplies() && (!state.paired || $("#opt-data").checked || $("#opt-files").checked) &&

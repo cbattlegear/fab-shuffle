@@ -23,26 +23,6 @@ def matches_endpoint(connection: Mapping[str, Any], server: str, database: str) 
     )
 
 
-def _check_creation_method(client: FabricClient) -> None:
-    for connector in client.list_all("connections/supportedConnectionTypes"):
-        if connector.get("type") != "SQL" or "ServicePrincipal" not in (
-            connector.get("supportedCredentialTypes") or []
-        ):
-            continue
-        for method in connector.get("creationMethods") or []:
-            parameters = {param["name"]: param for param in method.get("parameters") or []}
-            supplied = {"server", "database"}
-            if (
-                method.get("name") == "SQL"
-                and all(parameters.get(name, {}).get("dataType") == "Text" for name in supplied)
-                and all(not param.get("required") or name in supplied for name, param in parameters.items())
-            ):
-                return
-    raise FabricError(
-        "Fabric does not advertise the cloud SQL method with ServicePrincipal and server/database."
-    )
-
-
 def ensure_connection(
     client: FabricClient, principal: ServicePrincipal, *, name: str, server: str, database: str,
     recorded_id: str | None, record: Callable[[str | None], None],
@@ -78,7 +58,6 @@ def ensure_connection(
         connection_id = verified(matches[0])
         record(connection_id)
         return connection_id
-    _check_creation_method(client)
     if any(item.get("displayName") == name for item in client.list_all("connections")):
         raise FabricError(f"Connection '{name}' already exists without a recorded creation intent.")
     record("")

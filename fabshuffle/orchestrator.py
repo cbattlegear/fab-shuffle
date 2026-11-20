@@ -3139,8 +3139,6 @@ def _copy_sql_database_tables(
 
         pending = any(item_id == source["id"] for item_id, _ in ctx.active_copy_jobs)
         try:
-            if not pending and not ctx.plan.write_freeze_confirmed:
-                raise FabricError("Pause writes to both SQL databases and confirm the write freeze.")
             pair = {}
             lineage = ctx.run.lineage_id or ctx.run.id
             for role, item in (("source", source), ("destination", target)):
@@ -3165,7 +3163,7 @@ def _copy_sql_database_tables(
                         record=partial(ctx.journal.sql_connection, connection_name),
                     )
         except FabricError as error:
-            action = "Resolve the Fabric connection error or confirm the SQL write freeze, then resume."
+            action = "Resolve the Fabric connection error, then resume."
             evidence.step(
                 "data", EvidenceState.FAILED, "SQL connection provisioning failed.",
                 error=error, action=action,
@@ -3203,10 +3201,6 @@ def _copy_sql_database_tables(
     def check(spec: copyjobs.CopyJobSpec) -> None:
         source, target, tables = preflight[spec.item_id]
         endpoints = spec.content["properties"]
-        if not ctx.plan.write_freeze_confirmed:
-            raise sqlschema.SchemaTransferError(
-                "Pause writes to both databases and confirm the write freeze before resuming."
-            )
         current_target = sqldatabases.get_sql_database(
             ctx.destination_client, ctx.target_workspace_id, target["id"],
         )

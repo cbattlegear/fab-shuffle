@@ -3,13 +3,13 @@ import pytest
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric.client import FabricApiError, FabricError
 from fabshuffle.fabric.sql_connections import ensure_connection
-from tests.test_sql_database_migration import SUPPORTED_SQL
 
 
 def test_connection_error_surfaces_service_code_without_secret():
     class Client:
         def list_all(self, path):
-            return [SUPPORTED_SQL] if path.endswith("supportedConnectionTypes") else []
+            assert path == "connections"
+            return []
 
         def post(self, path, **kwargs):
             raise FabricApiError(

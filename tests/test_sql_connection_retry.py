@@ -164,3 +164,96 @@ def test_apply_script_waits_rather_than_failing(monkeypatch, tmp_path) -> None:
 
     assert sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens()) == []
     assert attempts["n"] == 3
+
+
+@pytest.mark.parametrize(
+    ("failures", "expected_attempts", "succeeds"),
+    [([LINK_FAILURE], 2, True), ([LINK_FAILURE] * 3, 3, False), ([NO_PERMISSION], 1, False)],
+)
+def test_schema_connection_setup_retries_only_before_ddl(
+    monkeypatch, tmp_path, failures, expected_attempts, succeeds,
+) -> None:
+    connections = []
+    executed = []
+
+    class Connection:
+        closed = False
+
+        def __init__(self, failure):
+            self.failure = failure
+
+        @property
+        def autocommit(self):
+            return True
+
+        @autocommit.setter
+        def autocommit(self, value):
+            if self.failure:
+                raise self.failure
+
+        def cursor(self):
+            class Cursor:
+                def execute(self, batch):
+                    executed.append(batch)
+            return Cursor()
+
+        def close(self):
+            self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+    def connect(*_args, **_kwargs):
+        index = len(connections)
+        connection = Connection(failures[index] if index < len(failures) else None)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlschema, "CONNECT_ATTEMPTS", 3)
+    monkeypatch.setattr(sqlschema, "connect", connect)
+    script = tmp_path / "Deploy.sql"
+    script.write_text("CREATE TABLE [dbo].[T] ([Id] INT);\n", encoding="utf-8")
+    if succeeds:
+        assert sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens()) == []
+        assert len(executed) == 1
+    else:
+        with pytest.raises(sqlschema.SchemaTransferError, match=str(failures[-1].args[0])):
+            sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens())
+        assert not executed
+    assert len(connections) == expected_attempts
+    assert all(connection.closed for connection in connections if connection.failure)
+
+
+def test_schema_batch_failure_never_reconnects_or_replays(monkeypatch, tmp_path):
+    executed = []
+    opened = []
+
+    class Connection:
+        autocommit = False
+
+        def cursor(self):
+            return self
+
+        def execute(self, batch):
+            executed.append(batch)
+            raise LINK_FAILURE
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+    def connect(*_args, **_kwargs):
+        opened.append(True)
+        return Connection()
+
+    monkeypatch.setattr(sqlschema, "connect", connect)
+    script = tmp_path / "Deploy.sql"
+    script.write_text("CREATE TABLE [dbo].[T] ([Id] INT);\n", encoding="utf-8")
+    warnings = sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens())
+    assert len(opened) == len(executed) == len(warnings) == 1
+    assert "08S01" in warnings[0]

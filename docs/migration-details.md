@@ -17,7 +17,7 @@ always rebuild; single-principal runs can reassign Power BI-only workspaces or r
 | Warehouse schema | SqlPackage extract, UnpackDacPac script, TDS execution | Destination-aware DacFx script with security exclusions |
 | Warehouse rows | Native Fabric Copy Jobs | Independently authenticated SQL row streaming |
 | Fabric SQL database schema | Export/apply item definition | Destination-aware SQL schema transfer with security exclusions |
-| Fabric SQL database rows | SQL Server Copy Jobs with explicit connections | Independently authenticated SQL row streaming |
+| Fabric SQL database rows | SQL Server Copy Jobs with automatically created connections | Independently authenticated SQL row streaming |
 | KQL rows | Cross-cluster `.set-or-replace` | Source query streaming and destination ingestion; target update policies disabled |
 | Cosmos DB documents | SDK reads and upserts | SDK reads/upserts with separate source and destination credentials |
 
@@ -29,9 +29,8 @@ an Azure Files mount.
 For single-principal SQL row copies, Fab Shuffle uses the signed-in service principal to
 create a shareable SQL Server connection for each endpoint after the destination exists.
 The [Fabric create-connection API](https://learn.microsoft.com/rest/api/fabric/core/connections/create-connection)
-requires the Fabric admin to allow service principals to create connections. Fab Shuffle checks the
-[cloud connector catalog](https://learn.microsoft.com/rest/api/fabric/core/connections/list-supported-connection-types)
-before creating and lets Fabric test each connection. Fabric stores the connection credentials;
+requires the Fabric admin to allow service principals to create connections. Fab Shuffle requests
+the SQL Server connection directly and lets Fabric test it. Fabric stores the connection credentials;
 the local journal stores connection names and IDs, never the secret. The connections remain
 in Fabric after the migration; don't change or delete them while a run may need to resume.
 If an accepted create response is lost, Fab Shuffle looks for its recorded connection and
@@ -53,9 +52,9 @@ and transfer definition.
 If truncation fails (for example, because of foreign keys or permissions), resolve the SQL
 error or manually clear the tables before retrying. Truncation resets identity counters and
 deletes mirrored OneLake data for the affected tables. A created but unsubmitted job may be
-submitted once; an unresolved submitted job is polled, never resubmitted. Keep writes paused
-until copying and final reconciliation finish; the freeze is an operator commitment, not a
-database lock. Validate row values, identity columns, constraints and application behavior
+submitted once; an unresolved submitted job is polled, never resubmitted. Pause writes to both
+databases until copying and final reconciliation finish; this is not enforced by a database lock.
+Validate row values, identity columns, constraints and application behavior
 before cutover.
 
 The user supplied a working SQL Server connection definition for Fabric SQL databases, but

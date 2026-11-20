@@ -125,18 +125,14 @@ const scenarios = {
     f.get("opt-data").checked = true;
     f.get("opt-files").checked = false;
     f.ui.renderReview();
-    assert.equal(f.get("sql-copy-info").hidden, false);
-    assert.equal(f.get("sql-copy-info").querySelectorAll("input").length, 0);
-    assert.equal(f.get("write-freeze").hidden, false);
-    assert.equal(f.get("start-run").disabled, true);
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("write-freeze").hidden, true);
     assert.equal(f.get("start-run").disabled, false);
-    assert.equal(f.ui.migrationBody().write_freeze_confirmed, true);
+    assert.equal(f.ui.migrationBody().write_freeze_confirmed, false);
     assert.equal(Object.hasOwn(f.ui.migrationBody(), "sql_copy_connections"), false);
     f.ui.state.preview.counts = [];
     f.ui.state.preview.hasSqlDatabase = true;
-    assert.equal(f.ui.resumeOptions().write_freeze_confirmed, true);
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
     assert.equal(Object.hasOwn(f.ui.resumeOptions(), "sql_copy_connections"), false);
   },
   async login(f) {

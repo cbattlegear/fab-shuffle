@@ -743,6 +743,44 @@ def _already_exists(error: pyodbc.Error) -> bool:
     return "already exists" in text or "there is already an object named" in text
 
 
+@contextmanager
+def _schema_cursor(
+    server: str,
+    database: str,
+    tokens: TokenProvider,
+    *,
+    cancel_requested: Callable[[], bool] | None,
+    on_progress: Callable[[str], None] | None,
+) -> Iterator[pyodbc.Cursor]:
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        check_cancelled(cancel_requested)
+        connection = connect(server, database, tokens, on_progress=on_progress)
+        try:
+            connection.autocommit = True
+            cursor = connection.cursor()
+        except pyodbc.Error as error:
+            try:
+                connection.close()
+            except pyodbc.Error as close_error:
+                logger.warning("Closing failed SQL schema connection: %s", close_error)
+            if not is_transient(error) or attempt == CONNECT_ATTEMPTS:
+                raise SchemaTransferError(
+                    f"Could not prepare SQL schema connection to {server}/{database}: {error}"
+                ) from error
+            logger.warning(
+                "SQL schema connection setup for %s/%s failed: %s; retrying (%s/%s)",
+                server, database, error, attempt, CONNECT_ATTEMPTS,
+            )
+        else:
+            with connection:
+                yield cursor
+            return
+        if on_progress and attempt % 4 == 1:
+            on_progress(f"Waiting for SQL endpoint {database} to accept schema deployment")
+        check_cancelled(cancel_requested)
+        time.sleep(CONNECT_WAIT_SECONDS)
+
+
 def apply_script(
     script_path: Path,
     *,
@@ -774,9 +812,9 @@ def apply_script(
         return []
 
     warnings: list[str] = []
-    with connect(server, database, tokens, on_progress=on_progress) as connection:
-        connection.autocommit = True
-        cursor = connection.cursor()
+    with _schema_cursor(
+        server, database, tokens, cancel_requested=cancel_requested, on_progress=on_progress,
+    ) as cursor:
         for index, batch in enumerate(batches, start=1):
             check_cancelled(cancel_requested)
             try:
