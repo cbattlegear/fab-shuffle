@@ -114,6 +114,7 @@ from fabshuffle.fabric import (
     shortcuts,
     spark,
     special_items,
+    sql_connections,
     sqldatabases,
     workspaces,
 )
@@ -3095,7 +3096,7 @@ def _copy_sql_database_tables(
     step: str,
     ready: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    """Copy rows using explicitly supplied SQL Server connections."""
+    """Copy rows using migration-owned SQL Server connections or explicit overrides."""
     warnings: list[str] = []
     specs: list[copyjobs.CopyJobSpec] = []
     preflight: dict[str, tuple[dict[str, Any], dict[str, Any], list[data_stores.TableRef]]] = {}
@@ -3152,15 +3153,41 @@ def _copy_sql_database_tables(
 
         pair = ctx.plan.sql_copy_connections.get(source["id"].casefold())
         if not pair:
-            evidence.step(
-                "data", EvidenceState.FAILED, "SQL Server connection pair missing.",
-                action="Supply the source and destination SQL Server connection IDs, then resume.",
+            action = (
+                "Check Fabric connection permissions and the connector error, then resume or "
+                "supply existing matching SQL Server connections under Advanced."
             )
-            warnings.append(
-                f"SQL database '{name}' requires source and destination SQL Server connection IDs. "
-                "Create the destination connection for the new database and resume with both IDs."
-            )
-            continue
+            try:
+                pending = any(item_id == source["id"] for item_id, _ in ctx.active_copy_jobs)
+                if not pending and not ctx.plan.write_freeze_confirmed:
+                    raise FabricError("Pause writes to both SQL databases and confirm the write freeze.")
+                pair = {}
+                for role, item in (("source", source), ("destination", target)):
+                    lineage = ctx.run.lineage_id or ctx.run.id
+                    scope = "|".join((lineage, source["id"], target["id"], role))
+                    digest = hashlib.sha256(scope.encode()).hexdigest()[:32]
+                    connection_name = f"FabShuffle-SQL-{role}-{digest}"
+                    recorded_id = ctx.prior.sql_connections.get(connection_name) if ctx.prior else None
+                    # Poll an existing job without requiring its connections to still be usable.
+                    if pending and recorded_id:
+                        pair[role] = recorded_id
+                        continue
+                    pair[role] = sql_connections.ensure_connection(
+                        ctx.client, ctx.principal, name=connection_name,
+                        server=sqldatabases.server_fqdn(item), database=sqldatabases.database_name(item),
+                        recorded_id=recorded_id,
+                        record=partial(ctx.journal.sql_connection, connection_name),
+                        allow_create=not pending,
+                    )
+            except FabricError as error:
+                evidence.step("data", EvidenceState.FAILED, "SQL connection provisioning failed.",
+                              error=error, action=action)
+                if pending:
+                    raise ResumeRefused(
+                        f"Cannot reconcile SQL Copy Job for '{name}': {error}. {action}"
+                    ) from error
+                warnings.append(f"SQL database '{name}': {error}. {action}")
+                continue
         content = copyjobs.build_sql_server_copy_job(
             source_connection_id=pair["source"], target_connection_id=pair["destination"], tables=tables,
         )
@@ -3191,7 +3218,7 @@ def _copy_sql_database_tables(
 
     def check(spec: copyjobs.CopyJobSpec) -> None:
         source, target, tables = preflight[spec.item_id]
-        pair = ctx.plan.sql_copy_connections[spec.item_id.casefold()]
+        endpoints = spec.content["properties"]
         if not ctx.plan.write_freeze_confirmed:
             raise sqlschema.SchemaTransferError(
                 "Pause writes to both databases and confirm the write freeze before resuming."
@@ -3213,18 +3240,12 @@ def _copy_sql_database_tables(
             and sqldatabases.database_name(source) == sqldatabases.database_name(target)
         ):
             raise sqlschema.SchemaTransferError("Source and destination SQL databases must differ.")
-        for connection_id, database in ((pair["source"], source), (pair["destination"], target)):
+        for role, database in (("source", source), ("destination", target)):
+            connection_id = endpoints[role]["connectionSettings"]["externalReferences"]["connection"]
             connection = ctx.client.get(f"connections/{connection_id}")
-            details = connection.get("connectionDetails") or {}
-            path = details.get("path")
-            expected_server = sqldatabases.server_fqdn(database).casefold().removesuffix(",1433")
+            expected_server = sqldatabases.server_fqdn(database)
             expected_database = sqldatabases.database_name(database)
-            parts = path.split(";") if isinstance(path, str) else []
-            if (
-                str(details.get("type") or "").casefold() != "sql" or len(parts) != 2
-                or parts[0].strip().casefold().removesuffix(",1433") != expected_server
-                or parts[1].strip() != expected_database
-            ):
+            if not sql_connections.matches_endpoint(connection, expected_server, expected_database):
                 raise sqlschema.SchemaTransferError(
                     f"Connection {connection_id} does not expose the expected SQL Server "
                     f"and database {expected_server}/{expected_database}. Supply a matching connection."

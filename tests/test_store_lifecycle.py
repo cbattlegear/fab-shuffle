@@ -180,7 +180,13 @@ def test_completed_definition_does_not_assert_semantic_model_data_readiness(ctx)
     assert report(ctx)["items"][0]["state"] == "unknown"
 
 
-def test_missing_sql_connections_do_not_claim_data_readiness(ctx, monkeypatch):
+def test_unsupported_sql_connection_provisioning_does_not_claim_data_readiness(ctx, monkeypatch):
+    class Client:
+        def list_all(self, path):
+            assert path == "connections/supportedConnectionTypes"
+            return []
+
+    ctx.client = Client()
     item = source("SQLDatabase")
     ctx.resolve_or_create(item, "SQLDatabase", lambda: {"id": "target"})
     monkeypatch.setattr(orchestrator.sqldatabases, "server_fqdn", lambda item: "server")

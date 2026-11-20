@@ -50,6 +50,7 @@ FINISHED = "finished"
 INVALIDATED = "invalidated"
 REFRESH = "refresh"
 COPY_JOB = "copy_job"
+SQL_CONNECTION = "sql_connection"
 FOLLOWER = "follower"
 OUTCOME = "outcome"
 INVENTORY = "inventory"
@@ -65,7 +66,7 @@ TENANT_BINDING_FIELDS = (
     "source_tenant_id", "target_tenant_id", "source_client_id", "target_client_id",
 )
 _OWNED_RECORDS = {
-    WORKSPACE, ITEM, MAPPING, DATA, INVALIDATED, REFRESH, COPY_JOB, FOLLOWER,
+    WORKSPACE, ITEM, MAPPING, DATA, INVALIDATED, REFRESH, COPY_JOB, SQL_CONNECTION, FOLLOWER,
     REFERENCE_BLOCK, RECOVERY_ACTION,
 }
 
@@ -343,6 +344,10 @@ class Journal:
     def copy_job(self, job: dict[str, Any], *, target_id: str, active: bool = True) -> None:
         self._write(COPY_JOB, job=job, target=target_id, active=active, strict=True)
 
+    def sql_connection(self, name: str, connection_id: str | None) -> None:
+        """Record a connection ID, an unresolved intent (empty), or a rejected intent (None)."""
+        self._write(SQL_CONNECTION, name=name, id=connection_id, strict=True)
+
     def follower(self, source: str, target: str, leader: str, parent: str) -> None:
         self._write(FOLLOWER, source=source, target=target, leader=leader, parent=parent, strict=True)
 
@@ -453,6 +458,7 @@ class Replay:
     blocked_references: dict[str, str] = field(default_factory=dict)
     refresh_needed: set[str] = field(default_factory=set)
     copy_jobs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    sql_connections: dict[str, str] = field(default_factory=dict)
     follower_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
     outcomes: dict[str, ItemOutcome] = field(default_factory=dict)
     inventory_complete: bool = False
@@ -545,6 +551,10 @@ def _state_records(replay: Replay) -> list[dict[str, Any]]:
     records.append({"t": REFRESH, "sources": sorted(replay.refresh_needed), "required": True})
     records.extend({"t": COPY_JOB, **record} for record in replay.copy_jobs.values())
     records.extend(
+        {"t": SQL_CONNECTION, "name": name, "id": cid}
+        for name, cid in replay.sql_connections.items()
+    )
+    records.extend(
         {"t": FOLLOWER, "source": source, **binding}
         for source, binding in replay.follower_bindings.items()
     )
@@ -613,7 +623,7 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
             return
         if binding and not replay.plan and (
             replay.id_map or replay.target_workspace_id or replay.scratch_workspace_id
-            or replay.copy_jobs or replay.data_done
+            or replay.copy_jobs or replay.sql_connections or replay.data_done
         ):
             replay.ownership_error = (
                 "Resource records precede this journal's paired admission. "
@@ -759,6 +769,12 @@ def _apply(replay: Replay, record: dict[str, Any]) -> None:
                     replay.outcomes[source].invalidate(replay.run_id, target_lost=False)
         else:
             replay.refresh_needed.difference_update(sources)
+    elif kind == SQL_CONNECTION:
+        name, connection_id = record["name"], record["id"]
+        if connection_id is None:
+            replay.sql_connections.pop(name, None)
+        else:
+            replay.sql_connections[name] = connection_id
     elif kind == COPY_JOB:
         job = record.get("job") or {}
         key = (str(job.get("item_id") or ""), str(job.get("display_name") or ""))

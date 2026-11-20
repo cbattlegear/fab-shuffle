@@ -283,7 +283,7 @@ unresolved dependencies; the review screen and per-item results report those sep
 | Lakehouse | Schema; tables via Copy Jobs; Files via OneLake streaming | Schema; tables and Files via OneLake streaming | Schema-enabled lakehouses supported; shortcuts excluded from table-data copy |
 | Lakehouse SQL analytics endpoint | Refresh and schema transfer | Refresh and schema transfer | Views, procedures and functions; catalog readiness is separate from byte-copy success |
 | Warehouse | T-SQL schema and Copy Job data | T-SQL schema and streamed rows | Collation preserved; paired transfer excludes source security assignments |
-| Fabric SQL database | Definition schema and SQL Server Copy Job rows | T-SQL schema and streamed rows | Supply both SQL Server connections; paired schema excludes source security assignments |
+| Fabric SQL database | Definition schema and SQL Server Copy Job rows | T-SQL schema and streamed rows | Provisions SQL Server connections using sign-in credentials; paired schema excludes source security assignments |
 | Cosmos DB database | Container definitions and SDK document copy | Container definitions and independently authenticated document copy | Destination connectivity and data access required |
 | Eventhouse | Recreated | Recreated | Created before its KQL databases |
 | KQL database (`ReadWrite`) | Definition and cross-cluster data copy | Definition and streamed data | Paired target update policies remain disabled; table shortcuts reconciled separately |
@@ -419,7 +419,7 @@ phase sequence and the single-principal versus paired differences.
 
 ### Connections
 
-Fab Shuffle never creates, adopts by name, or deletes a connection on the operator's behalf,
+For migrated item definitions, Fab Shuffle does not create, adopt by name, or delete connections,
 in any mode. A connection id is tenant scoped: it can be reused within that tenant when its
 target and access are still appropriate, but it does not resolve in another tenant.
 Existing connection credentials are not exported. Automatic connection recreation was

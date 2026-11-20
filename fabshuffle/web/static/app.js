@@ -556,6 +556,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
     state.preview = {
       ...plan, blockers: [], unsupportedSummary: [], dependencies: [],
       counts: [], migratedTotal: 0, largeSemanticModels: [],
+      hasSqlDatabase: saved.items.some(({ type }) => type === "SQLDatabase"),
       targetWorkspaceId: saved.targetWorkspaceId,
     };
     resetMappings();
@@ -814,11 +815,15 @@ async function settleAssessment(request, version = state.assessmentVersion) {
   setStartEnabled(state.preview.blockers.length === 0);
 }
 
-// Paired runs freeze for data and files; single-principal rebuilds only for files, which are streamed.
+function copiesSqlRows() {
+  return !state.paired && $("#opt-data").checked &&
+    (state.preview?.hasSqlDatabase || state.preview?.counts?.some(({ type }) => type === "SQLDatabase") ||
+      $("#sql-copy-mapping-rows").children.length > 0);
+}
+
 function freezeApplies() {
   if (state.preview?.strategy === "reassign") return false;
-  return state.paired || $("#opt-files").checked ||
-    (!state.paired && $("#opt-data").checked && $("#sql-copy-mapping-rows").children.length > 0);
+  return state.paired || $("#opt-files").checked || copiesSqlRows();
 }
 
 function setStartEnabled(enabled) {
@@ -962,7 +967,7 @@ function resumeOptions() {
   return {
     ...(state.paired ? {
       connection_mappings: mappings.connection_mappings, reference_mappings: mappings.reference_mappings,
-    } : ($("#sql-copy-mapping-rows").children.length || Object.keys(state.preview?.sqlCopyConnections || {}).length)
+    } : (copiesSqlRows() || Object.keys(state.preview?.sqlCopyConnections || {}).length)
       ? { sql_copy_connections: mappings.sql_copy_connections, write_freeze_confirmed: $("#opt-write-freeze").checked }
       : {}),
     start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,

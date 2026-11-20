@@ -26,11 +26,21 @@ do not use that workspace or native cross-tenant Copy Jobs as transport. Both mo
 local staging where needed, independently of whether that filesystem is a Docker volume or
 an Azure Files mount.
 
-For each single-principal SQL database, supply the source item ID and source/destination
-SQL Server connection IDs on review or resume. The destination database must be created
-before its connection can be configured. Grant the migration principal access to both
-connections and CONTROL on the destination database. Pause writes to both databases and
-keep connection definitions unchanged throughout copying.
+For single-principal SQL row copies, Fab Shuffle uses the signed-in service principal to
+create a shareable SQL Server connection for each endpoint after the destination exists.
+The [Fabric create-connection API](https://learn.microsoft.com/rest/api/fabric/core/connections/create-connection)
+requires the Fabric admin to allow service principals to create connections. Fab Shuffle checks the
+[cloud connector catalog](https://learn.microsoft.com/rest/api/fabric/core/connections/list-supported-connection-types)
+before creating and lets Fabric test each connection. Fabric stores the connection credentials;
+the local journal stores connection names and IDs, never the secret. The connections remain
+in Fabric after the migration; don't change or delete them while a run may need to resume.
+If an accepted create response is lost, Fab Shuffle looks for its recorded connection and
+refuses to create a duplicate if it cannot verify the result.
+
+If Fabric rejects provisioning, check the service error. You can optionally supply existing
+matching SQL Server connection IDs under **Advanced**. Grant the signed-in principal access
+to any overrides and CONTROL on the destination database. Pause writes to both databases
+and keep connection definitions unchanged throughout copying.
 
 The Copy Job uses the supplied SQL Server Append shape. Before submission Fab Shuffle checks
 the connection paths and verifies destination tables are empty; enabled row-level security

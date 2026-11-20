@@ -251,20 +251,22 @@
       </section>
       <section id="sql-copy-mappings" class="mapping-controls" hidden>
         <h3>SQL database Copy Jobs</h3>
-        <p class="hint">Supply SQL Server connection IDs for each source SQL database.
-          The destination database must exist before its connection can be created: start the
-          migration, create that connection, then resume with its ID. Stop writes to both
-          databases while copying. Append requires empty destination tables. After a confirmed
+        <p class="hint">Fab Shuffle uses your signed-in service principal to create the SQL Server
+          connections. Stop writes to both databases while copying. Append requires empty
+          destination tables. After a confirmed
           failed job, retry truncates its destination tables before copying; unresolved jobs are
           reconciled first. Truncation deletes all rows and may fail for constrained tables.</p>
-        <div id="sql-copy-mapping-rows"></div>
-        <button id="add-sql-copy-mapping" type="button" class="secondary">Add SQL database connections</button>
+        <details>
+          <summary>Advanced: use existing SQL Server connections</summary>
+          <div id="sql-copy-mapping-rows"></div>
+          <button id="add-sql-copy-mapping" type="button" class="secondary">Add connection override</button>
+        </details>
       </section>
       <fieldset id="write-freeze" class="options write-freeze" hidden>
         <legend>Source write freeze</legend>
         <label><input type="checkbox" id="opt-write-freeze" /> I have paused source writes, and SQL Copy Job destination writes, and will keep them paused until copying finishes.</label>
-        <p class="hint">Required when files are copied, and when separate destination credentials are used to
-          copy table data, even within one tenant. Otherwise turn off the copy options.
+        <p class="hint">Required for file copies, SQL Copy Jobs, and table copies with separate destination credentials.
+          Otherwise turn off the relevant copy options.
           This confirmation does not establish cutover readiness.</p>
       </fieldset>
       <div class="actions">

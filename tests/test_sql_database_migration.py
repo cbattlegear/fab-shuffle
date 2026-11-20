@@ -322,13 +322,13 @@ def test_a_failed_schema_stops_the_row_copy(monkeypatch):
     assert client.bulk_copies == []
 
 
-def test_missing_connection_pair_is_actionable(monkeypatch):
+def test_automatic_connections_require_write_freeze(monkeypatch):
     client = FakeClient()
     ctx = make_ctx(client, monkeypatch)
     ctx.plan.sql_copy_connections = {}
     orchestrator._migrate_sql_databases(ctx)
 
-    assert any("connection IDs" in w for w in step_of(ctx)["warnings"])
+    assert any("confirm the write freeze" in w for w in step_of(ctx)["warnings"])
     assert not client.bulk_copies
 
 
@@ -339,10 +339,65 @@ def test_missing_pair_with_unfinished_job_refuses_before_other_phases(monkeypatc
     ctx.active_copy_jobs[(SOURCE_DB, "CopyJob_SQLDatabase_RegionBounceTest")] = {
         "job": {"instance_id": "running"}, "target": TARGET_DB,
     }
-    with pytest.raises(orchestrator.ResumeRefused, match="unfinished SQL Copy Job"):
+    with pytest.raises(orchestrator.ResumeRefused, match="existing SQL Copy Job"):
         orchestrator._migrate_sql_databases(ctx)
     assert not client.bulk_copies
     assert not any(path.endswith("/updateDefinition") for path, _ in client.posts)
+
+
+def test_automatically_provisions_both_connections_and_reuses_them(monkeypatch, tmp_path):
+    class Client(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.created = {}
+
+        def list_all(self, path, **kwargs):
+            if path == "connections/supportedConnectionTypes":
+                return [SUPPORTED_SQL]
+            if path == "connections":
+                return list(self.created.values())
+            return super().list_all(path, **kwargs)
+
+        def post(self, path, json=None, **kwargs):
+            if path != "connections":
+                return super().post(path, json=json, **kwargs)
+            assert any(p.endswith("/updateDefinition") for p, _ in self.posts)
+            assert json["credentialDetails"]["credentials"] == {
+                "credentialType": "ServicePrincipal", "tenantId": "tenant-1",
+                "servicePrincipalClientId": "client-1", "servicePrincipalSecret": "shhh",
+            }
+            assert json["credentialDetails"]["skipTestConnection"] is False
+            server, catalog = (parameter["value"] for parameter in json["connectionDetails"]["parameters"])
+            cid = f"00000000-0000-0000-0000-{len(self.created) + 1:012d}"
+            response = {
+                "id": cid, "displayName": json["displayName"], "connectivityType": "ShareableCloud",
+                "myRole": "Owner", "credentialDetails": {"credentialType": "ServicePrincipal"},
+                "connectionDetails": {"type": "SQL", "path": f"{server};{catalog}"},
+            }
+            self.created[cid] = response
+            return response
+
+        def get(self, path, **kwargs):
+            if path.startswith("connections/"):
+                return self.created[path.split("/")[-1]]
+            return super().get(path, **kwargs)
+
+    client = Client()
+    ctx = make_ctx(client, monkeypatch)
+    ctx.journal = journal.Journal(tmp_path / "run.jsonl")
+    ctx.plan.sql_copy_connections = {}
+    ctx.plan.write_freeze_confirmed = True
+    orchestrator._migrate_sql_databases(ctx)
+    spec, preflight = client.bulk_copies[0]
+    monkeypatch.setattr(orchestrator.sqlschema, "require_empty_tables", lambda *args: None)
+    preflight(spec)
+    assert len(client.created) == 2
+    assert "shhh" not in ctx.journal.path.read_text()
+    ctx.prior = journal.read(ctx.journal.path)
+    assert set(ctx.prior.sql_connections.values()) == set(client.created)
+    orchestrator._copy_sql_database_tables(ctx, "sqldatabases", [(SOURCE_ITEM, TARGET_ITEM)])
+    assert len(client.created) == 2
+    assert client.bulk_copies[-1][0].fingerprint == spec.fingerprint
 
 
 # ------------------------------------------------------------- module basics
