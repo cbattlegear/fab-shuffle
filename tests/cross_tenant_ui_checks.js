@@ -90,7 +90,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, loginBody, updateLoginMode, renderReview, renderIdentity, migrationBody,
-      mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume,
+      mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume, resumeOptions,
       invalidateMappings, loadResumable, loadConnectionOptions, watchRun, resetReadiness };`, context);
   const flush = async () => { for (let i = 0; i < 18; i++) await Promise.resolve(); };
   async function reply(index, data, status = 200) {
@@ -118,6 +118,23 @@ function fixture() {
 }
 
 const scenarios = {
+  async single_sql_connections(f) {
+    f.paired();
+    f.ui.state.paired = false;
+    f.ui.state.preview.counts = [{ type: "SQLDatabase", label: "SQL database", count: 1 }];
+    f.get("opt-data").checked = true;
+    f.get("opt-files").checked = false;
+    f.ui.renderReview();
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("write-freeze").hidden, true);
+    assert.equal(f.get("start-run").disabled, false);
+    assert.equal(f.ui.migrationBody().write_freeze_confirmed, false);
+    assert.equal(Object.hasOwn(f.ui.migrationBody(), "sql_copy_connections"), false);
+    f.ui.state.preview.counts = [];
+    f.ui.state.preview.hasSqlDatabase = true;
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "sql_copy_connections"), false);
+  },
   async login(f) {
     f.ui.state.forceRebuild = true;
     const form = f.get("login-form");

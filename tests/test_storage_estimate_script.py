@@ -174,20 +174,13 @@ def test_streamed_or_skipped_files_do_not_need_full_datastore_staging(tmp_path, 
     assert result["Lakehouses"] == []
 
 
-def test_unknown_sql_export_refuses_to_present_an_incomplete_recommendation(tmp_path):
+def test_sql_copy_jobs_do_not_require_local_row_staging(tmp_path):
     result = report(tmp_path, "sql")
-    assert result["SuggestedShareQuotaGiB"] is None
-    assert "LargestBcpTableGiB" in result["Problems"][0]
-    assert "Source SQL" in result["Problems"][0]
+    assert result["Problems"] == []
+    assert result["SuggestedShareQuotaGiB"] == 175
 
 
-def test_explicit_bcp_allowance_uses_largest_table_not_whole_database(tmp_path):
-    result = report(tmp_path, "sql", "-LargestBcpTableGiB 250")
-    assert result["LargestBcpExportGiB"] == 250
-    assert result["SuggestedShareQuotaGiB"] == 313
-
-
-def test_skipped_sql_data_does_not_require_a_bcp_estimate(tmp_path):
+def test_skipped_sql_data_does_not_require_row_staging(tmp_path):
     result = report(tmp_path, "sql", "-SkipData")
     assert result["Problems"] == []
     assert result["SuggestedShareQuotaGiB"] == 175

@@ -80,6 +80,8 @@ nothing worth scanning for.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import shutil
@@ -112,6 +114,7 @@ from fabshuffle.fabric import (
     shortcuts,
     spark,
     special_items,
+    sql_connections,
     sqldatabases,
     workspaces,
 )
@@ -403,9 +406,7 @@ class _Context:
     def already_copied(self, item_id: str, kind: str, key: str = "") -> bool:
         """Whether an earlier attempt finished moving this data.
 
-        Copy Jobs overwrite, KQL replaces, Cosmos upserts, file streaming overwrites and bcp now
-        clears first, so doing any of it twice is *correct*. It is only slow. This is what
-        keeps a resume from spending another six hours being correct.
+        This keeps a resume from repeating work already completed for the same target.
         """
         if self.prior is None or not self.prior.data_is_done(item_id, kind, key):
             return False
@@ -2456,6 +2457,8 @@ def _run_copy_jobs(
     step: str,
     specs: list[copyjobs.CopyJobSpec],
     what: str,
+    *,
+    before_submit: Callable[[copyjobs.CopyJobSpec], None] | None = None,
 ) -> list[str]:
     if ctx.plan.paired:
         raise ValueError("Paired migrations use independent data clients, not native cross-tenant Copy Jobs.")
@@ -2483,6 +2486,7 @@ def _run_copy_jobs(
             spec = copyjobs.CopyJobSpec(
                 workspace_id=spec.workspace_id, display_name=record["job"]["display_name"],
                 content=spec.content, label=spec.label, item_id=spec.item_id,
+                fingerprint=spec.fingerprint,
             )
         resolved_specs.append(spec)
     specs = resolved_specs
@@ -2519,6 +2523,13 @@ def _run_copy_jobs(
                 error=RuntimeError(job.last_error) if job.last_error else None,
             )
         if job.last_status in copyjobs.TERMINAL_JOB_STATES and job.instance_id:
+            if (
+                what == "SQL database" and job.last_status not in copyjobs.SUCCESS_JOB_STATES
+                and job.fingerprint
+            ):
+                ctx.journal.data(
+                    job.item_id, "sql_retry", job.fingerprint, target_id=ctx.id_map.get(job.item_id, ""),
+                )
             ctx.journal.copy_job(asdict(job), target_id=ctx.id_map.get(job.item_id, ""), active=False)
             ctx.active_copy_jobs.pop((job.item_id, job.display_name), None)
         else:
@@ -2550,6 +2561,10 @@ def _run_copy_jobs(
             on_done=done,
             on_state=state,
             resume_jobs=resume_jobs,
+            **(
+                {"before_create": before_submit, "before_submit": before_submit}
+                if before_submit is not None else {}
+            ),
         )
     except copyjobs.CopyJobBatchIncomplete as error:
         ctx.run.summary["unresolvedCopyJobs"] = [asdict(job) for job in error.active_jobs]
@@ -2937,6 +2952,15 @@ def _migrate_sql_databases(ctx: _Context) -> None:
     ctx.run.raise_if_cancelled()
 
     source_databases = sqldatabases.list_sql_databases(ctx.client, ctx.plan.source_workspace_id)
+    sql_jobs = {
+        item_id for (item_id, name) in ctx.active_copy_jobs
+        if name.startswith("CopyJob_SQLDatabase_")
+    }
+    if sql_jobs - {database["id"] for database in source_databases}:
+        raise ResumeRefused(
+            "An unfinished SQL Copy Job's source database is missing. Restore the source "
+            "or reconcile the existing job in the scratch workspace before resuming."
+        )
     cosmos_migrated, cosmos_warnings = _migrate_cosmos_databases(ctx)
     if not source_databases and not cosmos_migrated and not cosmos_warnings:
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No SQL or Cosmos databases to migrate")
@@ -2979,6 +3003,22 @@ def _migrate_sql_databases(ctx: _Context) -> None:
             ctx.map_alias(source_catalog, target_catalog, database["id"])
         migrated += 1
 
+        if (
+            any(item_id == database["id"] for item_id, _ in ctx.active_copy_jobs)
+            or (not ctx.plan.paired and ctx.already_copied(database["id"], "sql_schema"))
+            or (
+                not ctx.plan.paired and ctx.prior is not None
+                and any(
+                    item_id == database["id"] and kind == "table"
+                    and ctx.already_copied(item_id, kind, key)
+                    for item_id, kind, key in ctx.prior.data_done
+                )
+            )
+        ):
+            # A running append job must never race a schema deployment.
+            ready.append((database, target))
+            continue
+
         ctx.run.update_step(step, f"Applying schema to SQL database '{name}'")
         try:
             with ctx.evidence(database["id"]).operation("schema", "SQL database schema applied."):
@@ -3005,6 +3045,7 @@ def _migrate_sql_databases(ctx: _Context) -> None:
                         target_workspace_id=ctx.target_workspace_id,
                         target_id=target_id,
                     )
+                    ctx.journal.data(database["id"], "sql_schema", target_id=target_id)
         except (FabricError, sqlschema.SchemaTransferError) as error:
             # Without the schema there is nowhere to land rows, so the data copy is skipped
             # too rather than left to fail one table at a time.
@@ -3016,6 +3057,11 @@ def _migrate_sql_databases(ctx: _Context) -> None:
 
         ready.append((database, target))
 
+    if sql_jobs - {database["id"] for database, _ in ready} or (sql_jobs and not ctx.plan.include_data):
+        raise ResumeRefused(
+            "An unfinished SQL Copy Job cannot be reconciled with the current databases. "
+            "Restore access or reconcile the job in Fabric before resuming."
+        )
     if ctx.plan.include_data and ready:
         warnings.extend(_copy_sql_database_tables(ctx, step, ready))
 
@@ -3036,19 +3082,10 @@ def _copy_sql_database_tables(
     step: str,
     ready: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    """Copy rows between SQL databases with bcp.
-
-    A Copy Job cannot do this. The SQL database in Fabric connector accepts only an
-    organizational account, so there is no connection a service principal can create that the
-    job would be able to use; the one we tried failed with an invalid token, having asked for
-    one against the wrong thing.
-
-    bcp supports SQL database in Fabric directly, and authenticates with the access token we
-    already hold and already use to read these tables. So the rows go out to a native-format
-    file and straight back in, without either end being parsed or retyped. The only connection
-    involved empties each target table first, because ``bcp in`` appends.
-    """
+    """Copy rows using migration-owned SQL Server connections."""
     warnings: list[str] = []
+    specs: list[copyjobs.CopyJobSpec] = []
+    preflight: dict[str, tuple[dict[str, Any], dict[str, Any], list[data_stores.TableRef]]] = {}
 
     for source, target in ready:
         ctx.run.raise_if_cancelled()
@@ -3089,62 +3126,137 @@ def _copy_sql_database_tables(
                 source_server, source_catalog, target_server, target_catalog,
             ))
             continue
-        expected = {bulkcopy.qualified_name(table) for table in tables}
-        copied = {
-            key for key in expected if ctx.already_copied(source["id"], "table", key)
-        }
-        # A resume does not repeat a table an earlier attempt finished. Doing so would be
-        # correct now that the target is cleared first, but for a large database it is hours.
-        tables = [
+        if ctx.already_copied(source["id"], "tables"):
+            continue
+        tables = sorted([
             table
             for table in tables
             if not ctx.already_copied(source["id"], "table", bulkcopy.qualified_name(table))
-        ]
+        ], key=lambda table: (table.schema or "", table.name))
         if not tables:
-            if not expected:
-                evidence.step("data", EvidenceState.SUCCEEDED, "No SQL base tables found.")
-            elif source["id"] not in ctx.refresh_needed and ctx.prior and all(
-                ctx.prior.data_targets.get((source["id"], "table", key)) == target["id"]
-                for key in expected
-            ):
-                evidence.step(
-                    "data", EvidenceState.SUCCEEDED,
-                    "Every enumerated table has a checkpoint for this target incarnation.",
-                )
+            evidence.step("data", EvidenceState.SUCCEEDED, "No uncopied SQL base tables found.")
             continue
 
-        ctx.run.update_step(step, f"Copying {len(tables)} table(s) from SQL database '{name}'")
-        evidence.step("data", EvidenceState.UNKNOWN, "SQL table copy has not completed.")
+        pending = any(item_id == source["id"] for item_id, _ in ctx.active_copy_jobs)
         try:
-            warnings.extend(
-                f"SQL database '{name}': {w}"
-                for w in bulkcopy.copy_tables(
-                    source_server=source_server,
-                    source_database=source_catalog,
-                    target_server=target_server,
-                    target_database=target_catalog,
-                    tables=tables,
-                    tokens=ctx.tokens,
-                    scratch_dir=ctx.scratch_dir / f"bcp-{source['id']}",
-                    on_progress=_bulk_copy_progress(ctx, step, f"SQL database '{name}'"),
-                    on_copied=_table_recorder(ctx, source["id"], copied),
-                )
-            )
-            missing = expected - copied
+            pair = {}
+            lineage = ctx.run.lineage_id or ctx.run.id
+            for role, item in (("source", source), ("destination", target)):
+                scope = "|".join((lineage, source["id"], target["id"], role))
+                digest = hashlib.sha256(scope.encode()).hexdigest()[:32]
+                connection_name = f"FabShuffle-SQL-{role}-{digest}"
+                recorded_id = ctx.prior.sql_connections.get(connection_name) if ctx.prior else None
+                if pending:
+                    # A submitted job must already have two durable IDs. Never reuse IDs from an old plan.
+                    if not recorded_id:
+                        raise ResumeRefused(
+                            f"The unfinished SQL Copy Job for '{name}' has no recorded migration-owned "
+                            f"{role} connection. Verify the job is no longer writing in Fabric before "
+                            "starting a fresh migration to a new destination."
+                        )
+                    pair[role] = recorded_id
+                else:
+                    pair[role] = sql_connections.ensure_connection(
+                        ctx.client, ctx.principal, name=connection_name,
+                        server=sqldatabases.server_fqdn(item), database=sqldatabases.database_name(item),
+                        recorded_id=recorded_id,
+                        record=partial(ctx.journal.sql_connection, connection_name),
+                    )
+        except FabricError as error:
+            action = "Resolve the Fabric connection error, then resume."
             evidence.step(
-                "data", EvidenceState.FAILED if missing else EvidenceState.SUCCEEDED,
-                f"Tables without successful copy checkpoints: {', '.join(sorted(missing))}."
-                if missing else "Every enumerated table has a successful target-bound copy checkpoint.",
-                action="Resolve the table copy failures and retry." if missing else "",
+                "data", EvidenceState.FAILED, "SQL connection provisioning failed.",
+                error=error, action=action,
             )
-        except bulkcopy.BulkCopyError as error:
-            evidence.step(
-                "data", EvidenceState.FAILED, "SQL table copy failed.", error=error,
-                action="Resolve the reported table copy failure and retry.",
-            )
-            warnings.append(f"Table data for SQL database '{name}' did not copy: {error}")
-        evidence.complete()
+            warnings.append(f"SQL database '{name}': {error}. {action}")
+            continue
+        content = copyjobs.build_sql_server_copy_job(
+            source_connection_id=pair["source"], target_connection_id=pair["destination"], tables=tables,
+        )
+        stable = {
+            "source": pair["source"], "destination": pair["destination"],
+            "target": target["id"], "tables": [(t.schema, t.name) for t in tables],
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        specs.append(copyjobs.CopyJobSpec(
+            workspace_id=ctx.scratch_workspace_id,
+            display_name=f"CopyJob_SQLDatabase_{name}",
+            content=content, label=f"Table data for SQL database '{name}'",
+            item_id=source["id"], fingerprint=fingerprint,
+        ))
+        preflight[source["id"]] = (source, target, tables)
 
+    pending_sql = {
+        item_id for (item_id, name) in ctx.active_copy_jobs
+        if name.startswith("CopyJob_SQLDatabase_")
+    }
+    if pending_sql - {spec.item_id for spec in specs}:
+        raise ResumeRefused(
+            "An unfinished SQL Copy Job cannot be reconciled with the current table inventory "
+            "and connection settings. Restore them or reconcile the job in Fabric before resuming."
+        )
+
+    def check(spec: copyjobs.CopyJobSpec) -> None:
+        source, target, tables = preflight[spec.item_id]
+        endpoints = spec.content["properties"]
+        current_target = sqldatabases.get_sql_database(
+            ctx.destination_client, ctx.target_workspace_id, target["id"],
+        )
+        if (
+            ctx.id_map.get(spec.item_id) != target["id"]
+            or sqldatabases.server_fqdn(current_target) != sqldatabases.server_fqdn(target)
+            or sqldatabases.database_name(current_target) != sqldatabases.database_name(target)
+        ):
+            raise sqlschema.SchemaTransferError(
+                "The target SQL database changed. Reconcile the recorded job and target before resuming."
+            )
+        if (
+            sqldatabases.server_fqdn(source).casefold().removesuffix(",1433")
+            == sqldatabases.server_fqdn(target).casefold().removesuffix(",1433")
+            and sqldatabases.database_name(source) == sqldatabases.database_name(target)
+        ):
+            raise sqlschema.SchemaTransferError("Source and destination SQL databases must differ.")
+        for role, database in (("source", source), ("destination", target)):
+            connection_id = endpoints[role]["connectionSettings"]["externalReferences"]["connection"]
+            connection = ctx.client.get(f"connections/{connection_id}")
+            expected_server = sqldatabases.server_fqdn(database)
+            expected_database = sqldatabases.database_name(database)
+            if not sql_connections.matches_endpoint(connection, expected_server, expected_database):
+                raise sqlschema.SchemaTransferError(
+                    f"Connection {connection_id} does not expose the expected SQL Server "
+                    f"and database {expected_server}/{expected_database}. "
+                    "Restore the migration-owned connection."
+                )
+        try:
+            retry_key = (spec.item_id, "sql_retry", spec.fingerprint)
+            if (
+                ctx.prior and retry_key in ctx.prior.data_done
+                and ctx.prior.data_targets.get(retry_key) == target["id"]
+            ):
+                try:
+                    sqlschema.require_empty_tables(
+                        sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
+                        ctx.tokens, [(table.schema or "dbo", table.name) for table in tables],
+                    )
+                except sqlschema.NonEmptyTables:
+                    sqlschema.truncate_tables(
+                        sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
+                        ctx.tokens, [(table.schema or "dbo", table.name) for table in tables],
+                    )
+            sqlschema.require_empty_tables(
+                sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
+                ctx.tokens, [(table.schema or "dbo", table.name) for table in tables],
+            )
+        except sqlschema.SchemaTransferError as error:
+            raise sqlschema.SchemaTransferError(
+                f"{error} Resolve the SQL error or manually clear the destination tables, "
+                "then resume with source and destination writes paused."
+            ) from error
+
+    if specs:
+        warnings.extend(_run_copy_jobs(ctx, step, specs, "SQL database", before_submit=check))
     return warnings
 
 

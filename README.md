@@ -43,7 +43,7 @@ principal, and destination-capacity access for the destination principal.
 
 Choose a local Docker container or Azure Container Apps. **Run and test through the Docker
 image, not a host Python preview.** It includes the required SqlPackage,
-UnpackDacPac, bcp and ODBC tools. SQL authentication uses service-principal access tokens,
+UnpackDacPac and ODBC tools. SQL authentication uses service-principal access tokens,
 not your desktop identity.
 
 ### Locally
@@ -104,7 +104,7 @@ Neither resizes the share nor changes the container's RAM allocation.
 Size for **peak concurrent staging plus retained files and headroom**, not simply the largest
 data store. Both credential modes stream lakehouse `Files/` content rather than staging whole
 directories. Delta checkpoint inspection can still use bounded disk staging; single-principal
-SQL database copies stage one native bcp table export at a time.
+SQL database rows use Fabric Copy Jobs.
 
 Run [`Get-FabShuffleStorageEstimate.ps1`](scripts/Get-FabShuffleStorageEstimate.ps1) in
 PowerShell 7+ with **Az.Accounts** and **Az.Storage**, using your user account with access
@@ -125,12 +125,8 @@ directories as a conservative legacy staging allowance. This can overestimate th
 return **Incomplete** when file enumeration fails or a source file exceeds 4 TiB, even though
 Files content is now streamed. Its `-FileConcurrency` controls that old allowance, not the
 `FAB_SHUFFLE_FILE_TRANSFER_WORKERS` setting. If the estimate is incomplete, size the required
-SQL exports, schema and checkpoint staging, retained files and headroom independently.
-
-If a single-principal run includes SQLDatabase data, supply `-LargestBcpTableGiB`: the
-largest measured or conservatively estimated native table export, **not compressed database
-storage size**. This size is not available from Fabric item metadata. Missing measurements
-or access failures produce **Incomplete**, with no quota recommendation. Metadata scans
+schema and checkpoint staging, retained files and headroom independently.
+Missing measurements or access failures produce **Incomplete**, with no quota recommendation. Metadata scans
 can take time and incur read costs; the estimate is not a guarantee against source growth.
 
 The template mounts the share through the Container Apps environment's `AzureFile` storage
@@ -160,9 +156,6 @@ copied to the share before switching; adding the mount does not copy the old eph
 5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
 
 Session client secrets and the token cache are held in memory, not persisted for recovery.
-The single-principal bcp path does write a SQL access token to an owner-only temporary file
-and removes it afterward. Protect the container filesystem; an abrupt process termination
-can bypass normal cleanup.
 
 ## Migration modes
 
@@ -227,8 +220,7 @@ budget. These are per-operation application checks, not aggregate RAM/filesystem
 Schema tools can briefly overshoot between checks and are stopped when excess is detected.
 SQL schema transfers use private, disk-budgeted staging in both credential modes and remove
 those artifacts after the transfer; script processing keeps its separate memory budget.
-The older single-principal bcp disk-staging path remains uncapped by these settings;
-size the share for its complete staging workload. Lakehouse Files no longer stage on disk.
+Lakehouse Files and SQL Copy Job rows do not stage on local disk.
 Delta preflight checks managed Tables and unmanaged Delta tables under Files for unsafe
 references; it does not rewrite logs to conceal dependencies. Unsupported features and
 budget failures are reported with corrective actions. See
@@ -291,7 +283,7 @@ unresolved dependencies; the review screen and per-item results report those sep
 | Lakehouse | Schema; tables via Copy Jobs; Files via OneLake streaming | Schema; tables and Files via OneLake streaming | Schema-enabled lakehouses supported; shortcuts excluded from table-data copy |
 | Lakehouse SQL analytics endpoint | Refresh and schema transfer | Refresh and schema transfer | Views, procedures and functions; catalog readiness is separate from byte-copy success |
 | Warehouse | T-SQL schema and Copy Job data | T-SQL schema and streamed rows | Collation preserved; paired transfer excludes source security assignments |
-| Fabric SQL database | Definition schema and bcp rows | T-SQL schema and streamed rows | Native bcp stages one table export at a time; paired schema excludes source security assignments |
+| Fabric SQL database | Definition schema and SQL Server Copy Job rows | T-SQL schema and streamed rows | Provisions SQL Server connections using sign-in credentials; paired schema excludes source security assignments |
 | Cosmos DB database | Container definitions and SDK document copy | Container definitions and independently authenticated document copy | Destination connectivity and data access required |
 | Eventhouse | Recreated | Recreated | Created before its KQL databases |
 | KQL database (`ReadWrite`) | Definition and cross-cluster data copy | Definition and streamed data | Paired target update policies remain disabled; table shortcuts reconciled separately |
@@ -427,7 +419,7 @@ phase sequence and the single-principal versus paired differences.
 
 ### Connections
 
-Fab Shuffle never creates, adopts by name, or deletes a connection on the operator's behalf,
+For migrated item definitions, Fab Shuffle does not create, adopt by name, or delete connections,
 in any mode. A connection id is tenant scoped: it can be reused within that tenant when its
 target and access are still appropriate, but it does not resolve in another tenant.
 Existing connection credentials are not exported. Automatic connection recreation was
@@ -666,7 +658,7 @@ Every setting has a sensible default; override with environment variables when n
 | `FAB_SHUFFLE_HOST` | `0.0.0.0` | Bind address |
 | `FAB_SHUFFLE_SCRATCH` | `/app/local` | Local staging directory |
 | `FAB_SHUFFLE_MAX_MEMORY_BYTES` | `1073741824` (1 GiB) | Per-operation in-memory processing budget; not a container RAM cap |
-| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota or legacy bcp cap |
+| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota |
 | `FAB_SHUFFLE_FILE_TRANSFER_WORKERS` | `4` | Files copied at once within a lakehouse (`1` is serial). `FAB_SHUFFLE_MAX_MEMORY_BYTES` is split between workers; no disk is used |
 | `FAB_SHUFFLE_SCHEMA_CONCURRENCY` | `2` | Concurrent schema transfers |
 | `FAB_SHUFFLE_MAX_RETRIES` | `6` | Retries for throttled/transient Fabric calls |
@@ -690,7 +682,7 @@ API integration. The [support matrix](fabshuffle/fabric/support.py) and
 
 **Use Docker for application execution, tests and lint, on every host OS.** The validation
 target extends the same pinned Debian/Python runtime as the production image, including
-SqlPackage, UnpackDacPac, bcp and ODBC. It adds hash-locked development dependencies
+SqlPackage, UnpackDacPac and ODBC. It adds hash-locked development dependencies
 and digest-pinned Node and PowerShell for the JavaScript UI and generated-script tests.
 
 ```bash

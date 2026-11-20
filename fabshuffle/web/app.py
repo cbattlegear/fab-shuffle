@@ -283,6 +283,7 @@ class ConfirmFullRestart(ConfirmSavedAction):
 
 
 class StartRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     capacity_id: str = Field(min_length=1)
     source_workspace_id: str = Field(min_length=1)
     target_workspace_name: str | None = None
@@ -339,6 +340,7 @@ class ResumeRunRequest(BaseModel):
     start_database_mirrors: StrictBool = False
     connection_mappings: dict[str, str] | None = Field(default=None, max_length=1000)
     reference_mappings: list[dict[str, str]] | None = Field(default=None, max_length=1000)
+    write_freeze_confirmed: StrictBool | None = None
 
     @field_validator("connection_mappings")
     @classmethod
@@ -351,7 +353,10 @@ class ResumeRunRequest(BaseModel):
         return StartRunRequest.item_ids(value) if value is not None else None
 
     def apply(self, plan: MigrationPlan) -> MigrationPlan:
-        return replace(plan, **self.model_dump(exclude_none=True))
+        options = self.model_dump(exclude_none=True)
+        if not plan.paired and self.write_freeze_confirmed is None:
+            options["write_freeze_confirmed"] = False
+        return replace(plan, **options)
 
 
 # ------------------------------------------------------------------------- app
@@ -715,6 +720,7 @@ def create_app() -> FastAPI:
         return {
             "runId": run_id, "plan": _plan_dict(plan), "cleanupWhenDone": replay.cleanup,
             "targetWorkspaceId": replay.target_workspace_id,
+            "inventoryComplete": replay.inventory_complete,
             "items": [
                 {"sourceId": source_id, "targetId": item.get("target", ""),
                  "name": item.get("name", ""), "type": item.get("type", "")}

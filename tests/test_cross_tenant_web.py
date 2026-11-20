@@ -420,6 +420,35 @@ def test_resume_updates_mappings_and_keeps_target_and_checkpoints(pair_api, monk
     assert journal.read(web._session_journal(session, run_id)).plan["connection_mappings"] == old_mapping
 
 
+def test_sql_copy_connection_overrides_are_rejected_on_start_and_resume(pair_api):
+    client, session, _, _ = pair_api
+    response = client.post(
+        "/api/runs", headers=headers(session), json=body(sql_copy_connections={}),
+    )
+    assert response.status_code == 422, response.text
+    response = client.post("/api/runs", headers=headers(session), json=body())
+    run_id = response.json()["runId"]
+    assert "sqlCopyConnections" not in response.json()["plan"]
+    web.REGISTRY = RunRegistry()
+    saved = client.get(f"/api/runs/{run_id}/resume-plan", headers=headers(session))
+    assert "sqlCopyConnections" not in saved.json()["plan"]
+    response = client.post(
+        f"/api/runs/{run_id}/resume", headers=headers(session),
+        json={"sql_copy_connections": {}},
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_single_principal_resume_requires_fresh_freeze_confirmation():
+    plan = MigrationPlan(
+        capacity_id="capacity", capacity_name="capacity", capacity_region="region",
+        source_workspace_id="workspace", source_workspace_name="source",
+        target_workspace_name="target", write_freeze_confirmed=True,
+    )
+    assert not web.ResumeRunRequest().apply(plan).write_freeze_confirmed
+    assert web.ResumeRunRequest(write_freeze_confirmed=True).apply(plan).write_freeze_confirmed
+
+
 @pytest.mark.parametrize("field", [
     "source_tenant_id", "target_tenant_id", "source_client_id", "target_client_id",
     "source_workspace_id", "target_workspace_id", "target_workspace_name", "capacity_id",

@@ -808,7 +808,6 @@ async function settleAssessment(request, version = state.assessmentVersion) {
   setStartEnabled(state.preview.blockers.length === 0);
 }
 
-// Paired runs freeze for data and files; single-principal rebuilds only for files, which are streamed.
 function freezeApplies() {
   if (state.preview?.strategy === "reassign") return false;
   return state.paired || $("#opt-files").checked;
@@ -931,8 +930,13 @@ function migrationBody() {
 }
 
 function resumeOptions() {
+  const mappings = mappingOptions();
   return {
-    ...(state.paired ? mappingOptions() : {}),
+    ...(state.paired ? {
+      connection_mappings: mappings.connection_mappings, reference_mappings: mappings.reference_mappings,
+    } : freezeApplies()
+      ? { write_freeze_confirmed: $("#opt-write-freeze").checked }
+      : {}),
     start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,
   };
 }

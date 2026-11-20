@@ -2,9 +2,9 @@
 
 Connections are tenant scoped, so the same connection id resolves from the migrated
 workspace; the API never returns an existing connection's credentials, so a faithful copy is
-never possible. Fab Shuffle never creates, adopts by name, or deletes a connection on the
-operator's behalf: it only rewrites an explicit ``connection_mappings`` entry the operator
-supplied, and reports the connections that still need one.
+never possible. For migrated definitions, Fab Shuffle only rewrites explicit
+``connection_mappings`` entries and reports unresolved references. Migration-owned
+SQL Copy Job connections are provisioned separately.
 """
 
 from __future__ import annotations

@@ -395,18 +395,6 @@ def test_sql_never_checkpoints_failed_or_incomplete_rows(monkeypatch, failure):
     assert ("NativeInsertDenied" if failure == "native" else "row counts differ") in warnings[0]
 
 
-def test_existing_sql_entry_point_selects_bounded_paired_transport(monkeypatch, tmp_path):
-    calls = []
-    monkeypatch.setattr(bulkcopy, "copy_tables_streaming", lambda **kwargs: calls.append(kwargs) or [])
-    bulkcopy.copy_tables(
-        source_server="source", source_database="original", target_server="target", target_database="copy",
-        tokens="source", target_tokens="target", tables=[], scratch_dir=tmp_path, max_staging_bytes=123,
-    )
-    assert calls[0]["target_tokens"] == "target"
-    assert calls[0]["max_staging_bytes"] == 123
-    assert not list(tmp_path.iterdir())
-
-
 class KqlResult(list):
     columns = (SimpleNamespace(column_name="Value", column_type="string"),)
 
