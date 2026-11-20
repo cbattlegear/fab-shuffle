@@ -21,7 +21,7 @@ def test_connection_error_surfaces_service_code_without_secret():
         ensure_connection(
             Client(), ServicePrincipal("tenant", "client", "secret-value"),
             name="owned", server="server", database="db", recorded_id=None,
-            record=recorded.append, allow_create=True,
+            record=recorded.append,
         )
     assert caught.value.__context__ is None
     assert recorded == ["", None]
@@ -40,7 +40,7 @@ def test_uncertain_create_recovers_only_a_unique_matching_owned_connection():
     recorded = []
     args = {
         "name": "owned", "server": "server", "database": "db", "recorded_id": "",
-        "record": recorded.append, "allow_create": True,
+        "record": recorded.append,
     }
     principal = ServicePrincipal("tenant", "client", "secret-value")
     with pytest.raises(FabricError, match="will not create a duplicate"):

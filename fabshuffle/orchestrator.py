@@ -208,7 +208,6 @@ class MigrationPlan:
     start_database_mirrors: bool = False
     connection_mappings: dict[str, str] = field(default_factory=dict)
     reference_mappings: list[dict[str, str]] = field(default_factory=list)
-    sql_copy_connections: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if type(self.start_database_mirrors) is not bool:
@@ -234,19 +233,6 @@ class MigrationPlan:
                 raise ValueError(f"Connection '{source}' has conflicting destination mappings.")
             normalized_connections[source] = target
         self.connection_mappings = normalized_connections
-        normalized_sql: dict[str, dict[str, Any]] = {}
-        for item, pair in self.sql_copy_connections.items():
-            if not isinstance(pair, dict) or set(pair) != {"source", "destination"}:
-                raise ValueError("SQL Copy Job mappings require source and destination connection IDs.")
-            try:
-                item_id = str(UUID(item))
-                normalized_pair = {key: str(UUID(pair[key])) for key in ("source", "destination")}
-            except (TypeError, ValueError, AttributeError) as error:
-                raise ValueError("SQL Copy Job mappings require item and connection GUIDs.") from error
-            if item_id in normalized_sql and normalized_sql[item_id] != normalized_pair:
-                raise ValueError(f"SQL database '{item_id}' has conflicting connection pairs.")
-            normalized_sql[item_id] = normalized_pair
-        self.sql_copy_connections = normalized_sql
 
     @property
     def paired(self) -> bool:
@@ -3096,7 +3082,7 @@ def _copy_sql_database_tables(
     step: str,
     ready: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    """Copy rows using migration-owned SQL Server connections or explicit overrides."""
+    """Copy rows using migration-owned SQL Server connections."""
     warnings: list[str] = []
     specs: list[copyjobs.CopyJobSpec] = []
     preflight: dict[str, tuple[dict[str, Any], dict[str, Any], list[data_stores.TableRef]]] = {}
@@ -3151,43 +3137,41 @@ def _copy_sql_database_tables(
             evidence.step("data", EvidenceState.SUCCEEDED, "No uncopied SQL base tables found.")
             continue
 
-        pair = ctx.plan.sql_copy_connections.get(source["id"].casefold())
-        if not pair:
-            action = (
-                "Check Fabric connection permissions and the connector error, then resume or "
-                "supply existing matching SQL Server connections under Advanced."
-            )
-            try:
-                pending = any(item_id == source["id"] for item_id, _ in ctx.active_copy_jobs)
-                if not pending and not ctx.plan.write_freeze_confirmed:
-                    raise FabricError("Pause writes to both SQL databases and confirm the write freeze.")
-                pair = {}
-                for role, item in (("source", source), ("destination", target)):
-                    lineage = ctx.run.lineage_id or ctx.run.id
-                    scope = "|".join((lineage, source["id"], target["id"], role))
-                    digest = hashlib.sha256(scope.encode()).hexdigest()[:32]
-                    connection_name = f"FabShuffle-SQL-{role}-{digest}"
-                    recorded_id = ctx.prior.sql_connections.get(connection_name) if ctx.prior else None
-                    # Poll an existing job without requiring its connections to still be usable.
-                    if pending and recorded_id:
-                        pair[role] = recorded_id
-                        continue
+        pending = any(item_id == source["id"] for item_id, _ in ctx.active_copy_jobs)
+        try:
+            if not pending and not ctx.plan.write_freeze_confirmed:
+                raise FabricError("Pause writes to both SQL databases and confirm the write freeze.")
+            pair = {}
+            lineage = ctx.run.lineage_id or ctx.run.id
+            for role, item in (("source", source), ("destination", target)):
+                scope = "|".join((lineage, source["id"], target["id"], role))
+                digest = hashlib.sha256(scope.encode()).hexdigest()[:32]
+                connection_name = f"FabShuffle-SQL-{role}-{digest}"
+                recorded_id = ctx.prior.sql_connections.get(connection_name) if ctx.prior else None
+                if pending:
+                    # A submitted job must already have two durable IDs. Never reuse IDs from an old plan.
+                    if not recorded_id:
+                        raise ResumeRefused(
+                            f"The unfinished SQL Copy Job for '{name}' has no recorded migration-owned "
+                            f"{role} connection. Verify the job is no longer writing in Fabric before "
+                            "starting a fresh migration to a new destination."
+                        )
+                    pair[role] = recorded_id
+                else:
                     pair[role] = sql_connections.ensure_connection(
                         ctx.client, ctx.principal, name=connection_name,
                         server=sqldatabases.server_fqdn(item), database=sqldatabases.database_name(item),
                         recorded_id=recorded_id,
                         record=partial(ctx.journal.sql_connection, connection_name),
-                        allow_create=not pending,
                     )
-            except FabricError as error:
-                evidence.step("data", EvidenceState.FAILED, "SQL connection provisioning failed.",
-                              error=error, action=action)
-                if pending:
-                    raise ResumeRefused(
-                        f"Cannot reconcile SQL Copy Job for '{name}': {error}. {action}"
-                    ) from error
-                warnings.append(f"SQL database '{name}': {error}. {action}")
-                continue
+        except FabricError as error:
+            action = "Resolve the Fabric connection error or confirm the SQL write freeze, then resume."
+            evidence.step(
+                "data", EvidenceState.FAILED, "SQL connection provisioning failed.",
+                error=error, action=action,
+            )
+            warnings.append(f"SQL database '{name}': {error}. {action}")
+            continue
         content = copyjobs.build_sql_server_copy_job(
             source_connection_id=pair["source"], target_connection_id=pair["destination"], tables=tables,
         )
@@ -3248,7 +3232,8 @@ def _copy_sql_database_tables(
             if not sql_connections.matches_endpoint(connection, expected_server, expected_database):
                 raise sqlschema.SchemaTransferError(
                     f"Connection {connection_id} does not expose the expected SQL Server "
-                    f"and database {expected_server}/{expected_database}. Supply a matching connection."
+                    f"and database {expected_server}/{expected_database}. "
+                    "Restore the migration-owned connection."
                 )
         try:
             retry_key = (spec.item_id, "sql_retry", spec.fingerprint)
@@ -4844,7 +4829,6 @@ def build_plan(
     start_database_mirrors: bool = False,
     connection_mappings: Mapping[str, str] | None = None,
     reference_mappings: list[dict[str, str]] | None = None,
-    sql_copy_connections: Mapping[str, dict[str, Any]] | None = None,
 ) -> MigrationPlan:
     paired = target_client is not None
     if paired != bool(source_tenant_id) or paired != bool(target_tenant_id):
@@ -4906,7 +4890,6 @@ def build_plan(
         start_database_mirrors=start_database_mirrors,
         connection_mappings=dict(connection_mappings or {}),
         reference_mappings=list(reference_mappings or []),
-        sql_copy_connections=dict(sql_copy_connections or {}),
     )
 
 

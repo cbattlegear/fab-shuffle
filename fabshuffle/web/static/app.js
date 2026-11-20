@@ -557,6 +557,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
       ...plan, blockers: [], unsupportedSummary: [], dependencies: [],
       counts: [], migratedTotal: 0, largeSemanticModels: [],
       hasSqlDatabase: saved.items.some(({ type }) => type === "SQLDatabase"),
+      inventoryIncomplete: saved.inventoryComplete === false,
       targetWorkspaceId: saved.targetWorkspaceId,
     };
     resetMappings();
@@ -574,12 +575,6 @@ async function prepareResume(runId, button, returnStage = "progress") {
       addMappingRow("reference").querySelectorAll("input").forEach((input) => {
         input.value = mapping[input.dataset.field] || "";
       });
-    }
-    for (const [item, pair] of Object.entries(plan.sqlCopyConnections || {})) {
-      const inputs = addMappingRow("sql-copy").querySelectorAll("input");
-      inputs[0].value = item;
-      inputs[1].value = pair.source;
-      inputs[2].value = pair.destination;
     }
     goTo("review");
     renderReview();
@@ -817,16 +812,17 @@ async function settleAssessment(request, version = state.assessmentVersion) {
 
 function copiesSqlRows() {
   return !state.paired && $("#opt-data").checked &&
-    (state.preview?.hasSqlDatabase || state.preview?.counts?.some(({ type }) => type === "SQLDatabase") ||
-      $("#sql-copy-mapping-rows").children.length > 0);
+    (state.preview?.hasSqlDatabase || state.preview?.counts?.some(({ type }) => type === "SQLDatabase"));
 }
 
 function freezeApplies() {
   if (state.preview?.strategy === "reassign") return false;
-  return state.paired || $("#opt-files").checked || copiesSqlRows();
+  return state.paired || $("#opt-files").checked || copiesSqlRows() ||
+    (state.preview?.inventoryIncomplete && $("#opt-data").checked);
 }
 
 function setStartEnabled(enabled) {
+  $("#sql-copy-info").hidden = state.preview?.strategy === "reassign" || !copiesSqlRows();
   $("#write-freeze").hidden = !freezeApplies();
   const start = $("#start-run");
   const freezeMissing = freezeApplies() && (!state.paired || $("#opt-data").checked || $("#opt-files").checked) &&
@@ -858,9 +854,6 @@ function addMappingRow(kind) {
   row.className = "mapping-row";
   const names = kind === "connection"
     ? [["source_connection_id", "Source connection ID"], ["target_connection_id", "Destination connection ID"]]
-    : kind === "sql-copy"
-    ? [["source_item_id", "Source SQL database item ID"], ["source", "Source SQL Server connection ID"],
-      ["destination", "Destination SQL Server connection ID"]]
     : [["source_workspace_id", "Source workspace ID"], ["source_item_id", "Source item ID"],
       ["target_workspace_id", "Destination workspace ID"], ["target_item_id", "Destination item ID"]];
   names.forEach(([name, title], index) => {
@@ -898,30 +891,13 @@ function resetMappings() {
   connectionOptionsVersion++;
   $("#connection-mapping-rows").innerHTML = "";
   $("#reference-mapping-rows").innerHTML = "";
-  $("#sql-copy-mapping-rows").innerHTML = "";
   $("#opt-write-freeze").checked = false;
   $("#opt-start-mirrors").checked = false;
   state.mappingsChecked = false;
 }
 
 function mappingOptions() {
-  const result = { connection_mappings: {}, reference_mappings: [], sql_copy_connections: {} };
-  if (!state.paired) {
-    for (const row of $("#sql-copy-mapping-rows").children) {
-      const values = Object.fromEntries(Array.from(row.querySelectorAll("input")).map((input) =>
-        [input.dataset.field, (input.value || "").trim()]));
-      if (Object.values(values).every((value) => !value)) continue;
-      if (!values.source_item_id || !values.source || !values.destination) {
-        throw new Error("Complete every SQL connection ID.");
-      }
-      if (Object.hasOwn(result.sql_copy_connections, values.source_item_id)) {
-        throw new Error("Each SQL database must have only one connection pair.");
-      }
-      result.sql_copy_connections[values.source_item_id] = {
-        source: values.source, destination: values.destination,
-      };
-    }
-  }
+  const result = { connection_mappings: {}, reference_mappings: [] };
   if (!state.paired) return result;
   for (const kind of ["connection", "reference"]) {
     for (const row of $(`#${kind}-mapping-rows`).children) {
@@ -967,8 +943,8 @@ function resumeOptions() {
   return {
     ...(state.paired ? {
       connection_mappings: mappings.connection_mappings, reference_mappings: mappings.reference_mappings,
-    } : (copiesSqlRows() || Object.keys(state.preview?.sqlCopyConnections || {}).length)
-      ? { sql_copy_connections: mappings.sql_copy_connections, write_freeze_confirmed: $("#opt-write-freeze").checked }
+    } : freezeApplies()
+      ? { write_freeze_confirmed: $("#opt-write-freeze").checked }
       : {}),
     start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,
   };
@@ -1022,7 +998,6 @@ async function loadConnectionOptions() {
 
 $("#add-connection-mapping").addEventListener("click", () => addMappingRow("connection").querySelector("input").focus());
 $("#add-reference-mapping").addEventListener("click", () => addMappingRow("reference").querySelector("input").focus());
-$("#add-sql-copy-mapping").addEventListener("click", () => addMappingRow("sql-copy").querySelector("input").focus());
 $("#recheck-mappings").addEventListener("click", () => {
   loadConnectionOptions();
   recheckMappings();
@@ -1256,7 +1231,6 @@ function renderReview() {
   $("#target-name").disabled = resuming;
   ["#opt-data", "#opt-files", "#opt-cleanup"].forEach((id) => { $(id).disabled = resuming; });
   $("#destination-mappings").hidden = !state.paired || reassign;
-  $("#sql-copy-mappings").hidden = state.paired || reassign;
   $("#write-freeze").hidden = reassign || !freezeApplies();
   $("#opt-permissions").disabled = state.paired || resuming;
   if (state.paired) $("#opt-permissions").checked = false;

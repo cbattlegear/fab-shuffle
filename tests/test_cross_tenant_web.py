@@ -51,7 +51,6 @@ def pair_api(monkeypatch, tmp_path):
                 "include_data", "include_files", "copy_permissions", "write_freeze_confirmed",
                 "start_database_mirrors",
                 "connection_mappings", "reference_mappings",
-                "sql_copy_connections",
             )},
         )
 
@@ -421,44 +420,33 @@ def test_resume_updates_mappings_and_keeps_target_and_checkpoints(pair_api, monk
     assert journal.read(web._session_journal(session, run_id)).plan["connection_mappings"] == old_mapping
 
 
-def test_sql_copy_mappings_are_saved_and_can_be_supplied_on_resume(pair_api):
+def test_sql_copy_connection_overrides_are_rejected_on_start_and_resume(pair_api):
     client, session, _, _ = pair_api
-    item = "11111111-1111-1111-1111-111111111111"
-    pair = {
-        "source": "22222222-2222-2222-2222-222222222222",
-        "destination": "33333333-3333-3333-3333-333333333333",
-    }
     response = client.post(
-        "/api/runs", headers=headers(session), json=body(sql_copy_connections={item: pair}),
+        "/api/runs", headers=headers(session), json=body(sql_copy_connections={}),
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 422, response.text
+    response = client.post("/api/runs", headers=headers(session), json=body())
     run_id = response.json()["runId"]
-    assert response.json()["plan"]["sqlCopyConnections"] == {item: pair}
+    assert "sqlCopyConnections" not in response.json()["plan"]
     web.REGISTRY = RunRegistry()
     saved = client.get(f"/api/runs/{run_id}/resume-plan", headers=headers(session))
-    assert saved.json()["plan"]["sqlCopyConnections"] == {item: pair}
+    assert "sqlCopyConnections" not in saved.json()["plan"]
     response = client.post(
         f"/api/runs/{run_id}/resume", headers=headers(session),
-        json={"sql_copy_connections": {item: pair}, "write_freeze_confirmed": True},
+        json={"sql_copy_connections": {}},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["plan"]["sqlCopyConnections"] == {item: pair}
-    assert response.json()["plan"]["writeFreezeConfirmed"] is True
+    assert response.status_code == 422, response.text
 
 
-def test_new_sql_resume_mapping_does_not_inherit_an_old_freeze_confirmation():
-    item = "11111111-1111-1111-1111-111111111111"
-    pair = {
-        "source": "22222222-2222-2222-2222-222222222222",
-        "destination": "33333333-3333-3333-3333-333333333333",
-    }
+def test_single_principal_resume_requires_fresh_freeze_confirmation():
     plan = MigrationPlan(
         capacity_id="capacity", capacity_name="capacity", capacity_region="region",
         source_workspace_id="workspace", source_workspace_name="source",
         target_workspace_name="target", write_freeze_confirmed=True,
     )
-    updated = web.ResumeRunRequest(sql_copy_connections={item: pair}).apply(plan)
-    assert not updated.write_freeze_confirmed
+    assert not web.ResumeRunRequest().apply(plan).write_freeze_confirmed
+    assert web.ResumeRunRequest(write_freeze_confirmed=True).apply(plan).write_freeze_confirmed
 
 
 @pytest.mark.parametrize("field", [

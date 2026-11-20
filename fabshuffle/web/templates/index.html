@@ -249,18 +249,13 @@
         <p id="mapping-status" class="hint" role="status">Re-check after editing mappings.</p>
         <button id="recheck-mappings" type="button" class="secondary">Re-check destination mappings</button>
       </section>
-      <section id="sql-copy-mappings" class="mapping-controls" hidden>
+      <section id="sql-copy-info" hidden>
         <h3>SQL database Copy Jobs</h3>
         <p class="hint">Fab Shuffle uses your signed-in service principal to create the SQL Server
           connections. Stop writes to both databases while copying. Append requires empty
           destination tables. After a confirmed
           failed job, retry truncates its destination tables before copying; unresolved jobs are
           reconciled first. Truncation deletes all rows and may fail for constrained tables.</p>
-        <details>
-          <summary>Advanced: use existing SQL Server connections</summary>
-          <div id="sql-copy-mapping-rows"></div>
-          <button id="add-sql-copy-mapping" type="button" class="secondary">Add connection override</button>
-        </details>
       </section>
       <fieldset id="write-freeze" class="options write-freeze" hidden>
         <legend>Source write freeze</legend>

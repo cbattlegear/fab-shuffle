@@ -79,8 +79,13 @@ class FakeClient:
         return None
 
 
-def make_ctx(client, monkeypatch, tables=(("dbo", "Orders"),), copied=None):
+def make_ctx(client, monkeypatch, tables=(("dbo", "Orders"),), copied=None, *, provision=False):
     monkeypatch.setattr(orchestrator.sqlschema, "list_base_tables", lambda *a, **k: list(tables))
+    if not provision:
+        monkeypatch.setattr(
+            orchestrator.sql_connections, "ensure_connection",
+            lambda *args, name, **kwargs: "src-conn" if "-source-" in name else "dst-conn",
+        )
 
     calls: list[dict] = []
 
@@ -98,6 +103,7 @@ def make_ctx(client, monkeypatch, tables=(("dbo", "Orders"),), copied=None):
         source_workspace_id=SOURCE_WS,
         source_workspace_name="src",
         target_workspace_name="dst",
+        write_freeze_confirmed=True,
     )
     ctx = orchestrator._Context(
         client=client,
@@ -109,7 +115,6 @@ def make_ctx(client, monkeypatch, tables=(("dbo", "Orders"),), copied=None):
     )
     ctx.target_workspace_id = TARGET_WS
     ctx.scratch_workspace_id = SCRATCH_WS
-    ctx.plan.sql_copy_connections[SOURCE_DB] = {"source": "src-conn", "destination": "dst-conn"}
     return ctx
 
 
@@ -161,7 +166,7 @@ def test_the_server_address_is_mapped_so_later_items_rebind(monkeypatch):
 # ------------------------------------------------------------------- the rows
 
 
-def test_rows_use_sql_server_copy_job_between_explicit_connections(monkeypatch):
+def test_rows_use_sql_server_copy_job_between_migration_owned_connections(monkeypatch):
     client = FakeClient()
     orchestrator._migrate_sql_databases(make_ctx(client, monkeypatch))
 
@@ -174,13 +179,6 @@ def test_rows_use_sql_server_copy_job_between_explicit_connections(monkeypatch):
     assert job["activities"][0]["properties"]["source"]["datasetSettings"] == {
         "schema": "dbo", "table": "Orders",
     }
-
-
-def test_no_connection_is_created_for_the_copy(monkeypatch):
-    client = FakeClient()
-    orchestrator._migrate_sql_databases(make_ctx(client, monkeypatch))
-
-    assert not any(path == "connections" for path, _ in client.posts)
 
 
 def test_per_table_failures_name_their_database(monkeypatch):
@@ -228,6 +226,7 @@ def test_submission_rejects_mismatched_destination_and_missing_freeze(monkeypatc
     ctx = make_ctx(client, monkeypatch)
     orchestrator._migrate_sql_databases(ctx)
     spec, preflight = client.bulk_copies[0]
+    ctx.plan.write_freeze_confirmed = False
     with pytest.raises(orchestrator.sqlschema.SchemaTransferError, match="freeze"):
         preflight(spec)
     ctx.plan.write_freeze_confirmed = True
@@ -324,22 +323,26 @@ def test_a_failed_schema_stops_the_row_copy(monkeypatch):
 
 def test_automatic_connections_require_write_freeze(monkeypatch):
     client = FakeClient()
-    ctx = make_ctx(client, monkeypatch)
-    ctx.plan.sql_copy_connections = {}
+    ctx = make_ctx(client, monkeypatch, provision=True)
+    ctx.plan.write_freeze_confirmed = False
     orchestrator._migrate_sql_databases(ctx)
 
     assert any("confirm the write freeze" in w for w in step_of(ctx)["warnings"])
     assert not client.bulk_copies
 
 
-def test_missing_pair_with_unfinished_job_refuses_before_other_phases(monkeypatch):
+def test_unfinished_legacy_job_refuses_without_adopting_old_plan_connections(monkeypatch):
     client = FakeClient()
-    ctx = make_ctx(client, monkeypatch)
-    ctx.plan.sql_copy_connections = {}
+    ctx = make_ctx(client, monkeypatch, provision=True)
+    ctx.prior = journal.Replay(plan={
+        **orchestrator._plan_record(ctx.plan),
+        "sql_copy_connections": {SOURCE_DB: {"source": "src-conn", "destination": "dst-conn"}},
+    })
+    ctx.plan = orchestrator.plan_from_journal(ctx.prior)
     ctx.active_copy_jobs[(SOURCE_DB, "CopyJob_SQLDatabase_RegionBounceTest")] = {
         "job": {"instance_id": "running"}, "target": TARGET_DB,
     }
-    with pytest.raises(orchestrator.ResumeRefused, match="existing SQL Copy Job"):
+    with pytest.raises(orchestrator.ResumeRefused, match="no recorded migration-owned source connection"):
         orchestrator._migrate_sql_databases(ctx)
     assert not client.bulk_copies
     assert not any(path.endswith("/updateDefinition") for path, _ in client.posts)
@@ -383,9 +386,8 @@ def test_automatically_provisions_both_connections_and_reuses_them(monkeypatch, 
             return super().get(path, **kwargs)
 
     client = Client()
-    ctx = make_ctx(client, monkeypatch)
+    ctx = make_ctx(client, monkeypatch, provision=True)
     ctx.journal = journal.Journal(tmp_path / "run.jsonl")
-    ctx.plan.sql_copy_connections = {}
     ctx.plan.write_freeze_confirmed = True
     orchestrator._migrate_sql_databases(ctx)
     spec, preflight = client.bulk_copies[0]
@@ -397,6 +399,12 @@ def test_automatically_provisions_both_connections_and_reuses_them(monkeypatch, 
     assert set(ctx.prior.sql_connections.values()) == set(client.created)
     orchestrator._copy_sql_database_tables(ctx, "sqldatabases", [(SOURCE_ITEM, TARGET_ITEM)])
     assert len(client.created) == 2
+    assert client.bulk_copies[-1][0].fingerprint == spec.fingerprint
+    ctx.active_copy_jobs[(SOURCE_DB, spec.display_name)] = {"job": {"instance_id": "running"}}
+    client.created.clear()
+    ctx.plan.write_freeze_confirmed = False
+    orchestrator._copy_sql_database_tables(ctx, "sqldatabases", [(SOURCE_ITEM, TARGET_ITEM)])
+    assert not client.created
     assert client.bulk_copies[-1][0].fingerprint == spec.fingerprint
 
 

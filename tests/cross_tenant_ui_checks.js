@@ -90,7 +90,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, loginBody, updateLoginMode, renderReview, renderIdentity, migrationBody,
-      mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume,
+      mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume, resumeOptions,
       invalidateMappings, loadResumable, loadConnectionOptions, watchRun, resetReadiness };`, context);
   const flush = async () => { for (let i = 0; i < 18; i++) await Promise.resolve(); };
   async function reply(index, data, status = 200) {
@@ -121,21 +121,23 @@ const scenarios = {
   async single_sql_connections(f) {
     f.paired();
     f.ui.state.paired = false;
+    f.ui.state.preview.counts = [{ type: "SQLDatabase", label: "SQL database", count: 1 }];
     f.get("opt-data").checked = true;
     f.get("opt-files").checked = false;
     f.ui.renderReview();
-    assert.equal(f.get("sql-copy-mappings").hidden, false);
-    const row = f.ui.addMappingRow("sql-copy");
-    const inputs = row.querySelectorAll("input");
-    ["source-item", "source-connection", "target-connection"].forEach((value, i) => { inputs[i].value = value; });
+    assert.equal(f.get("sql-copy-info").hidden, false);
+    assert.equal(f.get("sql-copy-info").querySelectorAll("input").length, 0);
     assert.equal(f.get("write-freeze").hidden, false);
     assert.equal(f.get("start-run").disabled, true);
     f.get("opt-write-freeze").checked = true;
     f.get("opt-write-freeze").handlers.change();
     assert.equal(f.get("start-run").disabled, false);
-    assert.deepEqual(JSON.parse(JSON.stringify(f.ui.migrationBody().sql_copy_connections)), {
-      "source-item": { source: "source-connection", destination: "target-connection" },
-    });
+    assert.equal(f.ui.migrationBody().write_freeze_confirmed, true);
+    assert.equal(Object.hasOwn(f.ui.migrationBody(), "sql_copy_connections"), false);
+    f.ui.state.preview.counts = [];
+    f.ui.state.preview.hasSqlDatabase = true;
+    assert.equal(f.ui.resumeOptions().write_freeze_confirmed, true);
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "sql_copy_connections"), false);
   },
   async login(f) {
     f.ui.state.forceRebuild = true;

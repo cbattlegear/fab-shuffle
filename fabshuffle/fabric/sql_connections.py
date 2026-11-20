@@ -45,7 +45,7 @@ def _check_creation_method(client: FabricClient) -> None:
 
 def ensure_connection(
     client: FabricClient, principal: ServicePrincipal, *, name: str, server: str, database: str,
-    recorded_id: str | None, record: Callable[[str | None], None], allow_create: bool,
+    recorded_id: str | None, record: Callable[[str | None], None],
 ) -> str:
     """Reuse only a journaled connection, or discover it after a lost create response."""
     def verified(connection: Mapping[str, Any]) -> str:
@@ -78,9 +78,6 @@ def ensure_connection(
         connection_id = verified(matches[0])
         record(connection_id)
         return connection_id
-    if not allow_create:
-        raise FabricError("An existing SQL Copy Job must be reconciled using its original connections.")
-
     _check_creation_method(client)
     if any(item.get("displayName") == name for item in client.list_all("connections")):
         raise FabricError(f"Connection '{name}' already exists without a recorded creation intent.")

@@ -37,10 +37,12 @@ in Fabric after the migration; don't change or delete them while a run may need 
 If an accepted create response is lost, Fab Shuffle looks for its recorded connection and
 refuses to create a duplicate if it cannot verify the result.
 
-If Fabric rejects provisioning, check the service error. You can optionally supply existing
-matching SQL Server connection IDs under **Advanced**. Grant the signed-in principal access
-to any overrides and CONTROL on the destination database. Pause writes to both databases
-and keep connection definitions unchanged throughout copying.
+If Fabric rejects provisioning, check the service error and resolve the permissions or endpoint
+issue before resuming. Grant the signed-in principal CONTROL on the destination database.
+Pause writes to both databases and keep the migration-owned connections unchanged while copying.
+An unfinished Copy Job from an older preview that used manually supplied connections cannot
+resume without the original migration-owned connection records. Verify in Fabric that the old
+job is no longer writing before starting a fresh migration to a new destination.
 
 The Copy Job uses the supplied SQL Server Append shape. Before submission Fab Shuffle checks
 the connection paths and verifies destination tables are empty; enabled row-level security
