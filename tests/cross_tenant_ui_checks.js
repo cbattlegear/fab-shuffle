@@ -126,14 +126,20 @@ const scenarios = {
     f.get("opt-files").checked = false;
     f.ui.renderReview();
     f.ui.setStartEnabled(true);
-    assert.equal(f.get("write-freeze").hidden, true);
+    assert.equal(f.get("write-freeze"), null);
     assert.equal(f.get("start-run").disabled, false);
-    assert.equal(f.ui.migrationBody().write_freeze_confirmed, false);
+    assert.equal(Object.hasOwn(f.ui.migrationBody(), "write_freeze_confirmed"), false);
     assert.equal(Object.hasOwn(f.ui.migrationBody(), "sql_copy_connections"), false);
     f.ui.state.preview.counts = [];
     f.ui.state.preview.hasSqlDatabase = true;
     assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
     assert.equal(Object.hasOwn(f.ui.resumeOptions(), "sql_copy_connections"), false);
+    f.get("opt-data").checked = false;
+    f.get("opt-files").checked = true;
+    f.get("opt-files").handlers.change();
+    assert.equal(f.get("start-run").disabled, false);
+    assert.equal(f.get("opt-write-freeze"), null);
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
   },
   async login(f) {
     f.ui.state.forceRebuild = true;
@@ -169,14 +175,11 @@ const scenarios = {
     f.paired();
     assert.equal(f.get("opt-permissions").disabled, true);
     assert.equal(f.get("opt-permissions").checked, false);
-    assert.equal(f.get("write-freeze").hidden, false);
+    assert.equal(f.get("write-freeze"), null);
     assert.match(f.get("review-summary").textContent, /source-tenant.*source-app/s);
     assert.match(f.get("review-summary").textContent, /target-tenant.*target-app/s);
-    assert.equal(f.get("start-run").disabled, true);
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
     assert.equal(f.get("start-run").disabled, false);
-    f.get("opt-write-freeze").checked = false;
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
     f.get("opt-data").checked = false;
     f.get("opt-files").checked = false;
     f.get("opt-files").handlers.change();
@@ -188,13 +191,10 @@ const scenarios = {
     f.ui.state.preview.targetTenantId = f.ui.state.preview.sourceTenantId;
     f.ui.renderReview();
     f.ui.setStartEnabled(true);
-    assert.equal(f.get("write-freeze").hidden, false);
-    assert.equal(f.get("start-run").disabled, true);
+    assert.equal(f.get("write-freeze"), null);
+    assert.equal(f.get("start-run").disabled, false);
     assert.equal(f.get("opt-permissions").disabled, true);
     assert.match(f.get("strategy-callout").textContent, /Rebuild with destination credentials/);
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
-    assert.equal(f.get("start-run").disabled, false);
     assert.equal(f.ui.migrationBody().strategy, "rebuild");
     assert.equal(f.ui.migrationBody().copy_permissions, false);
     f.ui.state.paired = false;
@@ -205,7 +205,6 @@ const scenarios = {
   },
   async mappings_and_execution(f) {
     f.paired();
-    f.get("opt-write-freeze").checked = true;
     const connection = f.ui.addMappingRow("connection").querySelectorAll("input");
     connection[0].value = "source-connection";
     assert.throws(() => f.ui.migrationBody(), /Complete every ID/);
@@ -227,7 +226,6 @@ const scenarios = {
   },
   async stale_and_failed_assessment(f) {
     f.paired();
-    f.get("opt-write-freeze").checked = true;
     f.ui.recheckMappings();
     f.ui.invalidateMappings();
     await f.reply(0, { blockers: [], dependencies: [], connectionAccess: null });

@@ -196,12 +196,6 @@ def _start_attempt(
     _require_identity(session, record)
     if session.paired and plan.strategy is not Strategy.REBUILD:
         raise HTTPException(status_code=409, detail="Paired migration must rebuild the workspace.")
-    if session.paired and (plan.include_data or plan.include_files) and not plan.write_freeze_confirmed:
-        raise HTTPException(
-            status_code=409,
-            detail="Pause source writes and confirm the write freeze before copying data or files "
-            "with separate destination credentials, or turn off both copy options.",
-        )
     if plan.execution_blocker:
         raise HTTPException(status_code=409, detail=plan.execution_blocker)
     run = MigrationRun(
@@ -332,7 +326,7 @@ class StartRunRequest(BaseModel):
         return result
 
     def plan_options(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"cleanup_when_done"})
+        return self.model_dump(exclude={"cleanup_when_done", "write_freeze_confirmed"})
 
 
 class ResumeRunRequest(BaseModel):
@@ -353,9 +347,8 @@ class ResumeRunRequest(BaseModel):
         return StartRunRequest.item_ids(value) if value is not None else None
 
     def apply(self, plan: MigrationPlan) -> MigrationPlan:
-        options = self.model_dump(exclude_none=True)
-        if not plan.paired and self.write_freeze_confirmed is None:
-            options["write_freeze_confirmed"] = False
+        options = self.model_dump(exclude_none=True, exclude={"write_freeze_confirmed"})
+        options["write_freeze_confirmed"] = False
         return replace(plan, **options)
 
 
@@ -797,8 +790,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         """Adopt the previous target with explicit mappings and this attempt's activation opt-in."""
         replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
-        if body is not None:
-            plan = body.apply(plan)
+        plan = (body or ResumeRunRequest()).apply(plan)
         run = _start_attempt(session, plan, cleanup=replay.cleanup, prior=replay)
         return {"runId": run.id, "plan": _plan_dict(plan), "resumedFrom": run_id}
 
@@ -930,7 +922,9 @@ def _resume_plan(session: Session, run_id: str) -> tuple[journal.Replay, Migrati
             detail="This migration was ignored or marked for full restart. It cannot be resumed.",
         )
     try:
-        return replay, replace(plan_from_journal(replay), start_database_mirrors=False)
+        return replay, replace(
+            plan_from_journal(replay), start_database_mirrors=False, write_freeze_confirmed=False,
+        )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 

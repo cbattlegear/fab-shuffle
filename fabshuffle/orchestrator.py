@@ -253,20 +253,6 @@ class MigrationPlan:
                 "Separate source and destination credentials recreate the workspace; "
                 "they never reassign it."
             )
-        if self.paired and (self.include_data or self.include_files) and not self.write_freeze_confirmed:
-            return (
-                "Stop writes to the source and confirm the write freeze before copying data or "
-                "files with separate credentials. Keep the freeze in place through final reconciliation."
-            )
-        if (
-            not self.paired and self.strategy is Strategy.REBUILD
-            and self.include_files and not self.write_freeze_confirmed
-        ):
-            return (
-                "Stop writes to the source lakehouse Files and confirm the write freeze before copying "
-                "files. Files are streamed and verified against the version first read, so a file "
-                "changed mid-copy fails the transfer. Keep the freeze in place until the copy completes."
-            )
         return None
 
 

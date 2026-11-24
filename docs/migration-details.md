@@ -206,8 +206,9 @@ accepts source credentials plus a destination object:
 ```
 
 Use the returned `sessionId` in `X-Fab-Shuffle-Session`. `POST /api/preview/dependencies`
-and `POST /api/runs` accept options including `write_freeze_confirmed`,
-`start_database_mirrors`, `connection_mappings` and `reference_mappings`.
+and `POST /api/runs` accept options including `start_database_mirrors`,
+`connection_mappings` and `reference_mappings`. The legacy `write_freeze_confirmed` field
+is accepted for compatibility but ignored; it does not gate a copy.
 External references contain `source_workspace_id`, `source_item_id`,
 `target_workspace_id` and `target_item_id`.
 

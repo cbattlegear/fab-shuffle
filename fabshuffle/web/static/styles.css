@@ -112,15 +112,12 @@ main { max-width: 62rem; margin: 0 auto; padding: 1.5rem 2rem 4rem; }
 .mapping-row button { justify-self: start; }
 .mapping-controls button { min-height: 2.75rem; }
 .mapping-controls .hint { overflow-wrap: anywhere; }
-.write-freeze { margin-top: 1.25rem; }
-.write-freeze label { align-items: flex-start; }
-.write-freeze .hint { margin: 0.4rem 0 0; }
 .resume-artifacts { margin-bottom: 1.25rem; }
 .resume-artifacts summary { cursor: pointer; padding: 0.5rem 0; }
 .resume-artifacts ul { padding-left: 1.25rem; font-size: 0.9rem; overflow-wrap: anywhere; max-height: 18rem; overflow-y: auto; }
 .resume-artifacts li + li { margin-top: 0.65rem; }
 .resume-artifacts :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.credentials[hidden], .mapping-controls[hidden], .write-freeze[hidden], .tool[hidden] { display: none; }
+.credentials[hidden], .mapping-controls[hidden], .tool[hidden] { display: none; }
 @media (max-width: 40rem) {
   .mapping-row { grid-template-columns: minmax(0, 1fr); }
   .credentials input { font-size: 1rem; }

@@ -4,6 +4,7 @@ import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -231,6 +232,37 @@ def test_resuming_a_run_that_finished_is_allowed(
     response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("legacy_confirmation", [False, True])
+def test_file_copy_start_and_legacy_resume_do_not_require_confirmation(
+    client, session_id, journal_dir, monkeypatch, legacy_confirmation,
+):
+    seen = []
+
+    def build(*_args, **kwargs):
+        assert "write_freeze_confirmed" not in kwargs
+        return replace(PLAN, include_data=False, include_files=True, write_freeze_confirmed=False)
+
+    def migrate(run, principal, plan, **kwargs):
+        seen.append(plan)
+        run.mark_finished(RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(web, "build_plan", build)
+    monkeypatch.setattr(web, "run_migration", migrate)
+    started = client.post(
+        "/api/runs", headers=auth(session_id),
+        json={"capacity_id": "cap-1", "source_workspace_id": "ws-1", "include_data": False,
+              "include_files": True, "write_freeze_confirmed": legacy_confirmation},
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["plan"]["writeFreezeConfirmed"] is False
+    old_run = write_journal()
+    resumed = client.post(f"/api/runs/{old_run}/resume", headers=auth(session_id))
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["plan"]["writeFreezeConfirmed"] is False
+    assert not seen[-1].write_freeze_confirmed
+    assert journal.read(SETTINGS.journal_for(old_run)).plan["write_freeze_confirmed"] is True
 
 
 def test_resuming_a_run_that_finished_retries_what_it_left_behind(

@@ -188,13 +188,11 @@ definitions are retained. Destination administrators must arrange human access a
 workspace identities or gateway infrastructure themselves. Sensitivity labels and tenant
 policies require destination configuration; encrypted report/model labels can prevent export.
 
-**Stop source writes before copying data or files.** The review screen requires confirmation.
-The freeze must cover scheduled jobs, ingestion, maintenance and expiration processes, and
-must remain in place through reconciliation and any retries. If the source changes, start a
-fresh migration rather than treating old checkpoints as a new snapshot. Metadata-only
-migrations can omit data and files without this confirmation. With a single service principal
-the freeze is required only for lakehouse Files, which are now streamed and verified against
-the version first read, so a file that changes mid-copy fails the transfer.
+Copies are not a point-in-time snapshot. If source writes continue, copied items may reflect
+different times and later changes may be missed, including on resume. For consistent cutover,
+pause writes (including scheduled jobs and maintenance) through copying and reconciliation;
+if the source changes, start a fresh migration rather than treating old checkpoints as a new
+snapshot. A lakehouse file changed during streaming fails its version check.
 
 On the review screen, map source connection IDs to connections configured in the destination.
 For dependencies outside the migrating workspace, provide both source and destination
@@ -579,7 +577,7 @@ Each saved migration offers two confirmed actions in addition to resuming:
 - **Full restart** deletes the recorded destination workspace and its contents, along with
   the run's recorded scratch workspace if it still exists, then returns to destination
   capacity selection. The source is retained. The next migration is a fresh run: no old item
-  mappings, completed-copy checkpoints, destination capacity or write-freeze confirmation
+  mappings, completed-copy checkpoints or destination capacity
   are reused.
 
 Neither action is available while a related migration is running. Full restart is refused

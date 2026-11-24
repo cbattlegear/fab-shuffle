@@ -249,13 +249,6 @@
         <p id="mapping-status" class="hint" role="status">Re-check after editing mappings.</p>
         <button id="recheck-mappings" type="button" class="secondary">Re-check destination mappings</button>
       </section>
-      <fieldset id="write-freeze" class="options write-freeze" hidden>
-        <legend>Source write freeze</legend>
-        <label><input type="checkbox" id="opt-write-freeze" /> I have paused source writes and will keep them paused until copying finishes.</label>
-        <p class="hint">Required for file copies and table copies with separate destination credentials.
-          Otherwise turn off the relevant copy options.
-          This confirmation does not establish cutover readiness.</p>
-      </fieldset>
       <div class="actions">
         <button class="secondary" id="review-back" data-back="workspace">Back</button>
         <button class="secondary" id="resume-back" type="button" hidden>Back without resuming</button>

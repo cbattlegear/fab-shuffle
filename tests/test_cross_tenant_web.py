@@ -48,7 +48,7 @@ def pair_api(monkeypatch, tmp_path):
             target_workspace_name=options.get("target_workspace_name") or "Sales-copy",
             **{key: options[key] for key in (
                 "source_tenant_id", "target_tenant_id", "source_client_id", "target_client_id",
-                "include_data", "include_files", "copy_permissions", "write_freeze_confirmed",
+                "include_data", "include_files", "copy_permissions",
                 "start_database_mirrors",
                 "connection_mappings", "reference_mappings",
             )},
@@ -133,25 +133,30 @@ def test_mirror_activation_is_recorded_but_requires_opt_in_again_on_resume(pair_
     {"include_files": True, "include_data": True},
 ])
 @pytest.mark.parametrize("same_tenant", [False, True])
-def test_missing_write_freeze_rejected_before_admission(pair_api, options, same_tenant):
+def test_paired_start_and_resume_need_no_freeze_acknowledgement(pair_api, options, same_tenant):
     client, session, _, workers = pair_api
     if same_tenant:
         destination = replace(TARGET, tenant_id=SOURCE.tenant_id)
         session = web.SESSIONS.create(SOURCE, StubTokens(SOURCE), target_tokens=StubTokens(destination))
     response = client.post("/api/runs", headers=headers(session), json=body(**options))
-    assert response.status_code == 409
-    assert "Pause source writes" in response.json()["detail"]
-    assert not workers
-    assert not web._session_directory(session).exists()
+    assert response.status_code == 200, response.text
+    assert response.json()["plan"]["writeFreezeConfirmed"] is False
+    run_id = response.json()["runId"]
+    assert len(workers) == 1
+    web.REGISTRY = RunRegistry()
+    resumed = client.post(f"/api/runs/{run_id}/resume", headers=headers(session), json={})
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["plan"]["writeFreezeConfirmed"] is False
 
 
-def test_write_freeze_allows_data_copy_admission(pair_api):
+def test_legacy_freeze_field_is_accepted_but_not_recorded(pair_api):
     client, session, _, workers = pair_api
     response = client.post(
         "/api/runs", headers=headers(session),
         json=body(include_data=True, write_freeze_confirmed=True),
     )
     assert response.status_code == 200
+    assert response.json()["plan"]["writeFreezeConfirmed"] is False
     assert len(workers) == 1
 
 
@@ -410,7 +415,7 @@ def test_resume_updates_mappings_and_keeps_target_and_checkpoints(pair_api, monk
     plan, kwargs = captured[0]
     assert plan.connection_mappings == new_mapping
     assert plan.reference_mappings == external
-    assert plan.include_data and plan.write_freeze_confirmed
+    assert plan.include_data and not plan.write_freeze_confirmed
     assert plan.source_workspace_id == "workspace" and plan.capacity_id == "capacity"
     assert plan.source_client_id == SOURCE.client_id and plan.target_client_id == TARGET.client_id
     assert kwargs["prior"].target_workspace_id == "created-target"
@@ -439,14 +444,14 @@ def test_sql_copy_connection_overrides_are_rejected_on_start_and_resume(pair_api
     assert response.status_code == 422, response.text
 
 
-def test_single_principal_resume_requires_fresh_freeze_confirmation():
+def test_legacy_freeze_is_not_inherited_or_recorded_on_resume():
     plan = MigrationPlan(
         capacity_id="capacity", capacity_name="capacity", capacity_region="region",
         source_workspace_id="workspace", source_workspace_name="source",
         target_workspace_name="target", write_freeze_confirmed=True,
     )
     assert not web.ResumeRunRequest().apply(plan).write_freeze_confirmed
-    assert web.ResumeRunRequest(write_freeze_confirmed=True).apply(plan).write_freeze_confirmed
+    assert not web.ResumeRunRequest(write_freeze_confirmed=True).apply(plan).write_freeze_confirmed
 
 
 @pytest.mark.parametrize("field", [

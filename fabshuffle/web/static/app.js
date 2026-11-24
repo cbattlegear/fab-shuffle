@@ -158,7 +158,6 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#capacity-next").disabled = true;
     $("#workspace-next").disabled = true;
     $("#opt-permissions").checked = !state.paired;
-    $("#opt-write-freeze").checked = false;
     $("#opt-start-mirrors").checked = false;
     form.reset();
     updateLoginMode();
@@ -808,21 +807,12 @@ async function settleAssessment(request, version = state.assessmentVersion) {
   setStartEnabled(state.preview.blockers.length === 0);
 }
 
-function freezeApplies() {
-  if (state.preview?.strategy === "reassign") return false;
-  return state.paired || $("#opt-files").checked;
-}
-
 function setStartEnabled(enabled) {
-  $("#write-freeze").hidden = !freezeApplies();
   const start = $("#start-run");
-  const freezeMissing = freezeApplies() && (!state.paired || $("#opt-data").checked || $("#opt-files").checked) &&
-    !$("#opt-write-freeze").checked;
   const mappingBlocked = state.paired && (!state.mappingsChecked || state.preview?.mappingBlockers?.length);
-  start.disabled = !enabled || state.assessmentPending || freezeMissing || !!mappingBlocked;
+  start.disabled = !enabled || state.assessmentPending || !!mappingBlocked;
   start.title = !enabled || state.assessmentPending ? "Finish the assessment and resolve its blockers"
-    : mappingBlocked ? "Re-check destination mappings and resolve their blockers"
-    : freezeMissing ? "Confirm the source write freeze, or turn off both data and file copying" : "";
+    : mappingBlocked ? "Re-check destination mappings and resolve their blockers" : "";
 }
 
 
@@ -882,7 +872,6 @@ function resetMappings() {
   connectionOptionsVersion++;
   $("#connection-mapping-rows").innerHTML = "";
   $("#reference-mapping-rows").innerHTML = "";
-  $("#opt-write-freeze").checked = false;
   $("#opt-start-mirrors").checked = false;
   state.mappingsChecked = false;
 }
@@ -923,7 +912,6 @@ function migrationBody() {
     include_files: $("#opt-files").checked,
     copy_permissions: state.paired ? false : $("#opt-permissions").checked,
     cleanup_when_done: $("#opt-cleanup").checked,
-    write_freeze_confirmed: $("#opt-write-freeze").checked,
     start_database_mirrors: !reassign && $("#opt-start-mirrors").checked,
     ...mappingOptions(),
   };
@@ -934,9 +922,7 @@ function resumeOptions() {
   return {
     ...(state.paired ? {
       connection_mappings: mappings.connection_mappings, reference_mappings: mappings.reference_mappings,
-    } : freezeApplies()
-      ? { write_freeze_confirmed: $("#opt-write-freeze").checked }
-      : {}),
+    } : {}),
     start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,
   };
 }
@@ -993,7 +979,7 @@ $("#recheck-mappings").addEventListener("click", () => {
   loadConnectionOptions();
   recheckMappings();
 });
-["#opt-data", "#opt-files", "#opt-write-freeze"].forEach((id) => {
+["#opt-data", "#opt-files"].forEach((id) => {
   $(id).addEventListener("change", () => setStartEnabled(!!state.preview && !state.preview.blockers.length));
 });
 
@@ -1015,7 +1001,6 @@ function renderReviewPending() {
   $("#target-name-field").hidden = true;
   $("#rebuild-options").hidden = true;
   $("#destination-mappings").hidden = true;
-  $("#write-freeze").hidden = true;
   $("#start-run").disabled = true;
 }
 
@@ -1222,7 +1207,6 @@ function renderReview() {
   $("#target-name").disabled = resuming;
   ["#opt-data", "#opt-files", "#opt-cleanup"].forEach((id) => { $(id).disabled = resuming; });
   $("#destination-mappings").hidden = !state.paired || reassign;
-  $("#write-freeze").hidden = reassign || !freezeApplies();
   $("#opt-permissions").disabled = state.paired || resuming;
   if (state.paired) $("#opt-permissions").checked = false;
   $("#opt-permissions").title = state.paired ? "Grant access to the destination workspace separately." : "";
