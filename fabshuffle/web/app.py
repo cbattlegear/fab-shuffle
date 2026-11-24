@@ -517,6 +517,10 @@ def create_app() -> FastAPI:
                     result.update(_semantic_model_preview(session, source_workspace_id, plan))
                     return result
 
+                result["visibleWorkspaceNames"] = [
+                    workspace["displayName"] for workspace in workspaces.list_workspaces(target)
+                    if workspace.get("displayName")
+                ]
                 # Counted from the assessment rather than by listing each type again: it costs
                 # nothing, covers every supported type automatically, and cannot disagree with
                 # what the migration then does.
@@ -594,9 +598,19 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         def prepare() -> MigrationPlan:
             with _planning_clients(session) as (client, target):
-                return build_plan(
+                plan = build_plan(
                     client, **body.plan_options(), **_tenant_plan_inputs(session, target),
                 )
+                if plan.strategy is Strategy.REBUILD and any(
+                    workspace.get("displayName") == plan.target_workspace_name
+                    for workspace in workspaces.list_workspaces(target)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"A workspace named '{plan.target_workspace_name}' is already visible. "
+                        "Choose a different destination workspace name.",
+                    )
+                return plan
 
         plan = await _run_fabric(prepare)
         run = _start_attempt(

@@ -152,7 +152,9 @@ copied to the share before switching; adding the mount does not copy the old eph
 3. **Pick the source workspace.**
 4. **Review** the plan. Fab Shuffle tells you whether the workspace can simply be reassigned
    or has to be rebuilt, lists anything it cannot move, and refuses to start if there is a
-   blocker.
+   blocker. For rebuilds it checks the chosen name against destination workspaces visible to
+   the service principal. This cannot guarantee availability: another workspace may be
+   invisible or created concurrently, and Fabric can still reject the name at creation.
 5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
 
 Session client secrets and the token cache are held in memory, not persisted for recovery.

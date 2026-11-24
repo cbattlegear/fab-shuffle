@@ -159,6 +159,24 @@ def test_full_rebuild_exports_from_source_creates_only_in_destination(monkeypatc
     assert not SETTINGS.journal_for(run.id).exists()
 
 
+def test_workspace_creation_race_preserves_fabric_error(monkeypatch):
+    from fabshuffle.fabric.client import FabricApiError
+
+    _source, target = install(monkeypatch)
+    body = '{"errorCode":"WorkspaceNameAlreadyExists","message":"Workspace name already exists"}'
+
+    def reject(*_args, **_kwargs):
+        raise FabricApiError("POST", "https://api.fabric.microsoft.com/v1/workspaces", 409, body)
+
+    monkeypatch.setattr(orchestrator.workspaces, "create_workspace", reject)
+    run = MigrationRun(source_workspace_name="Source", capacity_name="Target capacity")
+    orchestrator.run_migration(run, SOURCE, plan(), target_principal=TARGET)
+    assert run.status is RunStatus.FAILED
+    assert "WorkspaceNameAlreadyExists" in run.error
+    assert "Workspace name already exists" in run.error
+    assert not target.created
+
+
 def test_cross_tenant_bound_connection_uses_operator_destination_mapping(monkeypatch):
     _source, target = install(monkeypatch, uses_connection=True)
     run = MigrationRun(source_workspace_name="Source", capacity_name="Target capacity")

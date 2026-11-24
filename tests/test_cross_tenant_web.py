@@ -33,6 +33,10 @@ def pair_api(monkeypatch, tmp_path):
         def __exit__(self, *_):
             return None
 
+        def list_all(self, path, **_):
+            assert path == "workspaces"
+            return []
+
     class Thread:
         def __init__(self, *, target, **_):
             self.work = target
@@ -70,6 +74,43 @@ def body(**options):
         "capacity_id": "capacity", "source_workspace_id": "workspace",
         "include_data": False, "include_files": False, **options,
     }
+
+
+@pytest.mark.parametrize("requested", [None, "Edited name"])
+def test_fresh_rebuild_rejects_visible_target_name_before_start(pair_api, monkeypatch, requested):
+    client, session, _, workers = pair_api
+    expected = requested or "Sales-copy"
+    seen = []
+
+    def visible(destination):
+        seen.append(destination.tokens)
+        return [{"displayName": expected}]
+
+    monkeypatch.setattr(web.workspaces, "list_workspaces", visible)
+    response = client.post(
+        "/api/runs", headers=headers(session), json=body(target_workspace_name=requested),
+    )
+    assert response.status_code == 409
+    assert expected in response.json()["detail"]
+    assert "Choose a different" in response.json()["detail"]
+    assert seen == [session.destination_tokens]
+    assert workers == []
+
+
+def test_resume_does_not_recheck_the_workspace_it_created(pair_api, monkeypatch):
+    client, session, _, _ = pair_api
+    started = client.post("/api/runs", headers=headers(session), json=body())
+    run_id = started.json()["runId"]
+    book = journal.Journal(web._session_journal(session, run_id))
+    book.workspace("target", "created-target", "Sales-copy")
+    book.finished("failed", "interrupted")
+    web.REGISTRY = RunRegistry()
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: pytest.fail("A resume must not check its recorded destination as a conflict"),
+    )
+    response = client.post(f"/api/runs/{run_id}/resume", headers=headers(session))
+    assert response.status_code == 200, response.text
 
 
 def test_start_passes_the_bound_pair_and_operator_options_to_execution(pair_api, monkeypatch):

@@ -809,10 +809,18 @@ async function settleAssessment(request, version = state.assessmentVersion) {
 
 function setStartEnabled(enabled) {
   const start = $("#start-run");
+  const conflict = !state.resumeRunId && state.preview?.strategy === "rebuild" &&
+    (state.preview?.visibleWorkspaceNames || []).includes(
+      $("#target-name").value.trim() || state.preview.targetWorkspaceName,
+    );
+  const nameConflict = $("#target-name-conflict");
+  nameConflict.hidden = !conflict;
+  nameConflict.textContent = conflict ? "A workspace with this name is already visible. Choose a different name." : "";
   const mappingBlocked = state.paired && (!state.mappingsChecked || state.preview?.mappingBlockers?.length);
-  start.disabled = !enabled || state.assessmentPending || !!mappingBlocked;
+  start.disabled = !enabled || state.assessmentPending || !!mappingBlocked || !!conflict;
   start.title = !enabled || state.assessmentPending ? "Finish the assessment and resolve its blockers"
-    : mappingBlocked ? "Re-check destination mappings and resolve their blockers" : "";
+    : mappingBlocked ? "Re-check destination mappings and resolve their blockers"
+    : conflict ? "Choose a different destination workspace name" : "";
 }
 
 
@@ -982,6 +990,9 @@ $("#recheck-mappings").addEventListener("click", () => {
 ["#opt-data", "#opt-files"].forEach((id) => {
   $(id).addEventListener("change", () => setStartEnabled(!!state.preview && !state.preview.blockers.length));
 });
+$("#target-name").addEventListener("input", () => {
+  setStartEnabled(!!state.preview && !state.preview.blockers.length);
+});
 
 function renderReviewPending() {
   const callout = $("#strategy-callout");
@@ -999,6 +1010,7 @@ function renderReviewPending() {
   );
   // The name and options depend on the strategy, so they stay hidden until it is known.
   $("#target-name-field").hidden = true;
+  $("#target-name-conflict").hidden = true;
   $("#rebuild-options").hidden = true;
   $("#destination-mappings").hidden = true;
   $("#start-run").disabled = true;

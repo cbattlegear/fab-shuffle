@@ -71,6 +71,8 @@ class DisjointFabric:
                 return [{"id": "source-ws", "displayName": "Sales"}]
         elif path == "capacities":
             return [{"id": "target-cap", "displayName": "Destination", "region": "West Europe"}]
+        elif path == "workspaces":
+            return [{"id": "target-ws", "displayName": "Destination existing"}]
         raise AssertionError(f"Wrong-side listing: {self.side} {path}")
 
 
@@ -193,6 +195,8 @@ def test_preview_forces_rebuild_without_claiming_transport_readiness(api, calls,
     assert preview["strategy"] == "rebuild"
     assert preview["copyPermissions"] is False
     assert preview["targetWorkspaceName"] == "Sales-westeurope"
+    assert preview["visibleWorkspaceNames"] == ["Destination existing"]
+    assert ("target", "workspaces") in calls
     assert preview["sourceTenantId"] == SOURCE_TENANT
     assert preview["targetTenantId"] == TARGET_TENANT
     assert preview["paired"] is True

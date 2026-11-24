@@ -213,8 +213,9 @@
       </div>
 
       <label class="field" id="target-name-field">New workspace name
-        <input id="target-name" autocomplete="off" spellcheck="false" />
+        <input id="target-name" autocomplete="off" spellcheck="false" aria-describedby="target-name-conflict" />
       </label>
+      <p id="target-name-conflict" class="hint" role="status" hidden></p>
       <fieldset class="options" id="rebuild-options">
         <legend>Options</legend>
         <label><input type="checkbox" id="opt-data" checked /> Copy table data</label>

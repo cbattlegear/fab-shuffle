@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from fabshuffle import journal
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
-from fabshuffle.orchestrator import MigrationPlan
+from fabshuffle.orchestrator import MigrationPlan, Strategy
 from fabshuffle.run import REGISTRY, MigrationRun, RunStatus, StepStatus
 from fabshuffle.web import app as web
 
@@ -43,6 +43,7 @@ def client(monkeypatch) -> TestClient:
     registry = RunRegistry()
     monkeypatch.setattr(web, "REGISTRY", registry)
     monkeypatch.setitem(globals(), "REGISTRY", registry)
+    monkeypatch.setattr(web.workspaces, "list_workspaces", lambda _client: [])
     return TestClient(web.app)
 
 
@@ -121,6 +122,19 @@ def test_run_lifecycle_and_event_stream(client: TestClient, session_id: str, mon
 
     run = REGISTRY.get(run_id)
     assert run is not None and run.status == RunStatus.SUCCEEDED
+
+
+def test_reassign_start_does_not_check_existing_workspace_name(client, session_id, monkeypatch):
+    monkeypatch.setattr(web, "build_plan", lambda *args, **kwargs: replace(PLAN, strategy=Strategy.REASSIGN))
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: pytest.fail("Reassignment should not check workspace name availability"),
+    )
+    monkeypatch.setattr(web, "run_migration", lambda run, *a, **k: run.mark_finished(RunStatus.SUCCEEDED))
+    response = client.post(
+        "/api/runs", headers=auth(session_id), json={"capacity_id": "cap-1", "source_workspace_id": "ws-1"},
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_event_stream_requires_a_session(client: TestClient, session_id: str, monkeypatch):

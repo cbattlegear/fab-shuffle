@@ -115,6 +115,17 @@ def test_full_restart_preview_rebuilds_powerbi_content_instead_of_reassigning_so
     assert observed[0][0]["id"] == "model"
 
 
+def test_rebuild_preview_returns_visible_names_for_review(client, session_id, monkeypatch):
+    install(monkeypatch, [{"id": "lh", "displayName": "Lake", "type": "Lakehouse"}])
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: [{"id": "existing", "displayName": "Sales-westeurope"}],
+    )
+    result = preview(client, session_id)
+    assert result["targetWorkspaceName"] == "Sales-westeurope"
+    assert result["visibleWorkspaceNames"] == ["Sales-westeurope"]
+
+
 def test_preview_recommends_reassignment_for_power_bi_only(client, session_id, monkeypatch):
     install(
         monkeypatch,

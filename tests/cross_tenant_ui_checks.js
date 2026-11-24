@@ -118,6 +118,28 @@ function fixture() {
 }
 
 const scenarios = {
+  async workspace_name_conflict(f) {
+    f.paired();
+    f.ui.state.preview.visibleWorkspaceNames = ["Source-copy", "Other existing"];
+    f.ui.renderReview();
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("start-run").disabled, true);
+    assert.equal(f.get("target-name-conflict").hidden, false);
+    assert.match(f.get("target-name-conflict").textContent, /Choose a different name/);
+    f.get("target-name").value = "Free name";
+    f.get("target-name").handlers.input();
+    assert.equal(f.get("start-run").disabled, false);
+    assert.equal(f.get("target-name-conflict").hidden, true);
+    f.get("target-name").value = " Other existing ";
+    f.get("target-name").handlers.input();
+    assert.equal(f.get("start-run").disabled, true);
+    f.get("target-name").value = "";
+    f.get("target-name").handlers.input();
+    assert.equal(f.get("start-run").disabled, true);
+    f.ui.state.resumeRunId = "previous";
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("start-run").disabled, false);
+  },
   async single_sql_connections(f) {
     f.paired();
     f.ui.state.paired = false;
