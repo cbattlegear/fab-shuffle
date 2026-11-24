@@ -113,6 +113,51 @@ def test_resume_does_not_recheck_the_workspace_it_created(pair_api, monkeypatch)
     assert response.status_code == 200, response.text
 
 
+@pytest.mark.parametrize("occupied", [True, False])
+def test_resume_without_recorded_target_checks_destination_name(pair_api, monkeypatch, occupied):
+    client, session, _, workers = pair_api
+    started = client.post("/api/runs", headers=headers(session), json=body())
+    run_id = started.json()["runId"]
+    journal.Journal(web._session_journal(session, run_id)).finished("failed", "creation failed")
+    web.REGISTRY = RunRegistry()
+    seen = []
+
+    def visible(destination):
+        seen.append(destination.tokens)
+        return [{"displayName": "Sales-copy"}] if occupied else []
+
+    monkeypatch.setattr(web.workspaces, "list_workspaces", visible)
+    review = client.get(f"/api/runs/{run_id}/resume-plan", headers=headers(session))
+    assert review.status_code == 200, review.text
+    assert review.json()["targetWorkspaceId"] == ""
+    assert review.json()["visibleWorkspaceNames"] == (["Sales-copy"] if occupied else [])
+    response = client.post(f"/api/runs/{run_id}/resume", headers=headers(session))
+    if occupied:
+        assert response.status_code == 409
+        assert "Sales-copy" in response.json()["detail"]
+        assert "Inspect the existing workspace in Fabric" in response.json()["detail"]
+        assert "start a new migration with a different destination name" in response.json()["detail"]
+        assert len(workers) == 1
+    else:
+        assert response.status_code == 200, response.text
+        assert len(workers) == 2
+    assert seen == [session.destination_tokens, session.destination_tokens]
+
+
+def test_resume_rechecks_name_after_review(pair_api, monkeypatch):
+    client, session, _, workers = pair_api
+    started = client.post("/api/runs", headers=headers(session), json=body())
+    run_id = started.json()["runId"]
+    journal.Journal(web._session_journal(session, run_id)).finished("failed", "creation failed")
+    web.REGISTRY = RunRegistry()
+    review = client.get(f"/api/runs/{run_id}/resume-plan", headers=headers(session))
+    assert review.json()["visibleWorkspaceNames"] == []
+    monkeypatch.setattr(web.workspaces, "list_workspaces", lambda _target: [{"displayName": "Sales-copy"}])
+    response = client.post(f"/api/runs/{run_id}/resume", headers=headers(session))
+    assert response.status_code == 409
+    assert len(workers) == 1
+
+
 def test_start_passes_the_bound_pair_and_operator_options_to_execution(pair_api, monkeypatch):
     client, session, prepared, workers = pair_api
     mappings = {"11111111-1111-1111-1111-111111111111": "22222222-2222-2222-2222-222222222222"}

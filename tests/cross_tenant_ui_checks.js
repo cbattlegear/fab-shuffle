@@ -137,8 +137,14 @@ const scenarios = {
     f.get("target-name").handlers.input();
     assert.equal(f.get("start-run").disabled, true);
     f.ui.state.resumeRunId = "previous";
+    f.ui.state.preview.targetWorkspaceId = "recorded-target";
     f.ui.setStartEnabled(true);
     assert.equal(f.get("start-run").disabled, false);
+    f.ui.state.preview.targetWorkspaceId = "";
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("start-run").disabled, true);
+    assert.match(f.get("target-name-conflict").textContent, /saved plan cannot be renamed/);
+    assert.match(f.get("target-name-conflict").textContent, /start a new migration/);
   },
   async single_sql_connections(f) {
     f.paired();
@@ -269,6 +275,23 @@ const scenarios = {
     await f.reply(0, { runId: "resumed", resumedFrom: "previous" });
     assert.equal(f.ui.state.runId, "resumed");
     assert.match(f.streams[0].url, /session_id=bound-session/);
+  },
+  async resume_missing_target_conflict(f) {
+    f.paired();
+    f.ui.prepareResume("previous", f.get("retry-run"));
+    await f.reply(0, {
+      plan: { ...f.ui.state.preview, capacityId: "capacity", sourceWorkspaceId: "workspace",
+        connectionMappings: {}, referenceMappings: [] },
+      cleanupWhenDone: true, targetWorkspaceId: "", items: [],
+      visibleWorkspaceNames: ["Source-copy"],
+    });
+    await f.reply(1, { connections: [] });
+    await f.reply(2, { connections: [] });
+    await f.reply(3, { dependencies: [], blockers: [], connectionAccess: null });
+    assert.equal(f.get("start-run").disabled, true);
+    assert.match(f.get("target-name-conflict").textContent, /Inspect the workspace in Fabric/);
+    assert.match(f.get("target-name-conflict").textContent, /start a new migration/);
+    assert.match(f.get("resume-target-id").textContent, /attempt to create/);
   },
   async edit_mappings_before_retry(f) {
     f.paired();

@@ -556,6 +556,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
       ...plan, blockers: [], unsupportedSummary: [], dependencies: [],
       counts: [], migratedTotal: 0, largeSemanticModels: [],
       targetWorkspaceId: saved.targetWorkspaceId,
+      visibleWorkspaceNames: saved.visibleWorkspaceNames || [],
     };
     resetMappings();
     $("#opt-data").checked = plan.includeData;
@@ -577,7 +578,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
     renderReview();
     $("#resume-target-id").textContent = saved.targetWorkspaceId
       ? `Destination workspace ID: ${saved.targetWorkspaceId}`
-      : "No destination workspace was recorded yet. Resuming will create it.";
+      : "No destination workspace was recorded. Resuming will attempt to create it.";
     const items = $("#resume-item-ids");
     items.innerHTML = "";
     for (const item of saved.items) {
@@ -809,18 +810,21 @@ async function settleAssessment(request, version = state.assessmentVersion) {
 
 function setStartEnabled(enabled) {
   const start = $("#start-run");
-  const conflict = !state.resumeRunId && state.preview?.strategy === "rebuild" &&
+  const resumingWithoutTarget = !!state.resumeRunId && !state.preview?.targetWorkspaceId;
+  const conflict = (!state.resumeRunId || resumingWithoutTarget) && state.preview?.strategy === "rebuild" &&
     (state.preview?.visibleWorkspaceNames || []).includes(
       $("#target-name").value.trim() || state.preview.targetWorkspaceName,
     );
   const nameConflict = $("#target-name-conflict");
   nameConflict.hidden = !conflict;
-  nameConflict.textContent = conflict ? "A workspace with this name is already visible. Choose a different name." : "";
+  nameConflict.textContent = !conflict ? "" : resumingWithoutTarget
+    ? "A workspace with this name is already visible. This saved plan cannot be renamed. Inspect the workspace in Fabric, then go back and start a new migration with a different name."
+    : "A workspace with this name is already visible. Choose a different name.";
   const mappingBlocked = state.paired && (!state.mappingsChecked || state.preview?.mappingBlockers?.length);
   start.disabled = !enabled || state.assessmentPending || !!mappingBlocked || !!conflict;
   start.title = !enabled || state.assessmentPending ? "Finish the assessment and resolve its blockers"
     : mappingBlocked ? "Re-check destination mappings and resolve their blockers"
-    : conflict ? "Choose a different destination workspace name" : "";
+    : conflict ? (resumingWithoutTarget ? "Start a new migration with a different name" : "Choose a different destination workspace name") : "";
 }
 
 
@@ -1183,7 +1187,7 @@ function renderReview() {
   }
   if (resuming) {
     rows.push(["Destination workspace", preview.targetWorkspaceName],
-      ["Destination workspace ID", preview.targetWorkspaceId || "Not created yet"]);
+      ["Destination workspace ID", preview.targetWorkspaceId || "Not recorded"]);
   } else if (reassign) {
     rows.push(["Large semantic models", String(preview.largeSemanticModels.length)]);
   } else {

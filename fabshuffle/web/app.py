@@ -181,6 +181,24 @@ def _tenant_plan_inputs(session: Session, target: FabricClient) -> dict[str, Any
     }
 
 
+def _visible_workspace_names(client: FabricClient) -> list[str]:
+    return [
+        workspace["displayName"] for workspace in workspaces.list_workspaces(client)
+        if workspace.get("displayName")
+    ]
+
+
+def _check_workspace_name(client: FabricClient, name: str, *, resuming: bool = False) -> None:
+    if name not in _visible_workspace_names(client):
+        return
+    action = (
+        "This saved plan cannot be renamed. Inspect the existing workspace in Fabric, then "
+        "go back and start a new migration with a different destination name."
+        if resuming else "Choose a different destination workspace name."
+    )
+    raise HTTPException(status_code=409, detail=f"A workspace named '{name}' is already visible. {action}")
+
+
 def _run_conflict(error: RunConflict) -> HTTPException:
     return HTTPException(
         status_code=409, detail={"message": str(error), "runId": error.run_id}
@@ -517,10 +535,7 @@ def create_app() -> FastAPI:
                     result.update(_semantic_model_preview(session, source_workspace_id, plan))
                     return result
 
-                result["visibleWorkspaceNames"] = [
-                    workspace["displayName"] for workspace in workspaces.list_workspaces(target)
-                    if workspace.get("displayName")
-                ]
+                result["visibleWorkspaceNames"] = _visible_workspace_names(target)
                 # Counted from the assessment rather than by listing each type again: it costs
                 # nothing, covers every supported type automatically, and cannot disagree with
                 # what the migration then does.
@@ -601,15 +616,8 @@ def create_app() -> FastAPI:
                 plan = build_plan(
                     client, **body.plan_options(), **_tenant_plan_inputs(session, target),
                 )
-                if plan.strategy is Strategy.REBUILD and any(
-                    workspace.get("displayName") == plan.target_workspace_name
-                    for workspace in workspaces.list_workspaces(target)
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"A workspace named '{plan.target_workspace_name}' is already visible. "
-                        "Choose a different destination workspace name.",
-                    )
+                if plan.strategy is Strategy.REBUILD:
+                    _check_workspace_name(target, plan.target_workspace_name)
                 return plan
 
         plan = await _run_fabric(prepare)
@@ -723,10 +731,19 @@ def create_app() -> FastAPI:
         run_id: str,
         session: Session = Depends(require_execution_session),
     ) -> dict[str, Any]:
-        replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
+        def prepare() -> tuple[journal.Replay, MigrationPlan, list[str]]:
+            replay, plan = _resume_plan(session, run_id)
+            names: list[str] = []
+            if plan.strategy is Strategy.REBUILD and not replay.target_workspace_id:
+                with _planning_clients(session) as (_source, target):
+                    names = _visible_workspace_names(target)
+            return replay, plan, names
+
+        replay, plan, names = await _run_fabric(prepare)
         return {
             "runId": run_id, "plan": _plan_dict(plan), "cleanupWhenDone": replay.cleanup,
             "targetWorkspaceId": replay.target_workspace_id,
+            "visibleWorkspaceNames": names,
             "inventoryComplete": replay.inventory_complete,
             "items": [
                 {"sourceId": source_id, "targetId": item.get("target", ""),
@@ -805,6 +822,11 @@ def create_app() -> FastAPI:
         """Adopt the previous target with explicit mappings and this attempt's activation opt-in."""
         replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
         plan = (body or ResumeRunRequest()).apply(plan)
+        if plan.strategy is Strategy.REBUILD and not replay.target_workspace_id:
+            def check_name() -> None:
+                with _planning_clients(session) as (_source, target):
+                    _check_workspace_name(target, plan.target_workspace_name, resuming=True)
+            await _run_fabric(check_name)
         run = _start_attempt(session, plan, cleanup=replay.cleanup, prior=replay)
         return {"runId": run.id, "plan": _plan_dict(plan), "resumedFrom": run_id}
 

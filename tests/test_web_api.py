@@ -137,6 +137,22 @@ def test_reassign_start_does_not_check_existing_workspace_name(client, session_i
     assert response.status_code == 200, response.text
 
 
+def test_reassign_resume_without_target_does_not_check_name(client, session_id, journal_dir, monkeypatch):
+    run_id = uuid.uuid4().hex
+    book = journal.Journal(SETTINGS.journal_for(run_id))
+    book.run_created(web._plan_record(replace(PLAN, strategy=Strategy.REASSIGN)), cleanup=True)
+    book.finished("failed", "assignment failed")
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: pytest.fail("Reassignment should not check workspace name availability"),
+    )
+    monkeypatch.setattr(web, "run_migration", lambda run, *a, **k: run.mark_finished(RunStatus.SUCCEEDED))
+    review = client.get(f"/api/runs/{run_id}/resume-plan", headers=auth(session_id))
+    assert review.status_code == 200, review.text
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+    assert response.status_code == 200, response.text
+
+
 def test_event_stream_requires_a_session(client: TestClient, session_id: str, monkeypatch):
     monkeypatch.setattr(web, "build_plan", lambda *args, **kwargs: PLAN)
     monkeypatch.setattr(web, "run_migration", lambda run, *a, **k: run.mark_finished(RunStatus.SUCCEEDED))

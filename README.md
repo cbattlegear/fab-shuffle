@@ -560,6 +560,12 @@ resume rather than started twice; if a submission has no confirmed job or instan
 and reconcile it in Fabric before resolving its journal record. Do not delete its scratch
 workspace while completion is unknown.
 
+If a rebuild stopped before recording a destination workspace, review and resume check its
+saved name against visible destination workspaces. If the name is taken, inspect the existing
+workspace in Fabric, then start a new migration with a different name; the saved plan cannot
+be renamed and the existing workspace is not adopted. A name absent from the list can still
+be rejected by Fabric, including after a concurrent create.
+
 The same machinery retries a run that *did* finish but left items behind — a connection that
 was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
 what did not migrate** on the progress screen to review and resume the saved attempt. Missing
