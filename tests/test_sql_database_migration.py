@@ -66,6 +66,12 @@ class FakeClient:
 
 def make_ctx(client, monkeypatch, tables=(("dbo", "Orders"),), copied=None, *, provision=False):
     monkeypatch.setattr(orchestrator.sqlschema, "list_base_tables", lambda *a, **k: list(tables))
+    def suspend(server, database, tokens, table_names, *, record, prior=None):
+        state = prior or {"tables": table_names}
+        if prior is None:
+            record(state)
+        return state
+    monkeypatch.setattr(orchestrator.sqlschema, "suspend_copy_effects", suspend)
     if not provision:
         monkeypatch.setattr(
             orchestrator.sql_connections, "ensure_connection",
@@ -195,7 +201,53 @@ def test_submission_checks_connections_and_empty_target(monkeypatch):
     orchestrator._migrate_sql_databases(ctx)
     spec, preflight = client.bulk_copies[0]
     preflight(spec)
-    assert checked == [(TARGET_SERVER, "RegionBounceTest-2222", ctx.tokens, [("dbo", "Orders")])]
+    assert checked == [(TARGET_SERVER, "RegionBounceTest-2222", ctx.tokens, [("dbo", "Orders")])] * 2
+
+
+def test_sql_job_suspends_before_submit_and_restores_before_checkpoint(monkeypatch, tmp_path):
+    class Client(FakeClient):
+        def get(self, path, params=None):
+            if path == "connections/src-conn":
+                return {"connectionDetails": {
+                    "type": "SQL", "path": f"{SOURCE_SERVER};RegionBounceTest-1111",
+                }}
+            if path == "connections/dst-conn":
+                return {"connectionDetails": {
+                    "type": "SQL", "path": f"{TARGET_SERVER};RegionBounceTest-2222",
+                }}
+            return super().get(path, params=params)
+
+    runner = orchestrator._run_copy_jobs
+    ctx = make_ctx(Client(), monkeypatch, tables=(("SalesLT", "Address"), ("SalesLT", "CustomerAddress")))
+    monkeypatch.setattr(orchestrator, "_run_copy_jobs", runner)
+    ctx.journal = journal.Journal(tmp_path / "run.jsonl")
+    ctx.journal.run_created({"source_workspace_id": SOURCE_WS}, cleanup=False)
+    events = []
+    def suspend(server, database, tokens, tables, *, record, prior=None):
+        record({"tables": tables})
+        events.append("suspended")
+        return {"tables": tables}
+    def submit(*_):
+        assert journal.read(ctx.journal.path).sql_effects[SOURCE_DB]["target"] == TARGET_DB
+        assert events == ["suspended"]
+        events.append("submitted")
+        return orchestrator.copyjobs._CopyJobSubmission("instance", 0)
+    def restore(*_args, **_kwargs):
+        assert not journal.read(ctx.journal.path).data_is_done(SOURCE_DB, "tables")
+        events.append("restored")
+    monkeypatch.setattr(orchestrator.sqlschema, "suspend_copy_effects", suspend)
+    monkeypatch.setattr(orchestrator.sqlschema, "restore_copy_effects", restore)
+    monkeypatch.setattr(orchestrator.sqlschema, "require_empty_tables", lambda *_: None)
+    monkeypatch.setattr(orchestrator.copyjobs, "create_copy_job", lambda *_: {"id": "copy"})
+    monkeypatch.setattr(orchestrator.copyjobs, "_submit_copy_job", submit)
+    monkeypatch.setattr(orchestrator.copyjobs, "_job_status", lambda *_: ("Completed", {}))
+    monkeypatch.setattr(orchestrator.copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(orchestrator.copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    orchestrator._migrate_sql_databases(ctx)
+    replay = journal.read(ctx.journal.path)
+    assert events == ["suspended", "submitted", "restored"]
+    assert replay.sql_effects == {}
+    assert replay.data_is_done(SOURCE_DB, "tables")
 
 
 def test_submission_rejects_mismatched_destination_without_freeze_gate(monkeypatch):
@@ -246,7 +298,7 @@ def test_only_confirmed_matching_failed_job_can_truncate(monkeypatch, recorded_t
             raise orchestrator.sqlschema.NonEmptyTables("not empty")
 
     monkeypatch.setattr(orchestrator.sqlschema, "require_empty_tables", check)
-    monkeypatch.setattr(orchestrator.sqlschema, "truncate_tables", lambda *args: truncated.append(args))
+    monkeypatch.setattr(orchestrator.sqlschema, "clear_failed_sql_copy", lambda *args: truncated.append(args))
     if recorded_target == TARGET_DB:
         preflight(spec)
         assert len(truncated) == 1 and len(checked) == 2
@@ -382,6 +434,8 @@ def test_automatically_provisions_both_connections_and_reuses_them(monkeypatch, 
     preflight(spec)
     assert len(client.created) == 2
     assert "shhh" not in ctx.journal.path.read_text()
+    ctx.journal.sql_effects(SOURCE_DB, TARGET_DB, None)
+    ctx.sql_effects.clear()
     ctx.prior = journal.read(ctx.journal.path)
     assert set(ctx.prior.sql_connections.values()) == set(client.created)
     orchestrator._copy_sql_database_tables(ctx, "sqldatabases", [(SOURCE_ITEM, TARGET_ITEM)])

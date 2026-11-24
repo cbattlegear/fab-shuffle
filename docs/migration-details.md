@@ -45,14 +45,28 @@ job is no longer writing before starting a fresh migration to a new destination.
 
 The Copy Job uses the supplied SQL Server Append shape. Before submission Fab Shuffle checks
 the connection paths and verifies destination tables are empty; enabled row-level security
-prevents that proof. A confirmed failed job may leave partial rows: on retry, Fab Shuffle
-**truncates the destination tables**, in one transaction if they are not already empty,
-before checking again and starting a new job. It only does this for the same verified target
-and transfer definition.
-If truncation fails (for example, because of foreign keys or permissions), resolve the SQL
-error or manually clear the tables before retrying. Truncation resets identity counters and
-deletes mirrored OneLake data for the affected tables. A created but unsubmitted job may be
-submitted once; an unresolved submitted job is polled, never resubmitted. Pause writes to both
+prevents that proof. Before appending, Fab Shuffle records and disables relevant enabled
+destination foreign keys, check constraints and DML triggers. Originally disabled objects
+remain disabled. After the job reaches a confirmed terminal state, it restores the prior
+enabled and trust states; previously trusted constraints are validated against the copied
+data. If restoration fails, resolve the reported SQL error and resume; the run is not
+considered successfully copied until restoration succeeds. While a job's outcome is unknown,
+its recorded objects remain suspended and the job is reconciled before they are restored.
+See Microsoft's guidance on disabling
+[foreign keys](https://learn.microsoft.com/sql/relational-databases/tables/disable-foreign-key-constraints-with-insert-and-update-statements?view=sql-server-ver17),
+[check constraints](https://learn.microsoft.com/sql/relational-databases/tables/disable-check-constraints-with-insert-and-update-statements?view=sql-server-ver17),
+and [triggers](https://learn.microsoft.com/sql/t-sql/statements/disable-trigger-transact-sql?view=sql-server-ver17).
+
+A confirmed failed job may leave partial rows: on retry, Fab Shuffle clears its destination
+tables using transactional `DELETE` while the recorded constraints and triggers are
+suspended. `TRUNCATE` cannot clear tables referenced by foreign keys even if those keys are
+disabled ([SQL Server documentation](https://learn.microsoft.com/sql/t-sql/statements/truncate-table-transact-sql?view=sql-server-ver17)).
+The clear is permitted only for the same verified target and transfer definition,
+and does not reset identity counters. If restoring a failed job's constraints fails because
+its partial data is inconsistent, resuming may clear the partial tables before restoring
+them; another retry can then start the copy. If clearing fails, resolve the reported SQL error
+before resuming. A created but unsubmitted job may be submitted once; an unresolved submitted
+job is polled, never resubmitted. Pause writes to both
 databases until copying and final reconciliation finish; this is not enforced by a database lock.
 Validate row values, identity columns, constraints and application behavior
 before cutover.

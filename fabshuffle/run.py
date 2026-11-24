@@ -401,6 +401,7 @@ class RunRegistry:
                 if (
                     not replay.ignored and replay.restart_state != "complete"
                     and (replay.interrupted or replay.status == RunStatus.CANCELLED.value
+                         or replay.copy_jobs or replay.sql_effects
                          or failed_work or replay.restart_state == "pending")
                     and not self._active(lineage, target, replay.plan, replay.scratch_workspace_id)
                     and "*" not in self._cleaning

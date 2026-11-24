@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pyodbc
 
@@ -184,6 +185,208 @@ def truncate_tables(
         except pyodbc.Error as rollback_error:
             detail += f"; rollback also failed: {rollback_error}"
         raise SchemaTransferError(f"Could not truncate destination tables: {detail}") from error
+    finally:
+        connection.close()
+
+
+def _copy_effect_inventory(cursor: Any, tables: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    wanted = set(tables)
+    effects = []
+    foreign_keys = cursor.execute(
+        "SELECT object_id, parent_object_id, referenced_object_id, "
+        "OBJECT_SCHEMA_NAME(parent_object_id), OBJECT_NAME(parent_object_id), "
+        "name, is_disabled, is_not_trusted, OBJECT_SCHEMA_NAME(referenced_object_id), "
+        "OBJECT_NAME(referenced_object_id) FROM sys.foreign_keys"
+    ).fetchall()
+    for row in foreign_keys:
+        oid, parent_id, referenced_id, schema, table, name, disabled, untrusted, ref_schema, ref_table = row
+        if (schema, table) in wanted or (ref_schema, ref_table) in wanted:
+            effects.append({
+                "kind": "foreign_key", "id": oid, "schema": schema, "table": table,
+                "name": name, "disabled": bool(disabled), "untrusted": bool(untrusted),
+                "referenced_schema": ref_schema, "referenced_table": ref_table,
+                "parent_id": parent_id, "referenced_id": referenced_id,
+            })
+    checks = cursor.execute(
+        "SELECT object_id, parent_object_id, OBJECT_SCHEMA_NAME(parent_object_id), "
+        "OBJECT_NAME(parent_object_id), "
+        "name, is_disabled, is_not_trusted FROM sys.check_constraints"
+    ).fetchall()
+    for oid, parent_id, schema, table, name, disabled, untrusted in checks:
+        if (schema, table) in wanted:
+            effects.append({
+                "kind": "check", "id": oid, "schema": schema, "table": table,
+                "name": name, "disabled": bool(disabled), "untrusted": bool(untrusted),
+                "parent_id": parent_id,
+            })
+    triggers = cursor.execute(
+        "SELECT object_id, parent_id, OBJECT_SCHEMA_NAME(parent_id), OBJECT_NAME(parent_id), "
+        "name, is_disabled "
+        "FROM sys.triggers WHERE parent_class = 1 AND is_ms_shipped = 0"
+    ).fetchall()
+    for oid, parent_id, schema, table, name, disabled in triggers:
+        if (schema, table) in wanted:
+            effects.append({
+                "kind": "trigger", "id": oid, "schema": schema, "table": table,
+                "name": name, "disabled": bool(disabled), "parent_id": parent_id,
+            })
+    return sorted(effects, key=lambda value: (value["kind"], value["id"]))
+
+
+def _verify_copy_effects(
+    cursor: Any, tables: list[tuple[str, str]], effects: list[dict[str, Any]],
+) -> None:
+    current = _copy_effect_inventory(cursor, tables)
+    def identity(entry: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in entry.items() if key not in ("disabled", "untrusted")}
+    if [identity(entry) for entry in current] != [identity(entry) for entry in effects]:
+        raise SchemaTransferError(
+            "Destination constraints or triggers changed since their state was recorded. "
+            "Reconcile the SQL database and its recorded recovery state before resuming."
+        )
+    for original, now in zip(effects, current, strict=True):
+        if original["disabled"] and not now["disabled"]:
+            raise SchemaTransferError(
+                f"Originally disabled {original['kind']} '{original['name']}' was enabled externally. "
+                "Restore its recorded state before resuming."
+            )
+        if original["disabled"] and original.get("untrusted") != now.get("untrusted"):
+            raise SchemaTransferError(
+                f"Originally disabled {original['kind']} '{original['name']}' changed trust state. "
+                "Restore its recorded state before resuming."
+            )
+
+
+def _copy_table_ids(cursor: Any, tables: list[tuple[str, str]]) -> list[int]:
+    result = []
+    for schema, table in tables:
+        oid = cursor.execute("SELECT OBJECT_ID(?, 'U')", _quoted_table(schema, table)).fetchval()
+        if oid is None:
+            raise SchemaTransferError(f"Destination table {_quoted_table(schema, table)} is missing.")
+        result.append(int(oid))
+    return result
+
+
+def _effect_statement(effect: dict[str, Any], *, restore: bool) -> str:
+    table = _quoted_table(effect["schema"], effect["table"])
+    name = "[" + effect["name"].replace("]", "]]") + "]"
+    if effect["kind"] == "trigger":
+        trigger = "[" + effect["schema"].replace("]", "]]") + "]." + name
+        return f"{'ENABLE' if restore else 'DISABLE'} TRIGGER {trigger} ON {table}"
+    if not restore:
+        return f"ALTER TABLE {table} NOCHECK CONSTRAINT {name}"
+    check = "CHECK CONSTRAINT" if effect["untrusted"] else "WITH CHECK CHECK CONSTRAINT"
+    return f"ALTER TABLE {table} {check} {name}"
+
+
+def _copy_effect_error(connection: Any, action: str, error: Exception) -> SchemaTransferError:
+    detail = str(error)
+    try:
+        connection.rollback()
+    except pyodbc.Error as rollback_error:
+        detail += f"; rollback also failed: {rollback_error}"
+    return SchemaTransferError(f"Could not {action}: {detail}")
+
+
+def suspend_copy_effects(
+    server: str, database: str, tokens: TokenProvider, tables: list[tuple[str, str]],
+    *, record: Callable[[dict[str, Any]], None], prior: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Journal destination trigger/constraint state before disabling enabled objects."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        if prior is None:
+            state = {
+                "tables": [list(table) for table in tables], "table_ids": _copy_table_ids(cursor, tables),
+                "effects": _copy_effect_inventory(cursor, tables),
+            }
+            record(state)
+        else:
+            state = prior
+            if state["tables"] != [list(table) for table in tables]:
+                raise SchemaTransferError("The SQL table inventory changed; reconcile the saved copy first.")
+            if state["table_ids"] != _copy_table_ids(cursor, tables):
+                raise SchemaTransferError(
+                    "The destination SQL tables changed; reconcile the saved copy first."
+                )
+            _verify_copy_effects(cursor, tables, state["effects"])
+        for effect in state["effects"]:
+            if not effect["disabled"]:
+                cursor.execute(_effect_statement(effect, restore=False))
+        connection.commit()
+        return state
+    except (pyodbc.Error, SchemaTransferError) as error:
+        raise _copy_effect_error(connection, "suspend SQL constraints or triggers", error) from error
+    finally:
+        connection.close()
+
+
+def restore_copy_effects(
+    server: str, database: str, tokens: TokenProvider, state: dict[str, Any], *,
+    clear_failed: bool = False,
+) -> None:
+    """Restore the saved enabled/trust state; optionally clear a confirmed failed copy first."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        tables = [tuple(table) for table in state["tables"]]
+        if state["table_ids"] != _copy_table_ids(cursor, tables):
+            raise SchemaTransferError("The destination SQL tables changed; reconcile the saved copy first.")
+        _verify_copy_effects(cursor, tables, state["effects"])
+        if clear_failed:
+            current = _copy_effect_inventory(cursor, tables)
+            enabled = any(not original["disabled"] and not now["disabled"]
+                          for original, now in zip(state["effects"], current, strict=True))
+            if enabled:
+                # Restoration may have committed just before the journal write was interrupted.
+                if any(original["disabled"] != now["disabled"]
+                       or original.get("untrusted") != now.get("untrusted")
+                       for original, now in zip(state["effects"], current, strict=True)):
+                    raise SchemaTransferError(
+                        "SQL effects are only partially restored; reconcile them first."
+                    )
+            else:
+                for schema, table in tables:
+                    cursor.execute(f"DELETE FROM {_quoted_table(schema, table)}")
+                _check_tables_empty(cursor, tables)
+        for effect in state["effects"]:
+            if not effect["disabled"]:
+                cursor.execute(_effect_statement(effect, restore=True))
+        connection.commit()
+    except (pyodbc.Error, SchemaTransferError) as error:
+        failure = _copy_effect_error(connection, "restore SQL constraints or triggers", error)
+        raise SchemaTransferError(
+            f"{failure}. Inspect the destination data and recorded constraint state, then resume."
+        ) from error
+    finally:
+        connection.close()
+
+
+def clear_failed_sql_copy(
+    server: str, database: str, tokens: TokenProvider, state: dict[str, Any],
+) -> None:
+    """Clear a confirmed failed copy while its recorded SQL effects remain suspended."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        tables = [tuple(table) for table in state["tables"]]
+        if state["table_ids"] != _copy_table_ids(cursor, tables):
+            raise SchemaTransferError("The destination SQL tables changed; reconcile the saved copy first.")
+        _verify_copy_effects(cursor, tables, state["effects"])
+        current = _copy_effect_inventory(cursor, tables)
+        if any(not original["disabled"] and not now["disabled"]
+               for original, now in zip(state["effects"], current, strict=True)):
+            raise SchemaTransferError("A suspended SQL constraint or trigger is unexpectedly enabled.")
+        for schema, table in tables:
+            cursor.execute(f"DELETE FROM {_quoted_table(schema, table)}")
+        _check_tables_empty(cursor, tables)
+        connection.commit()
+    except (pyodbc.Error, SchemaTransferError) as error:
+        raise _copy_effect_error(connection, "clear destination tables", error) from error
     finally:
         connection.close()
 

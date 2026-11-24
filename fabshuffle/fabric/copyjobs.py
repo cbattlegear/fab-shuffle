@@ -499,6 +499,7 @@ def run_copy_jobs(
     on_state: Callable[[CopyJobRun], None] | None = None,
     before_submit: Callable[[CopyJobSpec], None] | None = None,
     before_create: Callable[[CopyJobSpec], None] | None = None,
+    on_terminal: Callable[[CopyJobRun], None] | None = None,
     resume_jobs: Sequence[CopyJobRun] = (),
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """Run a batch of Copy Jobs together rather than one after another.
@@ -581,6 +582,18 @@ def run_copy_jobs(
     def checkpoint(job: _InFlight) -> None:
         if on_state:
             notify("on_state", on_state, job.snapshot())
+
+    def terminal(job: _InFlight) -> None:
+        if on_terminal:
+            try:
+                on_terminal(job.snapshot())
+            except Exception as error:
+                detail = f" Service reported: {job.last_error}." if job.last_error else ""
+                stop(
+                    f"{job.spec.label} restoration failed: {error}.{detail} "
+                    "Resolve the reported problem, then resume to reconcile this job.",
+                    cause=error,
+                )
 
     def report() -> None:
         if on_progress and total:
@@ -681,6 +694,8 @@ def run_copy_jobs(
                 try:
                     before_submit(job.spec)
                 except Exception as error:
+                    job.last_error = str(error)
+                    terminal(job)
                     stop(
                         f"{job.spec.label} preflight failed: {error}. Resolve the reported "
                         "problem, then resume the existing unsubmitted job",
@@ -697,6 +712,11 @@ def run_copy_jobs(
                 submission = _submit_copy_job(client, job.spec.workspace_id, copy_job_id)
             except (FabricError, CopyJobFailed) as error:
                 if _submission_rejected(error):
+                    job.submission_state = "created"
+                    job.last_status = "NotStarted"
+                    job.last_error = str(error)
+                    checkpoint(job)
+                    terminal(job)
                     in_flight.remove(job)
                     failed_to_start += 1
                     warnings.append(
@@ -758,12 +778,14 @@ def run_copy_jobs(
             job.terminal_observed = True
             if status not in SUCCESS_JOB_STATES:
                 failed += 1
+                job.last_error = _failure_detail(instance).lstrip(": ")
                 warnings.append(
                     f"{job.spec.label} did not copy: the job ended as {status}{_failure_detail(instance)}. "
                     "Correct the reported error and retry this transfer."
                 )
             else:
                 succeeded += 1
+            terminal(job)
             if status in SUCCESS_JOB_STATES and on_done:
                 if job.spec.fingerprint and job.spec.fingerprint != job.fingerprint:
                     stop(

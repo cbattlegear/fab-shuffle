@@ -560,6 +560,12 @@ resume rather than started twice; if a submission has no confirmed job or instan
 and reconcile it in Fabric before resolving its journal record. Do not delete its scratch
 workspace while completion is unknown.
 
+SQL Copy Jobs temporarily disable relevant destination constraints and DML triggers and
+record their original state for restoration after the job finishes. If restoration fails,
+resolve the reported SQL error and resume; an unresolved job is reconciled before its
+constraints or triggers are restored. Confirmed failed copies may be cleared with `DELETE`
+before retrying. Copying is not a point-in-time snapshot if source writes continue.
+
 If a rebuild stopped before recording a destination workspace, review and resume check its
 saved name against visible destination workspaces. If the name is taken, inspect the existing
 workspace in Fabric, then start a new migration with a different name; the saved plan cannot
@@ -590,7 +596,8 @@ Each saved migration offers two confirmed actions in addition to resuming:
 
 Neither action is available while a related migration is running. Full restart is refused
 for reassignment runs (their workspace is the source), mismatched destination confirmations,
-or unresolved Copy Jobs. Reconcile those jobs first; Ignore does not stop them.
+unresolved Copy Jobs, or SQL constraints and triggers awaiting reconciliation. Reconcile
+them first; Ignore does not stop jobs or restore SQL objects.
 If deletion fails midway, the entry remains available to **finish the full restart**, but
 cannot resume the old copy into a partly deleted destination. Only confirmed workspace
 deletions are skipped on the next restart attempt. Service errors are retained in the message.
@@ -602,7 +609,8 @@ Two things follow from this:
 - **Journals live on the volume**, under `local/journal` for single-principal runs or
   `local/journal-paired-v1` for paired runs. They hold workspace and item ids and
   names — the same things the screen shows — and no credentials. The hundred most recent are
-  kept, along with the latest recoverable attempts and unresolved Copy Jobs.
+  kept, along with the latest recoverable attempts, unresolved Copy Jobs, and recorded SQL
+  effects awaiting restoration.
 
 Without a mounted volume the journal goes when the container does, and there is nothing to
 pick up. That is the main reason the `docker run` line above mounts one.

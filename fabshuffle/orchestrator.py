@@ -299,6 +299,7 @@ class _Context:
     adopted_targets: dict[str, str] = field(default_factory=dict)
     refresh_needed: set[str] = field(default_factory=set)
     active_copy_jobs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    sql_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
     target_client: FabricClient | None = None
     target_tokens: TokenProvider | None = None
     target_principal: ServicePrincipal | None = None
@@ -464,6 +465,7 @@ class _Context:
         if self.prior:
             self.refresh_needed.update(self.prior.refresh_needed)
             self.active_copy_jobs.update(self.prior.copy_jobs)
+            self.sql_effects.update(self.prior.sql_effects)
         self.run.lifecycle = Lifecycle(
             attempt_id=self.run.id, source_workspace=self.plan.source_workspace_id,
             record=self.journal.outcome, changed=self.run.readiness_changed,
@@ -587,6 +589,12 @@ def run_migration(
                             "verification", EvidenceState.SUCCEEDED,
                             "Recorded target identity is present in the recovery inventory.",
                         )
+                for source, saved in prior.sql_effects.items():
+                    if not saved.get("target") or starting_map.get(source) != saved["target"]:
+                        raise ResumeRefused(
+                            "SQL constraints or triggers may remain disabled on an earlier target. "
+                            "Restore access to that exact database and reconcile it before resuming."
+                        )
                 for key, record in list(prior.copy_jobs.items()):
                     job = record["job"]
                     checkpoint = (job["item_id"], "tables", "")
@@ -652,6 +660,11 @@ def run_migration(
                 raise ResumeRefused(
                     "Unfinished Copy Jobs were not reconciled by the data phases. Restore their "
                     "source items and retry before cleaning up the scratch workspace."
+                )
+            if context.sql_effects:
+                raise ResumeRefused(
+                    "SQL constraints or triggers have not been restored. "
+                    "Restore the recorded target and resume before cleanup."
                 )
             if cleanup:
                 cleanup_run(context.run, context.destination_client, scratch_dir)
@@ -2445,6 +2458,8 @@ def _run_copy_jobs(
     what: str,
     *,
     before_submit: Callable[[copyjobs.CopyJobSpec], None] | None = None,
+    check_before_create: bool = True,
+    on_terminal: Callable[[copyjobs.CopyJobRun], None] | None = None,
 ) -> list[str]:
     if ctx.plan.paired:
         raise ValueError("Paired migrations use independent data clients, not native cross-tenant Copy Jobs.")
@@ -2547,10 +2562,9 @@ def _run_copy_jobs(
             on_done=done,
             on_state=state,
             resume_jobs=resume_jobs,
-            **(
-                {"before_create": before_submit, "before_submit": before_submit}
-                if before_submit is not None else {}
-            ),
+            **({"before_submit": before_submit} if before_submit is not None else {}),
+            **({"before_create": before_submit} if before_submit is not None and check_before_create else {}),
+            **({"on_terminal": on_terminal} if on_terminal is not None else {}),
         )
     except copyjobs.CopyJobBatchIncomplete as error:
         ctx.run.summary["unresolvedCopyJobs"] = [asdict(job) for job in error.active_jobs]
@@ -2942,10 +2956,10 @@ def _migrate_sql_databases(ctx: _Context) -> None:
         item_id for (item_id, name) in ctx.active_copy_jobs
         if name.startswith("CopyJob_SQLDatabase_")
     }
-    if sql_jobs - {database["id"] for database in source_databases}:
+    if (sql_jobs | set(ctx.sql_effects)) - {database["id"] for database in source_databases}:
         raise ResumeRefused(
-            "An unfinished SQL Copy Job's source database is missing. Restore the source "
-            "or reconcile the existing job in the scratch workspace before resuming."
+            "A SQL Copy Job or suspended SQL constraints have a missing source database. "
+            "Restore the source and reconcile the recorded job and destination before resuming."
         )
     cosmos_migrated, cosmos_warnings = _migrate_cosmos_databases(ctx)
     if not source_databases and not cosmos_migrated and not cosmos_warnings:
@@ -2991,6 +3005,7 @@ def _migrate_sql_databases(ctx: _Context) -> None:
 
         if (
             any(item_id == database["id"] for item_id, _ in ctx.active_copy_jobs)
+            or database["id"] in ctx.sql_effects
             or (not ctx.plan.paired and ctx.already_copied(database["id"], "sql_schema"))
             or (
                 not ctx.plan.paired and ctx.prior is not None
@@ -3043,7 +3058,8 @@ def _migrate_sql_databases(ctx: _Context) -> None:
 
         ready.append((database, target))
 
-    if sql_jobs - {database["id"] for database, _ in ready} or (sql_jobs and not ctx.plan.include_data):
+    if ((sql_jobs | set(ctx.sql_effects)) - {database["id"] for database, _ in ready}
+            or ((sql_jobs or ctx.sql_effects) and not ctx.plan.include_data)):
         raise ResumeRefused(
             "An unfinished SQL Copy Job cannot be reconciled with the current databases. "
             "Restore access or reconcile the job in Fabric before resuming."
@@ -3112,6 +3128,13 @@ def _copy_sql_database_tables(
                 source_server, source_catalog, target_server, target_catalog,
             ))
             continue
+        if source["id"] in ctx.sql_effects and not any(
+            item_id == source["id"] for item_id, _ in ctx.active_copy_jobs
+        ):
+            raise ResumeRefused(
+                f"SQL database '{name}' has recorded suspended constraints or triggers but no "
+                "reconcilable Copy Job. Inspect the target and job in Fabric before restoring them."
+            )
         if ctx.already_copied(source["id"], "tables"):
             continue
         tables = sorted([
@@ -3184,14 +3207,13 @@ def _copy_sql_database_tables(
             "and connection settings. Restore them or reconcile the job in Fabric before resuming."
         )
 
-    def check(spec: copyjobs.CopyJobSpec) -> None:
-        source, target, tables = preflight[spec.item_id]
-        endpoints = spec.content["properties"]
+    def verify_target(item_id: str) -> tuple[dict[str, Any], dict[str, Any], list[data_stores.TableRef]]:
+        source, target, tables = preflight[item_id]
         current_target = sqldatabases.get_sql_database(
             ctx.destination_client, ctx.target_workspace_id, target["id"],
         )
         if (
-            ctx.id_map.get(spec.item_id) != target["id"]
+            ctx.id_map.get(item_id) != target["id"]
             or sqldatabases.server_fqdn(current_target) != sqldatabases.server_fqdn(target)
             or sqldatabases.database_name(current_target) != sqldatabases.database_name(target)
         ):
@@ -3204,6 +3226,21 @@ def _copy_sql_database_tables(
             and sqldatabases.database_name(source) == sqldatabases.database_name(target)
         ):
             raise sqlschema.SchemaTransferError("Source and destination SQL databases must differ.")
+        saved = ctx.sql_effects.get(item_id)
+        if saved and (
+            saved["target"] != target["id"]
+            or saved["state"]["server"] != sqldatabases.server_fqdn(target)
+            or saved["state"]["database"] != sqldatabases.database_name(target)
+        ):
+            raise sqlschema.SchemaTransferError(
+                "The saved SQL constraint state belongs to a different target database. "
+                "Reconcile the recorded target before resuming."
+            )
+        return source, target, tables
+
+    def check(spec: copyjobs.CopyJobSpec) -> None:
+        source, target, tables = verify_target(spec.item_id)
+        endpoints = spec.content["properties"]
         for role, database in (("source", source), ("destination", target)):
             connection_id = endpoints[role]["connectionSettings"]["externalReferences"]["connection"]
             connection = ctx.client.get(f"connections/{connection_id}")
@@ -3217,32 +3254,64 @@ def _copy_sql_database_tables(
                 )
         try:
             retry_key = (spec.item_id, "sql_retry", spec.fingerprint)
-            if (
+            retry = (
                 ctx.prior and retry_key in ctx.prior.data_done
                 and ctx.prior.data_targets.get(retry_key) == target["id"]
-            ):
-                try:
-                    sqlschema.require_empty_tables(
-                        sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
-                        ctx.tokens, [(table.schema or "dbo", table.name) for table in tables],
-                    )
-                except sqlschema.NonEmptyTables:
-                    sqlschema.truncate_tables(
-                        sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
-                        ctx.tokens, [(table.schema or "dbo", table.name) for table in tables],
-                    )
-            sqlschema.require_empty_tables(
-                sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
-                ctx.tokens, [(table.schema or "dbo", table.name) for table in tables],
             )
+            server = sqldatabases.server_fqdn(target)
+            catalog = sqldatabases.database_name(target)
+            table_names = [(table.schema or "dbo", table.name) for table in tables]
+            if not retry:
+                sqlschema.require_empty_tables(server, catalog, ctx.tokens, table_names)
+
+            def record(state: dict[str, Any]) -> None:
+                state.update(server=server, database=catalog)
+                ctx.journal.sql_effects(spec.item_id, target["id"], state)
+                ctx.sql_effects[spec.item_id] = {"target": target["id"], "state": state}
+
+            saved = ctx.sql_effects.get(spec.item_id)
+            state = sqlschema.suspend_copy_effects(
+                server, catalog, ctx.tokens, table_names, record=record,
+                prior=saved["state"] if saved else None,
+            )
+            if retry:
+                try:
+                    sqlschema.require_empty_tables(server, catalog, ctx.tokens, table_names)
+                except sqlschema.NonEmptyTables:
+                    sqlschema.clear_failed_sql_copy(server, catalog, ctx.tokens, state)
+            sqlschema.require_empty_tables(server, catalog, ctx.tokens, table_names)
         except sqlschema.SchemaTransferError as error:
             raise sqlschema.SchemaTransferError(
                 f"{error} Resolve the SQL error or manually clear the destination tables, "
                 "then resume with source and destination writes paused."
             ) from error
 
+    def restore(job: copyjobs.CopyJobRun) -> None:
+        saved = ctx.sql_effects.get(job.item_id)
+        if saved is None:
+            return
+        _source, target, _tables = verify_target(job.item_id)
+        previous = [
+            record["job"] for (item_id, _), record in (ctx.prior.copy_jobs.items() if ctx.prior else ())
+            if item_id == job.item_id
+        ]
+        clear_failed = bool(
+            job.last_status in {"Failed", "Cancelled"} and previous
+            and previous[0].get("instance_id") == job.instance_id
+            and previous[0].get("last_status") == job.last_status
+        )
+        sqlschema.restore_copy_effects(
+            sqldatabases.server_fqdn(target), sqldatabases.database_name(target),
+            ctx.tokens, saved["state"], clear_failed=clear_failed,
+        )
+        ctx.journal.sql_effects(job.item_id, target["id"], None)
+        del ctx.sql_effects[job.item_id]
+
     if specs:
-        warnings.extend(_run_copy_jobs(ctx, step, specs, "SQL database", before_submit=check))
+        warnings.extend(_run_copy_jobs(
+            ctx, step, specs, "SQL database", before_submit=check,
+            check_before_create=False, on_terminal=restore,
+        ))
     return warnings
 
 
