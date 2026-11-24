@@ -296,7 +296,7 @@ unresolved dependencies; the review screen and per-item results report those sep
 | Notebook | Definition and rebinding | Definition and rebinding | Default lakehouse and environment attachment remapped |
 | Environment | Libraries and Spark settings | Libraries and Spark settings | Publish before running dependent jobs |
 | Dataflow Gen2 (CI/CD) | Definition and rebinding | Definition and rebinding | Gen1 and classic Gen2 are not supported |
-| Data pipeline / Copy Job | Definition and rebinding | Definition and rebinding | Referenced source-bound connections need explicit replacement mappings |
+| Data pipeline / Copy Job | Definition and rebinding | Definition and rebinding | Referenced connections must be verified or safely rebound |
 | Apache Airflow job | Configuration and DAG files | Configuration and DAG files with reference checks | Inspect scheduler pause settings and runtime dependencies before enabling |
 | OneLake / KQL table shortcuts | Create missing; reuse identical | Create missing; reuse identical after destination checks | No overwrite of conflicting targets |
 | Workspace folders | Recreated hierarchy and placement | Recreated hierarchy and placement | Item identities are remapped |
@@ -419,16 +419,18 @@ phase sequence and the single-principal versus paired differences.
 
 ### Connections
 
-For migrated item definitions, Fab Shuffle does not create, adopt by name, or delete connections,
-in any mode. A connection id is tenant scoped: it can be reused within that tenant when its
-target and access are still appropriate, but it does not resolve in another tenant.
-Existing connection credentials are not exported. Automatic connection recreation was
-deliberately removed; see the [reference-safety rationale](docs/migration-details.md#reference-and-connection-safety).
+Fab Shuffle traces connections referenced by migrated items to their endpoints. An accessible
+same-tenant connection to an external store is reused unchanged. For a shareable SQL Server
+connection using service-principal authentication that points to a migrated Fabric SQL
+database, it can create a migration-owned replacement to the verified destination using the
+signed-in service principal. It does not change or delete the original connection.
 
-Supply replacement connection IDs through `connection_mappings`, keyed by source connection
-ID. They are read back with destination credentials and validated once the relevant stores
-exist. Changed or removed mappings invalidate the old binding instead of silently preserving
-it. Without supplied mappings there is no connection-replacement phase.
+Fabric does not disclose the original connection's credential identity or secret; the
+replacement uses the signed-in principal and may therefore have different permissions.
+Verify that identity and the dependent items before cutover. Fab Shuffle attempts to copy
+connection access assignments and reports any it cannot verify or grant. Other authentication
+types, connection settings, inaccessible metadata and cross-tenant references are not
+silently replaced. Existing `connection_mappings` for unrelated connectors remain supported.
 
 Migration dependency checks apply only to connections that a *migrated* item or shortcut
 actually references: a data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported
@@ -437,13 +439,12 @@ connection lives on the shortcut target, not in the item's own definition). Sepa
 cutover advisories report visible connections pointing into the source workspace, including
 ones no migrated item uses. That read-only inventory does not recreate connections or block
 the creation of unrelated items.
+Discovery covers structured connection IDs in readable JSON definition parts and supported
+shortcuts; it cannot prove that dynamically constructed or opaque references were found.
+Inspect those consumers before retiring the source workspace.
 
-A dependent item whose referenced connection still points into the source workspace, with no
-supplied `connection_mappings` entry for it, is refused rather than created against a
-connection that stops resolving once the source workspace is gone. The warning names the
-connection and the item and asks for a destination replacement to be created and mapped by
-hand in `connection_mappings`; it does not create one and does not promise that doing so will
-fix the underlying data source.
+A dependent item whose referenced connection cannot be verified or rebound is refused rather
+than created against a connection that stops resolving once the source workspace is gone.
 
 In single-principal mode, referenced connections that target something outside the moving
 workspace can be reused without recreation. Paired mode still needs explicit destination

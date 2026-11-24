@@ -93,7 +93,7 @@ pin the sequence. Later phases may only rely on mappings established earlier.
 | `lakehouses` | Create lakehouses before stores and definitions that reference their data or SQL endpoints. Move eligible tables and files. |
 | `warehouses` | Transfer schema before rows so later consumers have destinations to bind. |
 | `sqldatabases` | Recreate Fabric SQL databases and Cosmos DB databases, then copy eligible data using the mode-specific paths above. |
-| `connections` | Validate only explicit operator mappings against the destination. With no mappings, there is no validation work. No connection is automatically created or adopted by name. |
+| `connections` | Trace referenced endpoints; reconcile eligible SQL Database service-principal connections and validate existing explicit mappings before creating consumers. |
 | `mirrored` | Recreate mirrored stores and map returned SQL endpoint identities. Database mirrors arrive stopped; an explicit start option runs here before shortcuts. Databricks catalog sync remains disabled. |
 | `shortcuts` | Reconcile lakehouse and KQL shortcuts after their target stores exist. Refresh lakehouse SQL endpoint metadata, then transfer endpoint schema. |
 | `realtime` | Recreate KQL querysets/dashboards and eligible eventstreams. Paired eventstreams are withheld because inactive creation is not established for every node. |
@@ -120,15 +120,21 @@ and destination workspace/item IDs; its metadata is read with the corresponding 
 Connection detection and connection cutover advisories serve different purposes:
 
 - Dependency checks inspect connections actually referenced by selected items or shortcuts.
-  Explicit mappings are validated after the relevant stores exist.
+  SQL Server paths are matched by the complete server/database pair. Eligible same-tenant
+  service-principal connections to a migrated Fabric SQL database receive a recorded,
+  destination-bound replacement using the signed-in service principal. Fabric does not
+  return the original credential identity or secret; the replacement's identity may differ.
+  Access assignments are reconciled where readable and grantable. Other source-bound or
+  unverified connections remain blocked until resolved; explicit mappings are validated
+  after the relevant stores exist. Discovery covers structured IDs in readable JSON parts
+  and supported shortcuts, not dynamically constructed or opaque references.
 - Cutover advisories inventory all connections visible to the source credential. SQL paths
   require a server/database pair, not a database GUID or name in isolation. Other paths use
   recognised literal source references. This does not prove which consumers still use a
   connection.
 
-Neither path creates, adopts by name, deletes, or copies credentials/sharing for a connection.
-An earlier automatic-recreation path was deliberately removed: matching a friendly name is
-not proof of identity, and existing connection secrets cannot be faithfully exported.
+The advisory scan never mutates connections. Migration never adopts a connection by name
+without a durable creation intent, deletes the original, or copies an existing secret.
 Old identifier-only advisory snapshots are withheld as stale rather than silently treated
 as new exact-pair results.
 

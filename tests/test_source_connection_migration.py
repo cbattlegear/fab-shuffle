@@ -144,6 +144,14 @@ def test_a_source_bound_connection_is_never_created_or_adopted_without_a_mapping
     assert CONNECTION not in journal.read(SETTINGS.journal_for(run.id)).id_map
 
 
+def test_unreadable_connection_blocks_consumers_and_reports_service_error(fabric):
+    fabric.tenant_connections = [entry for entry in fabric.tenant_connections if entry["id"] != CONNECTION]
+    fabric.unreadable.add(CONNECTION)
+    run = rebuild(fabric)
+    assert not any(kind in {"DataPipeline", "Eventstream"} for kind, _, _ in fabric.created)
+    assert any("Denied" in warning and "share replacement" in warning for warning in run.summary["warnings"])
+
+
 def test_a_plausible_destination_connection_is_never_adopted_without_an_explicit_mapping(fabric):
     """A destination connection that happens to share the migrated target's path must not be
     treated as a replacement just because it looks like one; only a supplied mapping does."""

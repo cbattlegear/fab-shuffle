@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -10,6 +11,12 @@ from uuid import UUID
 
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
+
+
+def migration_connection_name(lineage: str, source_id: str, target_id: str, role: str) -> str:
+    scope = "|".join((lineage, source_id, target_id, role))
+    digest = hashlib.sha256(scope.encode()).hexdigest()[:32]
+    return f"FabShuffle-SQL-{role}-{digest}"
 
 
 def matches_endpoint(connection: Mapping[str, Any], server: str, database: str) -> bool:

@@ -1,10 +1,7 @@
 """Connection references inside item definitions.
 
-Connections are tenant scoped, so the same connection id resolves from the migrated
-workspace; the API never returns an existing connection's credentials, so a faithful copy is
-never possible. For migrated definitions, Fab Shuffle only rewrites explicit
-``connection_mappings`` entries and reports unresolved references. Migration-owned
-SQL Copy Job connections are provisioned separately.
+Connections are tenant scoped. Referenced connections must be checked against their actual
+endpoint before they can be reused or rebound; their credentials are not returned by the API.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError
 from fabshuffle.fabric.definitions import GUID_PATTERN, decode_payload, is_text_part
 
 logger = logging.getLogger(__name__)
@@ -278,6 +275,54 @@ def copy_role_assignments(
     return copied, warnings
 
 
+def reconcile_role_assignments(
+    client: FabricClient, source_id: str, target_id: str, *, client_id: str,
+) -> list[str]:
+    """Grant missing original roles without repeating a successful or uncertain grant."""
+    try:
+        source = client.list_all(f"connections/{source_id}/roleAssignments")
+        target = client.list_all(f"connections/{target_id}/roleAssignments")
+    except FabricError as error:
+        return [
+            f"Connection access could not be verified: {error}. Review and share replacement "
+            f"connection {target_id} with the original users, then retry."
+        ]
+    existing = {
+        (str((entry.get("principal") or {}).get("id") or "").casefold(),
+         str((entry.get("principal") or {}).get("type") or "").casefold()): entry.get("role")
+        for entry in target
+    }
+    warnings = []
+    for entry in source:
+        principal = entry.get("principal") or {}
+        principal_id, principal_type, role = principal.get("id"), principal.get("type"), entry.get("role")
+        if (principal.get("servicePrincipalDetails") or {}).get("aadAppId") == client_id:
+            continue
+        if not principal_id or not principal_type or role not in ("User", "UserWithReshare", "Owner"):
+            warnings.append(
+                f"Connection {source_id} has an assignment that cannot be reproduced. "
+                f"Review access on replacement {target_id}."
+            )
+            continue
+        key = (str(principal_id).casefold(), str(principal_type).casefold())
+        if key in existing:
+            if existing[key] != role:
+                warnings.append(
+                    f"Principal {principal_id} has role {existing[key]} rather than {role} on "
+                    f"connection {target_id}. Review its access in Fabric."
+                )
+            continue
+        try:
+            add_role_assignment(client, target_id, principal, role)
+            existing[key] = role
+        except FabricError as error:
+            warnings.append(
+                f"Could not share connection {target_id} with {principal_id}: {error}. "
+                "Review its access in Fabric, then retry."
+            )
+    return warnings
+
+
 def display_name(connection: Mapping[str, Any]) -> str:
     """A connection's name for messages, falling back to its id when unnamed.
 
@@ -353,6 +398,24 @@ def item_sql_targets(item: Mapping[str, Any]) -> set[SqlTarget]:
     if item.get("type") == "SQLDatabase":
         pairs.append((properties.get("serverFqdn") or "", properties.get("databaseName") or ""))
     return {target for server, database in pairs if (target := sql_target(server, database)) is not None}
+
+
+def source_sql_owners(
+    connection: Mapping[str, Any], source_items: Mapping[str, Mapping[str, Any]],
+) -> set[str] | None:
+    """Return exact source SQL endpoint owners, or None when the connection path is incomplete."""
+    details = connection.get("connectionDetails") or {}
+    if str(details.get("type") or "").casefold() != "sql":
+        return None
+    target = sql_path_target(str(details.get("path") or ""))
+    if target is None:
+        return None
+    return {
+        str(item.get("id") or item_id)
+        for item_id, item in source_items.items()
+        if item.get("type") in ("Lakehouse", "Warehouse", "SQLDatabase", "MirroredDatabase")
+        and target in item_sql_targets(item)
+    }
 
 
 def mapped_sql_target(source: SqlTarget, mappings: Mapping[str, str]) -> SqlTarget | None:
