@@ -1705,7 +1705,6 @@ def _load_source_references(ctx: _Context) -> None:
         item for item in ctx.source_items.values()
         if item.get("type") in ("Lakehouse", "Warehouse", "SQLDatabase", "MirroredDatabase")
     ]
-    incomplete_sql_inventory = any(not connections.item_sql_targets(item) for item in sql_items)
     for source_connection_id in sorted(referenced_connections):
         connection = source_connections.get(source_connection_id)
         if connection is None:
@@ -1723,13 +1722,10 @@ def _load_source_references(ctx: _Context) -> None:
         connection_type = str(details.get("type") or "")
         owners = connections.source_sql_owners(connection, ctx.source_items)
         if owners is not None:
-            ctx.connection_sql_owners[source_connection_id] = (
-                owners if not incomplete_sql_inventory else set()
-            )
+            ctx.connection_sql_owners[source_connection_id] = owners
             sql_path = connections.sql_path_target(path)
             ambiguous_item_id = bool(sql_path) and any(
-                (sql_path.database.casefold() == str(item.get("id") or "").casefold()
-                 and any(target.server == sql_path.server for target in connections.item_sql_targets(item)))
+                sql_path.database.casefold() == str(item.get("id") or "").casefold()
                 or any(
                     target.server == sql_path.server
                     and target.database.casefold() == sql_path.database.casefold()
@@ -1737,7 +1733,7 @@ def _load_source_references(ctx: _Context) -> None:
                 )
                 for item in sql_items
             )
-            source_bound = bool(owners) or incomplete_sql_inventory or ambiguous_item_id
+            source_bound = bool(owners) or ambiguous_item_id
         elif connection_type.casefold() == "sql" or not connection_type or not path:
             source_bound = True
         else:
@@ -1752,8 +1748,13 @@ def _load_source_references(ctx: _Context) -> None:
             ctx.source_items[source_connection_id] = {
                 **connection, "id": source_connection_id, "type": "Connection",
             }
-        elif source_connection_id in ctx.id_map:
-            ctx.invalidate_mapping(source_connection_id)
+        else:
+            if source_connection_id in ctx.id_map:
+                ctx.invalidate_mapping(source_connection_id)
+            if ctx.source_items.get(source_connection_id, {}).get("type") in (
+                "Connection", "ExternalReference",
+            ):
+                ctx.source_items.pop(source_connection_id)
 
 
 def _create_workspaces(ctx: _Context) -> None:

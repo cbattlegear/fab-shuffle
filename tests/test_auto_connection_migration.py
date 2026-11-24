@@ -112,6 +112,40 @@ def test_dependency_scan_does_not_continue_after_definition_read_fails(tmp_path,
         orchestrator._load_source_references(ctx)
 
 
+@pytest.mark.parametrize("prior_reference_type", ["Connection", "ExternalReference"])
+@pytest.mark.parametrize("external_path", [
+    "battlecabbagevideo.database.windows.net;BattleCabbageReplTest",
+    "source.example.com;Orders-456",
+])
+def test_missing_mirror_metadata_does_not_veto_external_or_exact_sql_connections(
+    tmp_path, monkeypatch, prior_reference_type, external_path,
+):
+    ctx = context(tmp_path)
+    external_id = "55555555-5555-5555-5555-555555555555"
+    external = connection(external_path, id=external_id, displayName="fab-sql-dest")
+    ctx.client.list_all = lambda path: [connection(), external] if path == "connections" else []
+    mirror = {"id": "mirror", "type": "MirroredDatabase", "displayName": "BattleCabbageReplTest"}
+    ctx.source_items.update({mirror["id"]: mirror, external_id: {**external, "type": prior_reference_type}})
+    ctx.id_map[external_id] = TARGET_CONNECTION
+    ctx.assessment = SimpleNamespace(migrated=[{"id": "copy", "type": "CopyJob"}, mirror])
+    monkeypatch.setattr(orchestrator.sqldatabases, "list_sql_databases", lambda *_: [SOURCE])
+    monkeypatch.setattr(orchestrator.data_stores, "list_mirrored_databases", lambda *_: [mirror])
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", lambda _c, _w, item: {
+        "parts": [part("content.json", {
+            "connectionId": SOURCE_CONNECTION if item == "copy" else external_id,
+        })],
+    })
+    orchestrator._load_source_references(ctx)
+    assert external_id not in ctx.source_items and external_id not in ctx.id_map
+    assert ctx.connection_sql_owners[SOURCE_CONNECTION] == {SOURCE_DB}
+    monkeypatch.setattr(sql_connections, "ensure_connection", lambda *a, **k: TARGET_CONNECTION)
+    monkeypatch.setattr(connections, "reconcile_role_assignments", lambda *a, **k: [])
+    monkeypatch.setattr(orchestrator.sqldatabases, "get_sql_database", lambda *_: TARGET)
+    orchestrator._validate_connection_mappings(ctx)
+    assert ctx.id_map[SOURCE_CONNECTION] == TARGET_CONNECTION
+    assert external_id not in ctx.id_map
+
+
 def test_owned_sql_connection_reused_for_multiple_consumers_and_resume(tmp_path, monkeypatch):
     ctx = context(tmp_path)
     source_name, target_name = names()

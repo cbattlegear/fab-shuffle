@@ -128,6 +128,8 @@ Connection detection and connection cutover advisories serve different purposes:
   unverified connections remain blocked until resolved; explicit mappings are validated
   after the relevant stores exist. Discovery covers structured IDs in readable JSON parts
   and supported shortcuts, not dynamically constructed or opaque references.
+  Missing endpoint metadata on another store does not veto a verified external connection
+  or an exact SQL endpoint match. Connection names are never used to infer its destination.
 - Cutover advisories inventory all connections visible to the source credential. SQL paths
   require a server/database pair, not a database GUID or name in isolation. Other paths use
   recognised literal source references. This does not prove which consumers still use a
@@ -161,6 +163,20 @@ overshoot between checks. Script reading, SQLCMD expansion, reference rewriting 
 materialization have separate memory checks. Neither budget is an OS-level aggregate quota.
 Files are streamed and SQL Copy Jobs do not stage their rows locally; see
 [storage sizing](../README.md#choosing-the-azure-files-size).
+
+Schema connection setup is retried before DDL. A disconnect during a prefix consisting only
+of known session SET options and literal PRINT statements can reconnect and replay that
+prefix. Once any other SQL has been submitted, a communication failure stops the script:
+later batches are not sent over the broken connection and uncertain batches are not replayed.
+Inspect the destination and regenerate a target-aware deployment before retrying DDL.
+
+Eventstream creation retries the reported `ArtifactOperationConflict` only after its LRO
+has ended as Failed, a bounded wait, and a paginated destination check finds no matching
+Eventstream. An existing or partially created item is never adopted or overwritten by name.
+Timeouts, transport losses and other failures are not replayed. The service's conflict code
+and message remain visible when retries are exhausted. Its internal conflicting operation
+cannot be identified from that error alone. LRO polling honors `Retry-After` and waits for
+terminal operation state, including HTTP 200 responses whose status is still Running.
 
 ## Item-specific history and constraints
 

@@ -946,6 +946,17 @@ def _already_exists(error: pyodbc.Error) -> bool:
     return "already exists" in text or "there is already an object named" in text
 
 
+def _session_only_batch(batch: str) -> bool:
+    """Only known SET options and literal PRINT statements are safe to replay on reconnect."""
+    _, code = _sql_guard_text(batch)
+    options = (
+        "ANSI_NULLS|ANSI_PADDING|ANSI_WARNINGS|ARITHABORT|CONCAT_NULL_YIELDS_NULL|"
+        "QUOTED_IDENTIFIER|NUMERIC_ROUNDABORT"
+    )
+    statement = rf"(?:SET\s+(?:{options})(?:\s*,\s*(?:{options}))*\s+(?:ON|OFF)|PRINT\s+N?\?)"
+    return re.fullmatch(rf"\s*(?:{statement}\s*;\s*)+|{statement}\s*", code, re.IGNORECASE) is not None
+
+
 @contextmanager
 def _schema_cursor(
     server: str,
@@ -995,7 +1006,7 @@ def apply_script(
     cancel_requested: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Execute a deployment script batch by batch, collecting per-batch failures."""
+    """Retry session setup, but never replay uncertain schema execution after a disconnect."""
     memory_budget = resolve_memory_budget(
         max_staging_bytes=max_staging_bytes,
         max_memory_bytes=max_memory_bytes,
@@ -1015,23 +1026,44 @@ def apply_script(
         return []
 
     warnings: list[str] = []
-    with _schema_cursor(
-        server, database, tokens, cancel_requested=cancel_requested, on_progress=on_progress,
-    ) as cursor:
-        for index, batch in enumerate(batches, start=1):
-            check_cancelled(cancel_requested)
-            try:
-                cursor.execute(batch)
-            except pyodbc.Error as error:
-                if _already_exists(error):
-                    # A schema-enabled lakehouse derives its schemas from OneLake, so the
-                    # deploy script recreating them is expected and not worth reporting.
-                    logger.debug("Skipping batch %s, the object already exists", index)
-                    continue
-                summary = " ".join(batch.split())[:120]
-                warnings.append(f"Batch {index} failed ({error}): {summary}")
-            if on_progress and index % 25 == 0:
-                on_progress(f"Applied {index}/{len(batches)} schema batches to {database}")
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        session_only = True
+        reconnect = False
+        with _schema_cursor(
+            server, database, tokens, cancel_requested=cancel_requested, on_progress=on_progress,
+        ) as cursor:
+            for index, batch in enumerate(batches, start=1):
+                check_cancelled(cancel_requested)
+                session_only = session_only and _session_only_batch(batch)
+                try:
+                    cursor.execute(batch)
+                except pyodbc.Error as error:
+                    if is_transient(error):
+                        if session_only and attempt < CONNECT_ATTEMPTS:
+                            logger.warning(
+                                "SQL schema session setup for %s/%s failed: %s; reconnecting (%s/%s)",
+                                server, database, error, attempt, CONNECT_ATTEMPTS,
+                            )
+                            reconnect = True
+                            break
+                        summary = " ".join(batch.split())[:120]
+                        warnings.append(
+                            f"Batch {index} failed ({error}): {summary}. Stopped before later batches; "
+                            "execution outcome is unknown and the batch was not replayed. Inspect the "
+                            "destination schema and regenerate a target-aware deployment before retrying."
+                        )
+                        return warnings
+                    if _already_exists(error):
+                        logger.debug("Skipping batch %s, the object already exists", index)
+                        continue
+                    summary = " ".join(batch.split())[:120]
+                    warnings.append(f"Batch {index} failed ({error}): {summary}")
+                if on_progress and index % 25 == 0:
+                    on_progress(f"Applied {index}/{len(batches)} schema batches to {database}")
+        if not reconnect:
+            break
+        check_cancelled(cancel_requested)
+        time.sleep(CONNECT_WAIT_SECONDS)
     return warnings
 
 

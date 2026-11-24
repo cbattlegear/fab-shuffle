@@ -357,11 +357,13 @@ class FabricClient:
 
     def wait_for_operation(self, operation_id: str, *, poll_seconds: float | None = None) -> dict[str, Any]:
         """Poll ``/operations/{id}`` until it succeeds, then return its result body."""
-        delay = poll_seconds or SETTINGS.lro_poll_seconds
+        delay = SETTINGS.lro_poll_seconds if poll_seconds is None else poll_seconds
         deadline = time.monotonic() + SETTINGS.lro_timeout_seconds
 
         while True:
-            state = self.get(f"operations/{operation_id}")
+            time.sleep(delay)
+            response = self.request("GET", f"operations/{operation_id}")
+            state = self._json(response)
             status = state.get("status", "Running")
 
             if status == "Succeeded":
@@ -380,17 +382,32 @@ class FabricClient:
                     f"Operation {operation_id} did not complete within "
                     f"{SETTINGS.lro_timeout_seconds}s (last status {status})"
                 )
-            time.sleep(delay)
+            delay = _retry_after_seconds(response, delay)
 
     def _poll_location(self, location: str, *, poll_seconds: float) -> dict[str, Any]:
         deadline = time.monotonic() + SETTINGS.lro_timeout_seconds
+        delay = poll_seconds
         while True:
+            time.sleep(delay)
             response = self.request("GET", location, expected=(200, 201, 202))
-            if response.status_code != 202:
-                return self._json(response)
+            payload = self._json(response)
+            status = payload.get("status")
+            if status in _TERMINAL_OPERATION_STATES:
+                if status != "Succeeded":
+                    raise OperationFailed(location, status, payload.get("error"))
+                result = response.headers.get("Location") or f"{location.rstrip('/')}/result"
+                try:
+                    return self.get(result)
+                except FabricApiError as error:
+                    if error.status_code in (400, 404):
+                        return payload
+                    raise
+            if response.status_code != 202 and status not in ("Running", "NotStarted"):
+                return payload
             if time.monotonic() > deadline:
                 raise OperationTimeout(f"Operation at {location} did not complete in time")
-            time.sleep(_retry_after_seconds(response, poll_seconds))
+            location = response.headers.get("Location") or location
+            delay = _retry_after_seconds(response, poll_seconds)
 
 
 __all__ = [

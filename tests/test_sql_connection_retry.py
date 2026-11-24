@@ -253,7 +253,88 @@ def test_schema_batch_failure_never_reconnects_or_replays(monkeypatch, tmp_path)
 
     monkeypatch.setattr(sqlschema, "connect", connect)
     script = tmp_path / "Deploy.sql"
-    script.write_text("CREATE TABLE [dbo].[T] ([Id] INT);\n", encoding="utf-8")
+    script.write_text(
+        "/* deployment */\nGO\nCREATE TABLE [dbo].[T] ([Id] INT);\nGO\nPRINT N'Creating view';\nGO\n"
+        "CREATE VIEW [dbo].[V] AS SELECT * FROM [dbo].[T];\n", encoding="utf-8",
+    )
     warnings = sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens())
     assert len(opened) == len(executed) == len(warnings) == 1
     assert "08S01" in warnings[0]
+    assert "not replayed" in warnings[0]
+
+
+def test_schema_session_batches_reconnect_before_any_ddl(monkeypatch, tmp_path):
+    opened = []
+    executed = []
+    class Connection:
+        autocommit = False
+
+        def cursor(self):
+            return self
+
+        def execute(self, batch):
+            executed.append(batch)
+            if len(opened) == 1:
+                raise LINK_FAILURE
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+    def connect(*_args, **_kwargs):
+        opened.append(True)
+        return Connection()
+    monkeypatch.setattr(sqlschema, "connect", connect)
+    script = tmp_path / "Deploy.sql"
+    script.write_text(
+        "/* deployment */\nGO\nSET ANSI_NULLS, QUOTED_IDENTIFIER ON;\nGO\nPRINT N'Creating view';\nGO\n"
+        "CREATE VIEW [dbo].[V] AS SELECT 1 AS Id;\n", encoding="utf-8",
+    )
+    assert sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens()) == []
+    assert len(opened) == 2
+    assert sum("CREATE VIEW" in batch for batch in executed) == 1
+
+
+def test_print_failure_after_ddl_never_restarts_the_script(monkeypatch, tmp_path):
+    executed = []
+    class Connection:
+        autocommit = False
+
+        def cursor(self):
+            return self
+
+        def execute(self, batch):
+            executed.append(batch)
+            if batch.startswith("PRINT"):
+                raise LINK_FAILURE
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+    opened = []
+    def connect(*_args, **_kwargs):
+        opened.append(True)
+        return Connection()
+    monkeypatch.setattr(sqlschema, "connect", connect)
+    script = tmp_path / "Deploy.sql"
+    script.write_text(
+        "/* deployment */\nGO\nCREATE VIEW [dbo].[V] AS SELECT 1 AS Id;\nGO\n"
+        "PRINT N'Update complete';\nGO\nCREATE VIEW [dbo].[Another] AS SELECT 2 AS Id;\n", encoding="utf-8",
+    )
+    warnings = sqlschema.apply_script(script, server="srv", database="db", tokens=Tokens())
+    assert len(opened) == 1 and len(executed) == 2
+    assert "Stopped before later batches" in warnings[0]
+
+
+@pytest.mark.parametrize("batch", [
+    "IF 1 = 1 PRINT N'test';",
+    "SET ANSI_NULLS ON; CREATE TABLE [dbo].[T] (Id INT);",
+    "SET @value = 1;",
+    "PRINT N'test'; EXEC dbo.Mutate;",
+])
+def test_unknown_or_mutating_batches_are_not_session_replayable(batch):
+    assert not sqlschema._session_only_batch(batch)

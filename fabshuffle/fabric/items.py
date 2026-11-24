@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Mapping
 from typing import Any
 
-from fabshuffle.fabric.client import FabricApiError, FabricClient
+from fabshuffle.config import SETTINGS
+from fabshuffle.fabric.client import FabricApiError, FabricClient, FabricError, OperationFailed
 from fabshuffle.fabric.definitions import definition as build_definition
+
+logger = logging.getLogger(__name__)
 
 # Items Fabric provisions for its own use. Recreating them either fails outright or
 # corrupts the target workspace, so they are skipped during migration. Matched case
@@ -95,7 +100,41 @@ def create_item(
     if parts:
         body["definition"] = build_definition(parts, definition_format)
 
-    return client.post(f"workspaces/{workspace_id}/items", json=body)
+    attempts = max(1, SETTINGS.max_retries) if item_type == "Eventstream" else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.post(f"workspaces/{workspace_id}/items", json=body)
+        except OperationFailed as error:
+            if (
+                error.status != "Failed" or error.error_code != "ArtifactOperationConflict"
+                or attempt == attempts
+            ):
+                raise
+            delay = min(60.0, max(float(SETTINGS.lro_poll_seconds), 2.0 ** attempt))
+            logger.warning(
+                "%s; waiting %.1fs before checking the destination and retrying (%s/%s)",
+                error, delay, attempt, attempts,
+            )
+            time.sleep(delay)
+            # A failed LRO is terminal, but may have left an item. Never adopt it by name,
+            # or retry an uncertain/ongoing create. List all pages before resubmitting.
+            try:
+                existing = list_items(client, workspace_id, item_type)
+            except FabricError as read_error:
+                raise FabricError(
+                    f"{error}. Could not check for a partial destination item: {read_error}. "
+                    "Inspect the destination before retrying."
+                ) from error
+            if any(
+                str(item.get("displayName") or "").casefold() == display_name.casefold()
+                for item in existing
+            ):
+                raise FabricError(
+                    f"{error}. The destination already contains an Eventstream named '{display_name}'; "
+                    "it was not adopted or overwritten, and no further create was submitted. "
+                    "Inspect that item before resuming."
+                ) from error
+    raise AssertionError("Creation retry budget exhausted without returning or raising")  # pragma: no cover
 
 
 def update_item_definition(
