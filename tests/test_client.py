@@ -144,6 +144,27 @@ def test_location_only_lro_preserves_failed_operation_details(monkeypatch):
     assert "Wait for the previous operation" in str(caught.value)
 
 
+@pytest.mark.parametrize("status", ["FutureState", None])
+def test_location_only_lro_never_accepts_unknown_status_as_completion(monkeypatch, status):
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "https://api.fabric.microsoft.com/v1/operations/op"})
+        return httpx.Response(200, json={"status": status})
+    with make_client(handler) as client, pytest.raises(FabricError, match="unrecognized status"):
+        client.post("workspaces/w/items")
+
+
+def test_location_only_lro_accepts_direct_result_without_status(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "https://api.fabric.microsoft.com/v1/operations/op"})
+        return httpx.Response(200, json={"id": "new-item"})
+    with make_client(handler) as client:
+        assert client.post("workspaces/w/items") == {"id": "new-item"}
+
+
 @pytest.mark.parametrize("path", ["workspaces/w/items", "workspaces/w/items/e/updateDefinition"])
 def test_mutating_operation_conflict_is_not_replayed(path, monkeypatch):
     calls = []

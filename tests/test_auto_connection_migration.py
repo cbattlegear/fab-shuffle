@@ -146,6 +146,23 @@ def test_missing_mirror_metadata_does_not_veto_external_or_exact_sql_connections
     assert external_id not in ctx.id_map
 
 
+@pytest.mark.parametrize("server_known", [True, False])
+def test_catalog_matching_source_guid_needs_relevant_server_evidence(tmp_path, monkeypatch, server_known):
+    ctx = context(tmp_path)
+    external = connection(f"external.example.com;{SOURCE_DB}")
+    ctx.client.list_all = lambda path: [external] if path == "connections" else []
+    source = SOURCE if server_known else {**SOURCE, "properties": {}}
+    ctx.source_items = {SOURCE_DB: source}
+    ctx.assessment = SimpleNamespace(migrated=[{"id": "copy", "type": "CopyJob"}])
+    monkeypatch.setattr(orchestrator.sqldatabases, "list_sql_databases", lambda *_: [source])
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", lambda *_: {
+        "parts": [part("content.json", {"connectionId": SOURCE_CONNECTION})],
+    })
+    orchestrator._load_source_references(ctx)
+    assert (SOURCE_CONNECTION in ctx.source_items) is not server_known
+    assert SOURCE_CONNECTION not in ctx.id_map
+
+
 def test_owned_sql_connection_reused_for_multiple_consumers_and_resume(tmp_path, monkeypatch):
     ctx = context(tmp_path)
     source_name, target_name = names()

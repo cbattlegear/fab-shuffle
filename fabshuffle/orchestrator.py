@@ -1725,7 +1725,16 @@ def _load_source_references(ctx: _Context) -> None:
             ctx.connection_sql_owners[source_connection_id] = owners
             sql_path = connections.sql_path_target(path)
             ambiguous_item_id = bool(sql_path) and any(
-                sql_path.database.casefold() == str(item.get("id") or "").casefold()
+                (
+                    sql_path.database.casefold() == str(item.get("id") or "").casefold()
+                    and (
+                        not connections.item_sql_targets(item)
+                        or any(
+                            target.server == sql_path.server
+                            for target in connections.item_sql_targets(item)
+                        )
+                    )
+                )
                 or any(
                     target.server == sql_path.server
                     and target.database.casefold() == sql_path.database.casefold()

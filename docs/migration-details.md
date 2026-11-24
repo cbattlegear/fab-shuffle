@@ -177,6 +177,7 @@ Timeouts, transport losses and other failures are not replayed. The service's co
 and message remain visible when retries are exhausted. Its internal conflicting operation
 cannot be identified from that error alone. LRO polling honors `Retry-After` and waits for
 terminal operation state, including HTTP 200 responses whose status is still Running.
+An unrecognized operation status is reported explicitly, not accepted as completion.
 
 ## Item-specific history and constraints
 

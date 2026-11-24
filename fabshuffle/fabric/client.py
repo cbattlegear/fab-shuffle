@@ -392,7 +392,7 @@ class FabricClient:
             response = self.request("GET", location, expected=(200, 201, 202))
             payload = self._json(response)
             status = payload.get("status")
-            if status in _TERMINAL_OPERATION_STATES:
+            if isinstance(status, str) and status in _TERMINAL_OPERATION_STATES:
                 if status != "Succeeded":
                     raise OperationFailed(location, status, payload.get("error"))
                 result = response.headers.get("Location") or f"{location.rstrip('/')}/result"
@@ -402,7 +402,9 @@ class FabricClient:
                     if error.status_code in (400, 404):
                         return payload
                     raise
-            if response.status_code != 202 and status not in ("Running", "NotStarted"):
+            if "status" in payload and status not in ("Running", "NotStarted"):
+                raise FabricError(f"Operation at {location} returned an unrecognized status: {status!r}")
+            if response.status_code != 202 and "status" not in payload:
                 return payload
             if time.monotonic() > deadline:
                 raise OperationTimeout(f"Operation at {location} did not complete in time")
