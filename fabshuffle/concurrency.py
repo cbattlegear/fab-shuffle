@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -33,17 +33,31 @@ DEPENDENCY_READ_WORKERS = 4
 def bounded_map(
     fn: Callable[[_T], _R], values: Iterable[_T], *, limit: int = DEPENDENCY_READ_WORKERS,
 ) -> Iterator[_R]:
-    """Yield results in input order without queueing more than ``limit`` reads."""
-    iterator = iter(values)
+    """Refill finished reads immediately, buffering their results for input-order output."""
+    iterator = enumerate(values)
     with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="dependency-read") as pool:
-        pending: list[Future[_R]] = []
+        pending: dict[Future[_R], int] = {}
+        completed: dict[int, _R] = {}
+        next_result = 0
+
+        def submit() -> None:
+            entry = next(iterator, None)
+            if entry is not None:
+                index, value = entry
+                pending[pool.submit(fn, value)] = index
+
         try:
-            for value in iterator:
-                pending.append(pool.submit(fn, value))
-                if len(pending) == limit:
-                    yield pending.pop(0).result()
-            for future in pending:
-                yield future.result()
+            for _ in range(limit):
+                submit()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=pending.__getitem__):
+                    completed[pending.pop(future)] = future.result()
+                for _ in done:
+                    submit()
+                while next_result in completed:
+                    yield completed.pop(next_result)
+                    next_result += 1
         finally:
             for future in pending:
                 future.cancel()

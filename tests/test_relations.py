@@ -82,6 +82,8 @@ def test_relation_reads_overlap_after_probe_and_respect_worker_limit():
     lock = threading.Lock()
     full = threading.Event()
     release = threading.Event()
+    release_later = threading.Event()
+    replacement_started = threading.Event()
     active = 0
     maximum = 0
     calls = []
@@ -99,8 +101,16 @@ def test_relation_reads_overlap_after_probe_and_respect_worker_limit():
                 if active == 4:
                     full.set()
             try:
-                assert release.wait(5)
-                return {"items": [], "relations": [], "workspaces": []}
+                if item_id == "1":
+                    assert release.wait(5)
+                else:
+                    assert release_later.wait(5)
+                if int(item_id) >= 5:
+                    replacement_started.set()
+                return upstream(
+                    items=[{"id": "shared", "displayName": item_id}],
+                    relations_=[edge(item_id, "shared")],
+                )
             finally:
                 with lock:
                     active -= 1
@@ -112,11 +122,18 @@ def test_relation_reads_overlap_after_probe_and_respect_worker_limit():
             assert full.wait(5)
             assert calls[0] == "0"
             assert len(calls) == 5
+            release_later.set()
+            assert replacement_started.wait(5)
+            assert not release.is_set()
+            assert not future.done()
         finally:
+            release_later.set()
             release.set()
         graph = future.result(timeout=5)
     assert maximum == 4
-    assert set(graph.items) == {str(i) for i in range(10)}
+    assert set(graph.items) == {str(i) for i in range(10)} | {"shared"}
+    assert graph.name_of("shared") == "1"
+    assert graph.dependencies == {str(i): {"shared"} for i in range(1, 10)}
 
 
 def test_parallel_results_are_aggregated_in_input_order():

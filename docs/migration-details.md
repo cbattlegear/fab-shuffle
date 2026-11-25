@@ -112,7 +112,9 @@ unknown outcomes), rather than once per API call. Expand an item to see its rece
 Review uses the same activity presentation for its read-only dependency walk. A total remains
 indeterminate (`?`) when the worklist cannot be known in advance.
 Dependency reads overlap at most four items, with paced requests and a shared cooldown when
-Fabric returns 429. Logs record aggregate counts and elapsed time for relation, connection
+Fabric returns 429. Finished reads free a worker immediately even when an earlier read is
+still waiting; results are aggregated in input order and connection scans buffer only IDs.
+Logs record aggregate counts and elapsed time for relation, connection
 definition, and shortcut reads, without recording definition contents. Times are wall-clock
 durations, including pacing and overlapping requests, not sums of individual request times.
 

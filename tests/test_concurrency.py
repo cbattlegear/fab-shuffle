@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -210,3 +211,76 @@ def test_a_guarded_job_runs_when_the_check_passes():
     guarded = concurrency.guarded(lambda: ["done"], before=lambda: None)
 
     assert guarded() == ["done"]
+
+
+def test_bounded_map_refills_while_first_result_is_blocked_and_yields_in_order():
+    release_first = threading.Event()
+    replacement = threading.Event()
+    first_started = threading.Event()
+
+    def read(index):
+        if index == 0:
+            first_started.set()
+            assert release_first.wait(5)
+        if index >= 4:
+            replacement.set()
+        return index
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(lambda: list(concurrency.bounded_map(read, range(10))))
+        try:
+            assert first_started.wait(5)
+            assert replacement.wait(5)
+            assert not result.done()
+        finally:
+            release_first.set()
+        assert result.result(timeout=5) == list(range(10))
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, CancelledError])
+def test_bounded_map_stops_refilling_on_failure_and_drains_in_flight_reads(error_type, monkeypatch):
+    full = threading.Event()
+    release_error = threading.Event()
+    release_others = threading.Event()
+    observed_error = threading.Event()
+    lock = threading.Lock()
+    started = []
+    finished = []
+    original_wait = concurrency.wait
+
+    def wait_for_completion(*args, **kwargs):
+        done, pending = original_wait(*args, **kwargs)
+        if any(future.exception() is not None for future in done):
+            observed_error.set()
+        return done, pending
+
+    monkeypatch.setattr(concurrency, "wait", wait_for_completion)
+
+    def read(index):
+        with lock:
+            started.append(index)
+            if len(started) == 4:
+                full.set()
+        try:
+            if index == 1:
+                assert release_error.wait(5)
+                raise error_type("stopped")
+            assert release_others.wait(5)
+            return index
+        finally:
+            with lock:
+                finished.append(index)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(lambda: list(concurrency.bounded_map(read, range(10))))
+        try:
+            assert full.wait(5)
+            release_error.set()
+            assert observed_error.wait(5)
+            assert not result.done()
+        finally:
+            release_others.set()
+            release_error.set()
+        with pytest.raises(error_type, match="stopped"):
+            result.result(timeout=5)
+    assert sorted(started) == sorted(finished) == [0, 1, 2, 3]

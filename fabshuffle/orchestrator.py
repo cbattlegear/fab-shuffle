@@ -1642,7 +1642,7 @@ def _unusable_bound_connections(
     count = 0
     count_lock = threading.Lock()
 
-    def read(binding: tuple[str, str, str]) -> dict[str, Any] | None:
+    def read(binding: tuple[str, str, str]) -> set[str]:
         nonlocal count
         item_type, name, item_id = binding
         item = {"id": item_id, "displayName": name, "type": item_type}
@@ -1659,19 +1659,18 @@ def _unusable_bound_connections(
         if not definition:
             if on_item:
                 on_item(item, "Connection references unavailable")
-            return None
+            return set()
         if on_item:
             on_item(item, "Connection references read")
-        return definition
+        return set(connections.referenced_connection_ids(definition.get("parts") or []))
 
     try:
-        for (item_type, name, _), definition in zip(
+        for (item_type, name, _), connection_ids in zip(
             binding_items, concurrency.bounded_map(read, binding_items), strict=True,
         ):
-            if definition:
-                for connection_id in connections.referenced_connection_ids(definition.get("parts") or []):
-                    if connection_id not in known:
-                        unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
+            for connection_id in sorted(connection_ids):
+                if connection_id not in known:
+                    unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
     finally:
         logger.info(
             "Dependency connection definition reads: count=%s elapsed_seconds=%.3f",
