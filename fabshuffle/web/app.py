@@ -56,6 +56,11 @@ from fabshuffle.orchestrator import (
     run_migration,
 )
 from fabshuffle.run import REGISTRY, MigrationRun, RunConflict, RunStatus
+from fabshuffle.web.dependency_progress import (
+    AssessmentCancelled,
+    DependencyAssessment,
+    DependencyAssessmentRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,7 @@ STATIC_DIR = WEB_DIR / "static"
 TEMPLATES_DIR = WEB_DIR / "templates"
 
 SESSION_HEADER = "X-Fab-Shuffle-Session"
+DEPENDENCY_ASSESSMENTS = DependencyAssessmentRegistry()
 
 
 # --------------------------------------------------------------------- sessions
@@ -122,6 +128,7 @@ class SessionStore:
             return self._sessions.get(session_id)
 
     def drop(self, session_id: str) -> None:
+        DEPENDENCY_ASSESSMENTS.cancel_session(session_id)
         with self._lock:
             self._sessions.pop(session_id, None)
 
@@ -593,6 +600,55 @@ def create_app() -> FastAPI:
                 ),
             )
         return result
+
+    @app.post("/api/preview/dependencies/assessments", status_code=202)
+    async def start_dependency_assessment(
+        source_workspace_id: str,
+        strategy: Literal["rebuild"] | None = None,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        rebuild = session.paired or bool(strategy)
+        try:
+            assessment, reused = DEPENDENCY_ASSESSMENTS.create(
+                session.id, source_workspace_id, rebuild,
+            )
+        except RuntimeError as error:
+            raise HTTPException(status_code=429, detail=str(error)) from error
+        if not reused:
+            try:
+                threading.Thread(
+                    target=_run_dependency_assessment,
+                    args=(assessment, session),
+                    name=f"dependency-assessment-{assessment.id[:8]}",
+                    daemon=True,
+                ).start()
+            except RuntimeError as error:
+                assessment.fail(error)
+                raise HTTPException(
+                    status_code=503, detail="Could not start the dependency assessment.",
+                ) from error
+        return {**assessment.snapshot(), "reused": reused}
+
+    @app.get("/api/preview/dependencies/assessments/{assessment_id}")
+    async def get_dependency_assessment(
+        assessment_id: str,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        assessment = DEPENDENCY_ASSESSMENTS.get(session.id, assessment_id)
+        if assessment is None:
+            raise HTTPException(status_code=404, detail="Dependency assessment not found.")
+        return assessment.snapshot()
+
+    @app.delete("/api/preview/dependencies/assessments/{assessment_id}", status_code=202)
+    async def cancel_dependency_assessment(
+        assessment_id: str,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        assessment = DEPENDENCY_ASSESSMENTS.get(session.id, assessment_id)
+        if assessment is None:
+            raise HTTPException(status_code=404, detail="Dependency assessment not found.")
+        assessment.cancel()
+        return assessment.snapshot()
 
     @app.post("/api/preview/dependencies")
     async def preview_destination_dependencies(
@@ -1275,6 +1331,8 @@ def _dependency_report(
     client_id: str,
     object_id: str = "",
     tenant_id: str = "",
+    on_item=None,
+    on_total=None,
 ) -> dict[str, Any]:
     """Run the same dependency check the migration runs, before anything is created.
 
@@ -1283,15 +1341,21 @@ def _dependency_report(
     connection has to be shared first.
     """
     if not migrated:
+        if on_total:
+            on_total(0)
         return {"dependencies": [], "connectionAccess": None}
 
     try:
-        report = dependency_warnings(
-            client,
-            source_workspace_id=source_workspace_id,
-            migrated=migrated,
-            client_id=client_id,
-        )
+        options = {
+            "source_workspace_id": source_workspace_id,
+            "migrated": migrated,
+            "client_id": client_id,
+        }
+        if on_item:
+            options["on_item"] = on_item
+        if on_total:
+            options["on_total"] = on_total
+        report = dependency_warnings(client, **options)
     except FabricApiError as error:
         return {
             "dependencies": [f"Dependencies could not be checked: {error}"],
@@ -1322,6 +1386,45 @@ def _dependency_report(
         else None
     )
     return {"dependencies": report.messages(), "connectionAccess": access}
+
+
+def _run_dependency_assessment(assessment: DependencyAssessment, session: Session) -> None:
+    assessment.start()
+    try:
+        with FabricClient(session.tokens) as client:
+            assessment.update("Reading source workspace items.")
+            source_items = list_items(client, assessment.source_workspace_id)
+            assessment.check_cancelled()
+            workspace_assessment = assess_workspace(
+                source_items,
+                force_rebuild=assessment.rebuild,
+                require_stopped=session.paired,
+            )
+            assessment.check_cancelled()
+            if workspace_assessment.strategy is Strategy.REASSIGN:
+                result = {"dependencies": [], "connectionAccess": None}
+                assessment.set_activity_total(0)
+            else:
+                assessment.update(
+                    f"Checking relations and connection references for "
+                    f"{len(workspace_assessment.migrated)} item(s)."
+                )
+                result = _dependency_report(
+                    client,
+                    source_workspace_id=assessment.source_workspace_id,
+                    migrated=workspace_assessment.migrated,
+                    client_id=session.principal.client_id,
+                    object_id=_object_id(session),
+                    tenant_id=session.principal.tenant_id,
+                    on_item=assessment.on_item,
+                    on_total=assessment.set_activity_total,
+                )
+                assessment.check_cancelled()
+        assessment.complete(result)
+    except AssessmentCancelled:
+        assessment.cancelled()
+    except Exception as error:
+        assessment.fail(error)
 
 
 def _semantic_model_preview(

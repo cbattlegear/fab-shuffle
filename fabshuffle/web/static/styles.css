@@ -405,6 +405,9 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .activity-items summary { color: var(--text); font-weight: 500; }
 .activity-current { display: block; margin: 0.2rem 0 0 1.1rem; color: var(--text-dim); font-weight: normal; }
 .activity-items ol { margin: 0.2rem 0 0; padding-left: 1.2rem; }
+.dependency-progress-status { margin: 0 0 0.4rem; color: var(--text-dim); font-size: 0.85rem; }
+.dependency-progress .activity-items { list-style: none; padding-left: 0; color: var(--text-dim); }
+.dependency-progress .step-activity { margin-top: 0.4rem; }
 
 .warnings {
   margin-top: 1.25rem;

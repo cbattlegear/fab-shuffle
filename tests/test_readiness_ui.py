@@ -17,6 +17,7 @@ NODE = shutil.which("node")
     [
         "throttle",
         "activity",
+        "shared_activity",
         "terminal",
         "run_races",
         "filters",

@@ -105,6 +105,13 @@ pin the sequence. Later phases may only rely on mappings established earlier.
 | `permissions` | Replay remaining workspace roles only when enabled for a single-principal run. Paired runs never copy access assignments. |
 | Cleanup | After content phases, reconcile tracked jobs and remove owned scratch resources when requested. Retain journals for recovery. |
 
+Live progress shows each stage's tracked work-item count as completed/total. The denominator
+comes from the stage's candidate worklist, not the bounded activity display; the numerator
+advances once when a tracked item reaches a terminal state (including failed or explicitly
+unknown outcomes), rather than once per API call. Expand an item to see its recent actions.
+Review uses the same activity presentation for its read-only dependency walk. A total remains
+indeterminate (`?`) when the worklist cannot be known in advance.
+
 In single-principal rebuilds, source workspace **Admin** assignments are attempted during
 workspace creation even when final permission copying is disabled. This preserves human
 access if the run stops early. Errors are reported; successful access replay is not assumed.

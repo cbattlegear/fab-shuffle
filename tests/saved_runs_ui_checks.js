@@ -19,6 +19,14 @@ const buttons = (f, index = 0) => row(f, index).querySelectorAll("button");
 const confirm = (f) => f.get("saved-run-confirm-submit").click();
 const payload = (f, index) => JSON.parse(f.requests[index].options.body);
 const stage = (f, name) => f.document.querySelectorAll(".panel").find((panel) => panel.dataset.stage === name);
+async function finishDependencyAssessment(f, request, result, id) {
+  assert.match(f.requests[request].url, /^\/api\/preview\/dependencies\/assessments\?/);
+  await f.reply(request, { assessmentId: id, status: "running" });
+  await f.tick(750);
+  const pollRequest = f.requests.length - 1;
+  assert.equal(f.requests[pollRequest].url, `/api/preview/dependencies/assessments/${id}`);
+  await f.reply(pollRequest, { assessmentId: id, status: "succeeded", result });
+}
 
 async function load(f, runs = [saved]) {
   const request = f.requests.length;
@@ -238,7 +246,10 @@ const scenarios = {
     const previewRequest = f.requests.length - 1;
     const dependenciesRequest = previewRequest - 1;
     assert.match(f.requests[previewRequest].url, /^\/api\/preview\?/);
-    assert.match(f.requests[dependenciesRequest].url, /^\/api\/preview\/dependencies\?/);
+    assert.match(
+      f.requests[dependenciesRequest].url,
+      /^\/api\/preview\/dependencies\/assessments\?/,
+    );
     for (const index of [previewRequest, dependenciesRequest]) {
       assert.equal(new URL(f.requests[index].url, "http://fixture").searchParams.get("strategy"), "rebuild");
     }
@@ -248,12 +259,18 @@ const scenarios = {
       targetWorkspaceName: "Fresh Power BI workspace", blockers: [], unsupportedSummary: [],
       counts: [{ label: "Reports", count: 1 }], largeSemanticModels: [],
     });
-    await f.reply(dependenciesRequest, { blockers: [], dependencies: [], connectionAccess: null });
+    await finishDependencyAssessment(
+      f, dependenciesRequest, { blockers: [], dependencies: [], connectionAccess: null },
+      "restart-preview-assessment",
+    );
     assert.equal(f.get("start-run").textContent, "Start migration");
     f.get("recheck").click();
     const recheckRequest = f.requests.length - 1;
     assert.equal(new URL(f.requests[recheckRequest].url, "http://fixture").searchParams.get("strategy"), "rebuild");
-    await f.reply(recheckRequest, { blockers: [], dependencies: [], connectionAccess: null });
+    await finishDependencyAssessment(
+      f, recheckRequest, { blockers: [], dependencies: [], connectionAccess: null },
+      "restart-recheck-assessment",
+    );
     f.get("start-run").click();
     const startRequest = f.requests.length - 1;
     assert.equal(f.requests[startRequest].url, "/api/runs");

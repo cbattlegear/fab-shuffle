@@ -16,6 +16,9 @@ const state = {
   crossTenant: false,
   assessmentVersion: 0,
   assessmentPending: false,
+  dependencyAssessmentId: null,
+  dependencyAssessment: null,
+  dependencyPollController: null,
   mappingsChecked: false,
   resumeRunId: null,
   resumeReturnStage: "capacity",
@@ -59,6 +62,7 @@ function showError(message) {
 }
 
 function goTo(stage) {
+  if (stage !== "review" && state.assessmentPending) cancelDependencyAssessment();
   $$(".panel").forEach((panel) => {
     panel.hidden = panel.dataset.stage !== stage;
   });
@@ -735,10 +739,11 @@ $("#workspace-next").addEventListener("click", async () => {
   // for it before showing anything left the wizard looking stuck.
   state.resumeRunId = null;
   resetMappings();
+  state.preview = null;
   state.assessmentPending = true;
+  cancelDependencyAssessment({ invalidate: false });
   const version = ++state.assessmentVersion;
-  const dependencies = state.paired ? null : api(`/api/preview/dependencies?${params}`);
-  dependencies?.catch(() => {});
+  const dependencies = state.paired ? null : startDependencyAssessment(params, version, sessionId);
 
   try {
     goTo("review");
@@ -773,10 +778,13 @@ $("#recheck").addEventListener("click", async () => {
   const params = new URLSearchParams({ source_workspace_id: state.workspace.id });
   if (state.forceRebuild) params.set("strategy", "rebuild");
 
+  cancelDependencyAssessment({ invalidate: false });
+  const version = ++state.assessmentVersion;
   showDependenciesPending();
+  state.assessmentPending = true;
   setStartEnabled(false);
   try {
-    await settleAssessment(api(`/api/preview/dependencies?${params}`));
+    await settleAssessment(startDependencyAssessment(params, version, state.sessionId), version);
   } finally {
     busy(button, false);
   }
@@ -798,14 +806,105 @@ async function settleAssessment(request, version = state.assessmentVersion) {
     state.preview.dependencies = [`Dependencies could not be checked: ${error.message}`];
     state.preview.connectionAccess = null;
     state.mappingsChecked = false;
+    state.dependencyAssessment = {
+      assessmentId: state.dependencyAssessmentId,
+      status: "failed",
+      error: error.message,
+      step: {
+        id: "dependencies",
+        title: "Checking dependencies (read-only review)",
+        status: "failed",
+        detail: `Check failed: ${error.message}`,
+        warnings: [],
+        activity: state.dependencyAssessment?.step?.activity || [],
+        activityOmitted: state.dependencyAssessment?.step?.activityOmitted || 0,
+      },
+    };
     $("#mapping-status").textContent = `Check failed: ${error.message}. Re-check to retry.`;
   }
   state.assessmentPending = false;
   stopAssessmentTimer();
+  renderDependencyAssessment();
   renderDependencies();
   renderConnectionAccess();
   // Only now is it known whether anything blocks the run.
   setStartEnabled(state.preview.blockers.length === 0);
+}
+
+async function startDependencyAssessment(params, version, sessionId) {
+  const query = new URLSearchParams(params);
+  let assessmentId = null;
+  let pollFailures = 0;
+  const startedAt = Date.now();
+  try {
+    const started = await api(`/api/preview/dependencies/assessments?${query}`, { method: "POST" });
+    assessmentId = started.assessmentId;
+    if (version !== state.assessmentVersion || sessionId !== state.sessionId) {
+      cancelRemoteDependencyAssessment(assessmentId);
+      return null;
+    }
+    state.dependencyAssessmentId = assessmentId;
+    state.dependencyAssessment = started;
+    if (state.preview) renderDependencyAssessment(started);
+
+    while (Date.now() - startedAt < 120_000) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (version !== state.assessmentVersion || sessionId !== state.sessionId) return null;
+      const controller = new AbortController();
+      state.dependencyPollController = controller;
+      let snapshot;
+      try {
+        snapshot = await api(
+          `/api/preview/dependencies/assessments/${encodeURIComponent(assessmentId)}`,
+          { signal: controller.signal },
+        );
+        pollFailures = 0;
+      } catch (error) {
+        if (error.name === "AbortError") return null;
+        if (++pollFailures >= 8) throw new Error(`Could not reconnect to dependency progress: ${error.message}`);
+        if (state.preview) renderDependencyAssessment({
+          ...state.dependencyAssessment,
+          step: {
+            ...state.dependencyAssessment?.step,
+            detail: `Reconnecting to the read-only dependency check (${pollFailures}/8).`,
+          },
+        });
+        continue;
+      } finally {
+        if (state.dependencyPollController === controller) state.dependencyPollController = null;
+      }
+      if (version !== state.assessmentVersion || sessionId !== state.sessionId) return null;
+      state.dependencyAssessment = snapshot;
+      if (state.preview) renderDependencyAssessment(snapshot);
+      if (snapshot.status === "succeeded") return snapshot.result || {};
+      if (snapshot.status === "failed") throw new Error(snapshot.error || "Dependency check failed.");
+      if (snapshot.status === "cancelled" || snapshot.status === "cancelling") {
+        throw new Error("Dependency check stopped. Re-check to start a new assessment.");
+      }
+    }
+    throw new Error("Dependency check timed out. Re-check to try again.");
+  } catch (error) {
+    if (assessmentId && version === state.assessmentVersion) cancelRemoteDependencyAssessment(assessmentId);
+    throw error;
+  }
+}
+
+function cancelRemoteDependencyAssessment(assessmentId) {
+  if (!assessmentId || !state.sessionId) return;
+  api(`/api/preview/dependencies/assessments/${encodeURIComponent(assessmentId)}`, {
+    method: "DELETE",
+  }).catch(() => {});
+}
+
+function cancelDependencyAssessment({ invalidate = true } = {}) {
+  if (invalidate) state.assessmentVersion++;
+  stopAssessmentTimer();
+  if (state.dependencyPollController) state.dependencyPollController.abort();
+  state.dependencyPollController = null;
+  cancelRemoteDependencyAssessment(state.dependencyAssessmentId);
+  state.dependencyAssessmentId = null;
+  state.dependencyAssessment = null;
+  state.assessmentPending = false;
 }
 
 function setStartEnabled(enabled) {
@@ -1031,6 +1130,7 @@ function renderDependencies() {
     : "References the migration cannot follow, and connections you will have to grant access to. " +
       "The new workspace will be created, but these need fixing before it works.";
   fillList(container, [...(state.preview.dependencies || []), ...(state.preview.mappingBlockers || [])]);
+  renderDependencyAssessment();
 }
 
 function renderConnectionAccess() {
@@ -1103,12 +1203,8 @@ function showDependenciesPending() {
   container.classList.add("pending");
   container.querySelector("h3").textContent = "Checking dependencies…";
   container.querySelector(".hint").hidden = true;
-  const list = container.querySelector("ul");
-  list.innerHTML = "";
-  const item = document.createElement("li");
-  item.id = "assessment-progress";
-  list.appendChild(item);
-  startAssessmentTimer(item);
+  container.querySelector("ul").replaceChildren();
+  renderDependencyAssessment();
 }
 
 /** Tick a live count so a slow assessment visibly moves. */
@@ -1121,8 +1217,7 @@ function startAssessmentTimer(element) {
   const tick = () => {
     const seconds = Math.round((Date.now() - started) / 1000);
     element.textContent =
-      `Reading references and connections across ${scope} — ${seconds}s elapsed. ` +
-      "This walks one API call per item, so it takes a moment on a large workspace.";
+      `Waiting for the first dependency update across ${scope} — ${seconds}s elapsed.`;
   };
   tick();
   state.assessmentTimer = setInterval(tick, 1000);
@@ -1133,6 +1228,42 @@ function stopAssessmentTimer() {
     clearInterval(state.assessmentTimer);
     state.assessmentTimer = null;
   }
+}
+
+function renderDependencyAssessment(snapshot = state.dependencyAssessment) {
+  const container = $("#dependencies");
+  if (!container || !state.preview) return;
+  const host = container.querySelector(".dependency-progress");
+  const expansion = captureActivityExpansion(host);
+  host.replaceChildren();
+  const step = snapshot?.step;
+  if (!step) {
+    if (state.assessmentPending) {
+      const waiting = document.createElement("p");
+      waiting.className = "dependency-progress-status";
+      waiting.setAttribute("role", "status");
+      waiting.textContent = "Starting the read-only dependency check…";
+      host.appendChild(waiting);
+      if (!state.assessmentTimer) startAssessmentTimer(waiting);
+    } else stopAssessmentTimer();
+    return;
+  }
+  stopAssessmentTimer();
+  const status = document.createElement("p");
+  status.className = "dependency-progress-status";
+  status.setAttribute("role", "status");
+  status.textContent = step.detail || "Read-only dependency check in progress.";
+  host.appendChild(status);
+  renderStepActivity(step, host, expansion);
+}
+
+function captureActivityExpansion(root) {
+  return {
+    steps: new Set([...root.querySelectorAll("details[data-activity-step]")]
+      .filter((entry) => entry.open).map((entry) => entry.dataset.activityStep)),
+    items: new Set([...root.querySelectorAll("details[data-activity-key]")]
+      .filter((entry) => entry.open).map((entry) => entry.dataset.activityKey)),
+  };
 }
 
 function itemTotal(counts) {
@@ -1344,10 +1475,7 @@ function renderRun(run) {
   }
 
   const list = $("#step-list");
-  const expanded = new Set([...list.querySelectorAll("details[data-activity-step]")]
-    .filter((entry) => entry.open).map((entry) => entry.dataset.activityStep));
-  const expandedItems = new Set([...list.querySelectorAll("details[data-activity-key]")]
-    .filter((entry) => entry.open).map((entry) => entry.dataset.activityKey));
+  const expansion = captureActivityExpansion(list);
   const focusedItem = document.activeElement?.closest?.("details[data-activity-key]")?.dataset.activityKey;
   const focusedStage = document.activeElement?.closest?.("details[data-activity-step]")?.dataset.activityStep;
   list.innerHTML = "";
@@ -1364,52 +1492,7 @@ function renderRun(run) {
     item.querySelector(".title").textContent = step.title;
     item.querySelector(".detail").textContent = step.detail || "";
 
-    const activities = Array.isArray(step.activity) ? step.activity : [];
-    if (activities.length) {
-      const details = document.createElement("details");
-      details.className = "step-activity";
-      details.dataset.activityStep = step.id;
-      details.open = expanded.has(step.id);
-      const summary = document.createElement("summary");
-      summary.textContent = `Item activity (${activities.length}${step.activityOmitted ? "+" : ""})`;
-      details.appendChild(summary);
-      const rows = document.createElement("ul");
-      rows.className = "activity-items";
-      activities.forEach((activity) => {
-        const row = document.createElement("li");
-        const history = document.createElement("details");
-        history.dataset.activityKey = JSON.stringify([step.id, activity.id]);
-        history.open = expandedItems.has(history.dataset.activityKey);
-        const label = document.createElement("summary");
-        label.textContent = [activity.type, activity.name].filter(Boolean).join(" · ");
-        history.appendChild(label);
-        const latest = (activity.actions || []).at(-1);
-        if (latest) {
-          const current = document.createElement("span");
-          current.className = "activity-current";
-          const concurrent = activity.active && latest.state !== "running" ? "; another action running" : "";
-          current.textContent = `${latest.action} (${latest.state}${concurrent})`;
-          label.appendChild(current);
-        }
-        const actions = document.createElement("ol");
-        (activity.actions || []).forEach((action) => {
-          const entry = document.createElement("li");
-          entry.textContent = `${action.action} (${action.state})`;
-          actions.appendChild(entry);
-        });
-        history.appendChild(actions);
-        row.appendChild(history);
-        rows.appendChild(row);
-      });
-      details.appendChild(rows);
-      if (step.activityOmitted) {
-        const note = document.createElement("p");
-        note.className = "hint";
-        note.textContent = `${step.activityOmitted} earlier item entr${step.activityOmitted === 1 ? "y" : "ies"} no longer shown.`;
-        details.appendChild(note);
-      }
-      item.querySelector(".step-body").appendChild(details);
-    }
+    renderStepActivity(step, item.querySelector(".step-body"), expansion);
     if (step.warnings.length) {
       const warnings = document.createElement("ul");
       warnings.className = "step-warnings";
@@ -1420,6 +1503,7 @@ function renderRun(run) {
       });
       item.querySelector(".step-body").appendChild(warnings);
     }
+
     list.appendChild(item);
   });
   if (focusedItem) {
@@ -1439,6 +1523,58 @@ function renderRun(run) {
   const leftSomething = (run.summary?.warnings || []).length > 0;
   $("#retry-run").hidden = !finished || !run.targetWorkspace || !leftSomething;
   $("#retry-run").textContent = state.paired ? "Update mappings and retry" : "Retry what did not migrate";
+}
+
+function renderStepActivity(step, parent, expansion = captureActivityExpansion(parent)) {
+  const activities = Array.isArray(step.activity) ? step.activity : [];
+  if (!activities.length && !Number.isInteger(step.activityTotal)) return null;
+  const details = document.createElement("details");
+  details.className = "step-activity";
+  details.dataset.activityStep = step.id;
+  details.open = expansion.steps.has(step.id);
+  const summary = document.createElement("summary");
+  const completed = Number.isInteger(step.activityCompleted) ? step.activityCompleted : 0;
+  const total = Number.isInteger(step.activityTotal) ? step.activityTotal : "?";
+  const shown = `${activities.length}${step.activityOmitted ? "+" : ""} shown`;
+  summary.textContent = `Item activity (${completed}/${total}${total === "?" ? " completed; " : ""}${total === "?" ? shown : ""})`;
+  details.appendChild(summary);
+  const rows = document.createElement("ul");
+  rows.className = "activity-items";
+  activities.forEach((activity) => {
+    const row = document.createElement("li");
+    const history = document.createElement("details");
+    history.dataset.activityKey = JSON.stringify([step.id, activity.id]);
+    history.open = expansion.items.has(history.dataset.activityKey);
+    const label = document.createElement("summary");
+    label.textContent = [activity.type, activity.name].filter(Boolean).join(" · ");
+    const latest = (activity.actions || []).at(-1);
+    if (latest) {
+      const current = document.createElement("span");
+      current.className = "activity-current";
+      const concurrent = activity.active && latest.state !== "running" ? "; another action running" : "";
+      current.textContent = `${latest.action} (${latest.state}${concurrent})`;
+      label.appendChild(current);
+    }
+    history.appendChild(label);
+    const actions = document.createElement("ol");
+    (activity.actions || []).forEach((action) => {
+      const entry = document.createElement("li");
+      entry.textContent = `${action.action} (${action.state})`;
+      actions.appendChild(entry);
+    });
+    history.appendChild(actions);
+    row.appendChild(history);
+    rows.appendChild(row);
+  });
+  details.appendChild(rows);
+  if (step.activityOmitted) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = `${step.activityOmitted} earlier item entr${step.activityOmitted === 1 ? "y" : "ies"} no longer shown.`;
+    details.appendChild(note);
+  }
+  parent.appendChild(details);
+  return details;
 }
 
 // ---------------------------------------------------------- cutover readiness

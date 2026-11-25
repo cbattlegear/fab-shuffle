@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
+import fabshuffle.orchestrator as orchestrator
 from fabshuffle.__main__ import configure_logging
 from fabshuffle.fabric.client import _log_route
 from fabshuffle.lifecycle import Lifecycle
 from fabshuffle.orchestrator import default_target_name
 from fabshuffle.run import MigrationRun, RunStatus, StepStatus
 from fabshuffle.transfer.sqlschema import _batches, _log_tool_output, _strip_sqlcmd_header
+from fabshuffle.web.dependency_progress import DependencyAssessment
 
 
 def test_target_name_uses_capacity_region():
@@ -93,6 +96,206 @@ def test_activity_window_shows_later_items_and_prefers_retaining_active_ones():
     assert snapshot["activityOmitted"] == 12
     run.item_activity("later", "current", "Notebook", "Still reading", "running")
     assert run.snapshot()["steps"][0]["activityOmitted"] == 12
+
+
+def test_stage_item_count_uses_full_worklist_not_bounded_activity_window():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("engineering", "Migrating engineering items")
+    run.set_activity_total("engineering", 56, operation="stage-item")
+
+    for index in range(56):
+        item_id = str(index)
+        run.item_activity(item_id, f"Item {index}", "Notebook", "Migration started", "running", "stage-item")
+        run.item_activity(item_id, f"Item {index}", "Notebook", "Creating target", "running", "target")
+        run.item_activity(item_id, f"Item {index}", "Notebook", "Target ready", "succeeded", "target")
+        run.item_activity(
+            item_id, f"Item {index}", "Notebook", "Migration completed", "succeeded", "stage-item",
+        )
+
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 56
+    assert step["activityCompleted"] == 56
+    assert len(step["activity"]) == 50
+    assert step["activityOmitted"] == 6
+    assert any(item["id"] == "55" for item in step["activity"])
+
+
+def test_unknown_stage_total_stays_indeterminate_and_other_operations_do_not_count():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("transfer", "Transferring data")
+    run.set_activity_total("transfer", 2, operation="stage-item")
+    run.item_activity("one", "One", "Warehouse", "Schema started", "running", "schema")
+    run.item_activity("one", "One", "Warehouse", "Schema ready", "succeeded", "schema")
+    run.item_activity("one", "One", "Warehouse", "Item started", "running", "stage-item")
+    run.item_activity("one", "One", "Warehouse", "Item done", "unknown", "stage-item")
+    step = run.snapshot()["steps"][0]
+    assert step["activityCompleted"] == 1
+    assert step["activityTotal"] == 2
+    assert step["activity"][0]["active"] is False
+
+    unknown = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    unknown.start_step("unmeasured", "Unmeasured work")
+    unknown.item_activity("one", "One", "Item", "Work started", "running")
+    assert "activityTotal" not in unknown.snapshot()["steps"][0]
+
+
+def test_reassign_counts_large_model_work_and_capacity_assignment(monkeypatch):
+    model = SimpleNamespace(id="model-id", name="Model", is_large=True, convertible=True)
+    conversions = []
+
+    class FakePowerBiClient:
+        def __init__(self, _tokens):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def list_semantic_models(self, _workspace_id):
+            return [model]
+
+        def convert(self, _workspace_id, selected, target, **_kwargs):
+            conversions.append((selected.id, target))
+
+    assignments = []
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", FakePowerBiClient)
+    monkeypatch.setattr(
+        orchestrator.powerbi, "SMALL", "small", raising=False,
+    )
+    monkeypatch.setattr(
+        orchestrator.powerbi, "LARGE", "large", raising=False,
+    )
+    monkeypatch.setattr(orchestrator, "supports_large_semantic_models", lambda _region: True)
+    monkeypatch.setattr(
+        orchestrator.workspaces, "assign_to_capacity",
+        lambda *_args: assignments.append(True),
+    )
+
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    ctx = SimpleNamespace(
+        tokens=None,
+        plan=SimpleNamespace(
+            capacity_warning=None, source_workspace_id="workspace-id",
+            source_workspace_name="Sales", capacity_region="westus",
+            capacity_name="F64", capacity_id="capacity-id",
+        ),
+        run=run,
+        warnings=[],
+        client=object(),
+    )
+    orchestrator._reassign_capacity(ctx)
+
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 2
+    assert all(not activity["active"] for activity in step["activity"])
+    assert assignments == [True]
+    assert conversions == [("model-id", "small"), ("model-id", "large")]
+
+
+def test_assessment_counts_inventory_items(monkeypatch):
+    items = [{"id": "item-1", "displayName": "Notebook", "type": "Notebook"}]
+    assessment = SimpleNamespace(migrated=items, unsupported=[], grouped_messages=lambda: [])
+    monkeypatch.setattr(orchestrator, "list_items", lambda *_args: items)
+    monkeypatch.setattr(orchestrator, "assess_workspace", lambda *_args, **_kwargs: assessment)
+
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    lifecycle = Lifecycle(attempt_id=run.id, activity=run.item_activity)
+
+    class FakeJournal:
+        def inventory(self):
+            pass
+
+    ctx = SimpleNamespace(
+        run=run,
+        plan=SimpleNamespace(
+            source_workspace_id="source-id", strategy=orchestrator.Strategy.REBUILD,
+            paired=False, capacity_warning=None,
+        ),
+        client=SimpleNamespace(list_all=lambda *_args: items),
+        lifecycle=lambda item: lifecycle.item(
+            item["id"], item["displayName"], item["type"],
+        ),
+        already_created=lambda _item_id: False,
+        assessment=None,
+        source_items={},
+        primary_item_ids=set(),
+        journal=FakeJournal(),
+        warnings=[],
+        summary={},
+    )
+    orchestrator._report_unsupported_items(ctx)
+
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 1
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["actions"][-1]["state"] == "succeeded"
+
+
+def test_dataflow_count_includes_ineligible_items(monkeypatch):
+    dataflows = [
+        {"id": "unsupported", "displayName": "Unsupported", "type": "Dataflow"},
+        {"id": "eligible", "displayName": "Eligible", "type": "Dataflow"},
+    ]
+    monkeypatch.setattr(
+        orchestrator.analytics, "classify_dataflow",
+        lambda _client, _workspace, item: ([], "Unsupported format")
+        if item["id"] == "unsupported" else ([], None),
+    )
+
+    def migrate(_ctx, **kwargs):
+        assert kwargs["track_activity"] is False
+        assert [item["id"] for item in kwargs["items"]] == ["eligible"]
+        return [SimpleNamespace(source_id="eligible")], []
+
+    monkeypatch.setattr(orchestrator, "_migrate_definition_items", migrate)
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("engineering", "Migrating engineering items")
+
+    class Evidence:
+        def step(self, *_args, **_kwargs):
+            pass
+
+    ctx = SimpleNamespace(
+        run=run,
+        plan=SimpleNamespace(source_workspace_id="source-id"),
+        client=object(),
+        target_workspace_id="target-id",
+        id_map={},
+        source_items={},
+        lifecycle=lambda *_args: Evidence(),
+        to_migrate=lambda items: items,
+    )
+    warnings = []
+    migrated = orchestrator._migrate_dataflows(
+        ctx, "engineering", dataflows, warnings, lambda _message: None,
+    )
+
+    step = run.snapshot()["steps"][0]
+    assert migrated == 1
+    assert warnings == ["Unsupported format"]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 2
+    assert {item["id"]: item["actions"][-1]["state"] for item in step["activity"]} == {
+        "unsupported": "skipped", "eligible": "succeeded",
+    }
+
+
+def test_read_only_dependency_assessment_counts_actual_candidate_reads():
+    assessment = DependencyAssessment(
+        id="assessment", session_id="session", source_workspace_id="workspace", rebuild=False,
+    )
+    assessment.start()
+    assessment.set_activity_total(2)
+    item = {"id": "one", "displayName": "One", "type": "Lakehouse"}
+    assessment.on_item(item, "Reading upstream relations")
+    assessment.on_item(item, "Upstream relations read")
+    step = assessment.snapshot()["step"]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["active"] is False
 
 
 def test_lifecycle_operations_publish_without_changing_evidence():

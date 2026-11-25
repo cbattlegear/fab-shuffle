@@ -127,7 +127,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, resetReadiness, observeReadiness, renderReadinessItems,
-      renderReadinessStatus, watchRun, renderRun, scheduleReadiness };`, context);
+      renderReadinessStatus, watchRun, renderRun, renderDependencyAssessment, scheduleReadiness };`, context);
   const ui = context.ui;
   const get = (id) => document.querySelector(`#${id}`);
   const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
@@ -235,6 +235,44 @@ const scenarios = {
     assert.equal(history.open, true);
     assert.equal(f.document.activeElement, history.querySelector("summary"));
     assert.match(details.textContent, /Finished/);
+  },
+  async shared_activity(f) {
+    f.ui.state.preview = {};
+    f.ui.state.dependencyAssessment = {
+      status: "running",
+      step: {
+        id: "dependencies", title: "Read-only dependency check",
+        activityTotal: 56, activityCompleted: 8, activityOmitted: 6,
+        activity: [{ id: "a", type: "Notebook", name: "<img src=x onerror=alert(1)>",
+          actions: [{ action: "Reading upstream relations", state: "running" }] }],
+      },
+    };
+    f.ui.renderDependencyAssessment();
+    const host = f.get("dependencies").querySelector(".dependency-progress");
+    let details = host.querySelector("details[data-activity-step]");
+    assert.ok(details);
+    assert.match(details.textContent, /Item activity \(8\/56\)/);
+    assert.equal(details.querySelector("img"), null);
+    details.open = true;
+    let history = details.querySelector("details[data-activity-key]");
+    history.open = true;
+    f.ui.state.dependencyAssessment.step.activity[0].actions.push({
+      action: "Connection references read", state: "succeeded",
+    });
+    f.ui.state.dependencyAssessment.step.activityCompleted = 9;
+    f.ui.renderDependencyAssessment();
+    details = host.querySelector("details[data-activity-step]");
+    history = details.querySelector("details[data-activity-key]");
+    assert.equal(details.open, true);
+    assert.equal(history.open, true);
+    assert.match(details.textContent, /Item activity \(9\/56\)/);
+    assert.match(details.textContent, /Connection references read/);
+
+    f.ui.state.dependencyAssessment.step.activityTotal = undefined;
+    f.ui.state.dependencyAssessment.step.activityCompleted = 9;
+    f.ui.renderDependencyAssessment();
+    details = host.querySelector("details[data-activity-step]");
+    assert.match(details.textContent, /Item activity \(9\/\? completed; 1\+ shown\)/);
   },
   async hidden_until_halted(f) {
     f.begin("one", null);

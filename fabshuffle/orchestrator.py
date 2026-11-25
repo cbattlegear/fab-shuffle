@@ -388,12 +388,20 @@ class _Context:
     ) -> str:
         evidence = self.lifecycle(item, item_type)
         adopted = self.already_created(str(item["id"]))
-        with evidence.operation("target", "Target resolved."):
-            target_id = self.id_map[item["id"]] if adopted else str(create()["id"])
-            self.resolve_item(
-                item, target_id, item_type,
-                disposition=Disposition.ADOPTED if adopted else Disposition.CREATED,
-            )
+        step = self.run._active_step
+        if step:
+            _stage_item_activity(self, step, item, "Resolving destination item", "running")
+        try:
+            with evidence.operation("target", "Target resolved."):
+                target_id = self.id_map[item["id"]] if adopted else str(create()["id"])
+                self.resolve_item(
+                    item, target_id, item_type,
+                    disposition=Disposition.ADOPTED if adopted else Disposition.CREATED,
+                )
+        except Exception:
+            if step:
+                _stage_item_activity(self, step, item, "Destination item was not resolved", "failed")
+            raise
         return target_id
 
     def already_copied(self, item_id: str, kind: str, key: str = "") -> bool:
@@ -796,9 +804,53 @@ def verify_prior(
     return kept, notes
 
 
-def _migrate_definition_items(ctx: _Context, **kwargs: Any) -> tuple[list[analytics.MigratedItem], list[str]]:
+def _stage_item_activity(
+    ctx: _Context,
+    step: str,
+    item: Mapping[str, Any],
+    action: str,
+    state: str,
+) -> None:
+    ctx.run.item_activity(
+        str(item.get("id") or ""),
+        str(item.get("displayName") or item.get("id") or "Item"),
+        str(item.get("type") or ""),
+        action,
+        state,
+        "stage-item",
+        step_id=step,
+    )
+
+
+def _role_assignment_activity(
+    ctx: _Context,
+    step: str,
+    workspace_id: str,
+    assignment: Mapping[str, Any],
+    action: str,
+    state: str,
+) -> None:
+    principal = assignment.get("principal") or {}
+    principal_id = str(principal.get("id") or "")
+    role = str(assignment.get("role") or "")
+    item_id = f"role:{workspace_id}:{principal_id}:{role}"
+    name = str(principal.get("displayName") or principal_id or "Unresolved principal")
+    _stage_item_activity(
+        ctx, step, {"id": item_id, "displayName": f"{role} — {name}", "type": "Role assignment"},
+        action, state,
+    )
+
+
+def _migrate_definition_items(
+    ctx: _Context, *, track_activity: bool = True, **kwargs: Any,
+) -> tuple[list[analytics.MigratedItem], list[str]]:
     selected = list(kwargs["items"])
     kwargs["items"] = selected
+    step = ctx.run._active_step
+    if step and track_activity:
+        ctx.run.add_activity_total(step, len(selected), operation="stage-item")
+        for item in selected:
+            _stage_item_activity(ctx, step, item, "Migration started", "running")
     for item in selected:
         ctx.primary_item_ids.add(item["id"])
         ctx.source_items[item["id"]] = {
@@ -816,7 +868,13 @@ def _migrate_definition_items(ctx: _Context, **kwargs: Any) -> tuple[list[analyt
         kwargs["exclude_identity"] = True
     if ctx.plan.cross_tenant:
         kwargs["cross_tenant"] = True
-    results, warnings = analytics.migrate_items(ctx.client, **kwargs)
+    try:
+        results, warnings = analytics.migrate_items(ctx.client, **kwargs)
+    except Exception:
+        if step and track_activity:
+            for item in selected:
+                _stage_item_activity(ctx, step, item, "Migration stopped before completion", "unknown")
+        raise
     if ctx.plan.paired:
         selected_by_id = {item["id"]: item for item in selected}
         for result in results:
@@ -824,6 +882,14 @@ def _migrate_definition_items(ctx: _Context, **kwargs: Any) -> tuple[list[analyt
                 {**selected_by_id[result.source_id], "type": kwargs["item_type"]}, result.target_id,
             )
     completed = {item.source_id for item in results}
+    if step and track_activity:
+        for item in selected:
+            migrated = str(item.get("id") or "") in completed
+            _stage_item_activity(
+                ctx, step, item,
+                "Migration completed" if migrated else "No destination item was returned",
+                "succeeded" if migrated else "unknown",
+            )
     ctx.journal.refresh(completed, required=False)
     ctx.refresh_needed.difference_update(completed)
     failed = set(existing) - completed
@@ -879,8 +945,31 @@ def _reassign_capacity(ctx: _Context) -> None:
         ctx.run.update_step(step, "Checking semantic model storage format")
         models = pbi.list_semantic_models(workspace_id)
         large_models = [model for model in models if model.is_large]
+        model_items = {
+            model.id: {
+                "id": model.id, "displayName": model.name, "type": "SemanticModel",
+            }
+            for model in large_models
+        }
+        assignment_item = {
+            "id": f"workspace:{workspace_id}",
+            "displayName": ctx.plan.source_workspace_name,
+            "type": "Workspace capacity assignment",
+        }
+        ctx.run.set_activity_total(step, len(large_models) + 1, operation="stage-item")
+        for item in model_items.values():
+            _stage_item_activity(ctx, step, item, "Checking large storage format", "running")
 
         if large_models and not supports_large_semantic_models(ctx.plan.capacity_region):
+            for item in model_items.values():
+                _stage_item_activity(ctx, step, item, "Large storage cannot be restored", "failed")
+            _stage_item_activity(
+                ctx, step, assignment_item, "Capacity assignment was not attempted", "running",
+            )
+            _stage_item_activity(
+                ctx, step, assignment_item, "Capacity assignment was not attempted", "skipped",
+            )
+            ctx.run.finish_step(step, StepStatus.FAILED, "Target region cannot restore large models")
             raise RuntimeError(
                 f"{len(large_models)} semantic model(s) use the large storage format, but region "
                 f"'{ctx.plan.capacity_region}' does not support it, so they could not be "
@@ -890,13 +979,30 @@ def _reassign_capacity(ctx: _Context) -> None:
         blocked = [model for model in large_models if not model.convertible]
         if blocked:
             names = ", ".join(f"'{model.name}'" for model in blocked)
+            blocked_ids = {model.id for model in blocked}
+            for model_id, item in model_items.items():
+                _stage_item_activity(
+                    ctx, step, item,
+                    "Model cannot leave large storage" if model_id in blocked_ids
+                    else "Conversion was not attempted because another model is blocked",
+                    "failed" if model_id in blocked_ids else "skipped",
+                )
+            _stage_item_activity(
+                ctx, step, assignment_item, "Capacity assignment was not attempted", "running",
+            )
+            _stage_item_activity(
+                ctx, step, assignment_item, "Capacity assignment was not attempted", "skipped",
+            )
+            ctx.run.finish_step(step, StepStatus.FAILED, "A semantic model cannot leave large storage")
             raise RuntimeError(
                 "These semantic models cannot leave the large storage format, so the workspace "
                 f"cannot be reassigned: {names}"
             )
 
+        current_model_id = ""
         try:
             for model in large_models:
+                current_model_id = model.id
                 ctx.run.raise_if_cancelled()
                 pbi.convert(
                     workspace_id,
@@ -907,7 +1013,28 @@ def _reassign_capacity(ctx: _Context) -> None:
                 converted.append(model)
         except (powerbi.PowerBiError, CancelledError) as error:
             ctx.run.update_step(step, "Conversion failed, restoring large semantic model storage")
-            warnings.extend(_restore_large_models(ctx, pbi, converted))
+            restore_warnings = _restore_large_models(ctx, pbi, converted)
+            warnings.extend(restore_warnings)
+            converted_ids = {model.id for model in converted}
+            for model_id, item in model_items.items():
+                if model_id in converted_ids:
+                    state = "unknown" if any(
+                        model_items[model_id]["displayName"] in warning for warning in restore_warnings
+                    ) else "succeeded"
+                    action = "Storage restored after conversion failure"
+                elif model_id == current_model_id and isinstance(error, CancelledError):
+                    state, action = "unknown", "Conversion was interrupted"
+                elif model_id == current_model_id:
+                    state, action = "failed", "Storage conversion failed"
+                else:
+                    state, action = "skipped", "Conversion was not attempted"
+                _stage_item_activity(ctx, step, item, action, state)
+            _stage_item_activity(
+                ctx, step, assignment_item, "Capacity assignment was not attempted", "running",
+            )
+            _stage_item_activity(
+                ctx, step, assignment_item, "Capacity assignment was not attempted", "skipped",
+            )
             ctx.warnings.extend(warnings)
             ctx.run.finish_step(step, StepStatus.FAILED, "Could not convert every model", warnings)
             raise RuntimeError(
@@ -915,11 +1042,19 @@ def _reassign_capacity(ctx: _Context) -> None:
             ) from error
 
         ctx.run.update_step(step, f"Assigning workspace to '{ctx.plan.capacity_name}'")
+        _stage_item_activity(ctx, step, assignment_item, "Assigning workspace to target capacity", "running")
         try:
             workspaces.assign_to_capacity(ctx.client, workspace_id, ctx.plan.capacity_id)
         except Exception as error:
             ctx.run.update_step(step, "Assignment failed, restoring large semantic model storage")
-            warnings.extend(_restore_large_models(ctx, pbi, converted))
+            restore_warnings = _restore_large_models(ctx, pbi, converted)
+            warnings.extend(restore_warnings)
+            for item in model_items.values():
+                state = "unknown" if any(
+                    item["displayName"] in warning for warning in restore_warnings
+                ) else "succeeded"
+                _stage_item_activity(ctx, step, item, "Storage restored after assignment failure", state)
+            _stage_item_activity(ctx, step, assignment_item, "Capacity assignment failed", "failed")
             ctx.warnings.extend(warnings)
             ctx.run.finish_step(step, StepStatus.FAILED, "Capacity assignment failed", warnings)
             if (
@@ -948,7 +1083,16 @@ def _reassign_capacity(ctx: _Context) -> None:
 
         if converted:
             ctx.run.update_step(step, "Restoring large semantic model storage")
-            warnings.extend(_restore_large_models(ctx, pbi, converted))
+            restore_warnings = _restore_large_models(ctx, pbi, converted)
+            warnings.extend(restore_warnings)
+        else:
+            restore_warnings = []
+        for item in model_items.values():
+            state = "unknown" if any(
+                item["displayName"] in warning for warning in restore_warnings
+            ) else "succeeded"
+            _stage_item_activity(ctx, step, item, "Model storage work completed", state)
+        _stage_item_activity(ctx, step, assignment_item, "Capacity assignment completed", "succeeded")
 
     ctx.run.target_workspace = {"id": workspace_id, "displayName": ctx.plan.source_workspace_name}
     ctx.warnings.extend(warnings)
@@ -993,6 +1137,9 @@ def _report_unsupported_items(ctx: _Context) -> None:
     # list_items already filters system items out, so monitoring is detected separately.
     all_items = ctx.client.list_all(f"workspaces/{ctx.plan.source_workspace_id}/items")
     monitoring = [item for item in all_items if is_monitoring_item(item)]
+    ctx.run.set_activity_total(
+        step, sum(bool(item.get("id")) for item in all_items), operation="stage-item",
+    )
 
     assessment = assess_workspace(
         list_items(ctx.client, ctx.plan.source_workspace_id),
@@ -1005,6 +1152,7 @@ def _report_unsupported_items(ctx: _Context) -> None:
     ctx.source_items = {item["id"]: item for item in all_items if item.get("id")}
     ctx.primary_item_ids = {item["id"] for item in assessment.migrated}
     for item in ctx.source_items.values():
+        _stage_item_activity(ctx, step, item, "Checking migration support", "running")
         evidence = ctx.lifecycle(item)
         if ctx.already_created(item["id"]):
             evidence.resolve(
@@ -1024,6 +1172,12 @@ def _report_unsupported_items(ctx: _Context) -> None:
                 "target", EvidenceState.SKIPPED, "Workspace monitoring was not migrated.",
                 action="Enable workspace monitoring in the target workspace settings if needed.",
             )
+        _stage_item_activity(
+            ctx, step, item,
+            "Item excluded from migration" if unsupported or is_monitoring_item(item)
+            else "Item support checked",
+            "skipped" if unsupported or is_monitoring_item(item) else "succeeded",
+        )
     ctx.run.inventory_complete = True
     ctx.journal.inventory()
     ctx.run.summary["unsupported"] = [item.as_dict() for item in assessment.unsupported]
@@ -1429,6 +1583,8 @@ def scan_connection_access(
     client: FabricClient,
     *,
     source_workspace_id: str,
+    on_item: Callable[[Mapping[str, Any], str], None] | None = None,
+    on_total: Callable[[int], None] | None = None,
 ) -> list[ConnectionAccess]:
     """Connections that items bind but this service principal cannot use.
 
@@ -1442,29 +1598,60 @@ def scan_connection_access(
     # Without the tenant's connections there is nothing to compare against, and the run
     # already reports that separately.
     if not known:
+        if on_total:
+            on_total(0)
         return []
-    return _unusable_bound_connections(client, source_workspace_id, known)
+    binding_items = _connection_binding_items(client, source_workspace_id)
+    if on_total:
+        on_total(len(binding_items))
+    return _unusable_bound_connections(
+        client, source_workspace_id, known, binding_items=binding_items, on_item=on_item,
+    )
+
+
+def _connection_binding_items(
+    client: FabricClient,
+    source_workspace_id: str,
+) -> list[tuple[str, str, str]]:
+    binding_items: list[tuple[str, str, str]] = []
+    for item_type in CONNECTION_BINDING_TYPES:
+        for item in analytics.list_of_type(client, source_workspace_id, item_type):
+            binding_items.append((item_type, item.get("displayName") or item["id"], item["id"]))
+    return binding_items
 
 
 def _unusable_bound_connections(
     client: FabricClient,
     source_workspace_id: str,
     known: Mapping[str, Any],
+    *,
+    binding_items: list[tuple[str, str, str]] | None = None,
+    on_item: Callable[[Mapping[str, Any], str], None] | None = None,
 ) -> list[ConnectionAccess]:
     """Connections that items bind but this service principal cannot see."""
-    binding_items: list[tuple[str, str, str]] = []
-    for item_type in CONNECTION_BINDING_TYPES:
-        for item in analytics.list_of_type(client, source_workspace_id, item_type):
-            binding_items.append((item_type, item.get("displayName") or item["id"], item["id"]))
+    if binding_items is None:
+        binding_items = _connection_binding_items(client, source_workspace_id)
 
     if not binding_items:
         return []
 
     unusable: dict[str, list[str]] = {}
     for item_type, name, item_id in binding_items:
-        definition = items_module.try_get_item_definition(client, source_workspace_id, item_id)
+        item = {"id": item_id, "displayName": name, "type": item_type}
+        if on_item:
+            on_item(item, "Reading connection references")
+        try:
+            definition = items_module.try_get_item_definition(client, source_workspace_id, item_id)
+        except Exception:
+            if on_item:
+                on_item(item, "Connection reference read failed")
+            raise
         if not definition:
+            if on_item:
+                on_item(item, "Connection references unavailable")
             continue
+        if on_item:
+            on_item(item, "Connection references read")
         for connection_id in connections.referenced_connection_ids(definition.get("parts") or []):
             if connection_id not in known:
                 unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
@@ -1501,6 +1688,7 @@ def dependency_warnings(
     migrated: list[dict[str, Any]],
     client_id: str,
     on_item: Callable[[Mapping[str, Any], str], None] | None = None,
+    on_total: Callable[[int], None] | None = None,
 ) -> DependencyReport:
     """Work out which references will not survive the move.
 
@@ -1508,6 +1696,9 @@ def dependency_warnings(
     same conclusions — a warning the operator was shown before starting should not reappear
     as a surprise, or worse, appear only once the workspace is half built.
     """
+    relation_total = sum(bool(item.get("id")) for item in migrated)
+    if on_total:
+        on_total(relation_total)
     graph = (
         relations.build_graph(client, source_workspace_id, migrated, on_item=on_item)
         if on_item else relations.build_graph(client, source_workspace_id, migrated)
@@ -1520,10 +1711,23 @@ def dependency_warnings(
         migrated_ids={item["id"] for item in migrated if item.get("id")},
         source_workspace_id=source_workspace_id,
     )
+    def set_total(connection_items: int) -> None:
+        if on_total:
+            on_total(relation_total + connection_items)
+
+    access = (
+        scan_connection_access(
+            client, source_workspace_id=source_workspace_id, on_item=on_item, on_total=set_total,
+        )
+        if on_item
+        else scan_connection_access(
+            client, source_workspace_id=source_workspace_id, on_total=set_total,
+        )
+    )
     return DependencyReport(
         graph=graph,
         issues=issues,
-        access=scan_connection_access(client, source_workspace_id=source_workspace_id),
+        access=access,
     )
 
 
@@ -1544,6 +1748,7 @@ def _check_dependencies(ctx: _Context) -> None:
 
     migrated = (ctx.assessment.migrated if ctx.assessment else []) or []
     if not migrated:
+        ctx.run.set_activity_total(step, 0, operation="item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to check")
         return
 
@@ -1557,11 +1762,14 @@ def _check_dependencies(ctx: _Context) -> None:
             str(item["id"]), str(item.get("displayName") or item["id"]),
             str(item.get("type") or ""), action,
             "running" if action.startswith("Reading") else (
-                "failed" if "failed" in action else (
-                    "unknown" if "unavailable" in action else "succeeded"
+                "failed" if "failed" in action.casefold() else (
+                    "unknown" if "unavailable" in action.casefold() else "succeeded"
                 )
             ),
             step_id=step,
+        ),
+        on_total=lambda total: ctx.run.set_activity_total(
+            step, total, operation="item",
         ),
     )
     ctx.graph = report.graph
@@ -1821,6 +2029,15 @@ def _create_workspaces(ctx: _Context) -> None:
     step = "workspaces"
     ctx.run.start_step(step, "Creating target and scratch workspaces")
     ctx.run.raise_if_cancelled()
+    ctx.run.set_activity_total(
+        step, 2 if not ctx.plan.paired else 1, operation="stage-item",
+    )
+    target_activity = {
+        "id": f"workspace:{ctx.plan.target_workspace_name}",
+        "displayName": ctx.plan.target_workspace_name,
+        "type": "Workspace",
+    }
+    _stage_item_activity(ctx, step, target_activity, "Preparing target workspace", "running")
 
     # A resumed run reuses the workspaces the earlier attempt made. Creating a second pair
     # would abandon everything already built in the first and collide on the name besides.
@@ -1849,6 +2066,7 @@ def _create_workspaces(ctx: _Context) -> None:
         }
         ctx.journal.workspace("target", target["id"], ctx.plan.target_workspace_name)
         ctx.id_map[ctx.plan.source_workspace_id] = target["id"]
+    _stage_item_activity(ctx, step, target_activity, "Target workspace ready", "succeeded")
     if ctx.plan.paired:
         for item in ctx.assessment.migrated if ctx.assessment else ():
             if item["id"] in ctx.id_map:
@@ -1862,8 +2080,20 @@ def _create_workspaces(ctx: _Context) -> None:
         ctx.source_role_assignments = workspaces.list_role_assignments(
             ctx.client, ctx.plan.source_workspace_id
         )
+        admin_assignments = [
+            item for item in ctx.source_role_assignments if item.get("role") == "Admin"
+        ]
+        scratch_admin_count = (
+            len(admin_assignments) if not ctx.plan.paired and not ctx.scratch_workspace_id else 0
+        )
+        ctx.run.add_activity_total(
+            step, len(admin_assignments) + scratch_admin_count, operation="stage-item",
+        )
         admin_warnings = workspaces.copy_role_assignments(
-            ctx.destination_client, ctx.source_role_assignments, ctx.target_workspace_id, roles={"Admin"}
+            ctx.destination_client, ctx.source_role_assignments, ctx.target_workspace_id, roles={"Admin"},
+            on_activity=lambda assignment, action, state: _role_assignment_activity(
+                ctx, step, ctx.target_workspace_id, assignment, action, state,
+            ),
         )
         ctx.warnings.extend(admin_warnings)
     else:
@@ -1876,6 +2106,10 @@ def _create_workspaces(ctx: _Context) -> None:
     # show up as leftover items in the migrated workspace.
     if not ctx.scratch_workspace_id and not ctx.plan.paired:
         scratch_name = workspaces.scratch_workspace_name()
+        scratch_activity = {
+            "id": f"workspace:{scratch_name}", "displayName": scratch_name, "type": "Workspace",
+        }
+        _stage_item_activity(ctx, step, scratch_activity, "Preparing Copy Job workspace", "running")
         ctx.run.update_step(step, "Creating scratch workspace for Copy Jobs")
         scratch = workspaces.create_workspace(
             ctx.client,
@@ -1889,13 +2123,25 @@ def _create_workspaces(ctx: _Context) -> None:
 
         # The scratch workspace needs the same treatment so a stranded one stays deletable.
         workspaces.copy_role_assignments(
-            ctx.client, ctx.source_role_assignments, ctx.scratch_workspace_id, roles={"Admin"}
+            ctx.client, ctx.source_role_assignments, ctx.scratch_workspace_id, roles={"Admin"},
+            on_activity=lambda assignment, action, state: _role_assignment_activity(
+                ctx, step, ctx.scratch_workspace_id, assignment, action, state,
+            ),
         )
 
         # A workspace is not fully initialised for Copy Jobs until it holds a lakehouse.
         data_stores.create_lakehouse(ctx.client, ctx.scratch_workspace_id, "hold")
     elif ctx.scratch_workspace_id:
         ctx.run.scratch_workspace = {"id": ctx.scratch_workspace_id, "displayName": ""}
+        scratch_activity = {
+            "id": f"workspace:{ctx.scratch_workspace_id}",
+            "displayName": "Copy Job workspace", "type": "Workspace",
+        }
+        _stage_item_activity(ctx, step, scratch_activity, "Reusing Copy Job workspace", "running")
+    if not ctx.plan.paired:
+        _stage_item_activity(
+            ctx, step, scratch_activity, "Copy Job workspace ready", "succeeded",
+        )
 
     ctx.run.update_step(step, "Recreating workspace folders")
     folder_map = workspaces.clone_folder_tree(
@@ -2000,9 +2246,18 @@ def _migrate_eventhouses(ctx: _Context) -> None:
 
     source_eventhouses = eventhouses.list_eventhouses(ctx.client, ctx.plan.source_workspace_id)
     if not source_eventhouses:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No eventhouses in the source workspace")
         return
 
+    kql_database_ids = {
+        str(database_id)
+        for item in source_eventhouses
+        for database_id in (item.get("properties") or {}).get("databasesItemIds") or []
+        if database_id
+    }
+    ctx.run.add_activity_total(step, len(source_eventhouses), operation="stage-item")
+    ctx.run.add_activity_total(step, len(kql_database_ids), operation="stage-item")
     warnings: list[str] = []
     databases_moved = 0
     # (database, target eventhouse id, source query URI) for shortcut databases, which are
@@ -2043,6 +2298,10 @@ def _migrate_eventhouses(ctx: _Context) -> None:
 
         for database_id in source_properties.get("databasesItemIds") or []:
             ctx.run.raise_if_cancelled()
+            database_stub = {
+                "id": str(database_id), "displayName": str(database_id), "type": "KQLDatabase",
+            }
+            _stage_item_activity(ctx, step, database_stub, "Reading source KQL database", "running")
             database = eventhouses.get_kql_database(
                 ctx.client, ctx.plan.source_workspace_id, database_id
             )
@@ -2051,6 +2310,9 @@ def _migrate_eventhouses(ctx: _Context) -> None:
                 # might not exist yet, so every follower waits until the leaders are done.
                 deferred_followers.append(
                     (database, target_id, source_properties.get("queryServiceUri", ""))
+                )
+                _stage_item_activity(
+                    ctx, step, database, "Waiting for its leader before recreation", "succeeded",
                 )
                 continue
 
@@ -2065,6 +2327,11 @@ def _migrate_eventhouses(ctx: _Context) -> None:
             )
             databases_moved += 1 if moved else 0
             warnings.extend(database_warnings)
+            _stage_item_activity(
+                ctx, step, database,
+                "KQL database migration completed" if moved else "KQL database was not recreated",
+                "succeeded" if moved else "unknown",
+            )
             if adopted:
                 adopted_names.add(adopted)
 
@@ -2078,6 +2345,7 @@ def _migrate_eventhouses(ctx: _Context) -> None:
 
     for database, target_eventhouse_id, source_query_uri in deferred_followers:
         ctx.run.raise_if_cancelled()
+        _stage_item_activity(ctx, step, database, "Recreating follower database", "running")
         ctx.run.update_step(step, f"Recreating shortcut database '{database['displayName']}'")
         moved, database_warnings = _migrate_follower_database(
             ctx,
@@ -2087,8 +2355,15 @@ def _migrate_eventhouses(ctx: _Context) -> None:
         )
         databases_moved += 1 if moved else 0
         warnings.extend(database_warnings)
+        _stage_item_activity(
+            ctx, step, database,
+            "Follower database recreated" if moved else "Follower database was not recreated",
+            "succeeded" if moved else "unknown",
+        )
 
     ctx.warnings.extend(warnings)
+    for eventhouse in source_eventhouses:
+        _stage_item_activity(ctx, step, eventhouse, "Eventhouse work completed", "succeeded")
     ctx.run.finish_step(
         step,
         StepStatus.SUCCEEDED,
@@ -2361,9 +2636,11 @@ def _migrate_lakehouses(ctx: _Context) -> None:
 
     source_lakehouses = data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id)
     if not source_lakehouses:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No lakehouses in the source workspace")
         return
 
+    ctx.run.set_activity_total(step, len(source_lakehouses), operation="stage-item")
     warnings: list[str] = []
     created_pairs: list[tuple[dict[str, Any], dict[str, Any], bool]] = []
 
@@ -2406,6 +2683,8 @@ def _migrate_lakehouses(ctx: _Context) -> None:
         warnings.extend(_copy_all_lakehouse_files(ctx, step, created_pairs))
 
     ctx.warnings.extend(warnings)
+    for lakehouse in source_lakehouses:
+        _stage_item_activity(ctx, step, lakehouse, "Lakehouse work completed", "succeeded")
     ctx.run.finish_step(
         step, StepStatus.SUCCEEDED, f"Migrated {len(source_lakehouses)} lakehouse(s)", warnings
     )
@@ -2813,9 +3092,11 @@ def _migrate_warehouses(ctx: _Context) -> None:
 
     source_warehouses = data_stores.list_warehouses(ctx.client, ctx.plan.source_workspace_id)
     if not source_warehouses:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No warehouses in the source workspace")
         return
 
+    ctx.run.set_activity_total(step, len(source_warehouses), operation="stage-item")
     warnings: list[str] = []
     created_pairs: list[tuple[dict[str, Any], str, str, str]] = []
 
@@ -2851,6 +3132,8 @@ def _migrate_warehouses(ctx: _Context) -> None:
         warnings.extend(_copy_warehouse_tables(ctx, step, ready))
 
     ctx.warnings.extend(warnings)
+    for warehouse, _, _, _ in created_pairs:
+        _stage_item_activity(ctx, step, warehouse, "Warehouse work completed", "succeeded")
     ctx.run.finish_step(
         step, StepStatus.SUCCEEDED, f"Migrated {len(source_warehouses)} warehouse(s)", warnings
     )
@@ -3048,6 +3331,7 @@ def _migrate_sql_databases(ctx: _Context) -> None:
     ctx.run.raise_if_cancelled()
 
     source_databases = sqldatabases.list_sql_databases(ctx.client, ctx.plan.source_workspace_id)
+    ctx.run.set_activity_total(step, len(source_databases), operation="stage-item")
     sql_jobs = {
         item_id for (item_id, name) in ctx.active_copy_jobs
         if name.startswith("CopyJob_SQLDatabase_")
@@ -3162,6 +3446,12 @@ def _migrate_sql_databases(ctx: _Context) -> None:
         )
     if ctx.plan.include_data and ready:
         warnings.extend(_copy_sql_database_tables(ctx, step, ready))
+
+    ready_ids = {str(database["id"]) for database, _ in ready}
+    for database in source_databases:
+        name = str(database.get("displayName") or database["id"])
+        state = "succeeded" if str(database["id"]) in ready_ids else "failed"
+        _stage_item_activity(ctx, step, database, "SQL database work completed", state)
 
     ctx.warnings.extend(warnings)
     summary = ", ".join(
@@ -3449,11 +3739,14 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
         return 0, []
 
     step = "sqldatabases"
+    ctx.run.add_activity_total(step, len(source_databases), operation="stage-item")
     warnings: list[str] = []
     migrated = 0
+    failed_targets: set[str] = set()
     for database in source_databases:
         ctx.run.raise_if_cancelled()
         name = database["displayName"]
+        _stage_item_activity(ctx, step, database, "Migrating Cosmos DB database", "running")
         evidence = ctx.lifecycle(database, cosmosdb.COSMOS_DB_DATABASE)
 
         # The definition holds only container metadata and no Fabric ids, so there is
@@ -3480,6 +3773,10 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
                 warnings.append(
                     analytics.describe_failure(cosmosdb.COSMOS_DB_DATABASE, name, error)
                 )
+                _stage_item_activity(
+                    ctx, step, database, "Cosmos DB target creation failed", "failed",
+                )
+                failed_targets.add(str(database["id"]))
                 continue
             target_id = result.target_id
             ctx.resolve_item(
@@ -3558,6 +3855,16 @@ def _migrate_cosmos_databases(ctx: _Context) -> tuple[int, list[str]]:
             )
         evidence.complete()
 
+    for database in source_databases:
+        if str(database["id"]) in failed_targets:
+            continue
+        name = str(database.get("displayName") or database["id"])
+        has_warning = any(name in warning for warning in warnings)
+        _stage_item_activity(
+            ctx, step, database, "Cosmos DB work completed",
+            "unknown" if has_warning else "succeeded",
+        )
+
     return migrated, warnings
 
 
@@ -3573,14 +3880,27 @@ def _validate_connection_mappings(ctx: _Context) -> None:
         key: connection for key, connection in ctx.bound_connections.items()
         if key in ctx.source_items and key not in ctx.plan.connection_mappings
     }
+    mapped_connections = [
+        key.casefold() for key in ctx.plan.connection_mappings
+        if key.casefold() in ctx.source_items
+        and ctx.source_items[key.casefold()].get("type") == "Connection"
+    ]
     if not ctx.plan.connection_mappings and not automatic:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No connection mappings supplied")
         return
 
+    ctx.run.set_activity_total(
+        step, len(automatic) + len(mapped_connections), operation="stage-item",
+    )
     warnings: list[str] = []
     for source_id, connection in automatic.items():
         owners = ctx.connection_sql_owners.get(source_id)
         name = connections.display_name(connection)
+        activity_item = {
+            "id": source_id, "displayName": name, "type": "Connection",
+        }
+        _stage_item_activity(ctx, step, activity_item, "Reconciling destination connection", "running")
         try:
             if ctx.plan.cross_tenant:
                 raise FabricError("The source connection belongs to another tenant.")
@@ -3656,6 +3976,7 @@ def _validate_connection_mappings(ctx: _Context) -> None:
                 "settings, open Fabric Settings > Manage connections and gateways, locate this "
                 "connection, and edit it."
             )
+            _stage_item_activity(ctx, step, activity_item, "Replacement connection verified", "succeeded")
         except FabricError as error:
             if source_id in ctx.id_map:
                 ctx.invalidate_mapping(source_id)
@@ -3664,6 +3985,7 @@ def _validate_connection_mappings(ctx: _Context) -> None:
                 f"Connection '{name}' could not be migrated: {error} "
                 "Inspect the connection and the consuming items in Fabric, then retry."
             )
+            _stage_item_activity(ctx, step, activity_item, "Connection could not be reconciled", "failed")
     for raw_source_id, supplied_target in ctx.plan.connection_mappings.items():
         source_connection_id = raw_source_id.casefold()
         connection = ctx.source_items.get(source_connection_id)
@@ -3671,6 +3993,12 @@ def _validate_connection_mappings(ctx: _Context) -> None:
             # Not a connection any migrated item or shortcut actually references: nothing to
             # validate or bind.
             continue
+        activity_item = {
+            "id": source_connection_id,
+            "displayName": connections.display_name(connection),
+            "type": "Connection",
+        }
+        _stage_item_activity(ctx, step, activity_item, "Validating supplied mapping", "running")
         path = (connection.get("connectionDetails") or {}).get("path") or ""
         if source_connection_id in ctx.id_map and ctx.id_map[source_connection_id] != supplied_target:
             ctx.invalidate_mapping(source_connection_id)
@@ -3681,6 +4009,7 @@ def _validate_connection_mappings(ctx: _Context) -> None:
             (key for key in ctx.id_map if key.casefold() == source_connection_id), None
         )
         if mapped_key is None:
+            _stage_item_activity(ctx, step, activity_item, "Mapping was not available", "unknown")
             continue
         target_id = ctx.id_map[mapped_key]
         rewrite = definitions.build_rewriter(ctx.id_map)
@@ -3698,6 +4027,9 @@ def _validate_connection_mappings(ctx: _Context) -> None:
                 f"Connection '{connections.display_name(connection)}' replacement {target_id} "
                 f"could not be verified: {error}. Grant access or restore it, then retry."
             )
+            _stage_item_activity(
+                ctx, step, activity_item, "Replacement connection could not be verified", "failed",
+            )
             continue
         if (
             needed or not connections.matches_replacement(target, connection, new_path)
@@ -3708,10 +4040,12 @@ def _validate_connection_mappings(ctx: _Context) -> None:
                 "matches its migrated target. Restore the replacement against the migrated "
                 "store, then retry; dependent items will not be created with the old binding."
             )
+            _stage_item_activity(ctx, step, activity_item, "Replacement endpoint did not match", "failed")
             continue
         if mapped_key != source_connection_id:
             del ctx.id_map[mapped_key]
             ctx.id_map[source_connection_id] = target_id
+        _stage_item_activity(ctx, step, activity_item, "Replacement connection verified", "succeeded")
 
     ctx.warnings.extend(warnings)
     if warnings:
@@ -3745,10 +4079,18 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
     catalogs = analytics.list_of_type(ctx.client, source_id, analytics.MIRRORED_ADB_CATALOG)
     snowflake = analytics.list_of_type(ctx.client, source_id, analytics.SNOWFLAKE_DATABASE)
     if not databases and not catalogs and not snowflake:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No mirrored data stores in the source workspace")
         return
 
     warnings: list[str] = []
+    selected_databases = ctx.to_migrate(databases)
+    selected_database_ids = {item["id"] for item in selected_databases}
+    adopted_mirrors = [
+        item for item in databases
+        if ctx.already_created(item["id"]) and item["id"] not in selected_database_ids
+    ]
+    ctx.run.add_activity_total(step, len(adopted_mirrors), operation="stage-item")
 
     def progress(message: str) -> None:
         ctx.run.update_step(step, message)
@@ -3760,7 +4102,7 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
             ctx,
             source_workspace_id=source_id,
             target_workspace_id=ctx.target_workspace_id,
-            items=ctx.to_migrate(databases),
+            items=selected_databases,
             item_type=analytics.MIRRORED_DATABASE,
             id_map=ctx.id_map,
             folder_map=ctx.id_map,
@@ -3770,22 +4112,28 @@ def _migrate_mirrored_databases(ctx: _Context) -> None:
         warnings.extend(item_warnings)
 
     mapped_mirrors = {result.source_id for result in migrated}
-    for database in databases:
-        if ctx.already_created(database["id"]) and database["id"] not in mapped_mirrors:
+    adopted_ids = {item["id"] for item in adopted_mirrors}
+    for database in adopted_mirrors:
+        if database["id"] not in mapped_mirrors:
             migrated.append(analytics.MigratedItem(
                 source_id=database["id"], target_id=ctx.id_map[database["id"]],
                 name=database["displayName"], rebound_parts=0,
             ))
     for result in migrated:
+        adopted = result.source_id in adopted_ids
+        source = next((db for db in databases if db["id"] == result.source_id), {})
+        if adopted:
+            _stage_item_activity(ctx, step, source, "Rechecking existing mirrored database", "running")
         target = ctx.destination_client.get(
             f"workspaces/{ctx.target_workspace_id}/mirroredDatabases/{result.target_id}"
         )
-        source = next((db for db in databases if db["id"] == result.source_id), {})
         source_endpoint = data_stores.mirrored_database_sql_endpoint(source)
         target_endpoint = data_stores.mirrored_database_sql_endpoint(target)
         _map_sql_endpoint(ctx, source_endpoint, target_endpoint, owner=result.source_id)
 
         _configure_database_mirror(ctx, source, result, warnings)
+        if adopted:
+            _stage_item_activity(ctx, step, source, "Existing mirrored database checked", "succeeded")
 
     if catalogs:
         results, item_warnings = _migrate_definition_items(
@@ -3896,9 +4244,11 @@ def _migrate_snowflake_databases(
     connection is tenant scoped, so nothing else has to move.
     """
     warnings: list[str] = []
+    ctx.run.add_activity_total(step, len(items), operation="stage-item")
 
     for item in items:
         name = item["displayName"]
+        _stage_item_activity(ctx, step, item, "Migrating Snowflake database", "running")
         progress(f"Migrating SnowflakeDatabase '{name}'")
         adopted = ctx.already_created(item["id"])
 
@@ -3915,6 +4265,7 @@ def _migrate_snowflake_databases(
         payload = special_items.snowflake_creation_payload(item, parts)
         if not payload:
             if adopted:
+                _stage_item_activity(ctx, step, item, "Snowflake settings could not be verified", "failed")
                 raise ResumeRefused(
                     f"SnowflakeDatabase '{name}' cannot be verified because its database name "
                     "and connection could not be read. Restore access and resume before using it."
@@ -3923,6 +4274,7 @@ def _migrate_snowflake_databases(
                 f"SnowflakeDatabase '{name}' was not migrated because the database name and "
                 "connection it uses could not be read. Recreate it by hand."
             )
+            _stage_item_activity(ctx, step, item, "Required Snowflake settings were unavailable", "unknown")
             continue
 
         try:
@@ -3950,6 +4302,7 @@ def _migrate_snowflake_databases(
                     )
                     ctx.journal.refresh([item["id"]], required=False)
                     ctx.refresh_needed.discard(item["id"])
+                _stage_item_activity(ctx, step, item, "Existing Snowflake database rebound", "succeeded")
                 continue
             created = items_module.create_item(
                 ctx.destination_client,
@@ -3962,15 +4315,20 @@ def _migrate_snowflake_databases(
             )
         except FabricError as error:
             if adopted:
+                _stage_item_activity(
+                    ctx, step, item, "Existing Snowflake database could not be rebound", "failed",
+                )
                 raise ResumeRefused(
                     f"SnowflakeDatabase '{name}' could not be rebound. Resolve the error and "
                     f"resume before using it: {error}"
                 ) from error
             warnings.append(analytics.describe_failure(analytics.SNOWFLAKE_DATABASE, name, error))
+            _stage_item_activity(ctx, step, item, "Snowflake database creation failed", "failed")
             continue
 
         ctx.id_map[item["id"]] = created["id"]
         ctx.journal.item(item["id"], created["id"], analytics.SNOWFLAKE_DATABASE, name)
+        _stage_item_activity(ctx, step, item, "Snowflake database migration completed", "succeeded")
 
     return warnings
 
@@ -3985,12 +4343,17 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
 
     source_lakehouses = data_stores.list_lakehouses(ctx.client, ctx.plan.source_workspace_id)
     if not source_lakehouses and not ctx.kql_databases:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing references other items")
         return
 
+    ctx.run.set_activity_total(
+        step, len(source_lakehouses) + len(ctx.kql_databases), operation="stage-item",
+    )
     warnings: list[str] = []
     shortcuts_completed = 0
     endpoints: list[tuple[str, str, str]] = []
+    tracked_lakehouses: list[dict[str, Any]] = []
 
     # Names for the items in the source workspace, so a shortcut pointing at something that
     # did not migrate can say which item that was rather than quoting a GUID.
@@ -4004,8 +4367,15 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     # are only safe to create now that every one of those exists.
     for source_db_id, target_db_id, database_name in ctx.kql_databases:
         ctx.run.raise_if_cancelled()
+        database_activity = {
+            "id": source_db_id, "displayName": database_name, "type": "KQLDatabase",
+        }
+        _stage_item_activity(ctx, step, database_activity, "Reconciling KQL table shortcuts", "running")
         table_shortcuts = ctx.kql_table_shortcuts.get(source_db_id) or []
         if not table_shortcuts:
+            _stage_item_activity(
+                ctx, step, database_activity, "No KQL table shortcuts to reconcile", "succeeded",
+            )
             continue
 
         ctx.run.update_step(step, f"Reconciling table shortcuts for KQL database '{database_name}'")
@@ -4025,13 +4395,19 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
         )
         shortcuts_completed += completed
         warnings.extend(f"KQL database '{database_name}': {w}" for w in shortcut_warnings)
+        _stage_item_activity(
+            ctx, step, database_activity, "KQL shortcut reconciliation completed", "succeeded",
+        )
 
     for lakehouse in source_lakehouses:
         ctx.run.raise_if_cancelled()
+        _stage_item_activity(ctx, step, lakehouse, "Reconciling lakehouse shortcuts and endpoint", "running")
         name = lakehouse["displayName"]
         target_id = ctx.id_map.get(lakehouse["id"])
         if not target_id:
+            _stage_item_activity(ctx, step, lakehouse, "Lakehouse has no verified destination", "unknown")
             continue
+        tracked_lakehouses.append(lakehouse)
 
         ctx.run.update_step(step, f"Reconciling shortcuts for '{name}'")
         completed, shortcut_warnings = shortcuts.copy_shortcuts(
@@ -4125,6 +4501,8 @@ def _migrate_shortcuts_and_endpoints(ctx: _Context) -> None:
     # are the slow part of this phase: a refreshed endpoint takes minutes to answer, and it
     # takes them whether or not we are also waiting on another one.
     warnings.extend(_transfer_endpoint_schemas(ctx, step, endpoints))
+    for lakehouse in tracked_lakehouses:
+        _stage_item_activity(ctx, step, lakehouse, "Lakehouse endpoint work completed", "succeeded")
 
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
@@ -4210,6 +4588,7 @@ def _migrate_realtime(ctx: _Context) -> None:
         (analytics.KQL_DASHBOARD, analytics.list_of_type(ctx.client, source_id, analytics.KQL_DASHBOARD)),
     ]
     if not any(items for _, items in groups):
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to migrate in this phase")
         return
 
@@ -4223,12 +4602,15 @@ def _migrate_realtime(ctx: _Context) -> None:
     for item_type, items in groups:
         if ctx.plan.paired and item_type == analytics.EVENTSTREAM:
             for item in items:
+                ctx.run.add_activity_total(step, 1, operation="stage-item")
+                _stage_item_activity(ctx, step, item, "Checking inactive creation safety", "running")
                 action = f"Eventstream '{item['displayName']}' was not created: {STOPPED_EVENTSTREAM_REASON}."
                 ctx.lifecycle(item, item_type).step(
                     "activation", EvidenceState.SKIPPED, "Inactive creation was not established.",
                     action=action,
                 )
                 warnings.append(action)
+                _stage_item_activity(ctx, step, item, "Eventstream withheld from migration", "skipped")
             continue
         if not items:
             continue
@@ -4290,6 +4672,7 @@ def _migrate_engineering(ctx: _Context) -> None:
     ]
 
     if not environments and not notebooks and not dataflows and not any(i for _, i in later):
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to migrate in this phase")
         return
 
@@ -4391,9 +4774,11 @@ def _migrate_dataflows(
     """
     movable: list[dict[str, Any]] = []
     parts_by_id: dict[str, list[dict[str, Any]]] = {}
+    ctx.run.add_activity_total(step, len(dataflows), operation="stage-item")
 
     for dataflow in dataflows:
         ctx.run.raise_if_cancelled()
+        _stage_item_activity(ctx, step, dataflow, "Checking dataflow eligibility", "running")
         progress(f"Checking dataflow '{dataflow.get('displayName')}'")
         parts, reason = analytics.classify_dataflow(ctx.client, ctx.plan.source_workspace_id, dataflow)
         if reason:
@@ -4402,6 +4787,7 @@ def _migrate_dataflows(
                 action=reason,
             )
             warnings.append(reason)
+            _stage_item_activity(ctx, step, dataflow, "Dataflow was not eligible to migrate", "skipped")
             continue
         movable.append(dataflow)
         parts_by_id[dataflow["id"]] = parts or []
@@ -4409,19 +4795,38 @@ def _migrate_dataflows(
     if not movable:
         return 0
 
-    results, item_warnings = _migrate_definition_items(
-        ctx,
-        source_workspace_id=ctx.plan.source_workspace_id,
-        target_workspace_id=ctx.target_workspace_id,
-        items=ctx.to_migrate(movable),
-        item_type=analytics.DATAFLOW,
-        id_map=ctx.id_map,
-        folder_map=ctx.id_map,
-        source_items=ctx.source_items,
-        parts_by_id=parts_by_id,
-        on_progress=progress,
-    )
+    selected = list(ctx.to_migrate(movable))
+    selected_ids = {str(item["id"]) for item in selected}
+    for dataflow in movable:
+        if str(dataflow["id"]) not in selected_ids:
+            _stage_item_activity(ctx, step, dataflow, "Existing dataflow needs no refresh", "succeeded")
+    try:
+        results, item_warnings = _migrate_definition_items(
+            ctx,
+            track_activity=False,
+            source_workspace_id=ctx.plan.source_workspace_id,
+            target_workspace_id=ctx.target_workspace_id,
+            items=selected,
+            item_type=analytics.DATAFLOW,
+            id_map=ctx.id_map,
+            folder_map=ctx.id_map,
+            source_items=ctx.source_items,
+            parts_by_id=parts_by_id,
+            on_progress=progress,
+        )
+    except Exception:
+        for dataflow in selected:
+            _stage_item_activity(ctx, step, dataflow, "Dataflow migration was interrupted", "unknown")
+        raise
     warnings.extend(item_warnings)
+    completed = {str(result.source_id) for result in results}
+    for dataflow in selected:
+        migrated = str(dataflow["id"]) in completed
+        _stage_item_activity(
+            ctx, step, dataflow,
+            "Dataflow migration completed" if migrated else "No destination dataflow was returned",
+            "succeeded" if migrated else "unknown",
+        )
     return len(results)
 
 
@@ -4544,6 +4949,7 @@ def _migrate_reports_and_models(ctx: _Context) -> None:
     reports = analytics.list_of_type(ctx.client, source_id, analytics.REPORT)
 
     if not models and not reports:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No semantic models or reports to migrate")
         return
 
@@ -4633,6 +5039,7 @@ def _migrate_orchestration(ctx: _Context) -> None:
     airflow_jobs = analytics.list_of_type(ctx.client, source_id, airflow.APACHE_AIRFLOW_JOB)
 
     if not pipelines and not jobs and not airflow_jobs:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to orchestrate in this workspace")
         return
 
@@ -4697,10 +5104,12 @@ def _migrate_airflow_jobs(
     """
     migrated = 0
     warnings: list[str] = []
+    ctx.run.add_activity_total(step, len(jobs), operation="stage-item")
 
     for job in jobs:
         ctx.run.raise_if_cancelled()
         name = job["displayName"]
+        _stage_item_activity(ctx, step, job, "Migrating Airflow job and files", "running")
         progress(f"Migrating Apache Airflow job '{name}'")
         refresh = job["id"] in ctx.refresh_needed
         evidence = ctx.lifecycle(job, airflow.APACHE_AIRFLOW_JOB)
@@ -4787,11 +5196,13 @@ def _migrate_airflow_jobs(
                     f"resume before using it: {error}"
                 ) from error
             warnings.append(analytics.describe_failure(airflow.APACHE_AIRFLOW_JOB, name, error))
+            _stage_item_activity(ctx, step, job, "Airflow job migration failed", "failed")
             continue
 
         migrated += 1
         warnings.extend(configuration_messages)
         if not refresh and ctx.already_copied(job["id"], "airflow-files"):
+            _stage_item_activity(ctx, step, job, "Airflow files already copied", "succeeded")
             continue
 
         copied, file_warnings = airflow.copy_files(
@@ -4832,6 +5243,10 @@ def _migrate_airflow_jobs(
                 f"Apache Airflow job '{name}' had no files to copy, so the new job has no DAGs."
             )
         evidence.complete()
+        _stage_item_activity(
+            ctx, step, job, "Airflow configuration and file work completed",
+            "unknown" if file_warnings else "succeeded",
+        )
 
     return migrated, warnings
 
@@ -4854,6 +5269,7 @@ def _migrate_reflexes(ctx: _Context) -> None:
     source_id = ctx.plan.source_workspace_id
     reflexes = analytics.list_of_type(ctx.client, source_id, analytics.REFLEX)
     if not reflexes:
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "No Activator items to migrate")
         return
 
@@ -4932,6 +5348,12 @@ def _scan_connection_advisories(ctx: _Context) -> None:
     """
     step = "connectionadvisory"
     ctx.run.start_step(step, "Scanning tenant connections for source workspace references")
+    ctx.run.set_activity_total(step, 1, operation="stage-item")
+    scan_activity = {
+        "id": "tenant-connection-scan", "displayName": "Tenant connections",
+        "type": "Connection advisory scan",
+    }
+    _stage_item_activity(ctx, step, scan_activity, "Scanning visible connection paths", "running")
     scan = connection_advisory.scan_source_connections(
         ctx.client,
         source_workspace_id=ctx.plan.source_workspace_id,
@@ -4940,6 +5362,10 @@ def _scan_connection_advisories(ctx: _Context) -> None:
         attempt_id=ctx.run.id,
         id_map=dict(ctx.id_map),
         check_cancel=ctx.run.raise_if_cancelled,
+    )
+    _stage_item_activity(
+        ctx, step, scan_activity, "Connection scan completed",
+        "succeeded" if scan.scan_state == connection_advisory.SCAN_COMPLETE else "unknown",
     )
     payload = scan.as_dict()
     ctx.journal.connection_advisory(payload)
@@ -4957,6 +5383,7 @@ def _copy_permissions(ctx: _Context) -> None:
     step = "permissions"
     if not ctx.plan.copy_permissions or ctx.plan.cross_tenant:
         ctx.run.add_step(step, "Copying workspace permissions")
+        ctx.run.set_activity_total(step, 0, operation="stage-item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Disabled for this run")
         return
 
@@ -4967,7 +5394,13 @@ def _copy_permissions(ctx: _Context) -> None:
     assignments = ctx.source_role_assignments or workspaces.list_role_assignments(
         ctx.client, ctx.plan.source_workspace_id
     )
-    warnings = workspaces.copy_role_assignments(ctx.destination_client, assignments, ctx.target_workspace_id)
+    ctx.run.set_activity_total(step, len(assignments), operation="stage-item")
+    warnings = workspaces.copy_role_assignments(
+        ctx.destination_client, assignments, ctx.target_workspace_id,
+        on_activity=lambda assignment, action, state: _role_assignment_activity(
+            ctx, step, ctx.target_workspace_id, assignment, action, state,
+        ),
+    )
     ctx.warnings.extend(warnings)
     ctx.run.finish_step(
         step,
@@ -5004,8 +5437,21 @@ def cleanup_run(run: MigrationRun, client: FabricClient, scratch_dir: Path | Non
             raise journal_module.TenantBindingError(
                 "The scratch workspace is not owned by this run's destination journal."
             )
+    directory = scratch_dir or (SETTINGS.scratch_root / run.id)
+    scratch_id = str((scratch or {}).get("id") or "")
+    has_directory = directory.exists()
     run.start_step(step, "Removing temporary artifacts")
+    run.set_activity_total(step, int(bool(scratch_id)) + int(has_directory), operation="stage-item")
     if scratch and scratch.get("id"):
+        scratch_activity = {
+            "id": f"workspace:{scratch_id}",
+            "displayName": str(scratch.get("displayName") or "Copy Job workspace"),
+            "type": "Workspace cleanup",
+        }
+        run.item_activity(
+            scratch_activity["id"], scratch_activity["displayName"], scratch_activity["type"],
+            "Deleting scratch workspace", "running", "stage-item", step_id=step,
+        )
         run.update_step(step, "Deleting scratch workspace")
         try:
             # Deleting the workspace removes the items under it. They must not be deleted
@@ -5013,13 +5459,40 @@ def cleanup_run(run: MigrationRun, client: FabricClient, scratch_dir: Path | Non
             # reject a direct delete with OperationNotSupportedForItem.
             workspaces.delete_workspace(client, scratch["id"])
             run.scratch_workspace = None
+            run.item_activity(
+                scratch_activity["id"], scratch_activity["displayName"], scratch_activity["type"],
+                "Scratch workspace deleted", "succeeded", "stage-item", step_id=step,
+            )
         except Exception as error:
             warnings.append(f"Scratch workspace {scratch['id']} could not be deleted: {error}")
+            run.item_activity(
+                scratch_activity["id"], scratch_activity["displayName"], scratch_activity["type"],
+                "Scratch workspace deletion failed", "failed", "stage-item", step_id=step,
+            )
 
-    directory = scratch_dir or (SETTINGS.scratch_root / run.id)
-    if directory.exists():
+    if has_directory:
+        staging_activity = {
+            "id": f"local-staging:{run.id}",
+            "displayName": "Local staging directory",
+            "type": "Temporary artifacts",
+        }
+        run.item_activity(
+            staging_activity["id"], staging_activity["displayName"], staging_activity["type"],
+            "Deleting local staging directory", "running", "stage-item", step_id=step,
+        )
         run.update_step(step, "Deleting local staging directory")
-        shutil.rmtree(directory, ignore_errors=True)
+        try:
+            shutil.rmtree(directory)
+            run.item_activity(
+                staging_activity["id"], staging_activity["displayName"], staging_activity["type"],
+                "Local staging directory deleted", "succeeded", "stage-item", step_id=step,
+            )
+        except OSError as error:
+            warnings.append(f"Local staging directory {directory} could not be deleted: {error}")
+            run.item_activity(
+                staging_activity["id"], staging_activity["displayName"], staging_activity["type"],
+                "Local staging directory deletion failed", "failed", "stage-item", step_id=step,
+            )
 
     run.cleanup_done = not warnings
     run.finish_step(

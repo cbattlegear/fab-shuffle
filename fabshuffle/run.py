@@ -56,9 +56,69 @@ class Step:
     finished_at: str | None = None
     activity: dict[str, dict[str, Any]] = field(default_factory=dict)
     activity_omitted: int = 0
+    activity_total: int | None = None
+    activity_completed: int = 0
+    activity_operation: str | None = None
+
+    def record_activity(
+        self,
+        item_id: str,
+        name: str,
+        item_type: str,
+        action: str,
+        state: str,
+        operation: str = "",
+        *,
+        counted: bool = True,
+    ) -> None:
+        """Record one bounded item action for both migration and read-only review progress."""
+        item_id = str(item_id)[:128]
+        name, item_type, action = (safe_text(str(value))[:300] for value in (name, item_type, action))
+        entry = self.activity.get(item_id)
+        if entry is None:
+            if len(self.activity) >= MAX_ACTIVITY_ITEMS:
+                oldest = next(iter(self.activity))
+                evicted = next(
+                    (key for key, value in self.activity.items() if not value["_inflight"]),
+                    oldest,
+                )
+                del self.activity[evicted]
+                self.activity_omitted += 1
+            entry = {"id": item_id, "name": name, "type": item_type, "actions": [], "_inflight": {}}
+        else:
+            del self.activity[item_id]
+        self.activity[item_id] = entry
+        inflight = entry["_inflight"]
+        operation = safe_text(str(operation))[:100] or "item"
+        if operation not in inflight and (
+            (state == "running" and len(inflight) >= MAX_ACTIVITY_OPERATIONS)
+            or (state != "running" and "_overflow" in inflight)
+        ):
+            operation = "_overflow"
+        if state == "running":
+            inflight[operation] = inflight.get(operation, 0) + 1
+        elif state in ("succeeded", "failed", "skipped", "planned", "unknown") and operation in inflight:
+            inflight[operation] -= 1
+            if not inflight[operation]:
+                del inflight[operation]
+            if counted:
+                self.activity_completed += 1
+        entry["actions"].append({"action": action, "state": state, "time": _now()})
+        del entry["actions"][:-MAX_ACTIVITY_HISTORY]
+
+    def close_active_activity(self) -> None:
+        """Close in-flight actions as unknown when their stage ends before confirmation."""
+        for entry in list(self.activity.values()):
+            for operation, count in list(entry["_inflight"].items()):
+                for _ in range(count):
+                    self.record_activity(
+                        entry["id"], entry["name"], entry["type"],
+                        "Work ended before this action was confirmed", "unknown", operation,
+                        counted=self.activity_operation is None or operation == self.activity_operation,
+                    )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "id": self.id,
             "title": self.title,
             "status": self.status.value,
@@ -73,6 +133,10 @@ class Step:
             ],
             "activityOmitted": self.activity_omitted,
         }
+        if self.activity_total is not None:
+            result["activityTotal"] = self.activity_total
+        result["activityCompleted"] = self.activity_completed
+        return result
 
 
 class CancelledError(RuntimeError):
@@ -176,43 +240,41 @@ class MigrationRun:
         *, step_id: str | None = None,
     ) -> None:
         """Publish a bounded, payload-free history of actual item actions."""
-        name, item_type, action = (self._safe_text(str(value))[:300] for value in (name, item_type, action))
         with self._lock:
             step = self._steps_by_id.get(step_id or self._active_step or "")
             if not step:
                 return
-            entry = step.activity.get(item_id)
-            if entry is None:
-                if len(step.activity) >= MAX_ACTIVITY_ITEMS:
-                    oldest = next(iter(step.activity))
-                    evicted = next(
-                        (key for key, value in step.activity.items()
-                         if not value["_inflight"]),
-                        oldest,
-                    )
-                    del step.activity[evicted]
-                    step.activity_omitted += 1
-                entry = {"id": item_id, "name": name, "type": item_type, "actions": [], "_inflight": {}}
-            else:
-                # Dict insertion order is the most-recent-activity order.
-                del step.activity[item_id]
-            step.activity[item_id] = entry
-            inflight = entry["_inflight"]
-            operation = self._safe_text(operation)[:100] or "item"
-            if operation not in inflight and (
-                (state == "running" and len(inflight) >= MAX_ACTIVITY_OPERATIONS)
-                or (state != "running" and "_overflow" in inflight)
-            ):
-                operation = "_overflow"
-            if state == "running":
-                inflight[operation] = inflight.get(operation, 0) + 1
-            elif state in ("succeeded", "failed", "skipped", "planned") and operation in inflight:
-                inflight[operation] -= 1
-                if not inflight[operation]:
-                    del inflight[operation]
-            entry["actions"].append({"action": action, "state": state, "time": _now()})
-            del entry["actions"][:-MAX_ACTIVITY_HISTORY]
+            safe_operation = self._safe_text(str(operation))
+            step.record_activity(
+                item_id, self._safe_text(str(name)), self._safe_text(str(item_type)),
+                self._safe_text(str(action)), state, safe_operation,
+                counted=step.activity_operation is None or safe_operation == step.activity_operation,
+            )
         activity_logger.info("%s: %s %s — %s (%s)", step.title, item_type, name, action, state)
+        self._publish()
+
+    def set_activity_total(
+        self, step_id: str, total: int, *, operation: str | None = None,
+    ) -> None:
+        with self._lock:
+            step = self._steps_by_id.get(step_id)
+            if not step:
+                return
+            step.activity_total = max(0, int(total))
+            step.activity_operation = operation
+        self._publish()
+
+    def add_activity_total(
+        self, step_id: str, total: int, *, operation: str,
+    ) -> None:
+        with self._lock:
+            step = self._steps_by_id.get(step_id)
+            if not step:
+                return
+            if step.activity_operation not in (None, operation):
+                raise ValueError(f"Activity count operation already set for step {step_id}")
+            step.activity_operation = operation
+            step.activity_total = (step.activity_total or 0) + max(0, int(total))
         self._publish()
 
     def finish_step(
@@ -226,6 +288,7 @@ class MigrationRun:
             step = self._steps_by_id.get(step_id)
             if not step:
                 return
+            step.close_active_activity()
             step.status = status
             step.finished_at = _now()
             if detail:

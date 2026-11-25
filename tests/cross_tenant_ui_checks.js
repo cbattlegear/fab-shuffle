@@ -5,6 +5,8 @@ const vm = require("node:vm");
 
 function fixture() {
   const requests = [], streams = [];
+  const timers = new Map();
+  let now = 0, nextTimer = 0;
   class Element {
     constructor(tag) {
       this.tagName = tag; this.children = []; this.dataset = {}; this.handlers = {};
@@ -75,7 +77,13 @@ function fixture() {
   document.activeElement = document.body;
   const context = vm.createContext({
     document, console, URLSearchParams, AbortController,
-    setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
+    setTimeout(callback, delay) {
+      const id = ++nextTimer;
+      timers.set(id, { callback, at: now + delay });
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    setInterval: () => 1, clearInterval() {},
     FormData: class {
       constructor(form) { this.form = form; }
       entries() { return this.form.querySelectorAll("input").filter((i) => i.name).map((i) => [i.name, i.value]); }
@@ -93,6 +101,20 @@ function fixture() {
       mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume, resumeOptions,
       invalidateMappings, loadResumable, loadConnectionOptions, watchRun, resetReadiness };`, context);
   const flush = async () => { for (let i = 0; i < 18; i++) await Promise.resolve(); };
+  async function tick(ms) {
+    const end = now + ms;
+    while (true) {
+      const next = Array.from(timers.entries()).filter(([, timer]) => timer.at <= end)
+        .sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at;
+      timers.delete(next[0]);
+      next[1].callback();
+      await flush();
+    }
+    now = end;
+    await flush();
+  }
   async function reply(index, data, status = 200) {
     requests[index].resolve({ ok: status < 400, status, text: async () => JSON.stringify(data) });
     await flush();
@@ -114,7 +136,7 @@ function fixture() {
     ui.renderReview();
     ui.setStartEnabled(true);
   }
-  return { get, ui, document, requests, streams, reply, flush, paired };
+  return { get, ui, document, requests, streams, reply, flush, tick, paired };
 }
 
 const scenarios = {
