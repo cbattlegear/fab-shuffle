@@ -22,6 +22,7 @@ logger = logging.getLogger("fabshuffle.stage")
 activity_logger = logging.getLogger("fabshuffle.activity")
 MAX_ACTIVITY_ITEMS = 50
 MAX_ACTIVITY_HISTORY = 5
+MAX_ACTIVITY_OPERATIONS = 32
 
 
 class StepStatus(StrEnum):
@@ -65,7 +66,11 @@ class Step:
             "warnings": list(self.warnings),
             "startedAt": self.started_at,
             "finishedAt": self.finished_at,
-            "activity": deepcopy(list(self.activity.values())),
+            "activity": [
+                {**deepcopy({key: value for key, value in entry.items() if key != "_inflight"}),
+                 "active": bool(entry["_inflight"])}
+                for entry in self.activity.values()
+            ],
             "activityOmitted": self.activity_omitted,
         }
 
@@ -157,7 +162,7 @@ class MigrationRun:
             if not step:
                 return
             step.detail = detail
-        logger.info("Stage progress: %s — %s", self._safe_text(step.title), self._safe_text(detail))
+        activity_logger.info("Stage progress: %s — %s", self._safe_text(step.title), self._safe_text(detail))
         self._publish()
 
     def _safe_text(self, value: str) -> str:
@@ -167,6 +172,7 @@ class MigrationRun:
 
     def item_activity(
         self, item_id: str, name: str, item_type: str, action: str, state: str,
+        operation: str = "",
         *, step_id: str | None = None,
     ) -> None:
         """Publish a bounded, payload-free history of actual item actions."""
@@ -178,13 +184,34 @@ class MigrationRun:
             entry = step.activity.get(item_id)
             if entry is None:
                 if len(step.activity) >= MAX_ACTIVITY_ITEMS:
+                    oldest = next(iter(step.activity))
+                    evicted = next(
+                        (key for key, value in step.activity.items()
+                         if not value["_inflight"]),
+                        oldest,
+                    )
+                    del step.activity[evicted]
                     step.activity_omitted += 1
-                else:
-                    entry = {"id": item_id, "name": name, "type": item_type, "actions": []}
-                    step.activity[item_id] = entry
-            if entry is not None:
-                entry["actions"].append({"action": action, "state": state, "time": _now()})
-                del entry["actions"][:-MAX_ACTIVITY_HISTORY]
+                entry = {"id": item_id, "name": name, "type": item_type, "actions": [], "_inflight": {}}
+            else:
+                # Dict insertion order is the most-recent-activity order.
+                del step.activity[item_id]
+            step.activity[item_id] = entry
+            inflight = entry["_inflight"]
+            operation = self._safe_text(operation)[:100] or "item"
+            if operation not in inflight and (
+                (state == "running" and len(inflight) >= MAX_ACTIVITY_OPERATIONS)
+                or (state != "running" and "_overflow" in inflight)
+            ):
+                operation = "_overflow"
+            if state == "running":
+                inflight[operation] = inflight.get(operation, 0) + 1
+            elif state in ("succeeded", "failed", "skipped", "planned") and operation in inflight:
+                inflight[operation] -= 1
+                if not inflight[operation]:
+                    del inflight[operation]
+            entry["actions"].append({"action": action, "state": state, "time": _now()})
+            del entry["actions"][:-MAX_ACTIVITY_HISTORY]
         activity_logger.info("%s: %s %s — %s (%s)", step.title, item_type, name, action, state)
         self._publish()
 

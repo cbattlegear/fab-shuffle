@@ -1346,7 +1346,10 @@ function renderRun(run) {
   const list = $("#step-list");
   const expanded = new Set([...list.querySelectorAll("details[data-activity-step]")]
     .filter((entry) => entry.open).map((entry) => entry.dataset.activityStep));
-  const focused = document.activeElement?.closest?.("details[data-activity-step]")?.dataset.activityStep;
+  const expandedItems = new Set([...list.querySelectorAll("details[data-activity-key]")]
+    .filter((entry) => entry.open).map((entry) => entry.dataset.activityKey));
+  const focusedItem = document.activeElement?.closest?.("details[data-activity-key]")?.dataset.activityKey;
+  const focusedStage = document.activeElement?.closest?.("details[data-activity-step]")?.dataset.activityStep;
   list.innerHTML = "";
   run.steps.forEach((step) => {
     const item = document.createElement("li");
@@ -1374,23 +1377,35 @@ function renderRun(run) {
       rows.className = "activity-items";
       activities.forEach((activity) => {
         const row = document.createElement("li");
-        const label = document.createElement("strong");
+        const history = document.createElement("details");
+        history.dataset.activityKey = JSON.stringify([step.id, activity.id]);
+        history.open = expandedItems.has(history.dataset.activityKey);
+        const label = document.createElement("summary");
         label.textContent = [activity.type, activity.name].filter(Boolean).join(" · ");
-        row.appendChild(label);
+        history.appendChild(label);
+        const latest = (activity.actions || []).at(-1);
+        if (latest) {
+          const current = document.createElement("span");
+          current.className = "activity-current";
+          const concurrent = activity.active && latest.state !== "running" ? "; another action running" : "";
+          current.textContent = `${latest.action} (${latest.state}${concurrent})`;
+          label.appendChild(current);
+        }
         const actions = document.createElement("ol");
         (activity.actions || []).forEach((action) => {
           const entry = document.createElement("li");
           entry.textContent = `${action.action} (${action.state})`;
           actions.appendChild(entry);
         });
-        row.appendChild(actions);
+        history.appendChild(actions);
+        row.appendChild(history);
         rows.appendChild(row);
       });
       details.appendChild(rows);
       if (step.activityOmitted) {
         const note = document.createElement("p");
         note.className = "hint";
-        note.textContent = "Additional item activity is omitted from this live view.";
+        note.textContent = `${step.activityOmitted} earlier item entr${step.activityOmitted === 1 ? "y" : "ies"} no longer shown.`;
         details.appendChild(note);
       }
       item.querySelector(".step-body").appendChild(details);
@@ -1407,9 +1422,12 @@ function renderRun(run) {
     }
     list.appendChild(item);
   });
-  if (focused) {
+  if (focusedItem) {
+    [...list.querySelectorAll("details[data-activity-key]")]
+      .find((entry) => entry.dataset.activityKey === focusedItem)?.querySelector("summary")?.focus();
+  } else if (focusedStage) {
     [...list.querySelectorAll("details[data-activity-step]")]
-      .find((entry) => entry.dataset.activityStep === focused)?.querySelector("summary")?.focus();
+      .find((entry) => entry.dataset.activityStep === focusedStage)?.querySelector("summary")?.focus();
   }
 
   const finished = run.status !== "running" && run.status !== "pending";

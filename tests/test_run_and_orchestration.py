@@ -72,8 +72,27 @@ def test_activity_tracks_parallel_items_and_keeps_latest_snapshot_bounded():
         events.append(subscriber.get_nowait())
     assert events[-1] is None
     assert any(event and event["status"] == "succeeded" for event in events)
-    history = run.snapshot()["steps"][0]["activity"][0]["actions"]
+    history = next(
+        entry["actions"] for entry in run.snapshot()["steps"][0]["activity"] if entry["id"] == first
+    )
     assert len(history) == 5 and history[-1]["action"] == "action 9"
+
+
+def test_activity_window_shows_later_items_and_prefers_retaining_active_ones():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("dependencies", "Checking dependencies")
+    run.item_activity("active", "still running", "Notebook", "Reading", "running")
+    for i in range(60):
+        run.item_activity(str(i), f"item {i}", "Notebook", "Reading", "running")
+        run.item_activity(str(i), f"item {i}", "Notebook", "Read", "succeeded")
+    run.item_activity("later", "current", "Notebook", "Reading", "running")
+    snapshot = run.snapshot()["steps"][0]
+    ids = {entry["id"] for entry in snapshot["activity"]}
+    assert {"active", "later", "59"} <= ids
+    assert "0" not in ids
+    assert snapshot["activityOmitted"] == 12
+    run.item_activity("later", "current", "Notebook", "Still reading", "running")
+    assert run.snapshot()["steps"][0]["activityOmitted"] == 12
 
 
 def test_lifecycle_operations_publish_without_changing_evidence():
@@ -86,15 +105,46 @@ def test_lifecycle_operations_publish_without_changing_evidence():
     assert run.snapshot()["steps"][0]["activity"][0]["actions"][-1]["state"] == "succeeded"
 
 
+def test_activity_keeps_item_active_when_parallel_operation_finishes():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("items", "Migrating items")
+    run.item_activity("one", "Report", "Report", "Data started", "running", "data")
+    run.item_activity("one", "Report", "Report", "Schema started", "running", "schema")
+    run.item_activity("one", "Report", "Report", "Schema done", "succeeded", "schema")
+    for i in range(50):
+        run.item_activity(str(i), str(i), "Report", "Done", "succeeded")
+    entries = run.snapshot()["steps"][0]["activity"]
+    assert next(item for item in entries if item["id"] == "one")["active"]
+    run.item_activity("one", "Report", "Report", "Data done", "succeeded", "data")
+    entries = run.snapshot()["steps"][0]["activity"]
+    assert not next(item for item in entries if item["id"] == "one")["active"]
+
+
 def test_log_modes_and_safe_tool_output(caplog):
-    root = logging.getLogger()
+    names = ("", "fabshuffle", "fabshuffle.stage", "fabshuffle.activity",
+             "httpx", "httpcore", "urllib3", "azure", "msal", "uvicorn.access")
+    previous = {name: logging.getLogger(name).level for name in names}
     activity = logging.getLogger("fabshuffle.activity")
-    previous_root, previous_activity = root.level, activity.level
+    item_log = logging.getLogger("fabshuffle.orchestrator")
     try:
         configure_logging("basic")
         assert not activity.isEnabledFor(logging.INFO)
+        item_log.info("Per-item detail")
+        item_log.warning("A real warning")
+        logging.getLogger("fabshuffle.stage").info("Stage progress")
+        run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+        run.start_step("lakehouse", "Migrating lakehouses")
+        run.update_step("lakehouse", "Creating lakehouse 'bronze'")
+        assert "Per-item detail" not in caplog.text
+        assert "Creating lakehouse 'bronze'" not in caplog.text
+        assert "A real warning" in caplog.text
+        assert "Stage progress" in caplog.text
         configure_logging("verbose")
         assert activity.isEnabledFor(logging.INFO)
+        item_log.info("Per-item detail")
+        run.update_step("lakehouse", "Creating lakehouse 'bronze'")
+        assert "Per-item detail" in caplog.text
+        assert "Creating lakehouse 'bronze'" in caplog.text
         assert not logging.getLogger("fabshuffle.transfer.sqlschema").isEnabledFor(logging.DEBUG)
         configure_logging("debug")
         assert logging.getLogger("fabshuffle.transfer.sqlschema").isEnabledFor(logging.DEBUG)
@@ -107,8 +157,8 @@ def test_log_modes_and_safe_tool_output(caplog):
         route = _log_route("https://example.test/v1/workspaces/private/items/secret?token=hidden")
         assert route == "v1/workspaces/{resource}/items/{resource}"
     finally:
-        root.setLevel(previous_root)
-        activity.setLevel(previous_activity)
+        for name, level in previous.items():
+            logging.getLogger(name).setLevel(level)
 
 
 def test_cancellation_is_observable():

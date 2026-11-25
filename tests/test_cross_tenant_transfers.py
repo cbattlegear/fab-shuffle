@@ -5,8 +5,11 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -1080,6 +1083,52 @@ def test_schema_tool_redirects_temporary_locations_and_counts_their_files(tmp_pa
     assert (root / ".tool-work" / "temporary.bin").stat().st_size == 24
     assert sqlschema._staging_size(root) >= 24
     assert os.environ.get("TMPDIR") == previous
+
+
+def test_bounded_schema_tool_streams_only_safe_progress_before_exit(tmp_path, caplog):
+    root = tmp_path / "stage"
+    root.mkdir()
+    release = root / "release"
+    seen = threading.Event()
+
+    class ProgressHandler(logging.Handler):
+        def emit(self, record):
+            if "Initializing deployment (Start)" in record.getMessage():
+                seen.set()
+
+    logger = logging.getLogger("fabshuffle.transfer.sqlschema")
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+    handler = ProgressHandler()
+    logger.addHandler(handler)
+    code = (
+        "import pathlib,time; "
+        "print('x'*70000+'Initializing deployment (Start)', flush=True); "
+        "print('password=private-value', flush=True); "
+        "print('Initializing deployment (Start)', flush=True); "
+        "p=pathlib.Path('release'); "
+        "exec('while not p.exists():\\n time.sleep(.02)'); "
+        "print('Initializing deployment (Complete)', flush=True)"
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                sqlschema._run_bounded, [sys.executable, "-u", "-c", code],
+                what="sqlpackage extract of private-value", staging_root=root,
+                max_staging_bytes=1024 * 1024,
+            )
+            try:
+                assert seen.wait(10), "safe progress was not logged while the process was running"
+                assert not future.done()
+            finally:
+                release.touch()
+            future.result(timeout=10)
+    finally:
+        logger.removeHandler(handler)
+    assert caplog.text.count("Initializing deployment (Start)") == 1
+    assert "SqlPackage extract started" in caplog.text
+    assert "SqlPackage extract finished (exit 0)" in caplog.text
+    assert "Initializing deployment (Complete)" in caplog.text
+    assert "private-value" not in caplog.text
 
 
 def test_bounded_schema_extract_explicitly_excludes_rows_and_redirects_table_temporary_files(

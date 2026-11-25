@@ -1275,16 +1275,54 @@ def _tool_output(path: Path) -> str:
         return stream.read(1500).decode("utf-8", errors="replace").strip()
 
 
-def _log_tool_output(output: str) -> None:
+_SAFE_TOOL_PROGRESS = frozenset({
+    "Initializing deployment (Start)", "Initializing deployment (Complete)",
+    "Analyzing deployment plan (Start)", "Analyzing deployment plan (Complete)",
+    "Updating database (Start)", "Updating database (Complete)",
+    "Extracting schema", "Extracting schema from database",
+})
+
+
+def _tool_operation(what: str) -> str:
+    for prefix, operation in (
+        ("sqlpackage extract of ", "SqlPackage extract"),
+        ("sqlpackage script of ", "SqlPackage script"),
+        ("unpackdacpac of ", "unpackdacpac"),
+    ):
+        if what.startswith(prefix):
+            return operation
+    return "schema tool"
+
+
+def _log_tool_output(output: str, operation: str = "SqlPackage") -> None:
     """Log only fixed, credential-free progress lines; arbitrary tool output is private."""
-    allowed = {
-        "Initializing deployment (Start)", "Initializing deployment (Complete)",
-        "Analyzing deployment plan (Start)", "Analyzing deployment plan (Complete)",
-        "Updating database (Start)", "Updating database (Complete)",
-    }
     for line in output.splitlines():
-        if line.strip() in allowed:
-            logger.debug("SqlPackage: %s", line.strip())
+        if line.strip() in _SAFE_TOOL_PROGRESS:
+            logger.debug("%s: %s", operation, line.strip())
+
+
+class _ToolProgress:
+    """Incrementally filter complete lines without retaining arbitrary tool output."""
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        self.pending = b""
+        self.overflow = False
+
+    def feed(self, chunk: bytes, *, final: bool = False) -> None:
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if not self.overflow:
+                if len(self.pending) + len(part) <= 256:
+                    self.pending += part
+                else:
+                    self.pending = b""
+                    self.overflow = True
+            if index < len(parts) - 1 or final:
+                if not self.overflow:
+                    _log_tool_output(self.pending.decode("utf-8", errors="replace"), self.operation)
+                self.pending = b""
+                self.overflow = False
 
 
 def _run_bounded(
@@ -1328,8 +1366,9 @@ def _run_bounded(
     if executable:
         command = [str(Path(executable).resolve()), *command[1:]]
     output = root / f".tool-output-{uuid.uuid4().hex}.log"
-    logger.debug("Starting schema tool")
-    with output.open("wb") as log:
+    operation = _tool_operation(what)
+    logger.debug("%s started", operation)
+    with output.open("wb") as log, output.open("rb", buffering=0) as reader:
         try:
             process = subprocess.Popen(
                 command, cwd=root, env=environment, stdin=subprocess.DEVNULL,
@@ -1340,10 +1379,13 @@ def _run_bounded(
                 f"{what} could not run because '{command[0]}' is not installed in this runtime. "
                 "T-SQL schema transfer needs sqlpackage."
             ) from error
+        progress = _ToolProgress(operation)
         try:
             while True:
                 check_cancelled(cancel_requested)
                 _check_staging(root, disk_budget)
+                if logger.isEnabledFor(logging.DEBUG):
+                    progress.feed(reader.read(65536))
                 if process.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -1357,8 +1399,11 @@ def _run_bounded(
             raise
         finally:
             _stop_tool(process, environment)
-    _log_tool_output(_tool_output(output))
-    logger.debug("Schema tool finished (exit %s)", process.returncode)
+            if logger.isEnabledFor(logging.DEBUG):
+                while chunk := reader.read(65536):
+                    progress.feed(chunk)
+                progress.feed(b"", final=True)
+            logger.debug("%s finished (exit %s)", operation, process.returncode)
     if process.returncode:
         raise SchemaTransferError(
             f"{what} failed with exit code {process.returncode}: {_tool_output(output)}"
@@ -1366,7 +1411,8 @@ def _run_bounded(
 
 
 def _run(command: list[str], *, what: str) -> None:
-    logger.debug("Starting schema tool")
+    operation = _tool_operation(what)
+    logger.debug("%s started", operation)
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except FileNotFoundError as error:
@@ -1374,9 +1420,9 @@ def _run(command: list[str], *, what: str) -> None:
             f"{what} could not run because '{command[0]}' is not installed in this runtime. "
             "T-SQL schema transfer needs sqlpackage and unpackdacpac."
         ) from error
-    _log_tool_output(result.stdout or "")
-    _log_tool_output(result.stderr or "")
-    logger.debug("Schema tool finished (exit %s)", result.returncode)
+    _log_tool_output(result.stdout or "", operation)
+    _log_tool_output(result.stderr or "", operation)
+    logger.debug("%s finished (exit %s)", operation, result.returncode)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1500:]
         raise SchemaTransferError(f"{what} failed with exit code {result.returncode}: {detail}")

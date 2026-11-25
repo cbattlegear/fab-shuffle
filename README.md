@@ -619,14 +619,16 @@ pick up. That is the main reason the `docker run` line above mounts one.
 ### Migration activity and logging
 
 Expand a migration stage to see its recorded item actions as they happen. The live view
-retains up to 50 items per stage and five recent actions per item; additional activity is
-omitted from the view. These actions report work, not cutover-readiness guarantees.
+retains up to 50 recently active items per stage and five recent actions per item. Older
+entries are evicted, preferring completed items, with an eviction count shown in the view.
+Expand each item to see its action history. These actions report work, not cutover-readiness
+guarantees.
 
 Set `FAB_SHUFFLE_LOG_LEVEL` to `basic` (default, stage transitions), `verbose` (stages
 and item actions), or `debug` (also Fabric API request status and workstream diagnostics),
 for example `docker run -e FAB_SHUFFLE_LOG_LEVEL=verbose ...`. Warnings and errors remain
 visible in every mode. Request bodies, credentials and arbitrary SqlPackage output are not
-logged; debug shows only recognized safe SqlPackage progress lines and exit status.
+logged; debug streams only recognized safe SqlPackage progress lines and exit status.
 
 ### Building the image yourself
 

@@ -211,7 +211,7 @@ class Lifecycle:
         changed: Callable[[], None] | None = None,
         initial: Mapping[str, ItemOutcome] | None = None,
         secrets: tuple[str, ...] = (),
-        activity: Callable[[str, str, str, str, str], None] | None = None,
+        activity: Callable[[str, str, str, str, str, str], None] | None = None,
     ) -> None:
         self.attempt_id = attempt_id
         self.source_workspace = source_workspace
@@ -336,7 +336,7 @@ class ItemLifecycle:
                 status = "running" if reason == "Operation started; completion not recorded." else state.value
                 self.owner._activity(
                     self.source_id, item.name, item.itemType,
-                    self.owner._text(f"{step}: {reason}"), status,
+                    self.owner._text(f"{step}: {reason}"), status, step,
                 )
 
     @contextmanager

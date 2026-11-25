@@ -46,6 +46,7 @@ function fixture() {
       if (selector.startsWith(".")) return this.className.split(" ").includes(selector.slice(1));
       if (selector === "[data-readiness-key]") return this.dataset.readinessKey !== undefined;
       if (selector === "details[data-activity-step]") return this.tagName === "details" && this.dataset.activityStep !== undefined;
+      if (selector === "details[data-activity-key]") return this.tagName === "details" && this.dataset.activityKey !== undefined;
       return this.tagName === selector;
     }
     querySelectorAll(selector) {
@@ -223,12 +224,16 @@ const scenarios = {
     assert.match(details.textContent, /<img src=x/);
     assert.equal(details.querySelector("img"), null);
     details.open = true;
-    details.querySelector("summary").focus();
+    let history = details.querySelector("details[data-activity-key]");
+    history.open = true;
+    history.querySelector("summary").focus();
     snapshot.steps[0].activity[0].actions.push({ action: "Finished", state: "succeeded" });
     f.ui.renderRun(snapshot);
     details = f.get("step-list").querySelector("details[data-activity-step]");
+    history = details.querySelector("details[data-activity-key]");
     assert.equal(details.open, true);
-    assert.equal(f.document.activeElement, details.querySelector("summary"));
+    assert.equal(history.open, true);
+    assert.equal(f.document.activeElement, history.querySelector("summary"));
     assert.match(details.textContent, /Finished/);
   },
   async hidden_until_halted(f) {

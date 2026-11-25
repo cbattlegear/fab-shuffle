@@ -17,10 +17,12 @@ def configure_logging(mode: str) -> None:
         level=logging.DEBUG if mode == "debug" else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    logging.getLogger().setLevel(logging.DEBUG if mode == "debug" else logging.INFO)
-    logging.getLogger("fabshuffle.activity").setLevel(
-        logging.WARNING if mode == "basic" else logging.INFO
-    )
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("fabshuffle").setLevel({
+        "basic": logging.WARNING, "verbose": logging.INFO, "debug": logging.DEBUG,
+    }[mode])
+    logging.getLogger("fabshuffle.stage").setLevel(logging.INFO)
+    logging.getLogger("fabshuffle.activity").setLevel(logging.NOTSET)
     # Third-party HTTP debug output may contain credentials, URLs or response bodies.
     for name in ("httpx", "httpcore", "urllib3", "azure", "msal", "uvicorn.access"):
         logging.getLogger(name).setLevel(logging.WARNING)

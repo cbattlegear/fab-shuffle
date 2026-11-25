@@ -402,7 +402,8 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .step-activity summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .activity-items { list-style: none; margin: 0.5rem 0 0; padding: 0; }
 .activity-items > li { padding: 0.4rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
-.activity-items strong { color: var(--text); font-weight: 500; }
+.activity-items summary { color: var(--text); font-weight: 500; }
+.activity-current { display: block; margin: 0.2rem 0 0 1.1rem; color: var(--text-dim); font-weight: normal; }
 .activity-items ol { margin: 0.2rem 0 0; padding-left: 1.2rem; }
 
 .warnings {
