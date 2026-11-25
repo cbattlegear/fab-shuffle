@@ -1,15 +1,19 @@
 """Rebind only SQL connections whose endpoint and credential provenance are known."""
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from fabshuffle import journal, orchestrator
 from fabshuffle.auth import ServicePrincipal
 from fabshuffle.fabric import connections, sql_connections
-from fabshuffle.fabric.client import FabricApiError
+from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.definitions import decode_json_part, part, rewrite_parts
-from fabshuffle.run import MigrationRun
+from fabshuffle.run import CancelledError, MigrationRun
 
 SOURCE_CONNECTION = "11111111-1111-1111-1111-111111111111"
 TARGET_CONNECTION = "22222222-2222-2222-2222-222222222222"
@@ -110,6 +114,128 @@ def test_dependency_scan_does_not_continue_after_definition_read_fails(tmp_path,
     monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", denied)
     with pytest.raises(orchestrator.FabricError, match=r"Denied.*grant access"):
         orchestrator._load_source_references(ctx)
+
+
+def test_source_reference_definition_reads_overlap_and_keep_all_results(tmp_path, monkeypatch):
+    ctx = context(tmp_path)
+    ctx.assessment = SimpleNamespace(migrated=[
+        {"id": str(i), "type": "Notebook"} for i in range(9)
+    ])
+    lock = threading.Lock()
+    full = threading.Event()
+    release = threading.Event()
+    active = 0
+    maximum = 0
+
+    def read(_client, _workspace, item_id):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 4:
+                full.set()
+        try:
+            assert release.wait(5)
+            return {"parts": [part("content.json", {"connectionId": SOURCE_CONNECTION})]}
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(orchestrator._source_definition_connections, ctx, "workspace")
+        try:
+            assert full.wait(5)
+        finally:
+            release.set()
+        assert future.result(timeout=5) == {SOURCE_CONNECTION}
+    assert maximum == 4
+
+
+def test_cancelled_source_reference_scan_does_not_start_reads(tmp_path, monkeypatch):
+    ctx = context(tmp_path)
+    ctx.assessment = SimpleNamespace(migrated=[{"id": "copy", "type": "CopyJob"}])
+    monkeypatch.setattr(
+        orchestrator.items_module, "try_get_item_definition",
+        lambda *_: pytest.fail("cancelled scan must not start a read"),
+    )
+    ctx.run.cancel()
+    with pytest.raises(CancelledError):
+        orchestrator._source_definition_connections(ctx, "workspace")
+
+
+def test_source_shortcut_reads_overlap_and_keep_failure_warnings(tmp_path, monkeypatch):
+    ctx = context(tmp_path)
+    ctx.assessment = SimpleNamespace(migrated=[
+        {"id": str(i), "type": "Lakehouse"} for i in range(6)
+    ])
+    lock = threading.Lock()
+    full = threading.Event()
+    release = threading.Event()
+    active = 0
+    maximum = 0
+
+    def read(_client, _workspace, item_id):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 4:
+                full.set()
+        try:
+            assert release.wait(5)
+            if item_id == "2":
+                raise FabricApiError("GET", "shortcuts", 403, "denied")
+            return []
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(orchestrator.shortcuts, "list_shortcuts", read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(orchestrator._source_shortcut_connections, ctx, "workspace")
+        try:
+            assert full.wait(5)
+        finally:
+            release.set()
+        assert future.result(timeout=5) == set()
+    assert maximum == 4
+    assert len(ctx.warnings) == 1
+    assert "denied" in ctx.warnings[0] and "'2'" in ctx.warnings[0]
+
+
+def test_source_definition_lro_waits_overlap_without_polling_early(tmp_path, monkeypatch):
+    ctx = context(tmp_path)
+    ctx.assessment = SimpleNamespace(migrated=[
+        {"id": str(i), "type": "Notebook"} for i in range(2)
+    ])
+    monkeypatch.setattr("fabshuffle.fabric.client._ASSESSMENT_REQUEST_INTERVAL", 0.01)
+    requests = []
+    lock = threading.Lock()
+
+    def handler(request):
+        now = time.monotonic()
+        with lock:
+            requests.append((request.method, request.url.path, now))
+        if request.method == "POST":
+            item_id = request.url.path.split("/items/")[1].split("/")[0]
+            return httpx.Response(202, headers={"x-ms-operation-id": item_id, "Retry-After": "0.2"})
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, json={"definition": {"parts": []}})
+        return httpx.Response(200, json={"status": "Succeeded"})
+
+    tokens = SimpleNamespace(fabric_token=lambda: "stub-token")
+    with FabricClient(tokens, transport=httpx.MockTransport(handler)) as client:
+        ctx.client = client
+        with client.coordinated_throttling(ctx.run.raise_if_cancelled):
+            assert orchestrator._source_definition_connections(ctx, "workspace") == set()
+    posts = {path.split("/items/")[1].split("/")[0]: timestamp for method, path, timestamp in requests
+             if method == "POST"}
+    polls = {path.split("/operations/")[1]: timestamp for method, path, timestamp in requests
+             if method == "GET" and not path.endswith("/result")}
+    assert len(posts) == len(polls) == 2
+    assert max(posts.values()) < min(polls.values())
+    assert all(polls[item] - posts[item] >= 0.19 for item in posts)
 
 
 @pytest.mark.parametrize("prior_reference_type", ["Connection", "ExternalReference"])

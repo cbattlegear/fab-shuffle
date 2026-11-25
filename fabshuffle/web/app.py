@@ -1333,6 +1333,7 @@ def _dependency_report(
     tenant_id: str = "",
     on_item=None,
     on_total=None,
+    check_cancelled=None,
 ) -> dict[str, Any]:
     """Run the same dependency check the migration runs, before anything is created.
 
@@ -1355,6 +1356,8 @@ def _dependency_report(
             options["on_item"] = on_item
         if on_total:
             options["on_total"] = on_total
+        if check_cancelled:
+            options["check_cancelled"] = check_cancelled
         report = dependency_warnings(client, **options)
     except FabricApiError as error:
         return {
@@ -1418,6 +1421,7 @@ def _run_dependency_assessment(assessment: DependencyAssessment, session: Sessio
                     tenant_id=session.principal.tenant_id,
                     on_item=assessment.on_item,
                     on_total=assessment.set_activity_total,
+                    check_cancelled=assessment.check_cancelled,
                 )
                 assessment.check_cancelled()
         assessment.complete(result)

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import httpx
 import pytest
 
@@ -40,6 +44,55 @@ def test_get_sends_bearer_token():
     with make_client(handler) as client:
         assert client.get("workspaces/abc") == {"id": "abc"}
     assert seen["auth"] == "Bearer stub-token"
+
+
+def test_coordinated_assessment_paces_requests_and_shares_429_cooldown(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client._ASSESSMENT_REQUEST_INTERVAL", 0.02)
+    first_throttled = threading.Event()
+    calls = []
+    lock = threading.Lock()
+
+    def handler(request):
+        with lock:
+            calls.append((request.url.path, time.monotonic()))
+            if len(calls) == 1:
+                first_throttled.set()
+                return httpx.Response(429, headers={"Retry-After": "0.3"})
+        return httpx.Response(200, json={})
+
+    with make_client(handler) as client, client.coordinated_throttling():
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(client.get, "first")
+            assert first_throttled.wait(5)
+            second = pool.submit(client.get, "second")
+            first.result(timeout=5)
+            second.result(timeout=5)
+    assert len(calls) == 3
+    assert calls[1][1] - calls[0][1] >= 0.28
+    assert calls[2][1] - calls[1][1] >= 0.018
+
+
+def test_coordinated_assessment_cancels_waiting_requests(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client._ASSESSMENT_REQUEST_INTERVAL", 2)
+    cancelled = threading.Event()
+    calls = []
+
+    def check():
+        if cancelled.is_set():
+            raise RuntimeError("cancelled")
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    with make_client(handler) as client, client.coordinated_throttling(check):
+        client.get("first")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(client.get, "second")
+            cancelled.set()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                pending.result(timeout=1)
+    assert len(calls) == 1
 
 
 def test_paged_follows_continuation_token():

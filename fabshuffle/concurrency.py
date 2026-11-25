@@ -18,12 +18,35 @@ is a count rather than a line each worker overwrites.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+DEPENDENCY_READ_WORKERS = 4
+
+
+def bounded_map(
+    fn: Callable[[_T], _R], values: Iterable[_T], *, limit: int = DEPENDENCY_READ_WORKERS,
+) -> Iterator[_R]:
+    """Yield results in input order without queueing more than ``limit`` reads."""
+    iterator = iter(values)
+    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="dependency-read") as pool:
+        pending: list[Future[_R]] = []
+        try:
+            for value in iterator:
+                pending.append(pool.submit(fn, value))
+                if len(pending) == limit:
+                    yield pending.pop(0).result()
+            for future in pending:
+                yield future.result()
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 @dataclass(frozen=True, slots=True)

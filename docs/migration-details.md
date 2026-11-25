@@ -111,6 +111,10 @@ advances once when a tracked item reaches a terminal state (including failed or 
 unknown outcomes), rather than once per API call. Expand an item to see its recent actions.
 Review uses the same activity presentation for its read-only dependency walk. A total remains
 indeterminate (`?`) when the worklist cannot be known in advance.
+Dependency reads overlap at most four items, with paced requests and a shared cooldown when
+Fabric returns 429. Logs record aggregate counts and elapsed time for relation, connection
+definition, and shortcut reads, without recording definition contents. Times are wall-clock
+durations, including pacing and overlapping requests, not sums of individual request times.
 
 In single-principal rebuilds, source workspace **Admin** assignments are attempted during
 workspace creation even when final permission copying is disabled. This preserves human

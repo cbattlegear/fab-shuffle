@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -26,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _SAFE_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# Below the documented 200/minute item-definition quota for this client's assessment.
+_ASSESSMENT_REQUEST_INTERVAL = 0.35
 _TERMINAL_OPERATION_STATES = frozenset({"Succeeded", "Failed", "Undefined"})
 _LOG_ROUTE_SEGMENTS = frozenset({
     "v1", "workspaces", "items", "operations", "result", "connections", "relations",
@@ -143,6 +147,10 @@ class FabricClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._tokens = tokens
+        self._throttle_condition = threading.Condition()
+        self._throttle_until = 0.0
+        self._throttle_next = 0.0
+        self._throttle_check: Callable[[], None] | None = None
         self.base_url = base_url.rstrip("/")
         self._http = httpx.Client(
             timeout=httpx.Timeout(SETTINGS.request_timeout_seconds),
@@ -183,6 +191,33 @@ class FabricClient:
             headers.update(extra)
         return headers
 
+    @contextmanager
+    def coordinated_throttling(self, check_cancelled: Callable[[], None] | None = None) -> Iterator[None]:
+        """Share a 429 cooldown between the concurrent reads of one assessment."""
+        with self._throttle_condition:
+            self._throttle_until = 0.0
+            self._throttle_next = 0.0
+            self._throttle_check = check_cancelled or (lambda: None)
+        try:
+            yield
+        finally:
+            with self._throttle_condition:
+                self._throttle_check = None
+                self._throttle_until = 0.0
+                self._throttle_next = 0.0
+                self._throttle_condition.notify_all()
+
+    def _wait_for_throttle(self) -> None:
+        with self._throttle_condition:
+            while self._throttle_check is not None:
+                self._throttle_check()
+                now = time.monotonic()
+                remaining = max(self._throttle_until, self._throttle_next) - now
+                if remaining <= 0:
+                    self._throttle_next = now + _ASSESSMENT_REQUEST_INTERVAL
+                    break
+                self._throttle_condition.wait(min(remaining, 0.1))
+
     def request(
         self,
         method: str,
@@ -210,6 +245,7 @@ class FabricClient:
         attempts = max(1, SETTINGS.max_retries)
 
         for attempt in range(1, attempts + 1):
+            self._wait_for_throttle()
             route = _log_route(url)
             logger.debug("Fabric API %s %s attempt %s/%s", method, route, attempt, attempts)
             try:
@@ -237,6 +273,15 @@ class FabricClient:
             retryable = response.status_code == 429 or (
                 safe_read and response.status_code in RETRYABLE_STATUS
             )
+            if response.status_code == 429:
+                delay = _retry_after_seconds(response, fallback=min(60.0, 2.0 ** attempt))
+                with self._throttle_condition:
+                    coordinated = self._throttle_check is not None
+                    if coordinated:
+                        self._throttle_until = max(self._throttle_until, time.monotonic() + delay)
+                        self._throttle_condition.notify_all()
+            else:
+                coordinated = False
             if retryable and attempt < attempts:
                 delay = _retry_after_seconds(response, fallback=min(60.0, 2.0 ** attempt))
                 logger.warning(
@@ -248,7 +293,8 @@ class FabricClient:
                     attempt,
                     attempts,
                 )
-                time.sleep(delay)
+                if not coordinated:
+                    time.sleep(delay)
                 continue
 
             if expected is not None:

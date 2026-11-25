@@ -81,8 +81,10 @@ import json
 import logging
 import re
 import shutil
+import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, field, fields
 from functools import partial
 from pathlib import Path
@@ -1636,11 +1638,19 @@ def _unusable_bound_connections(
         return []
 
     unusable: dict[str, list[str]] = {}
-    for item_type, name, item_id in binding_items:
+    started = time.monotonic()
+    count = 0
+    count_lock = threading.Lock()
+
+    def read(binding: tuple[str, str, str]) -> dict[str, Any] | None:
+        nonlocal count
+        item_type, name, item_id = binding
         item = {"id": item_id, "displayName": name, "type": item_type}
         if on_item:
             on_item(item, "Reading connection references")
         try:
+            with count_lock:
+                count += 1
             definition = items_module.try_get_item_definition(client, source_workspace_id, item_id)
         except Exception:
             if on_item:
@@ -1649,12 +1659,24 @@ def _unusable_bound_connections(
         if not definition:
             if on_item:
                 on_item(item, "Connection references unavailable")
-            continue
+            return None
         if on_item:
             on_item(item, "Connection references read")
-        for connection_id in connections.referenced_connection_ids(definition.get("parts") or []):
-            if connection_id not in known:
-                unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
+        return definition
+
+    try:
+        for (item_type, name, _), definition in zip(
+            binding_items, concurrency.bounded_map(read, binding_items), strict=True,
+        ):
+            if definition:
+                for connection_id in connections.referenced_connection_ids(definition.get("parts") or []):
+                    if connection_id not in known:
+                        unusable.setdefault(connection_id, []).append(f"{item_type} '{name}'")
+    finally:
+        logger.info(
+            "Dependency connection definition reads: count=%s elapsed_seconds=%.3f",
+            count, time.monotonic() - started,
+        )
 
     return [
         ConnectionAccess(
@@ -1689,6 +1711,7 @@ def dependency_warnings(
     client_id: str,
     on_item: Callable[[Mapping[str, Any], str], None] | None = None,
     on_total: Callable[[int], None] | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> DependencyReport:
     """Work out which references will not survive the move.
 
@@ -1696,6 +1719,29 @@ def dependency_warnings(
     same conclusions — a warning the operator was shown before starting should not reappear
     as a surprise, or worse, appear only once the workspace is half built.
     """
+    coordinate = getattr(client, "coordinated_throttling", None)
+    scope = coordinate(check_cancelled) if coordinate else nullcontext()
+    def report_item(item: Mapping[str, Any], action: str) -> None:
+        if check_cancelled:
+            check_cancelled()
+        if on_item:
+            on_item(item, action)
+
+    with scope:
+        return _dependency_warnings(
+            client, source_workspace_id=source_workspace_id, migrated=migrated,
+            on_item=report_item if check_cancelled or on_item else None, on_total=on_total,
+        )
+
+
+def _dependency_warnings(
+    client: FabricClient,
+    *,
+    source_workspace_id: str,
+    migrated: list[dict[str, Any]],
+    on_item: Callable[[Mapping[str, Any], str], None] | None,
+    on_total: Callable[[int], None] | None,
+) -> DependencyReport:
     relation_total = sum(bool(item.get("id")) for item in migrated)
     if on_total:
         on_total(relation_total)
@@ -1771,6 +1817,7 @@ def _check_dependencies(ctx: _Context) -> None:
         on_total=lambda total: ctx.run.set_activity_total(
             step, total, operation="item",
         ),
+        check_cancelled=ctx.run.raise_if_cancelled,
     )
     ctx.graph = report.graph
     if ctx.plan.cross_tenant:
@@ -1815,6 +1862,106 @@ def _check_dependencies(ctx: _Context) -> None:
 
 
 # --------------------------------------------------------------------- phase 1
+
+
+def _source_definition_connections(ctx: _Context, source_id: str) -> set[str]:
+    candidates = [
+        item for item in (ctx.assessment.migrated if ctx.assessment else ())
+        if item.get("type") in CONNECTION_DEFINITION_TYPES and item.get("id")
+    ]
+    started = time.monotonic()
+    count = 0
+    count_lock = threading.Lock()
+
+    def read(item: dict[str, Any]) -> set[str]:
+        nonlocal count
+        ctx.run.raise_if_cancelled()
+        item_id = str(item["id"])
+        name = str(item.get("displayName") or item_id)
+        item_type = str(item.get("type") or "")
+        ctx.run.item_activity(item_id, name, item_type, "Reading connection references", "running",
+                              step_id="dependencies")
+        try:
+            with count_lock:
+                count += 1
+            definition = items_module.try_get_item_definition(ctx.client, source_id, item_id)
+        except FabricError as error:
+            ctx.run.item_activity(item_id, name, item_type, "Connection reference read failed", "failed",
+                                  step_id="dependencies")
+            raise FabricError(
+                f"Connection bindings for '{name}' could not be read: {error}. "
+                "Restore source definition access before retrying."
+            ) from error
+        if definition is None:
+            ctx.run.item_activity(item_id, name, item_type, "Definition unavailable", "unknown",
+                                  step_id="dependencies")
+            return set()
+        ctx.run.item_activity(item_id, name, item_type, "Connection references read", "succeeded",
+                              step_id="dependencies")
+        return {
+            value.casefold()
+            for value in connections.referenced_connection_ids(definition.get("parts") or [])
+        }
+
+    found: set[str] = set()
+    try:
+        for result in concurrency.bounded_map(read, candidates):
+            found.update(result)
+    finally:
+        logger.info(
+            "Source connection definition reads: count=%s elapsed_seconds=%.3f",
+            count, time.monotonic() - started,
+        )
+    return found
+
+
+def _source_shortcut_connections(ctx: _Context, source_id: str) -> set[str]:
+    candidates = [
+        item for item in (ctx.assessment.migrated if ctx.assessment else ())
+        if item.get("id") and item.get("type") in ("Lakehouse", "KQLDatabase")
+    ]
+    started = time.monotonic()
+    count = 0
+    count_lock = threading.Lock()
+
+    def read(item: dict[str, Any]) -> tuple[set[str], str | None]:
+        nonlocal count
+        ctx.run.raise_if_cancelled()
+        item_id = str(item["id"])
+        name = str(item.get("displayName") or item_id)
+        item_type = str(item["type"])
+        ctx.run.item_activity(
+            item_id, name, item_type, "Reading shortcuts", "running", step_id="dependencies",
+        )
+        try:
+            with count_lock:
+                count += 1
+            found = (
+                shortcuts.list_shortcuts(ctx.client, source_id, item_id) if item_type == "Lakehouse"
+                else shortcuts.list_table_shortcuts(ctx.client, source_id, item_id)
+            )
+        except FabricApiError as error:
+            ctx.run.item_activity(item_id, name, item_type, "Shortcut read failed", "failed",
+                                  step_id="dependencies")
+            return set(), (
+                f"Shortcuts for '{name}' could not be listed: {error}. "
+                "Restore source shortcut access before retrying."
+            )
+        ctx.run.item_activity(item_id, name, item_type, "Shortcuts read", "succeeded", step_id="dependencies")
+        return {value.casefold() for value in shortcuts.referenced_connection_ids(found)}, None
+
+    referenced: set[str] = set()
+    try:
+        for found, warning in concurrency.bounded_map(read, candidates):
+            referenced.update(found)
+            if warning:
+                ctx.warnings.append(warning)
+    finally:
+        logger.info(
+            "Source shortcut reads: count=%s elapsed_seconds=%.3f",
+            count, time.monotonic() - started,
+        )
+    return referenced
 
 
 def _load_source_references(ctx: _Context) -> None:
@@ -1895,76 +2042,19 @@ def _load_source_references(ctx: _Context) -> None:
     # scans every tenant connection looking for a reason to act on one - only the connections
     # its selected items and shortcuts actually reference.
     referenced_connections: set[str] = {key.casefold() for key in ctx.plan.connection_mappings}
-    for item in ctx.assessment.migrated if ctx.assessment else ():
-        if item.get("type") not in CONNECTION_DEFINITION_TYPES or not item.get("id"):
-            continue
-        try:
-            ctx.run.item_activity(
-                str(item["id"]), str(item.get("displayName") or item["id"]),
-                str(item.get("type") or ""), "Reading connection references", "running",
-                step_id="dependencies",
-            )
-            definition = items_module.try_get_item_definition(ctx.client, source_id, item["id"])
-        except FabricError as error:
-            ctx.run.item_activity(
-                str(item["id"]), str(item.get("displayName") or item["id"]),
-                str(item.get("type") or ""), "Connection reference read failed", "failed",
-                step_id="dependencies",
-            )
-            raise FabricError(
-                f"Connection bindings for '{item.get('displayName') or item['id']}' could "
-                f"not be read: {error}. Restore source definition access before retrying."
-            ) from error
-        if definition is None:
-            ctx.run.item_activity(
-                str(item["id"]), str(item.get("displayName") or item["id"]),
-                str(item.get("type") or ""), "Definition unavailable", "unknown", step_id="dependencies",
-            )
-            continue
-        referenced_connections.update(
-            value.casefold()
-            for value in connections.referenced_connection_ids(definition.get("parts") or [])
-        )
-        ctx.run.item_activity(
-            str(item["id"]), str(item.get("displayName") or item["id"]),
-            str(item.get("type") or ""), "Connection references read", "succeeded", step_id="dependencies",
-        )
-    for item in ctx.assessment.migrated if ctx.assessment else ():
-        item_id = item.get("id")
-        item_type = item.get("type")
-        if not item_id or item_type not in ("Lakehouse", "KQLDatabase"):
-            continue
-        try:
-            ctx.run.item_activity(
-                str(item_id), str(item.get("displayName") or item_id), str(item_type),
-                "Reading shortcuts", "running", step_id="dependencies",
-            )
-            found = (
-                shortcuts.list_shortcuts(ctx.client, source_id, item_id) if item_type == "Lakehouse"
-                else shortcuts.list_table_shortcuts(ctx.client, source_id, item_id)
-            )
-        except FabricApiError as error:
-            ctx.run.item_activity(
-                str(item_id), str(item.get("displayName") or item_id), str(item_type),
-                "Shortcut read failed", "failed", step_id="dependencies",
-            )
-            ctx.warnings.append(
-                f"Shortcuts for '{item.get('displayName') or item_id}' could not be listed: "
-                f"{error}. Restore source shortcut access before retrying."
-            )
-            continue
-        ctx.run.item_activity(
-            str(item_id), str(item.get("displayName") or item_id), str(item_type),
-            "Shortcuts read", "succeeded", step_id="dependencies",
-        )
-        referenced_connections.update(
-            value.casefold() for value in shortcuts.referenced_connection_ids(found)
-        )
+    coordinate = getattr(ctx.client, "coordinated_throttling", None)
+    scope = coordinate(ctx.run.raise_if_cancelled) if coordinate else nullcontext()
+    with scope:
+        referenced_connections.update(_source_definition_connections(ctx, source_id))
+        ctx.run.raise_if_cancelled()
+        referenced_connections.update(_source_shortcut_connections(ctx, source_id))
+        ctx.run.raise_if_cancelled()
     sql_items = [
         item for item in ctx.source_items.values()
         if item.get("type") in ("Lakehouse", "Warehouse", "SQLDatabase", "MirroredDatabase")
     ]
     for source_connection_id in sorted(referenced_connections):
+        ctx.run.raise_if_cancelled()
         connection = source_connections.get(source_connection_id)
         if connection is None:
             try:

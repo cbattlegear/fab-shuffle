@@ -7,6 +7,9 @@ region. Neither is visible from the item definitions.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from fabshuffle.fabric import relations
@@ -73,6 +76,108 @@ def test_relation_activity_reports_real_reads_and_unavailable_api():
         ("sm-1", "Reading upstream relations", []),
         ("sm-1", "Relations unavailable", ["sm-1"]),
     ]
+
+
+def test_relation_reads_overlap_after_probe_and_respect_worker_limit():
+    lock = threading.Lock()
+    full = threading.Event()
+    release = threading.Event()
+    active = 0
+    maximum = 0
+    calls = []
+
+    class BlockingClient(FakeClient):
+        def get(self, path, params=None):
+            nonlocal active, maximum
+            item_id = path.split("/items/")[1].split("/")[0]
+            with lock:
+                calls.append(item_id)
+                if item_id == "0":
+                    return {"items": [], "relations": [], "workspaces": []}
+                active += 1
+                maximum = max(maximum, active)
+                if active == 4:
+                    full.set()
+            try:
+                assert release.wait(5)
+                return {"items": [], "relations": [], "workspaces": []}
+            finally:
+                with lock:
+                    active -= 1
+
+    items = [{"id": str(i), "type": "Notebook"} for i in range(10)]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(relations.build_graph, BlockingClient({}), SOURCE_WS, items)
+        try:
+            assert full.wait(5)
+            assert calls[0] == "0"
+            assert len(calls) == 5
+        finally:
+            release.set()
+        graph = future.result(timeout=5)
+    assert maximum == 4
+    assert set(graph.items) == {str(i) for i in range(10)}
+
+
+def test_parallel_results_are_aggregated_in_input_order():
+    second_started = threading.Event()
+    release = threading.Event()
+    shared = {"id": "shared", "type": "Notebook"}
+
+    class OrderedClient(FakeClient):
+        def get(self, path, params=None):
+            item_id = path.split("/items/")[1].split("/")[0]
+            if item_id == "0":
+                return upstream(items=[], relations_=[])
+            if item_id == "1":
+                assert second_started.wait(5)
+                assert release.wait(5)
+            if item_id == "2":
+                second_started.set()
+                release.set()
+            return upstream(items=[{**shared, "displayName": item_id}], relations_=[])
+
+    graph = relations.build_graph(
+        OrderedClient({}), SOURCE_WS, [{"id": str(i)} for i in range(3)],
+    )
+    assert graph.name_of("shared") == "1"
+
+
+def test_cancellation_prevents_queued_relation_reads():
+    full = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    lock = threading.Lock()
+    calls = []
+
+    class BlockingClient(FakeClient):
+        def get(self, path, params=None):
+            item_id = path.split("/items/")[1].split("/")[0]
+            with lock:
+                calls.append(item_id)
+                if len(calls) == 5:
+                    full.set()
+            if item_id != "0":
+                assert release.wait(5)
+            return upstream(items=[], relations_=[])
+
+    def progress(_item, _action):
+        if cancelled.is_set():
+            raise RuntimeError("cancelled")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            relations.build_graph, BlockingClient({}), SOURCE_WS,
+            [{"id": str(i)} for i in range(10)], on_item=progress,
+        )
+        try:
+            assert full.wait(5)
+            cancelled.set()
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            future.result(timeout=5)
+    assert len(calls) == 5
 
 
 def test_relations_that_are_not_dependencies_are_ignored():
