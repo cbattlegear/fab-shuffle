@@ -468,6 +468,12 @@ class _Context:
         item to something that is no longer there. Anything already present is kept as the
         starting point, which is how a resumed run begins with what the journal replayed.
         """
+        self.run._secrets = tuple(
+            secret for secret in (
+                getattr(self.principal, "client_secret", ""),
+                getattr(self.target_principal, "client_secret", ""),
+            ) if secret
+        )
         if self.prior:
             self.refresh_needed.update(self.prior.refresh_needed)
             self.active_copy_jobs.update(self.prior.copy_jobs)
@@ -477,7 +483,8 @@ class _Context:
             attempt_id=self.run.id, source_workspace=self.plan.source_workspace_id,
             record=self.journal.outcome, changed=self.run.readiness_changed,
             initial=self.prior.outcomes if self.prior else None,
-            secrets=(getattr(self.principal, "client_secret", ""),),
+            secrets=self.run._secrets,
+            activity=self.run.item_activity,
         )
         self.run.inventory_complete = bool(self.prior and self.prior.inventory_complete)
         if self.prior:
@@ -1493,6 +1500,7 @@ def dependency_warnings(
     source_workspace_id: str,
     migrated: list[dict[str, Any]],
     client_id: str,
+    on_item: Callable[[Mapping[str, Any], str], None] | None = None,
 ) -> DependencyReport:
     """Work out which references will not survive the move.
 
@@ -1500,7 +1508,10 @@ def dependency_warnings(
     same conclusions — a warning the operator was shown before starting should not reappear
     as a surprise, or worse, appear only once the workspace is half built.
     """
-    graph = relations.build_graph(client, source_workspace_id, migrated)
+    graph = (
+        relations.build_graph(client, source_workspace_id, migrated, on_item=on_item)
+        if on_item else relations.build_graph(client, source_workspace_id, migrated)
+    )
     if not graph.available:
         return DependencyReport(graph=graph, available=False)
 
@@ -1542,6 +1553,16 @@ def _check_dependencies(ctx: _Context) -> None:
         source_workspace_id=ctx.plan.source_workspace_id,
         migrated=migrated,
         client_id=ctx.principal.client_id,
+        on_item=lambda item, action: ctx.run.item_activity(
+            str(item["id"]), str(item.get("displayName") or item["id"]),
+            str(item.get("type") or ""), action,
+            "running" if action.startswith("Reading") else (
+                "failed" if "failed" in action else (
+                    "unknown" if "unavailable" in action else "succeeded"
+                )
+            ),
+            step_id=step,
+        ),
     )
     ctx.graph = report.graph
     if ctx.plan.cross_tenant:
@@ -1670,17 +1691,35 @@ def _load_source_references(ctx: _Context) -> None:
         if item.get("type") not in CONNECTION_DEFINITION_TYPES or not item.get("id"):
             continue
         try:
+            ctx.run.item_activity(
+                str(item["id"]), str(item.get("displayName") or item["id"]),
+                str(item.get("type") or ""), "Reading connection references", "running",
+                step_id="dependencies",
+            )
             definition = items_module.try_get_item_definition(ctx.client, source_id, item["id"])
         except FabricError as error:
+            ctx.run.item_activity(
+                str(item["id"]), str(item.get("displayName") or item["id"]),
+                str(item.get("type") or ""), "Connection reference read failed", "failed",
+                step_id="dependencies",
+            )
             raise FabricError(
                 f"Connection bindings for '{item.get('displayName') or item['id']}' could "
                 f"not be read: {error}. Restore source definition access before retrying."
             ) from error
         if definition is None:
+            ctx.run.item_activity(
+                str(item["id"]), str(item.get("displayName") or item["id"]),
+                str(item.get("type") or ""), "Definition unavailable", "unknown", step_id="dependencies",
+            )
             continue
         referenced_connections.update(
             value.casefold()
             for value in connections.referenced_connection_ids(definition.get("parts") or [])
+        )
+        ctx.run.item_activity(
+            str(item["id"]), str(item.get("displayName") or item["id"]),
+            str(item.get("type") or ""), "Connection references read", "succeeded", step_id="dependencies",
         )
     for item in ctx.assessment.migrated if ctx.assessment else ():
         item_id = item.get("id")
@@ -1688,16 +1727,28 @@ def _load_source_references(ctx: _Context) -> None:
         if not item_id or item_type not in ("Lakehouse", "KQLDatabase"):
             continue
         try:
+            ctx.run.item_activity(
+                str(item_id), str(item.get("displayName") or item_id), str(item_type),
+                "Reading shortcuts", "running", step_id="dependencies",
+            )
             found = (
                 shortcuts.list_shortcuts(ctx.client, source_id, item_id) if item_type == "Lakehouse"
                 else shortcuts.list_table_shortcuts(ctx.client, source_id, item_id)
             )
         except FabricApiError as error:
+            ctx.run.item_activity(
+                str(item_id), str(item.get("displayName") or item_id), str(item_type),
+                "Shortcut read failed", "failed", step_id="dependencies",
+            )
             ctx.warnings.append(
                 f"Shortcuts for '{item.get('displayName') or item_id}' could not be listed: "
                 f"{error}. Restore source shortcut access before retrying."
             )
             continue
+        ctx.run.item_activity(
+            str(item_id), str(item.get("displayName") or item_id), str(item_type),
+            "Shortcuts read", "succeeded", step_id="dependencies",
+        )
         referenced_connections.update(
             value.casefold() for value in shortcuts.referenced_connection_ids(found)
         )

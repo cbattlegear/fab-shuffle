@@ -12,7 +12,7 @@ information" rather than failing a migration.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -112,6 +112,8 @@ def build_graph(
     client: FabricClient,
     workspace_id: str,
     items: Iterable[Mapping[str, Any]],
+    *,
+    on_item: Callable[[Mapping[str, Any], str], None] | None = None,
 ) -> DependencyGraph:
     """Build a dependency graph for the given items.
 
@@ -137,7 +139,16 @@ def build_graph(
             },
         )
 
-        response = get_upstream(client, workspace_id, item_id)
+        if on_item:
+            on_item(item, "Reading upstream relations")
+        try:
+            response = get_upstream(client, workspace_id, item_id)
+        except Exception:
+            if on_item:
+                on_item(item, "Relations read failed")
+            raise
+        if on_item:
+            on_item(item, "Relations unavailable" if response is None else "Upstream relations read")
         if response is None:
             if first:
                 logger.info("Relations API unavailable; skipping dependency analysis")

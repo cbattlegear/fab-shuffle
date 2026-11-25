@@ -45,6 +45,7 @@ function fixture() {
       if (selector.startsWith("#")) return this.id === selector.slice(1);
       if (selector.startsWith(".")) return this.className.split(" ").includes(selector.slice(1));
       if (selector === "[data-readiness-key]") return this.dataset.readinessKey !== undefined;
+      if (selector === "details[data-activity-step]") return this.tagName === "details" && this.dataset.activityStep !== undefined;
       return this.tagName === selector;
     }
     querySelectorAll(selector) {
@@ -208,6 +209,28 @@ function advisories(overrides = {}) {
 }
 
 const scenarios = {
+  async activity(f) {
+    f.ui.state.runId = "one";
+    const snapshot = {
+      id: "one", status: "running", readinessRevision: 0,
+      steps: [{ id: "deps", title: "Dependencies", status: "running", warnings: [],
+        activity: [{ id: "a", type: "Notebook", name: "<img src=x onerror=alert(1)>",
+          actions: [{ action: "<script>bad</script>", state: "running" }] }] }],
+    };
+    f.ui.renderRun(snapshot);
+    let details = f.get("step-list").querySelector("details[data-activity-step]");
+    assert.ok(details);
+    assert.match(details.textContent, /<img src=x/);
+    assert.equal(details.querySelector("img"), null);
+    details.open = true;
+    details.querySelector("summary").focus();
+    snapshot.steps[0].activity[0].actions.push({ action: "Finished", state: "succeeded" });
+    f.ui.renderRun(snapshot);
+    details = f.get("step-list").querySelector("details[data-activity-step]");
+    assert.equal(details.open, true);
+    assert.equal(f.document.activeElement, details.querySelector("summary"));
+    assert.match(details.textContent, /Finished/);
+  },
   async hidden_until_halted(f) {
     f.begin("one", null);
     assert.equal(f.get("cutover-readiness").hidden, true);

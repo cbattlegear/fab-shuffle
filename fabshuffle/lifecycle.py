@@ -211,11 +211,13 @@ class Lifecycle:
         changed: Callable[[], None] | None = None,
         initial: Mapping[str, ItemOutcome] | None = None,
         secrets: tuple[str, ...] = (),
+        activity: Callable[[str, str, str, str, str], None] | None = None,
     ) -> None:
         self.attempt_id = attempt_id
         self.source_workspace = source_workspace
         self._record = record
         self._changed = changed
+        self._activity = activity
         self._items = copy.deepcopy(dict(initial or {}))
         for item in self._items.values():
             if item.steps and any(step.attemptId != attempt_id for step in item.steps.values()):
@@ -330,6 +332,12 @@ class ItemLifecycle:
                 self.owner.attempt_id, item.targetId, self.owner._text(waits_on),
             )
             self.owner._save(item)
+            if self.owner._activity:
+                status = "running" if reason == "Operation started; completion not recorded." else state.value
+                self.owner._activity(
+                    self.source_id, item.name, item.itemType,
+                    self.owner._text(f"{step}: {reason}"), status,
+                )
 
     @contextmanager
     def operation(self, step: str, success: str | None) -> Iterator[None]:

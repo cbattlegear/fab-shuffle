@@ -1275,6 +1275,18 @@ def _tool_output(path: Path) -> str:
         return stream.read(1500).decode("utf-8", errors="replace").strip()
 
 
+def _log_tool_output(output: str) -> None:
+    """Log only fixed, credential-free progress lines; arbitrary tool output is private."""
+    allowed = {
+        "Initializing deployment (Start)", "Initializing deployment (Complete)",
+        "Analyzing deployment plan (Start)", "Analyzing deployment plan (Complete)",
+        "Updating database (Start)", "Updating database (Complete)",
+    }
+    for line in output.splitlines():
+        if line.strip() in allowed:
+            logger.debug("SqlPackage: %s", line.strip())
+
+
 def _run_bounded(
     command: list[str],
     *,
@@ -1316,6 +1328,7 @@ def _run_bounded(
     if executable:
         command = [str(Path(executable).resolve()), *command[1:]]
     output = root / f".tool-output-{uuid.uuid4().hex}.log"
+    logger.debug("Starting schema tool")
     with output.open("wb") as log:
         try:
             process = subprocess.Popen(
@@ -1344,6 +1357,8 @@ def _run_bounded(
             raise
         finally:
             _stop_tool(process, environment)
+    _log_tool_output(_tool_output(output))
+    logger.debug("Schema tool finished (exit %s)", process.returncode)
     if process.returncode:
         raise SchemaTransferError(
             f"{what} failed with exit code {process.returncode}: {_tool_output(output)}"
@@ -1351,7 +1366,7 @@ def _run_bounded(
 
 
 def _run(command: list[str], *, what: str) -> None:
-    logger.debug("Running %s", command[0])
+    logger.debug("Starting schema tool")
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except FileNotFoundError as error:
@@ -1359,6 +1374,9 @@ def _run(command: list[str], *, what: str) -> None:
             f"{what} could not run because '{command[0]}' is not installed in this runtime. "
             "T-SQL schema transfer needs sqlpackage and unpackdacpac."
         ) from error
+    _log_tool_output(result.stdout or "")
+    _log_tool_output(result.stderr or "")
+    logger.debug("Schema tool finished (exit %s)", result.returncode)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1500:]
         raise SchemaTransferError(f"{what} failed with exit code {result.returncode}: {detail}")

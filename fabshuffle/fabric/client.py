@@ -15,6 +15,7 @@ import logging
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -26,6 +27,19 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _SAFE_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _TERMINAL_OPERATION_STATES = frozenset({"Succeeded", "Failed", "Undefined"})
+_LOG_ROUTE_SEGMENTS = frozenset({
+    "v1", "workspaces", "items", "operations", "result", "connections", "relations",
+    "upstream", "downstream", "getDefinition", "updateDefinition", "jobs", "instances",
+    "lakehouses", "warehouses", "eventhouses", "sqlDatabases", "shortcuts",
+})
+
+
+def _log_route(url: str) -> str:
+    """Keep only fixed route components, never query parameters or resource names."""
+    return "/".join(
+        part if part in _LOG_ROUTE_SEGMENTS else "{resource}"
+        for part in urlsplit(url).path.split("/") if part
+    )
 
 
 class FabricError(RuntimeError):
@@ -196,6 +210,8 @@ class FabricClient:
         attempts = max(1, SETTINGS.max_retries)
 
         for attempt in range(1, attempts + 1):
+            route = _log_route(url)
+            logger.debug("Fabric API %s %s attempt %s/%s", method, route, attempt, attempts)
             try:
                 response = self._http.request(
                     method,
@@ -205,6 +221,7 @@ class FabricClient:
                     params=params,
                     headers=self._headers(headers),
                 )
+                logger.debug("Fabric API %s %s returned HTTP %s", method, route, response.status_code)
             except httpx.RequestError as error:
                 if not safe_read or attempt == attempts or not isinstance(error, httpx.TransportError):
                     raise FabricTransportError(method, url, attempt, error) from error

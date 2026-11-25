@@ -1308,14 +1308,19 @@ function watchRun(runId) {
   state.events = events;
 
   events.onmessage = (message) => {
-    if (state.events === events) renderRun(JSON.parse(message.data));
+    if (state.events !== events) return;
+    const run = JSON.parse(message.data);
+    renderRun(run);
+    if (run.status !== "running" && run.status !== "pending") events.close();
   };
   events.onerror = () => {
-    events.close();
     if (state.events !== events) return;
-    // The stream ends when the run finishes; fall back to a single fetch for the final state.
+    // Keep EventSource's reconnect behavior; the snapshot catches up after a dropped stream.
     api(`/api/runs/${runId}`).then((run) => {
-      if (state.events === events) renderRun(run);
+      if (state.events === events) {
+        renderRun(run);
+        if (run.status !== "running" && run.status !== "pending") events.close();
+      }
     }).catch(() => {});
   };
 }
@@ -1339,6 +1344,9 @@ function renderRun(run) {
   }
 
   const list = $("#step-list");
+  const expanded = new Set([...list.querySelectorAll("details[data-activity-step]")]
+    .filter((entry) => entry.open).map((entry) => entry.dataset.activityStep));
+  const focused = document.activeElement?.closest?.("details[data-activity-step]")?.dataset.activityStep;
   list.innerHTML = "";
   run.steps.forEach((step) => {
     const item = document.createElement("li");
@@ -1353,6 +1361,40 @@ function renderRun(run) {
     item.querySelector(".title").textContent = step.title;
     item.querySelector(".detail").textContent = step.detail || "";
 
+    const activities = Array.isArray(step.activity) ? step.activity : [];
+    if (activities.length) {
+      const details = document.createElement("details");
+      details.className = "step-activity";
+      details.dataset.activityStep = step.id;
+      details.open = expanded.has(step.id);
+      const summary = document.createElement("summary");
+      summary.textContent = `Item activity (${activities.length}${step.activityOmitted ? "+" : ""})`;
+      details.appendChild(summary);
+      const rows = document.createElement("ul");
+      rows.className = "activity-items";
+      activities.forEach((activity) => {
+        const row = document.createElement("li");
+        const label = document.createElement("strong");
+        label.textContent = [activity.type, activity.name].filter(Boolean).join(" · ");
+        row.appendChild(label);
+        const actions = document.createElement("ol");
+        (activity.actions || []).forEach((action) => {
+          const entry = document.createElement("li");
+          entry.textContent = `${action.action} (${action.state})`;
+          actions.appendChild(entry);
+        });
+        row.appendChild(actions);
+        rows.appendChild(row);
+      });
+      details.appendChild(rows);
+      if (step.activityOmitted) {
+        const note = document.createElement("p");
+        note.className = "hint";
+        note.textContent = "Additional item activity is omitted from this live view.";
+        details.appendChild(note);
+      }
+      item.querySelector(".step-body").appendChild(details);
+    }
     if (step.warnings.length) {
       const warnings = document.createElement("ul");
       warnings.className = "step-warnings";
@@ -1365,6 +1407,10 @@ function renderRun(run) {
     }
     list.appendChild(item);
   });
+  if (focused) {
+    [...list.querySelectorAll("details[data-activity-step]")]
+      .find((entry) => entry.dataset.activityStep === focused)?.querySelector("summary")?.focus();
+  }
 
   const finished = run.status !== "running" && run.status !== "pending";
   $("#cancel-run").hidden = finished;

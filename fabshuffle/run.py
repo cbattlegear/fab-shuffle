@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import queue
 import threading
 import uuid
@@ -15,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from fabshuffle import journal
-from fabshuffle.lifecycle import EvidenceState, Lifecycle
+from fabshuffle.lifecycle import EvidenceState, Lifecycle, safe_text
+
+logger = logging.getLogger("fabshuffle.stage")
+activity_logger = logging.getLogger("fabshuffle.activity")
+MAX_ACTIVITY_ITEMS = 50
+MAX_ACTIVITY_HISTORY = 5
 
 
 class StepStatus(StrEnum):
@@ -47,6 +53,8 @@ class Step:
     warnings: list[str] = field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
+    activity: dict[str, dict[str, Any]] = field(default_factory=dict)
+    activity_omitted: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +65,8 @@ class Step:
             "warnings": list(self.warnings),
             "startedAt": self.started_at,
             "finishedAt": self.finished_at,
+            "activity": deepcopy(list(self.activity.values())),
+            "activityOmitted": self.activity_omitted,
         }
 
 
@@ -88,7 +98,9 @@ class MigrationRun:
 
         self._steps: list[Step] = []
         self._steps_by_id: dict[str, Step] = {}
-        self._lock = threading.Lock()
+        self._active_step: str | None = None
+        self._secrets: tuple[str, ...] = ()
+        self._lock = threading.RLock()
         self._cancel = threading.Event()
         self._subscribers: list[queue.Queue[dict[str, Any] | None]] = []
         self.readiness_revision = 0
@@ -134,6 +146,8 @@ class MigrationRun:
             step.status = StepStatus.RUNNING
             step.started_at = _now()
             step.detail = ""
+            self._active_step = step_id
+        logger.info("Stage started: %s", self._safe_text(title))
         self._publish()
         return step
 
@@ -143,6 +157,35 @@ class MigrationRun:
             if not step:
                 return
             step.detail = detail
+        logger.info("Stage progress: %s — %s", self._safe_text(step.title), self._safe_text(detail))
+        self._publish()
+
+    def _safe_text(self, value: str) -> str:
+        for secret in self._secrets:
+            value = value.replace(secret, "[redacted]")
+        return safe_text(value)
+
+    def item_activity(
+        self, item_id: str, name: str, item_type: str, action: str, state: str,
+        *, step_id: str | None = None,
+    ) -> None:
+        """Publish a bounded, payload-free history of actual item actions."""
+        name, item_type, action = (self._safe_text(str(value))[:300] for value in (name, item_type, action))
+        with self._lock:
+            step = self._steps_by_id.get(step_id or self._active_step or "")
+            if not step:
+                return
+            entry = step.activity.get(item_id)
+            if entry is None:
+                if len(step.activity) >= MAX_ACTIVITY_ITEMS:
+                    step.activity_omitted += 1
+                else:
+                    entry = {"id": item_id, "name": name, "type": item_type, "actions": []}
+                    step.activity[item_id] = entry
+            if entry is not None:
+                entry["actions"].append({"action": action, "state": state, "time": _now()})
+                del entry["actions"][:-MAX_ACTIVITY_HISTORY]
+        activity_logger.info("%s: %s %s — %s (%s)", step.title, item_type, name, action, state)
         self._publish()
 
     def finish_step(
@@ -162,6 +205,12 @@ class MigrationRun:
                 step.detail = detail
             if warnings:
                 step.warnings.extend(warnings)
+            if self._active_step == step_id:
+                self._active_step = None
+        log = logger.warning if status == StepStatus.FAILED else logger.info
+        log("Stage %s: %s — %s", status.value, self._safe_text(step.title), self._safe_text(detail))
+        for warning in warnings or ():
+            logger.warning("Stage %s: %s", self._safe_text(step.title), self._safe_text(warning))
         self._publish()
 
     # ------------------------------------------------------------------ status
@@ -176,6 +225,10 @@ class MigrationRun:
             self.status = status
             self.error = error
             self.finished_at = _now()
+        if error:
+            logger.error("Migration %s: %s", status.value, self._safe_text(error))
+        else:
+            logger.info("Migration %s", status.value)
         self._publish()
         self._close_subscribers()
 
@@ -215,10 +268,10 @@ class MigrationRun:
     # -------------------------------------------------------------- event feed
 
     def subscribe(self) -> queue.Queue[dict[str, Any] | None]:
-        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=200)
+        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=5)
         with self._lock:
+            subscriber.put_nowait(self.snapshot())
             self._subscribers.append(subscriber)
-        subscriber.put(self.snapshot())
         return subscriber
 
     def unsubscribe(self, subscriber: queue.Queue[dict[str, Any] | None]) -> None:
@@ -227,20 +280,27 @@ class MigrationRun:
                 self._subscribers.remove(subscriber)
 
     def _publish(self) -> None:
-        snapshot = self.snapshot()
         with self._lock:
-            subscribers = list(self._subscribers)
-        for subscriber in subscribers:
-            # A slow reader must not stall the migration; it will catch up on the next event.
-            with contextlib.suppress(queue.Full):
-                subscriber.put_nowait(snapshot)
+            snapshot = self.snapshot()
+            for subscriber in self._subscribers:
+                # Discard stale snapshots instead of blocking migration or losing the latest.
+                try:
+                    subscriber.put_nowait(snapshot)
+                except queue.Full:
+                    with contextlib.suppress(queue.Empty, queue.Full):
+                        subscriber.get_nowait()
+                        subscriber.put_nowait(snapshot)
 
     def _close_subscribers(self) -> None:
         with self._lock:
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
-            with contextlib.suppress(queue.Full):
+            try:
                 subscriber.put_nowait(None)
+            except queue.Full:
+                with contextlib.suppress(queue.Empty, queue.Full):
+                    subscriber.get_nowait()
+                    subscriber.put_nowait(None)
 
 
 class RunConflict(RuntimeError):

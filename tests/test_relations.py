@@ -61,6 +61,20 @@ def test_unavailable_beta_api_stops_after_one_call():
     assert len(client.asked) == 1
 
 
+def test_relation_activity_reports_real_reads_and_unavailable_api():
+    events = []
+    client = FakeClient({}, unavailable=True)
+    graph = relations.build_graph(
+        client, SOURCE_WS, [MODEL, REPORT],
+        on_item=lambda item, action: events.append((item["id"], action, list(client.asked))),
+    )
+    assert not graph.available
+    assert events == [
+        ("sm-1", "Reading upstream relations", []),
+        ("sm-1", "Relations unavailable", ["sm-1"]),
+    ]
+
+
 def test_relations_that_are_not_dependencies_are_ignored():
     client = FakeClient(
         {

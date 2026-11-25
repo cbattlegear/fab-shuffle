@@ -616,6 +616,18 @@ Two things follow from this:
 Without a mounted volume the journal goes when the container does, and there is nothing to
 pick up. That is the main reason the `docker run` line above mounts one.
 
+### Migration activity and logging
+
+Expand a migration stage to see its recorded item actions as they happen. The live view
+retains up to 50 items per stage and five recent actions per item; additional activity is
+omitted from the view. These actions report work, not cutover-readiness guarantees.
+
+Set `FAB_SHUFFLE_LOG_LEVEL` to `basic` (default, stage transitions), `verbose` (stages
+and item actions), or `debug` (also Fabric API request status and workstream diagnostics),
+for example `docker run -e FAB_SHUFFLE_LOG_LEVEL=verbose ...`. Warnings and errors remain
+visible in every mode. Request bodies, credentials and arbitrary SqlPackage output are not
+logged; debug shows only recognized safe SqlPackage progress lines and exit status.
+
 ### Building the image yourself
 
 Use the [container validation workflow](#development) before publishing a custom build.

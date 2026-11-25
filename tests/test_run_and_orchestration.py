@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from fabshuffle.__main__ import configure_logging
+from fabshuffle.fabric.client import _log_route
+from fabshuffle.lifecycle import Lifecycle
 from fabshuffle.orchestrator import default_target_name
 from fabshuffle.run import MigrationRun, RunStatus, StepStatus
-from fabshuffle.transfer.sqlschema import _batches, _strip_sqlcmd_header
+from fabshuffle.transfer.sqlschema import _batches, _log_tool_output, _strip_sqlcmd_header
 
 
 def test_target_name_uses_capacity_region():
@@ -39,6 +47,68 @@ def test_subscriber_receives_snapshots_and_a_close_sentinel():
     # One snapshot for the status change, then the sentinel that closes the SSE stream.
     assert subscriber.get_nowait()["status"] == "succeeded"
     assert subscriber.get_nowait() is None
+
+
+def test_activity_tracks_parallel_items_and_keeps_latest_snapshot_bounded():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run._secrets = ("private-value",)
+    run.start_step("dependencies", "Checking dependencies")
+    subscriber = run.subscribe()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda n: run.item_activity(str(n), f"item {n} private-value", "Notebook", "Reading", "running"),
+            range(60),
+        ))
+    snapshot = run.snapshot()["steps"][0]
+    assert len(snapshot["activity"]) == 50
+    assert snapshot["activityOmitted"] == 10
+    assert "private-value" not in str(snapshot)
+    first = snapshot["activity"][0]["id"]
+    for i in range(10):
+        run.item_activity(first, "item", "Notebook", f"action {i}", "running")
+    run.mark_finished(RunStatus.SUCCEEDED)
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+    assert events[-1] is None
+    assert any(event and event["status"] == "succeeded" for event in events)
+    history = run.snapshot()["steps"][0]["activity"][0]["actions"]
+    assert len(history) == 5 and history[-1]["action"] == "action 9"
+
+
+def test_lifecycle_operations_publish_without_changing_evidence():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("items", "Migrating items")
+    lifecycle = Lifecycle(attempt_id=run.id, activity=run.item_activity)
+    item = lifecycle.item("one", "Report", "Report")
+    with item.operation("definition", "Definition created."):
+        assert run.snapshot()["steps"][0]["activity"][0]["actions"][-1]["state"] == "running"
+    assert run.snapshot()["steps"][0]["activity"][0]["actions"][-1]["state"] == "succeeded"
+
+
+def test_log_modes_and_safe_tool_output(caplog):
+    root = logging.getLogger()
+    activity = logging.getLogger("fabshuffle.activity")
+    previous_root, previous_activity = root.level, activity.level
+    try:
+        configure_logging("basic")
+        assert not activity.isEnabledFor(logging.INFO)
+        configure_logging("verbose")
+        assert activity.isEnabledFor(logging.INFO)
+        assert not logging.getLogger("fabshuffle.transfer.sqlschema").isEnabledFor(logging.DEBUG)
+        configure_logging("debug")
+        assert logging.getLogger("fabshuffle.transfer.sqlschema").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+        _log_tool_output("Initializing deployment (Start)\npassword=secret\n")
+        assert "Initializing deployment (Start)" in caplog.text
+        assert "password=secret" not in caplog.text
+        with pytest.raises(ValueError, match="FAB_SHUFFLE_LOG_LEVEL"):
+            configure_logging("invalid")
+        route = _log_route("https://example.test/v1/workspaces/private/items/secret?token=hidden")
+        assert route == "v1/workspaces/{resource}/items/{resource}"
+    finally:
+        root.setLevel(previous_root)
+        activity.setLevel(previous_activity)
 
 
 def test_cancellation_is_observable():

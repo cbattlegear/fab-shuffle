@@ -397,6 +397,14 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .steps .step-warnings li { margin-bottom: 0.2rem; }
 
+.step-activity { margin-top: 0.45rem; color: var(--text-dim); font-size: 0.85rem; }
+.step-activity summary { cursor: pointer; color: var(--accent); width: fit-content; }
+.step-activity summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.activity-items { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.activity-items > li { padding: 0.4rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.activity-items strong { color: var(--text); font-weight: 500; }
+.activity-items ol { margin: 0.2rem 0 0; padding-left: 1.2rem; }
+
 .warnings {
   margin-top: 1.25rem;
   padding: 0.9rem 1rem;
