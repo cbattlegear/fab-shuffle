@@ -1787,11 +1787,20 @@ def _check_dependencies(ctx: _Context) -> None:
     ctx.run.start_step(step, "Checking dependencies between items")
     ctx.run.raise_if_cancelled()
 
+    migrated = (ctx.assessment.migrated if ctx.assessment else []) or []
+    source_read_total = sum(
+        int(item.get("type") in CONNECTION_DEFINITION_TYPES)
+        + int(item.get("type") in ("Lakehouse", "KQLDatabase"))
+        for item in migrated if item.get("id")
+    )
+    ctx.run.set_activity_total(
+        step, source_read_total + sum(bool(item.get("id")) for item in migrated), operation="item",
+    )
+
     # Source-bound connections and endpoint aliases must be known even when relations are
     # unavailable. Early data-store consumers use the same missing-reference guard.
     _load_source_references(ctx)
 
-    migrated = (ctx.assessment.migrated if ctx.assessment else []) or []
     if not migrated:
         ctx.run.set_activity_total(step, 0, operation="item")
         ctx.run.finish_step(step, StepStatus.SKIPPED, "Nothing to check")
@@ -1814,7 +1823,7 @@ def _check_dependencies(ctx: _Context) -> None:
             step_id=step,
         ),
         on_total=lambda total: ctx.run.set_activity_total(
-            step, total, operation="item",
+            step, source_read_total + total, operation="item",
         ),
         check_cancelled=ctx.run.raise_if_cancelled,
     )

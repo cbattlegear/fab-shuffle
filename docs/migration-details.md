@@ -111,6 +111,9 @@ advances once when a tracked item reaches a terminal state (including failed or 
 unknown outcomes), rather than once per API call. Expand an item to see its recent actions.
 Review uses the same activity presentation for its read-only dependency walk. A total remains
 indeterminate (`?`) when the worklist cannot be known in advance.
+Migration dependency progress includes known source-definition, shortcut, and relation
+read candidates before the first item read; the total grows when connection-binding
+candidates are discovered. Review does not perform the migration-only source-reference scan.
 Dependency reads overlap at most four items, with paced requests and a shared cooldown when
 Fabric returns 429. Finished reads free a worker immediately even when an earlier read is
 still waiting; results are aggregated in input order and connection scans buffer only IDs.

@@ -244,7 +244,7 @@ class MigrationRun:
             step = self._steps_by_id.get(step_id or self._active_step or "")
             if not step:
                 return
-            safe_operation = self._safe_text(str(operation))
+            safe_operation = self._safe_text(str(operation)) or "item"
             step.record_activity(
                 item_id, self._safe_text(str(name)), self._safe_text(str(item_type)),
                 self._safe_text(str(action)), state, safe_operation,

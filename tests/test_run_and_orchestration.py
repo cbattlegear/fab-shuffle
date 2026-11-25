@@ -8,7 +8,7 @@ import pytest
 
 import fabshuffle.orchestrator as orchestrator
 from fabshuffle.__main__ import configure_logging
-from fabshuffle.fabric.client import _log_route
+from fabshuffle.fabric.client import FabricApiError, _log_route
 from fabshuffle.lifecycle import Lifecycle
 from fabshuffle.orchestrator import default_target_name
 from fabshuffle.run import MigrationRun, RunStatus, StepStatus
@@ -296,6 +296,99 @@ def test_read_only_dependency_assessment_counts_actual_candidate_reads():
     assert step["activityTotal"] == 2
     assert step["activityCompleted"] == 1
     assert step["activity"][0]["active"] is False
+
+
+def test_default_item_operation_counts_when_stage_filters_item_reads():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("dependencies", "Checking dependencies")
+    run.set_activity_total("dependencies", 1, operation="item")
+    run.item_activity("one", "One", "Notebook", "Reading", "running")
+    run.item_activity("one", "One", "Notebook", "Read", "succeeded")
+    assert run.snapshot()["steps"][0]["activityCompleted"] == 1
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_migrate_dependency_total_includes_initial_source_reads_and_later_candidates(
+    monkeypatch, unavailable,
+):
+    migrated = [
+        {"id": "notebook", "displayName": "Notebook", "type": "Notebook"},
+        {"id": "lakehouse", "displayName": "Lakehouse", "type": "Lakehouse"},
+        {"id": "kql", "displayName": "KQL database", "type": "KQLDatabase"},
+        {"id": "copy", "displayName": "Copy Job", "type": "CopyJob"},
+        {"type": "Report"},
+    ]
+    binding_items = [*migrated, {"id": "pipeline", "type": "DataPipeline"}]
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    snapshots = []
+    monkeypatch.setattr(run, "_publish", lambda: snapshots.append(run.snapshot()["steps"][0]))
+
+    class Client:
+        def get(self, path, params=None):
+            if unavailable:
+                raise FabricApiError("GET", path, 403, "relations unavailable")
+            return {}
+
+        def list_all(self, path, params=None, value_key="value"):
+            return [{"id": "connection"}] if path == "connections" else binding_items
+
+    ctx = SimpleNamespace(
+        run=run, assessment=SimpleNamespace(migrated=migrated), client=Client(),
+        plan=SimpleNamespace(source_workspace_id="source", cross_tenant=False),
+        principal=SimpleNamespace(client_id="principal"), warnings=[],
+    )
+
+    def read_definition(_client, _workspace, item_id):
+        # Source reads start with their known candidates already in the denominator.
+        assert run.snapshot()["steps"][0]["activityTotal"] >= 8
+        return None if item_id == "notebook" else {"parts": []}
+
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", read_definition)
+    monkeypatch.setattr(orchestrator.shortcuts, "list_shortcuts", lambda *_: [])
+    monkeypatch.setattr(orchestrator.shortcuts, "list_table_shortcuts", lambda *_: [])
+    def load_references(context):
+        orchestrator._source_definition_connections(context, "source")
+        orchestrator._source_shortcut_connections(context, "source")
+    monkeypatch.setattr(orchestrator, "_load_source_references", load_references)
+
+    orchestrator._check_dependencies(ctx)
+
+    activity_snapshots = [snapshot for snapshot in snapshots if snapshot["activity"]]
+    assert activity_snapshots[0]["activityTotal"] == 8  # 2 definitions, 2 shortcuts, 4 relations
+    assert all(snapshot["activityTotal"] >= snapshot["activityCompleted"] for snapshot in activity_snapshots)
+    step = run.snapshot()["steps"][0]
+    if unavailable:
+        assert step["status"] == "skipped"
+        assert step["activityTotal"] == 8
+        assert step["activityCompleted"] == 5
+    else:
+        assert step["status"] == "succeeded"
+        assert step["activityTotal"] == step["activityCompleted"] == 10
+        # Connection-binding candidates become known only after the connection/item lists.
+        assert {snapshot["activityTotal"] for snapshot in activity_snapshots} == {8, 10}
+
+
+def test_migrate_dependency_source_failure_retains_known_total(monkeypatch):
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    ctx = SimpleNamespace(
+        run=run, assessment=SimpleNamespace(migrated=[{"id": "copy", "type": "CopyJob"}]),
+        client=object(),
+    )
+    def read_definition(*_args):
+        assert run.snapshot()["steps"][0]["activityTotal"] == 2
+        raise FabricApiError("POST", "definition", 403, "Denied: grant access")
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", read_definition)
+    monkeypatch.setattr(
+        orchestrator, "_load_source_references",
+        lambda context: orchestrator._source_definition_connections(context, "source"),
+    )
+
+    with pytest.raises(orchestrator.FabricError, match="Denied: grant access"):
+        orchestrator._check_dependencies(ctx)
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["actions"][-1]["state"] == "failed"
 
 
 def test_lifecycle_operations_publish_without_changing_evidence():
