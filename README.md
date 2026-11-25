@@ -420,17 +420,23 @@ phase sequence and the single-principal versus paired differences.
 ### Connections
 
 Fab Shuffle traces connections referenced by migrated items to their endpoints. An accessible
-same-tenant connection to an external store is reused unchanged. For a shareable SQL Server
-connection using service-principal authentication that points to a migrated Fabric SQL
-database, it can create a migration-owned replacement to the verified destination using the
-signed-in service principal. It does not change or delete the original connection.
+same-tenant connection to an external store is reused unchanged. For a SQL Server connection
+whose exact endpoint uniquely matches a migrated Fabric SQL database, it creates a
+migration-owned ShareableCloud replacement to the verified destination using the signed-in
+service principal and safe organizational privacy/no-SSO defaults. The original connection's
+authentication, gateway, privacy and usage settings are not copied, and the original connection
+is not changed or deleted.
 
 Fabric does not disclose the original connection's credential identity or secret; the
-replacement uses the signed-in principal and may therefore have different permissions.
-Verify that identity and the dependent items before cutover. Fab Shuffle attempts to copy
-connection access assignments and reports any it cannot verify or grant. Other authentication
-types, connection settings, inaccessible metadata and cross-tenant references are not
-silently replaced. Existing `connection_mappings` for unrelated connectors remain supported.
+replacement uses the signed-in principal and may therefore have different permissions. The
+run warning names the replacement and gives the path to edit it in **Settings > Manage
+connections and gateways**. Review its credentials, access and dependent items before cutover.
+Connection role assignments are copied only for connections whose existing metadata matched
+the prior service-principal/shareable-cloud rules; other replacements are not shared
+automatically, to avoid granting other principals use of a different identity. Share the
+replacement with required consumers in the UI if needed. Endpoint
+ambiguity, unsupported connector metadata, inaccessible endpoints and cross-tenant references
+remain blocked. Existing `connection_mappings` for unrelated connectors remain supported.
 
 Migration dependency checks apply only to connections that a *migrated* item or shortcut
 actually references: a data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported

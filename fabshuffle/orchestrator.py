@@ -3594,22 +3594,25 @@ def _validate_connection_mappings(ctx: _Context) -> None:
             source_name = sql_connections.migration_connection_name(
                 ctx.run.lineage_id or ctx.run.id, owner, target_id, "source",
             )
+            owned_source = ctx.sql_connections.get(source_name, "").casefold() == source_id
             current = ctx.client.get(f"connections/{source_id}")
-            credentials = current.get("credentialDetails") or {}
             if (
-                current.get("connectivityType") != "ShareableCloud"
-                or credentials.get("credentialType") != "ServicePrincipal"
-                or credentials.get("singleSignOnType") != "None"
-                or current.get("privacyLevel") != "Organizational"
-                or current.get("allowUsageInUserControlledCode")
-                or current.get("allowConnectionUsageInGateway")
+                str(current.get("id") or "").casefold() != source_id
                 or connections.source_sql_owners(current, ctx.source_items) != {owner}
             ):
                 raise FabricError(
-                    "Its SQL endpoint, authentication or connection settings cannot be safely "
-                    "reproduced with the signed-in service principal."
+                    "Its exact source SQL endpoint could not be verified against only this "
+                    "migrated SQL database."
                 )
-            owned_source = ctx.sql_connections.get(source_name, "").casefold() == source_id
+            credentials = current.get("credentialDetails") or {}
+            preserve_access_roles = (
+                current.get("connectivityType") == "ShareableCloud"
+                and credentials.get("credentialType") == "ServicePrincipal"
+                and credentials.get("singleSignOnType") == "None"
+                and current.get("privacyLevel") == "Organizational"
+                and not current.get("allowUsageInUserControlledCode")
+                and not current.get("allowConnectionUsageInGateway")
+            )
             target = sqldatabases.get_sql_database(ctx.destination_client, ctx.target_workspace_id, target_id)
             server, database = sqldatabases.server_fqdn(target), sqldatabases.database_name(target)
             target_endpoint = connections.sql_target(server, database)
@@ -3640,15 +3643,19 @@ def _validate_connection_mappings(ctx: _Context) -> None:
                 raise FabricError("The replacement is the source connection, not a destination connection.")
             if ctx.id_map.get(source_id) != target_connection:
                 ctx.map_alias(source_id, target_connection, owner)
-            warnings.extend(connections.reconcile_role_assignments(
-                ctx.client, source_id, target_connection, client_id=ctx.principal.client_id,
-            ))
-            if not owned_source:
-                warnings.append(
-                    f"Connection '{name}' was replaced using signed-in service principal "
-                    f"{ctx.principal.client_id}; Fabric does not disclose the original identity. "
-                    "Verify the replacement's permissions and dependent items before cutover."
-                )
+            if preserve_access_roles:
+                warnings.extend(connections.reconcile_role_assignments(
+                    ctx.client, source_id, target_connection, client_id=ctx.principal.client_id,
+                ))
+            warnings.append(
+                f"Created replacement connection '{target_name}' ({target_connection}) "
+                f"for '{name}' using the supplied service principal {ctx.principal.client_id}; "
+                "the original credentials and connection settings were not preserved. Review "
+                "the replacement's access and dependent items; share it with required consumers "
+                "in the UI if needed. To change its credentials or "
+                "settings, open Fabric Settings > Manage connections and gateways, locate this "
+                "connection, and edit it."
+            )
         except FabricError as error:
             if source_id in ctx.id_map:
                 ctx.invalidate_mapping(source_id)

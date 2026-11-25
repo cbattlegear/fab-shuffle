@@ -120,14 +120,19 @@ and destination workspace/item IDs; its metadata is read with the corresponding 
 Connection detection and connection cutover advisories serve different purposes:
 
 - Dependency checks inspect connections actually referenced by selected items or shortcuts.
-  SQL Server paths are matched by the complete server/database pair. Eligible same-tenant
-  service-principal connections to a migrated Fabric SQL database receive a recorded,
-  destination-bound replacement using the signed-in service principal. Fabric does not
-  return the original credential identity or secret; the replacement's identity may differ.
-  Access assignments are reconciled where readable and grantable. Other source-bound or
-  unverified connections remain blocked until resolved; explicit mappings are validated
-  after the relevant stores exist. Discovery covers structured IDs in readable JSON parts
-  and supported shortcuts, not dynamically constructed or opaque references.
+  SQL Server paths are matched by the complete server/database pair. A same-tenant connection
+  that uniquely matches a migrated Fabric SQL database receives a recorded, destination-bound
+  ShareableCloud replacement using the signed-in service principal and safe organizational
+  privacy/no-SSO defaults; original authentication and usage settings are not copied. Fabric
+  does not return the original credential identity or secret, so the replacement identity and
+  permissions may differ. The run warning names the replacement and points to **Settings >
+  Manage connections and gateways** to edit it. Existing access assignments are reconciled
+  only when source metadata matches the previously supported ShareableCloud/service-principal
+  rules; other replacements are not automatically shared. The run warning asks operators to
+  review or share those connections in the UI as needed. Ambiguous, unsupported, inaccessible
+  or cross-tenant source endpoints remain blocked; explicit mappings are validated after the
+  relevant stores exist. Discovery covers structured IDs in readable JSON parts and supported
+  shortcuts, not dynamically constructed or opaque references.
   Missing endpoint metadata on another store does not veto a verified external connection
   or an exact SQL endpoint match. Connection names are never used to infer its destination.
 - Cutover advisories inventory all connections visible to the source credential. SQL paths

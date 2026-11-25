@@ -195,7 +195,7 @@ def test_owned_sql_connection_reused_for_multiple_consumers_and_resume(tmp_path,
     assert "secret" not in ctx.journal.path.read_text()
 
 
-@pytest.mark.parametrize("case", ["ambiguous", "unsupported", "cross_tenant", "different_auth"])
+@pytest.mark.parametrize("case", ["ambiguous", "unsupported", "cross_tenant", "retargeted"])
 def test_unverifiable_connection_never_gets_a_replacement(tmp_path, monkeypatch, case):
     ctx = context(tmp_path)
     if case == "ambiguous":
@@ -204,9 +204,9 @@ def test_unverifiable_connection_never_gets_a_replacement(tmp_path, monkeypatch,
         ctx.connection_sql_owners[SOURCE_CONNECTION] = None
     if case == "cross_tenant":
         monkeypatch.setattr(type(ctx.plan), "cross_tenant", property(lambda _: True))
-    if case == "different_auth":
+    if case == "retargeted":
         monkeypatch.setattr(ctx.client, "get", lambda _: connection(
-            credentialDetails={"credentialType": "Basic", "singleSignOnType": "None"},
+            "other.example.com;Orders-123",
         ))
     monkeypatch.setattr(sql_connections, "ensure_connection", lambda *a, **k: pytest.fail("must not create"))
     orchestrator._validate_connection_mappings(ctx)
@@ -243,7 +243,56 @@ def test_preexisting_sql_connection_uses_distinct_replacement_and_reports_identi
     assert calls == [sql_connections.migration_connection_name(
         "lineage", SOURCE_DB, TARGET_DB, f"binding-{SOURCE_CONNECTION}",
     )]
-    assert any("signed-in service principal app" in warning for warning in ctx.warnings)
+    warning = next(warning for warning in ctx.warnings if "Created replacement connection" in warning)
+    assert "supplied service principal app" in warning
+    assert TARGET_CONNECTION in warning
+    assert "original credentials and connection settings were not preserved" in warning
+    assert "Settings > Manage connections and gateways" in warning
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"credentialDetails": {"credentialType": "Basic", "singleSignOnType": "Prompt"}},
+        {"credentialDetails": {"credentialType": "OAuth2"}},
+        {"credentialDetails": {}},
+        {"credentialDetails": None, "privacyLevel": None},
+        {"connectivityType": "OnPremisesGateway"},
+        {"privacyLevel": "Private"},
+        {"allowUsageInUserControlledCode": True},
+        {"allowConnectionUsageInGateway": True},
+    ],
+)
+def test_exact_source_endpoint_rebinds_different_original_settings_without_copying_roles(
+    tmp_path, monkeypatch, fields,
+):
+    ctx = context(tmp_path)
+    original = connection(**fields)
+    monkeypatch.setattr(ctx.client, "get", lambda path: original)
+    monkeypatch.setattr(sql_connections, "ensure_connection", lambda *a, **k: TARGET_CONNECTION)
+    monkeypatch.setattr(
+        connections, "reconcile_role_assignments",
+        lambda *a, **k: pytest.fail("changed connection identity must not copy original role grants"),
+    )
+    monkeypatch.setattr(orchestrator.sqldatabases, "get_sql_database", lambda *_: TARGET)
+    orchestrator._validate_connection_mappings(ctx)
+    assert ctx.id_map[SOURCE_CONNECTION] == TARGET_CONNECTION
+    warning = next(warning for warning in ctx.warnings if "Created replacement connection" in warning)
+    assert TARGET_CONNECTION in warning
+    assert "supplied service principal app" in warning
+    assert "Manage connections and gateways" in warning
+
+
+def test_previously_eligible_source_settings_keep_role_reconciliation(tmp_path, monkeypatch):
+    ctx = context(tmp_path)
+    calls = []
+    monkeypatch.setattr(sql_connections, "ensure_connection", lambda *a, **k: TARGET_CONNECTION)
+    monkeypatch.setattr(
+        connections, "reconcile_role_assignments", lambda *a, **k: calls.append(a) or [],
+    )
+    monkeypatch.setattr(orchestrator.sqldatabases, "get_sql_database", lambda *_: TARGET)
+    orchestrator._validate_connection_mappings(ctx)
+    assert len(calls) == 1
 
 
 def test_preexisting_connection_creation_is_journaled_and_reused_on_resume(tmp_path, monkeypatch):
@@ -254,7 +303,13 @@ def test_preexisting_connection_creation_is_journaled_and_reused_on_resume(tmp_p
 
         def get(self, path):
             if path == f"connections/{SOURCE_CONNECTION}":
-                return connection()
+                return connection(
+                    credentialDetails={"credentialType": "OAuth2", "singleSignOnType": "Prompt"},
+                    connectivityType="OnPremisesGateway",
+                    privacyLevel="Private",
+                    allowUsageInUserControlledCode=True,
+                    allowConnectionUsageInGateway=True,
+                )
             if path == f"connections/{TARGET_CONNECTION}":
                 return self.created
             raise AssertionError(path)
@@ -284,6 +339,11 @@ def test_preexisting_connection_creation_is_journaled_and_reused_on_resume(tmp_p
     orchestrator._validate_connection_mappings(ctx)
     assert ctx.id_map[SOURCE_CONNECTION] == TARGET_CONNECTION
     assert client.posts[0]["credentialDetails"]["credentials"]["servicePrincipalClientId"] == "app"
+    assert client.posts[0]["connectivityType"] == "ShareableCloud"
+    assert client.posts[0]["privacyLevel"] == "Organizational"
+    assert client.posts[0]["credentialDetails"]["singleSignOnType"] == "None"
+    assert not client.posts[0].get("allowUsageInUserControlledCode", False)
+    assert not client.posts[0].get("allowConnectionUsageInGateway", False)
     assert "secret" not in ctx.journal.path.read_text()
     resumed = context(tmp_path, journal.read(ctx.journal.path))
     resumed.client = client
