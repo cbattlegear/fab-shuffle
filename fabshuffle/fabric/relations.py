@@ -12,10 +12,13 @@ information" rather than failing a migration.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from fabshuffle.concurrency import bounded_map
 from fabshuffle.fabric.client import FabricApiError, FabricClient
 from fabshuffle.fabric.items import is_monitoring_item
 from fabshuffle.fabric.support import is_derived_type, normalise_type
@@ -112,6 +115,8 @@ def build_graph(
     client: FabricClient,
     workspace_id: str,
     items: Iterable[Mapping[str, Any]],
+    *,
+    on_item: Callable[[Mapping[str, Any], str], None] | None = None,
 ) -> DependencyGraph:
     """Build a dependency graph for the given items.
 
@@ -120,32 +125,51 @@ def build_graph(
     spending the caller's API quota on certain failures.
     """
     graph = DependencyGraph()
-    first = True
+    candidates = [item for item in items if item.get("id")]
+    started = time.monotonic()
+    count = 0
+    count_lock = threading.Lock()
 
-    for item in items:
-        item_id = item.get("id")
-        if not item_id:
-            continue
+    def read(item: Mapping[str, Any]) -> dict[str, Any] | None:
+        nonlocal count
+        if on_item:
+            on_item(item, "Reading upstream relations")
+        try:
+            with count_lock:
+                count += 1
+            response = get_upstream(client, workspace_id, item["id"])
+        except Exception:
+            if on_item:
+                on_item(item, "Relations read failed")
+            raise
+        if on_item:
+            on_item(item, "Relations unavailable" if response is None else "Upstream relations read")
+        return response
 
-        graph.items.setdefault(
-            item_id,
-            {
-                "id": item_id,
-                "type": item.get("type"),
-                "displayName": item.get("displayName"),
-                "workspaceId": workspace_id,
-            },
-        )
+    def absorb(item: Mapping[str, Any], response: dict[str, Any] | None) -> None:
+        item_id = item["id"]
+        graph.items.setdefault(item_id, {
+            "id": item_id, "type": item.get("type"),
+            "displayName": item.get("displayName"), "workspaceId": workspace_id,
+        })
+        if response is not None:
+            _absorb(graph, response)
 
-        response = get_upstream(client, workspace_id, item_id)
-        if response is None:
-            if first:
+    try:
+        if candidates:
+            first = read(candidates[0])
+            absorb(candidates[0], first)
+            if first is None:
                 logger.info("Relations API unavailable; skipping dependency analysis")
                 graph.available = False
                 return graph
-            continue
-        first = False
-        _absorb(graph, response)
+            for item, response in zip(candidates[1:], bounded_map(read, candidates[1:]), strict=True):
+                absorb(item, response)
+    finally:
+        logger.info(
+            "Dependency relation reads: count=%s elapsed_seconds=%.3f",
+            count, time.monotonic() - started,
+        )
 
     return graph
 

@@ -159,6 +159,24 @@ def test_full_rebuild_exports_from_source_creates_only_in_destination(monkeypatc
     assert not SETTINGS.journal_for(run.id).exists()
 
 
+def test_workspace_creation_race_preserves_fabric_error(monkeypatch):
+    from fabshuffle.fabric.client import FabricApiError
+
+    _source, target = install(monkeypatch)
+    body = '{"errorCode":"WorkspaceNameAlreadyExists","message":"Workspace name already exists"}'
+
+    def reject(*_args, **_kwargs):
+        raise FabricApiError("POST", "https://api.fabric.microsoft.com/v1/workspaces", 409, body)
+
+    monkeypatch.setattr(orchestrator.workspaces, "create_workspace", reject)
+    run = MigrationRun(source_workspace_name="Source", capacity_name="Target capacity")
+    orchestrator.run_migration(run, SOURCE, plan(), target_principal=TARGET)
+    assert run.status is RunStatus.FAILED
+    assert "WorkspaceNameAlreadyExists" in run.error
+    assert "Workspace name already exists" in run.error
+    assert not target.created
+
+
 def test_cross_tenant_bound_connection_uses_operator_destination_mapping(monkeypatch):
     _source, target = install(monkeypatch, uses_connection=True)
     run = MigrationRun(source_workspace_name="Source", capacity_name="Target capacity")
@@ -186,13 +204,12 @@ def test_missing_connection_mapping_never_creates_source_bound_consumer(monkeypa
     {"include_data": True},
     {"include_files": True},
 ])
-def test_cross_tenant_data_requires_write_freeze_before_creating_resources(monkeypatch, option):
+def test_cross_tenant_data_does_not_require_freeze_confirmation(monkeypatch, option):
     source, target = install(monkeypatch)
     run = MigrationRun(source_workspace_name="Source", capacity_name="Target capacity")
-    with pytest.raises(ValueError, match="write freeze"):
-        orchestrator.run_migration(run, SOURCE, plan(**option), target_principal=TARGET)
-    assert not source.calls and not target.calls
-    assert not SETTINGS.journal_for_plan(run.id, orchestrator._plan_record(plan(**option))).exists()
+    orchestrator.run_migration(run, SOURCE, plan(**option), target_principal=TARGET)
+    assert run.status is RunStatus.SUCCEEDED, run.error
+    assert source.calls and target.calls
 
 
 def test_swapped_credentials_never_reach_a_fabric_client(monkeypatch):

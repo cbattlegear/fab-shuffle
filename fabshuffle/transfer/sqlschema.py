@@ -16,9 +16,10 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pyodbc
 
@@ -127,6 +128,267 @@ class SchemaStagingError(SchemaTransferError, StagingBudgetError):
 
 class SchemaMemoryError(SchemaTransferError, StagingBudgetError):
     """A schema script cannot be processed safely inside the configured memory budget."""
+
+
+class NonEmptyTables(SchemaTransferError):
+    """A destination table contains rows."""
+
+
+def _check_table_visibility(cursor: pyodbc.Cursor) -> None:
+    if cursor.execute("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL')").fetchval() != 1:
+        raise SchemaTransferError("Checking for existing rows requires CONTROL on the destination database.")
+    if cursor.execute("SELECT TOP (1) 1 FROM sys.security_policies WHERE is_enabled = 1").fetchone():
+        raise SchemaTransferError("An enabled row-level security policy prevents proving tables are empty.")
+
+
+def _quoted_table(schema: str, table: str) -> str:
+    return f"[{schema.replace(']', ']]')}].[{table.replace(']', ']]')}]"
+
+
+def _check_tables_empty(cursor: pyodbc.Cursor, tables: Iterable[tuple[str, str]]) -> None:
+    for schema, table in tables:
+        name = _quoted_table(schema, table)
+        if cursor.execute(f"SELECT TOP (1) 1 FROM {name}").fetchone():
+            raise NonEmptyTables(f"Destination table {name} is not empty.")
+
+
+def require_empty_tables(
+    server: str, database: str, tokens: TokenProvider, tables: Iterable[tuple[str, str]],
+) -> None:
+    """Prove the target tables are empty before an append-only copy."""
+    try:
+        with connect(server, database, tokens) as connection:
+            cursor = connection.cursor()
+            _check_table_visibility(cursor)
+            _check_tables_empty(cursor, tables)
+    except pyodbc.Error as error:
+        raise SchemaTransferError(f"Could not verify destination tables are empty: {error}") from error
+
+
+def truncate_tables(
+    server: str, database: str, tokens: TokenProvider, tables: Iterable[tuple[str, str]],
+) -> None:
+    """Clear a confirmed failed copy's tables together, or roll back the transaction."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        tables = list(tables)
+        for schema, table in tables:
+            cursor.execute(f"TRUNCATE TABLE {_quoted_table(schema, table)}")
+        _check_tables_empty(cursor, tables)
+        connection.commit()
+    except (pyodbc.Error, SchemaTransferError) as error:
+        detail = str(error)
+        try:
+            connection.rollback()
+        except pyodbc.Error as rollback_error:
+            detail += f"; rollback also failed: {rollback_error}"
+        raise SchemaTransferError(f"Could not truncate destination tables: {detail}") from error
+    finally:
+        connection.close()
+
+
+def _copy_effect_inventory(cursor: Any, tables: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    wanted = set(tables)
+    effects = []
+    foreign_keys = cursor.execute(
+        "SELECT object_id, parent_object_id, referenced_object_id, "
+        "OBJECT_SCHEMA_NAME(parent_object_id), OBJECT_NAME(parent_object_id), "
+        "name, is_disabled, is_not_trusted, OBJECT_SCHEMA_NAME(referenced_object_id), "
+        "OBJECT_NAME(referenced_object_id) FROM sys.foreign_keys"
+    ).fetchall()
+    for row in foreign_keys:
+        oid, parent_id, referenced_id, schema, table, name, disabled, untrusted, ref_schema, ref_table = row
+        if (schema, table) in wanted or (ref_schema, ref_table) in wanted:
+            effects.append({
+                "kind": "foreign_key", "id": oid, "schema": schema, "table": table,
+                "name": name, "disabled": bool(disabled), "untrusted": bool(untrusted),
+                "referenced_schema": ref_schema, "referenced_table": ref_table,
+                "parent_id": parent_id, "referenced_id": referenced_id,
+            })
+    checks = cursor.execute(
+        "SELECT object_id, parent_object_id, OBJECT_SCHEMA_NAME(parent_object_id), "
+        "OBJECT_NAME(parent_object_id), "
+        "name, is_disabled, is_not_trusted FROM sys.check_constraints"
+    ).fetchall()
+    for oid, parent_id, schema, table, name, disabled, untrusted in checks:
+        if (schema, table) in wanted:
+            effects.append({
+                "kind": "check", "id": oid, "schema": schema, "table": table,
+                "name": name, "disabled": bool(disabled), "untrusted": bool(untrusted),
+                "parent_id": parent_id,
+            })
+    triggers = cursor.execute(
+        "SELECT object_id, parent_id, OBJECT_SCHEMA_NAME(parent_id), OBJECT_NAME(parent_id), "
+        "name, is_disabled "
+        "FROM sys.triggers WHERE parent_class = 1 AND is_ms_shipped = 0"
+    ).fetchall()
+    for oid, parent_id, schema, table, name, disabled in triggers:
+        if (schema, table) in wanted:
+            effects.append({
+                "kind": "trigger", "id": oid, "schema": schema, "table": table,
+                "name": name, "disabled": bool(disabled), "parent_id": parent_id,
+            })
+    return sorted(effects, key=lambda value: (value["kind"], value["id"]))
+
+
+def _verify_copy_effects(
+    cursor: Any, tables: list[tuple[str, str]], effects: list[dict[str, Any]],
+) -> None:
+    current = _copy_effect_inventory(cursor, tables)
+    def identity(entry: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in entry.items() if key not in ("disabled", "untrusted")}
+    if [identity(entry) for entry in current] != [identity(entry) for entry in effects]:
+        raise SchemaTransferError(
+            "Destination constraints or triggers changed since their state was recorded. "
+            "Reconcile the SQL database and its recorded recovery state before resuming."
+        )
+    for original, now in zip(effects, current, strict=True):
+        if original["disabled"] and not now["disabled"]:
+            raise SchemaTransferError(
+                f"Originally disabled {original['kind']} '{original['name']}' was enabled externally. "
+                "Restore its recorded state before resuming."
+            )
+        if original["disabled"] and original.get("untrusted") != now.get("untrusted"):
+            raise SchemaTransferError(
+                f"Originally disabled {original['kind']} '{original['name']}' changed trust state. "
+                "Restore its recorded state before resuming."
+            )
+
+
+def _copy_table_ids(cursor: Any, tables: list[tuple[str, str]]) -> list[int]:
+    result = []
+    for schema, table in tables:
+        oid = cursor.execute("SELECT OBJECT_ID(?, 'U')", _quoted_table(schema, table)).fetchval()
+        if oid is None:
+            raise SchemaTransferError(f"Destination table {_quoted_table(schema, table)} is missing.")
+        result.append(int(oid))
+    return result
+
+
+def _effect_statement(effect: dict[str, Any], *, restore: bool) -> str:
+    table = _quoted_table(effect["schema"], effect["table"])
+    name = "[" + effect["name"].replace("]", "]]") + "]"
+    if effect["kind"] == "trigger":
+        trigger = "[" + effect["schema"].replace("]", "]]") + "]." + name
+        return f"{'ENABLE' if restore else 'DISABLE'} TRIGGER {trigger} ON {table}"
+    if not restore:
+        return f"ALTER TABLE {table} NOCHECK CONSTRAINT {name}"
+    check = "CHECK CONSTRAINT" if effect["untrusted"] else "WITH CHECK CHECK CONSTRAINT"
+    return f"ALTER TABLE {table} {check} {name}"
+
+
+def _copy_effect_error(connection: Any, action: str, error: Exception) -> SchemaTransferError:
+    detail = str(error)
+    try:
+        connection.rollback()
+    except pyodbc.Error as rollback_error:
+        detail += f"; rollback also failed: {rollback_error}"
+    return SchemaTransferError(f"Could not {action}: {detail}")
+
+
+def suspend_copy_effects(
+    server: str, database: str, tokens: TokenProvider, tables: list[tuple[str, str]],
+    *, record: Callable[[dict[str, Any]], None], prior: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Journal destination trigger/constraint state before disabling enabled objects."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        if prior is None:
+            state = {
+                "tables": [list(table) for table in tables], "table_ids": _copy_table_ids(cursor, tables),
+                "effects": _copy_effect_inventory(cursor, tables),
+            }
+            record(state)
+        else:
+            state = prior
+            if state["tables"] != [list(table) for table in tables]:
+                raise SchemaTransferError("The SQL table inventory changed; reconcile the saved copy first.")
+            if state["table_ids"] != _copy_table_ids(cursor, tables):
+                raise SchemaTransferError(
+                    "The destination SQL tables changed; reconcile the saved copy first."
+                )
+            _verify_copy_effects(cursor, tables, state["effects"])
+        for effect in state["effects"]:
+            if not effect["disabled"]:
+                cursor.execute(_effect_statement(effect, restore=False))
+        connection.commit()
+        return state
+    except (pyodbc.Error, SchemaTransferError) as error:
+        raise _copy_effect_error(connection, "suspend SQL constraints or triggers", error) from error
+    finally:
+        connection.close()
+
+
+def restore_copy_effects(
+    server: str, database: str, tokens: TokenProvider, state: dict[str, Any], *,
+    clear_failed: bool = False,
+) -> None:
+    """Restore the saved enabled/trust state; optionally clear a confirmed failed copy first."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        tables = [tuple(table) for table in state["tables"]]
+        if state["table_ids"] != _copy_table_ids(cursor, tables):
+            raise SchemaTransferError("The destination SQL tables changed; reconcile the saved copy first.")
+        _verify_copy_effects(cursor, tables, state["effects"])
+        if clear_failed:
+            current = _copy_effect_inventory(cursor, tables)
+            enabled = any(not original["disabled"] and not now["disabled"]
+                          for original, now in zip(state["effects"], current, strict=True))
+            if enabled:
+                # Restoration may have committed just before the journal write was interrupted.
+                if any(original["disabled"] != now["disabled"]
+                       or original.get("untrusted") != now.get("untrusted")
+                       for original, now in zip(state["effects"], current, strict=True)):
+                    raise SchemaTransferError(
+                        "SQL effects are only partially restored; reconcile them first."
+                    )
+            else:
+                for schema, table in tables:
+                    cursor.execute(f"DELETE FROM {_quoted_table(schema, table)}")
+                _check_tables_empty(cursor, tables)
+        for effect in state["effects"]:
+            if not effect["disabled"]:
+                cursor.execute(_effect_statement(effect, restore=True))
+        connection.commit()
+    except (pyodbc.Error, SchemaTransferError) as error:
+        failure = _copy_effect_error(connection, "restore SQL constraints or triggers", error)
+        raise SchemaTransferError(
+            f"{failure}. Inspect the destination data and recorded constraint state, then resume."
+        ) from error
+    finally:
+        connection.close()
+
+
+def clear_failed_sql_copy(
+    server: str, database: str, tokens: TokenProvider, state: dict[str, Any],
+) -> None:
+    """Clear a confirmed failed copy while its recorded SQL effects remain suspended."""
+    connection = connect(server, database, tokens)
+    try:
+        cursor = connection.cursor()
+        _check_table_visibility(cursor)
+        tables = [tuple(table) for table in state["tables"]]
+        if state["table_ids"] != _copy_table_ids(cursor, tables):
+            raise SchemaTransferError("The destination SQL tables changed; reconcile the saved copy first.")
+        _verify_copy_effects(cursor, tables, state["effects"])
+        current = _copy_effect_inventory(cursor, tables)
+        if any(not original["disabled"] and not now["disabled"]
+               for original, now in zip(state["effects"], current, strict=True)):
+            raise SchemaTransferError("A suspended SQL constraint or trigger is unexpectedly enabled.")
+        for schema, table in tables:
+            cursor.execute(f"DELETE FROM {_quoted_table(schema, table)}")
+        _check_tables_empty(cursor, tables)
+        connection.commit()
+    except (pyodbc.Error, SchemaTransferError) as error:
+        raise _copy_effect_error(connection, "clear destination tables", error) from error
+    finally:
+        connection.close()
 
 
 def _driver() -> str:
@@ -684,6 +946,55 @@ def _already_exists(error: pyodbc.Error) -> bool:
     return "already exists" in text or "there is already an object named" in text
 
 
+def _session_only_batch(batch: str) -> bool:
+    """Only known SET options and literal PRINT statements are safe to replay on reconnect."""
+    _, code = _sql_guard_text(batch)
+    options = (
+        "ANSI_NULLS|ANSI_PADDING|ANSI_WARNINGS|ARITHABORT|CONCAT_NULL_YIELDS_NULL|"
+        "QUOTED_IDENTIFIER|NUMERIC_ROUNDABORT"
+    )
+    statement = rf"(?:SET\s+(?:{options})(?:\s*,\s*(?:{options}))*\s+(?:ON|OFF)|PRINT\s+N?\?)"
+    return re.fullmatch(rf"\s*(?:{statement}\s*;\s*)+|{statement}\s*", code, re.IGNORECASE) is not None
+
+
+@contextmanager
+def _schema_cursor(
+    server: str,
+    database: str,
+    tokens: TokenProvider,
+    *,
+    cancel_requested: Callable[[], bool] | None,
+    on_progress: Callable[[str], None] | None,
+) -> Iterator[pyodbc.Cursor]:
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        check_cancelled(cancel_requested)
+        connection = connect(server, database, tokens, on_progress=on_progress)
+        try:
+            connection.autocommit = True
+            cursor = connection.cursor()
+        except pyodbc.Error as error:
+            try:
+                connection.close()
+            except pyodbc.Error as close_error:
+                logger.warning("Closing failed SQL schema connection: %s", close_error)
+            if not is_transient(error) or attempt == CONNECT_ATTEMPTS:
+                raise SchemaTransferError(
+                    f"Could not prepare SQL schema connection to {server}/{database}: {error}"
+                ) from error
+            logger.warning(
+                "SQL schema connection setup for %s/%s failed: %s; retrying (%s/%s)",
+                server, database, error, attempt, CONNECT_ATTEMPTS,
+            )
+        else:
+            with connection:
+                yield cursor
+            return
+        if on_progress and attempt % 4 == 1:
+            on_progress(f"Waiting for SQL endpoint {database} to accept schema deployment")
+        check_cancelled(cancel_requested)
+        time.sleep(CONNECT_WAIT_SECONDS)
+
+
 def apply_script(
     script_path: Path,
     *,
@@ -695,7 +1006,7 @@ def apply_script(
     cancel_requested: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Execute a deployment script batch by batch, collecting per-batch failures."""
+    """Retry session setup, but never replay uncertain schema execution after a disconnect."""
     memory_budget = resolve_memory_budget(
         max_staging_bytes=max_staging_bytes,
         max_memory_bytes=max_memory_bytes,
@@ -715,23 +1026,44 @@ def apply_script(
         return []
 
     warnings: list[str] = []
-    with connect(server, database, tokens, on_progress=on_progress) as connection:
-        connection.autocommit = True
-        cursor = connection.cursor()
-        for index, batch in enumerate(batches, start=1):
-            check_cancelled(cancel_requested)
-            try:
-                cursor.execute(batch)
-            except pyodbc.Error as error:
-                if _already_exists(error):
-                    # A schema-enabled lakehouse derives its schemas from OneLake, so the
-                    # deploy script recreating them is expected and not worth reporting.
-                    logger.debug("Skipping batch %s, the object already exists", index)
-                    continue
-                summary = " ".join(batch.split())[:120]
-                warnings.append(f"Batch {index} failed ({error}): {summary}")
-            if on_progress and index % 25 == 0:
-                on_progress(f"Applied {index}/{len(batches)} schema batches to {database}")
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        session_only = True
+        reconnect = False
+        with _schema_cursor(
+            server, database, tokens, cancel_requested=cancel_requested, on_progress=on_progress,
+        ) as cursor:
+            for index, batch in enumerate(batches, start=1):
+                check_cancelled(cancel_requested)
+                session_only = session_only and _session_only_batch(batch)
+                try:
+                    cursor.execute(batch)
+                except pyodbc.Error as error:
+                    if is_transient(error):
+                        if session_only and attempt < CONNECT_ATTEMPTS:
+                            logger.warning(
+                                "SQL schema session setup for %s/%s failed: %s; reconnecting (%s/%s)",
+                                server, database, error, attempt, CONNECT_ATTEMPTS,
+                            )
+                            reconnect = True
+                            break
+                        summary = " ".join(batch.split())[:120]
+                        warnings.append(
+                            f"Batch {index} failed ({error}): {summary}. Stopped before later batches; "
+                            "execution outcome is unknown and the batch was not replayed. Inspect the "
+                            "destination schema and regenerate a target-aware deployment before retrying."
+                        )
+                        return warnings
+                    if _already_exists(error):
+                        logger.debug("Skipping batch %s, the object already exists", index)
+                        continue
+                    summary = " ".join(batch.split())[:120]
+                    warnings.append(f"Batch {index} failed ({error}): {summary}")
+                if on_progress and index % 25 == 0:
+                    on_progress(f"Applied {index}/{len(batches)} schema batches to {database}")
+        if not reconnect:
+            break
+        check_cancelled(cancel_requested)
+        time.sleep(CONNECT_WAIT_SECONDS)
     return warnings
 
 
@@ -943,6 +1275,56 @@ def _tool_output(path: Path) -> str:
         return stream.read(1500).decode("utf-8", errors="replace").strip()
 
 
+_SAFE_TOOL_PROGRESS = frozenset({
+    "Initializing deployment (Start)", "Initializing deployment (Complete)",
+    "Analyzing deployment plan (Start)", "Analyzing deployment plan (Complete)",
+    "Updating database (Start)", "Updating database (Complete)",
+    "Extracting schema", "Extracting schema from database",
+})
+
+
+def _tool_operation(what: str) -> str:
+    for prefix, operation in (
+        ("sqlpackage extract of ", "SqlPackage extract"),
+        ("sqlpackage script of ", "SqlPackage script"),
+        ("unpackdacpac of ", "unpackdacpac"),
+    ):
+        if what.startswith(prefix):
+            return operation
+    return "schema tool"
+
+
+def _log_tool_output(output: str, operation: str = "SqlPackage") -> None:
+    """Log only fixed, credential-free progress lines; arbitrary tool output is private."""
+    for line in output.splitlines():
+        if line.strip() in _SAFE_TOOL_PROGRESS:
+            logger.debug("%s: %s", operation, line.strip())
+
+
+class _ToolProgress:
+    """Incrementally filter complete lines without retaining arbitrary tool output."""
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        self.pending = b""
+        self.overflow = False
+
+    def feed(self, chunk: bytes, *, final: bool = False) -> None:
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if not self.overflow:
+                if len(self.pending) + len(part) <= 256:
+                    self.pending += part
+                else:
+                    self.pending = b""
+                    self.overflow = True
+            if index < len(parts) - 1 or final:
+                if not self.overflow:
+                    _log_tool_output(self.pending.decode("utf-8", errors="replace"), self.operation)
+                self.pending = b""
+                self.overflow = False
+
+
 def _run_bounded(
     command: list[str],
     *,
@@ -984,7 +1366,9 @@ def _run_bounded(
     if executable:
         command = [str(Path(executable).resolve()), *command[1:]]
     output = root / f".tool-output-{uuid.uuid4().hex}.log"
-    with output.open("wb") as log:
+    operation = _tool_operation(what)
+    logger.debug("%s started", operation)
+    with output.open("wb") as log, output.open("rb", buffering=0) as reader:
         try:
             process = subprocess.Popen(
                 command, cwd=root, env=environment, stdin=subprocess.DEVNULL,
@@ -995,10 +1379,13 @@ def _run_bounded(
                 f"{what} could not run because '{command[0]}' is not installed in this runtime. "
                 "T-SQL schema transfer needs sqlpackage."
             ) from error
+        progress = _ToolProgress(operation)
         try:
             while True:
                 check_cancelled(cancel_requested)
                 _check_staging(root, disk_budget)
+                if logger.isEnabledFor(logging.DEBUG):
+                    progress.feed(reader.read(65536))
                 if process.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -1012,6 +1399,11 @@ def _run_bounded(
             raise
         finally:
             _stop_tool(process, environment)
+            if logger.isEnabledFor(logging.DEBUG):
+                while chunk := reader.read(65536):
+                    progress.feed(chunk)
+                progress.feed(b"", final=True)
+            logger.debug("%s finished (exit %s)", operation, process.returncode)
     if process.returncode:
         raise SchemaTransferError(
             f"{what} failed with exit code {process.returncode}: {_tool_output(output)}"
@@ -1019,7 +1411,8 @@ def _run_bounded(
 
 
 def _run(command: list[str], *, what: str) -> None:
-    logger.debug("Running %s", command[0])
+    operation = _tool_operation(what)
+    logger.debug("%s started", operation)
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except FileNotFoundError as error:
@@ -1027,6 +1420,9 @@ def _run(command: list[str], *, what: str) -> None:
             f"{what} could not run because '{command[0]}' is not installed in this runtime. "
             "T-SQL schema transfer needs sqlpackage and unpackdacpac."
         ) from error
+    _log_tool_output(result.stdout or "", operation)
+    _log_tool_output(result.stderr or "", operation)
+    logger.debug("%s finished (exit %s)", operation, result.returncode)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-1500:]
         raise SchemaTransferError(f"{what} failed with exit code {result.returncode}: {detail}")

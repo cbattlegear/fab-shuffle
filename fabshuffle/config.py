@@ -115,7 +115,6 @@ class Settings:
     max_staging_bytes: int | None = field(default_factory=_legacy_staging_budget)
     sqlpackage_path: str = os.environ.get("FAB_SHUFFLE_SQLPACKAGE", "sqlpackage")
     unpackdacpac_path: str = os.environ.get("FAB_SHUFFLE_UNPACKDACPAC", "unpackdacpac")
-    bcp_path: str = os.environ.get("FAB_SHUFFLE_BCP", "bcp")
 
     def __post_init__(self) -> None:
         legacy = self.max_staging_bytes

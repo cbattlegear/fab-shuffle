@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
+
+import fabshuffle.orchestrator as orchestrator
+from fabshuffle.__main__ import configure_logging
+from fabshuffle.fabric.client import FabricApiError, _log_route
+from fabshuffle.lifecycle import Lifecycle
 from fabshuffle.orchestrator import default_target_name
 from fabshuffle.run import MigrationRun, RunStatus, StepStatus
-from fabshuffle.transfer.sqlschema import _batches, _strip_sqlcmd_header
+from fabshuffle.transfer.sqlschema import _batches, _log_tool_output, _strip_sqlcmd_header
+from fabshuffle.web.dependency_progress import DependencyAssessment
 
 
 def test_target_name_uses_capacity_region():
@@ -39,6 +50,411 @@ def test_subscriber_receives_snapshots_and_a_close_sentinel():
     # One snapshot for the status change, then the sentinel that closes the SSE stream.
     assert subscriber.get_nowait()["status"] == "succeeded"
     assert subscriber.get_nowait() is None
+
+
+def test_activity_tracks_parallel_items_and_keeps_latest_snapshot_bounded():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run._secrets = ("private-value",)
+    run.start_step("dependencies", "Checking dependencies")
+    subscriber = run.subscribe()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda n: run.item_activity(str(n), f"item {n} private-value", "Notebook", "Reading", "running"),
+            range(60),
+        ))
+    snapshot = run.snapshot()["steps"][0]
+    assert len(snapshot["activity"]) == 50
+    assert snapshot["activityOmitted"] == 10
+    assert "private-value" not in str(snapshot)
+    first = snapshot["activity"][0]["id"]
+    for i in range(10):
+        run.item_activity(first, "item", "Notebook", f"action {i}", "running")
+    run.mark_finished(RunStatus.SUCCEEDED)
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+    assert events[-1] is None
+    assert any(event and event["status"] == "succeeded" for event in events)
+    history = next(
+        entry["actions"] for entry in run.snapshot()["steps"][0]["activity"] if entry["id"] == first
+    )
+    assert len(history) == 5 and history[-1]["action"] == "action 9"
+
+
+def test_activity_window_shows_later_items_and_prefers_retaining_active_ones():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("dependencies", "Checking dependencies")
+    run.item_activity("active", "still running", "Notebook", "Reading", "running")
+    for i in range(60):
+        run.item_activity(str(i), f"item {i}", "Notebook", "Reading", "running")
+        run.item_activity(str(i), f"item {i}", "Notebook", "Read", "succeeded")
+    run.item_activity("later", "current", "Notebook", "Reading", "running")
+    snapshot = run.snapshot()["steps"][0]
+    ids = {entry["id"] for entry in snapshot["activity"]}
+    assert {"active", "later", "59"} <= ids
+    assert "0" not in ids
+    assert snapshot["activityOmitted"] == 12
+    run.item_activity("later", "current", "Notebook", "Still reading", "running")
+    assert run.snapshot()["steps"][0]["activityOmitted"] == 12
+
+
+def test_stage_item_count_uses_full_worklist_not_bounded_activity_window():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("engineering", "Migrating engineering items")
+    run.set_activity_total("engineering", 56, operation="stage-item")
+
+    for index in range(56):
+        item_id = str(index)
+        run.item_activity(item_id, f"Item {index}", "Notebook", "Migration started", "running", "stage-item")
+        run.item_activity(item_id, f"Item {index}", "Notebook", "Creating target", "running", "target")
+        run.item_activity(item_id, f"Item {index}", "Notebook", "Target ready", "succeeded", "target")
+        run.item_activity(
+            item_id, f"Item {index}", "Notebook", "Migration completed", "succeeded", "stage-item",
+        )
+
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 56
+    assert step["activityCompleted"] == 56
+    assert len(step["activity"]) == 50
+    assert step["activityOmitted"] == 6
+    assert any(item["id"] == "55" for item in step["activity"])
+
+
+def test_unknown_stage_total_stays_indeterminate_and_other_operations_do_not_count():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("transfer", "Transferring data")
+    run.set_activity_total("transfer", 2, operation="stage-item")
+    run.item_activity("one", "One", "Warehouse", "Schema started", "running", "schema")
+    run.item_activity("one", "One", "Warehouse", "Schema ready", "succeeded", "schema")
+    run.item_activity("one", "One", "Warehouse", "Item started", "running", "stage-item")
+    run.item_activity("one", "One", "Warehouse", "Item done", "unknown", "stage-item")
+    step = run.snapshot()["steps"][0]
+    assert step["activityCompleted"] == 1
+    assert step["activityTotal"] == 2
+    assert step["activity"][0]["active"] is False
+
+    unknown = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    unknown.start_step("unmeasured", "Unmeasured work")
+    unknown.item_activity("one", "One", "Item", "Work started", "running")
+    assert "activityTotal" not in unknown.snapshot()["steps"][0]
+
+
+def test_reassign_counts_large_model_work_and_capacity_assignment(monkeypatch):
+    model = SimpleNamespace(id="model-id", name="Model", is_large=True, convertible=True)
+    conversions = []
+
+    class FakePowerBiClient:
+        def __init__(self, _tokens):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def list_semantic_models(self, _workspace_id):
+            return [model]
+
+        def convert(self, _workspace_id, selected, target, **_kwargs):
+            conversions.append((selected.id, target))
+
+    assignments = []
+    monkeypatch.setattr(orchestrator.powerbi, "PowerBiClient", FakePowerBiClient)
+    monkeypatch.setattr(
+        orchestrator.powerbi, "SMALL", "small", raising=False,
+    )
+    monkeypatch.setattr(
+        orchestrator.powerbi, "LARGE", "large", raising=False,
+    )
+    monkeypatch.setattr(orchestrator, "supports_large_semantic_models", lambda _region: True)
+    monkeypatch.setattr(
+        orchestrator.workspaces, "assign_to_capacity",
+        lambda *_args: assignments.append(True),
+    )
+
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    ctx = SimpleNamespace(
+        tokens=None,
+        plan=SimpleNamespace(
+            capacity_warning=None, source_workspace_id="workspace-id",
+            source_workspace_name="Sales", capacity_region="westus",
+            capacity_name="F64", capacity_id="capacity-id",
+        ),
+        run=run,
+        warnings=[],
+        client=object(),
+    )
+    orchestrator._reassign_capacity(ctx)
+
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 2
+    assert all(not activity["active"] for activity in step["activity"])
+    assert assignments == [True]
+    assert conversions == [("model-id", "small"), ("model-id", "large")]
+
+
+def test_assessment_counts_inventory_items(monkeypatch):
+    items = [{"id": "item-1", "displayName": "Notebook", "type": "Notebook"}]
+    assessment = SimpleNamespace(migrated=items, unsupported=[], grouped_messages=lambda: [])
+    monkeypatch.setattr(orchestrator, "list_items", lambda *_args: items)
+    monkeypatch.setattr(orchestrator, "assess_workspace", lambda *_args, **_kwargs: assessment)
+
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    lifecycle = Lifecycle(attempt_id=run.id, activity=run.item_activity)
+
+    class FakeJournal:
+        def inventory(self):
+            pass
+
+    ctx = SimpleNamespace(
+        run=run,
+        plan=SimpleNamespace(
+            source_workspace_id="source-id", strategy=orchestrator.Strategy.REBUILD,
+            paired=False, capacity_warning=None,
+        ),
+        client=SimpleNamespace(list_all=lambda *_args: items),
+        lifecycle=lambda item: lifecycle.item(
+            item["id"], item["displayName"], item["type"],
+        ),
+        already_created=lambda _item_id: False,
+        assessment=None,
+        source_items={},
+        primary_item_ids=set(),
+        journal=FakeJournal(),
+        warnings=[],
+        summary={},
+    )
+    orchestrator._report_unsupported_items(ctx)
+
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 1
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["actions"][-1]["state"] == "succeeded"
+
+
+def test_dataflow_count_includes_ineligible_items(monkeypatch):
+    dataflows = [
+        {"id": "unsupported", "displayName": "Unsupported", "type": "Dataflow"},
+        {"id": "eligible", "displayName": "Eligible", "type": "Dataflow"},
+    ]
+    monkeypatch.setattr(
+        orchestrator.analytics, "classify_dataflow",
+        lambda _client, _workspace, item: ([], "Unsupported format")
+        if item["id"] == "unsupported" else ([], None),
+    )
+
+    def migrate(_ctx, **kwargs):
+        assert kwargs["track_activity"] is False
+        assert [item["id"] for item in kwargs["items"]] == ["eligible"]
+        return [SimpleNamespace(source_id="eligible")], []
+
+    monkeypatch.setattr(orchestrator, "_migrate_definition_items", migrate)
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("engineering", "Migrating engineering items")
+
+    class Evidence:
+        def step(self, *_args, **_kwargs):
+            pass
+
+    ctx = SimpleNamespace(
+        run=run,
+        plan=SimpleNamespace(source_workspace_id="source-id"),
+        client=object(),
+        target_workspace_id="target-id",
+        id_map={},
+        source_items={},
+        lifecycle=lambda *_args: Evidence(),
+        to_migrate=lambda items: items,
+    )
+    warnings = []
+    migrated = orchestrator._migrate_dataflows(
+        ctx, "engineering", dataflows, warnings, lambda _message: None,
+    )
+
+    step = run.snapshot()["steps"][0]
+    assert migrated == 1
+    assert warnings == ["Unsupported format"]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 2
+    assert {item["id"]: item["actions"][-1]["state"] for item in step["activity"]} == {
+        "unsupported": "skipped", "eligible": "succeeded",
+    }
+
+
+def test_read_only_dependency_assessment_counts_actual_candidate_reads():
+    assessment = DependencyAssessment(
+        id="assessment", session_id="session", source_workspace_id="workspace", rebuild=False,
+    )
+    assessment.start()
+    assessment.set_activity_total(2)
+    item = {"id": "one", "displayName": "One", "type": "Lakehouse"}
+    assessment.on_item(item, "Reading upstream relations")
+    assessment.on_item(item, "Upstream relations read")
+    step = assessment.snapshot()["step"]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["active"] is False
+
+
+def test_default_item_operation_counts_when_stage_filters_item_reads():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("dependencies", "Checking dependencies")
+    run.set_activity_total("dependencies", 1, operation="item")
+    run.item_activity("one", "One", "Notebook", "Reading", "running")
+    run.item_activity("one", "One", "Notebook", "Read", "succeeded")
+    assert run.snapshot()["steps"][0]["activityCompleted"] == 1
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_migrate_dependency_total_includes_initial_source_reads_and_later_candidates(
+    monkeypatch, unavailable,
+):
+    migrated = [
+        {"id": "notebook", "displayName": "Notebook", "type": "Notebook"},
+        {"id": "lakehouse", "displayName": "Lakehouse", "type": "Lakehouse"},
+        {"id": "kql", "displayName": "KQL database", "type": "KQLDatabase"},
+        {"id": "copy", "displayName": "Copy Job", "type": "CopyJob"},
+        {"type": "Report"},
+    ]
+    binding_items = [*migrated, {"id": "pipeline", "type": "DataPipeline"}]
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    snapshots = []
+    monkeypatch.setattr(run, "_publish", lambda: snapshots.append(run.snapshot()["steps"][0]))
+
+    class Client:
+        def get(self, path, params=None):
+            if unavailable:
+                raise FabricApiError("GET", path, 403, "relations unavailable")
+            return {}
+
+        def list_all(self, path, params=None, value_key="value"):
+            return [{"id": "connection"}] if path == "connections" else binding_items
+
+    ctx = SimpleNamespace(
+        run=run, assessment=SimpleNamespace(migrated=migrated), client=Client(),
+        plan=SimpleNamespace(source_workspace_id="source", cross_tenant=False),
+        principal=SimpleNamespace(client_id="principal"), warnings=[],
+    )
+
+    def read_definition(_client, _workspace, item_id):
+        # Source reads start with their known candidates already in the denominator.
+        assert run.snapshot()["steps"][0]["activityTotal"] >= 8
+        return None if item_id == "notebook" else {"parts": []}
+
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", read_definition)
+    monkeypatch.setattr(orchestrator.shortcuts, "list_shortcuts", lambda *_: [])
+    monkeypatch.setattr(orchestrator.shortcuts, "list_table_shortcuts", lambda *_: [])
+    def load_references(context):
+        orchestrator._source_definition_connections(context, "source")
+        orchestrator._source_shortcut_connections(context, "source")
+    monkeypatch.setattr(orchestrator, "_load_source_references", load_references)
+
+    orchestrator._check_dependencies(ctx)
+
+    activity_snapshots = [snapshot for snapshot in snapshots if snapshot["activity"]]
+    assert activity_snapshots[0]["activityTotal"] == 8  # 2 definitions, 2 shortcuts, 4 relations
+    assert all(snapshot["activityTotal"] >= snapshot["activityCompleted"] for snapshot in activity_snapshots)
+    step = run.snapshot()["steps"][0]
+    if unavailable:
+        assert step["status"] == "skipped"
+        assert step["activityTotal"] == 8
+        assert step["activityCompleted"] == 5
+    else:
+        assert step["status"] == "succeeded"
+        assert step["activityTotal"] == step["activityCompleted"] == 10
+        # Connection-binding candidates become known only after the connection/item lists.
+        assert {snapshot["activityTotal"] for snapshot in activity_snapshots} == {8, 10}
+
+
+def test_migrate_dependency_source_failure_retains_known_total(monkeypatch):
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    ctx = SimpleNamespace(
+        run=run, assessment=SimpleNamespace(migrated=[{"id": "copy", "type": "CopyJob"}]),
+        client=object(),
+    )
+    def read_definition(*_args):
+        assert run.snapshot()["steps"][0]["activityTotal"] == 2
+        raise FabricApiError("POST", "definition", 403, "Denied: grant access")
+    monkeypatch.setattr(orchestrator.items_module, "try_get_item_definition", read_definition)
+    monkeypatch.setattr(
+        orchestrator, "_load_source_references",
+        lambda context: orchestrator._source_definition_connections(context, "source"),
+    )
+
+    with pytest.raises(orchestrator.FabricError, match="Denied: grant access"):
+        orchestrator._check_dependencies(ctx)
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["actions"][-1]["state"] == "failed"
+
+
+def test_lifecycle_operations_publish_without_changing_evidence():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("items", "Migrating items")
+    lifecycle = Lifecycle(attempt_id=run.id, activity=run.item_activity)
+    item = lifecycle.item("one", "Report", "Report")
+    with item.operation("definition", "Definition created."):
+        assert run.snapshot()["steps"][0]["activity"][0]["actions"][-1]["state"] == "running"
+    assert run.snapshot()["steps"][0]["activity"][0]["actions"][-1]["state"] == "succeeded"
+
+
+def test_activity_keeps_item_active_when_parallel_operation_finishes():
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    run.start_step("items", "Migrating items")
+    run.item_activity("one", "Report", "Report", "Data started", "running", "data")
+    run.item_activity("one", "Report", "Report", "Schema started", "running", "schema")
+    run.item_activity("one", "Report", "Report", "Schema done", "succeeded", "schema")
+    for i in range(50):
+        run.item_activity(str(i), str(i), "Report", "Done", "succeeded")
+    entries = run.snapshot()["steps"][0]["activity"]
+    assert next(item for item in entries if item["id"] == "one")["active"]
+    run.item_activity("one", "Report", "Report", "Data done", "succeeded", "data")
+    entries = run.snapshot()["steps"][0]["activity"]
+    assert not next(item for item in entries if item["id"] == "one")["active"]
+
+
+def test_log_modes_and_safe_tool_output(caplog):
+    names = ("", "fabshuffle", "fabshuffle.stage", "fabshuffle.activity",
+             "httpx", "httpcore", "urllib3", "azure", "msal", "uvicorn.access")
+    previous = {name: logging.getLogger(name).level for name in names}
+    activity = logging.getLogger("fabshuffle.activity")
+    item_log = logging.getLogger("fabshuffle.orchestrator")
+    try:
+        configure_logging("basic")
+        assert not activity.isEnabledFor(logging.INFO)
+        item_log.info("Per-item detail")
+        item_log.warning("A real warning")
+        logging.getLogger("fabshuffle.stage").info("Stage progress")
+        run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+        run.start_step("lakehouse", "Migrating lakehouses")
+        run.update_step("lakehouse", "Creating lakehouse 'bronze'")
+        assert "Per-item detail" not in caplog.text
+        assert "Creating lakehouse 'bronze'" not in caplog.text
+        assert "A real warning" in caplog.text
+        assert "Stage progress" in caplog.text
+        configure_logging("verbose")
+        assert activity.isEnabledFor(logging.INFO)
+        item_log.info("Per-item detail")
+        run.update_step("lakehouse", "Creating lakehouse 'bronze'")
+        assert "Per-item detail" in caplog.text
+        assert "Creating lakehouse 'bronze'" in caplog.text
+        assert not logging.getLogger("fabshuffle.transfer.sqlschema").isEnabledFor(logging.DEBUG)
+        configure_logging("debug")
+        assert logging.getLogger("fabshuffle.transfer.sqlschema").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+        _log_tool_output("Initializing deployment (Start)\npassword=secret\n")
+        assert "Initializing deployment (Start)" in caplog.text
+        assert "password=secret" not in caplog.text
+        with pytest.raises(ValueError, match="FAB_SHUFFLE_LOG_LEVEL"):
+            configure_logging("invalid")
+        route = _log_route("https://example.test/v1/workspaces/private/items/secret?token=hidden")
+        assert route == "v1/workspaces/{resource}/items/{resource}"
+    finally:
+        for name, level in previous.items():
+            logging.getLogger(name).setLevel(level)
 
 
 def test_cancellation_is_observable():

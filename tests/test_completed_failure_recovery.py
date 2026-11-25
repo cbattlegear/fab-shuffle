@@ -38,6 +38,15 @@ def test_clean_or_manual_only_completions_are_not_added_as_failed_retries(tmp_pa
         assert RunRegistry().resumable(directory) == []
 
 
+def test_completed_run_with_unrestored_sql_effects_is_offered_and_cannot_restart(tmp_path):
+    run, book = saved_run(tmp_path, EvidenceState.SUCCEEDED)
+    book.sql_effects("lakehouse", "new-lakehouse", {"effects": []})
+    recovered = RunRegistry().resumable(tmp_path)
+    assert [entry.run_id for entry in recovered] == [run.id]
+    from fabshuffle import recovery
+    assert "constraints or triggers" in recovery.restart_blocker(recovered[0])
+
+
 def test_active_attempt_is_not_offered_even_if_its_journal_has_a_final_record(tmp_path):
     run, book = saved_run(tmp_path, EvidenceState.FAILED)
     run.plan = journal.read(book.path).plan

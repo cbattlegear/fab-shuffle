@@ -2,14 +2,13 @@
 
 Most of a migration is waiting on HTTP, and that is handled by submitting work and polling
 it in one loop rather than by threads. A few things cannot be: sqlpackage and unpackdacpac
-are subprocesses, the schema deploy is a batch at a time over ODBC, and bcp stages rows
-through local disk. Those genuinely block a thread, so they get a pool.
+are subprocesses and the schema deploy is a batch at a time over ODBC. Those genuinely
+block a thread, so they get a pool.
 
 Two rules make that safe to read afterwards.
 
 **The limit is small and deliberate.** sqlpackage is a .NET process of a few hundred
-megabytes, and bcp stages whole tables locally, so
-several at once compete for the same memory and disk rather than going faster.
+megabytes, so several at once compete for the same memory and disk rather than going faster.
 
 **Output does not depend on timing.** Warnings are collected per job and sorted by a stable
 key before being returned, so two runs of the same workspace read the same way, and progress
@@ -19,12 +18,49 @@ is a count rather than a line each worker overwrites.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+DEPENDENCY_READ_WORKERS = 4
+
+
+def bounded_map(
+    fn: Callable[[_T], _R], values: Iterable[_T], *, limit: int = DEPENDENCY_READ_WORKERS,
+) -> Iterator[_R]:
+    """Refill finished reads immediately, buffering their results for input-order output."""
+    iterator = enumerate(values)
+    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="dependency-read") as pool:
+        pending: dict[Future[_R], int] = {}
+        completed: dict[int, _R] = {}
+        next_result = 0
+
+        def submit() -> None:
+            entry = next(iterator, None)
+            if entry is not None:
+                index, value = entry
+                pending[pool.submit(fn, value)] = index
+
+        try:
+            for _ in range(limit):
+                submit()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=pending.__getitem__):
+                    completed[pending.pop(future)] = future.result()
+                for _ in done:
+                    submit()
+                while next_result in completed:
+                    yield completed.pop(next_result)
+                    next_result += 1
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 @dataclass(frozen=True, slots=True)

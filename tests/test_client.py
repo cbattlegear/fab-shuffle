@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import httpx
 import pytest
 
 from fabshuffle.auth import ServicePrincipal, TokenProvider
+from fabshuffle.fabric import items
 from fabshuffle.fabric.client import (
     SETTINGS,
     FabricApiError,
@@ -11,6 +16,7 @@ from fabshuffle.fabric.client import (
     FabricError,
     FabricTransportError,
     OperationFailed,
+    OperationTimeout,
 )
 
 
@@ -38,6 +44,55 @@ def test_get_sends_bearer_token():
     with make_client(handler) as client:
         assert client.get("workspaces/abc") == {"id": "abc"}
     assert seen["auth"] == "Bearer stub-token"
+
+
+def test_coordinated_assessment_paces_requests_and_shares_429_cooldown(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client._ASSESSMENT_REQUEST_INTERVAL", 0.02)
+    first_throttled = threading.Event()
+    calls = []
+    lock = threading.Lock()
+
+    def handler(request):
+        with lock:
+            calls.append((request.url.path, time.monotonic()))
+            if len(calls) == 1:
+                first_throttled.set()
+                return httpx.Response(429, headers={"Retry-After": "0.3"})
+        return httpx.Response(200, json={})
+
+    with make_client(handler) as client, client.coordinated_throttling():
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(client.get, "first")
+            assert first_throttled.wait(5)
+            second = pool.submit(client.get, "second")
+            first.result(timeout=5)
+            second.result(timeout=5)
+    assert len(calls) == 3
+    assert calls[1][1] - calls[0][1] >= 0.28
+    assert calls[2][1] - calls[1][1] >= 0.018
+
+
+def test_coordinated_assessment_cancels_waiting_requests(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client._ASSESSMENT_REQUEST_INTERVAL", 2)
+    cancelled = threading.Event()
+    calls = []
+
+    def check():
+        if cancelled.is_set():
+            raise RuntimeError("cancelled")
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    with make_client(handler) as client, client.coordinated_throttling(check):
+        client.get("first")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(client.get, "second")
+            cancelled.set()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                pending.result(timeout=1)
+    assert len(calls) == 1
 
 
 def test_paged_follows_continuation_token():
@@ -98,6 +153,170 @@ def test_failed_operation_raises():
     with make_client(handler) as client:
         with pytest.raises(OperationFailed):
             client.post("workspaces/w/warehouses", json={})
+
+
+def test_location_only_lro_waits_for_running_200_before_the_next_call(monkeypatch):
+    calls = []
+    delays = []
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", delays.append)
+    def handler(request):
+        calls.append(request.url.path)
+        if request.method == "POST":
+            return httpx.Response(202, headers={
+                "Location": "https://api.fabric.microsoft.com/v1/operations/export",
+                "Retry-After": "3",
+            })
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, json={"definition": {"parts": []}})
+        if calls.count(request.url.path) == 1:
+            return httpx.Response(200, json={"status": "Running"}, headers={"Retry-After": "7"})
+        return httpx.Response(200, json={"status": "Succeeded"}, headers={
+            "Location": "https://api.fabric.microsoft.com/v1/operations/export/result",
+        })
+    with make_client(handler) as client:
+        assert client.post("workspaces/w/items/e/getDefinition") == {"definition": {"parts": []}}
+    assert calls == [
+        "/v1/workspaces/w/items/e/getDefinition", "/v1/operations/export",
+        "/v1/operations/export", "/v1/operations/export/result",
+    ]
+    assert delays == [3.0, 7.0]
+
+
+def test_location_only_lro_preserves_failed_operation_details(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "https://api.fabric.microsoft.com/v1/operations/op"})
+        return httpx.Response(200, json={
+            "status": "Failed",
+            "error": {"errorCode": "ArtifactOperationConflict", "message": "Wait for the previous operation"},
+        })
+    with make_client(handler) as client, pytest.raises(OperationFailed) as caught:
+        client.post("workspaces/w/items")
+    assert "ArtifactOperationConflict" in str(caught.value)
+    assert "Wait for the previous operation" in str(caught.value)
+
+
+@pytest.mark.parametrize("status", ["FutureState", None])
+def test_location_only_lro_never_accepts_unknown_status_as_completion(monkeypatch, status):
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "https://api.fabric.microsoft.com/v1/operations/op"})
+        return httpx.Response(200, json={"status": status})
+    with make_client(handler) as client, pytest.raises(FabricError, match="unrecognized status"):
+        client.post("workspaces/w/items")
+
+
+def test_location_only_lro_accepts_direct_result_without_status(monkeypatch):
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(202, headers={"Location": "https://api.fabric.microsoft.com/v1/operations/op"})
+        return httpx.Response(200, json={"id": "new-item"})
+    with make_client(handler) as client:
+        assert client.post("workspaces/w/items") == {"id": "new-item"}
+
+
+@pytest.mark.parametrize("path", ["workspaces/w/items", "workspaces/w/items/e/updateDefinition"])
+def test_mutating_operation_conflict_is_not_replayed(path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: pytest.fail("must not retry"))
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(409, json={
+            "errorCode": "ArtifactOperationConflict", "message": "Wait for the previous operation",
+        })
+    with make_client(handler) as client, pytest.raises(FabricApiError) as caught:
+        client.post(path)
+    assert len(calls) == 1
+    assert caught.value.error_code == "ArtifactOperationConflict"
+
+
+def test_eventstream_failed_conflict_reconciles_and_retries_once(monkeypatch):
+    calls = []
+    creates = []
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        calls.append(request.url.path)
+        if request.method == "POST":
+            creates.append(request)
+            if len(creates) == 1:
+                return httpx.Response(202, headers={"x-ms-operation-id": "failed-create", "Retry-After": "0"})
+            return httpx.Response(201, json={"id": "new-eventstream"})
+        if request.url.path.endswith("/operations/failed-create"):
+            return httpx.Response(200, json={"status": "Failed", "error": {
+                "errorCode": "ArtifactOperationConflict",
+                "message": (
+                    "Please wait until the previous operation is completed before initiating the new call."
+                ),
+            }})
+        assert request.url.path.endswith("/items")
+        return httpx.Response(200, json={"value": []})
+    with make_client(handler) as client:
+        assert items.create_item(client, "w", "Meshtastic", "Eventstream") == {"id": "new-eventstream"}
+    assert len(creates) == 2
+    assert calls == [
+        "/v1/workspaces/w/items", "/v1/operations/failed-create",
+        "/v1/workspaces/w/items", "/v1/workspaces/w/items",
+    ]
+
+
+def test_eventstream_conflict_does_not_adopt_partial_item_on_later_page(monkeypatch):
+    creates = []
+    monkeypatch.setattr("fabshuffle.fabric.client.time.sleep", lambda _: None)
+    def handler(request):
+        if request.method == "POST":
+            creates.append(request)
+            return httpx.Response(202, headers={"x-ms-operation-id": "failed", "Retry-After": "0"})
+        if request.url.path.endswith("/operations/failed"):
+            return httpx.Response(200, json={"status": "Failed", "error": {
+                "errorCode": "ArtifactOperationConflict", "message": "Wait for the previous operation",
+            }})
+        if not request.url.params.get("continuationToken"):
+            return httpx.Response(200, json={"value": [], "continuationToken": "next"})
+        return httpx.Response(200, json={"value": [{"id": "partial", "displayName": "Meshtastic"}]})
+    with (
+        make_client(handler) as client,
+        pytest.raises(FabricError, match="not adopted or overwritten") as caught,
+    ):
+        items.create_item(client, "w", "Meshtastic", "Eventstream")
+    assert len(creates) == 1 and "ArtifactOperationConflict" in str(caught.value)
+
+
+@pytest.mark.parametrize("error", [
+    OperationTimeout("create still running"),
+    OperationFailed("op", "Failed", {"errorCode": "Other", "message": "permanent"}),
+    OperationFailed("op", "Undefined", {"errorCode": "ArtifactOperationConflict"}),
+])
+def test_eventstream_uncertain_or_other_failure_never_retries(error, monkeypatch):
+    calls = []
+    class Client:
+        def post(self, *_args, **_kwargs):
+            calls.append(True)
+            raise error
+    monkeypatch.setattr("fabshuffle.fabric.items.time.sleep", lambda _: pytest.fail("must not retry"))
+    with pytest.raises(type(error)):
+        items.create_item(Client(), "w", "Meshtastic", "Eventstream")
+    assert len(calls) == 1
+
+
+def test_eventstream_exhausted_conflict_preserves_service_error(monkeypatch):
+    calls = []
+    class Client:
+        def post(self, *_args, **_kwargs):
+            calls.append(True)
+            raise OperationFailed("op", "Failed", {
+                "errorCode": "ArtifactOperationConflict", "message": "Wait for the previous operation",
+            })
+
+        def list_all(self, *_args, **_kwargs):
+            return []
+    monkeypatch.setattr(SETTINGS, "max_retries", 2)
+    monkeypatch.setattr("fabshuffle.fabric.items.time.sleep", lambda _: None)
+    with pytest.raises(OperationFailed, match=r"ArtifactOperationConflict.*Wait for the previous operation"):
+        items.create_item(Client(), "w", "Meshtastic", "Eventstream")
+    assert len(calls) == 2
 
 
 def test_retries_on_throttling(monkeypatch):

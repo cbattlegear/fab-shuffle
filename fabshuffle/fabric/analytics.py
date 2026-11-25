@@ -854,6 +854,10 @@ def describe_failure(
     # Advice that goes alongside what the service said rather than instead of it: our reading
     # of an error code is a guess, and the service's own words are not.
     advice = {
+        "ArtifactOperationConflict": (
+            " Wait for the preceding Fabric operation to finish, then resume. Inspect the "
+            "destination before attempting another create; this rejection was not blindly resubmitted."
+        ),
         "ItemDisplayNameAlreadyInUse": (
             " The new workspace already holds an item of that name; delete or rename it "
             "there, then migrate again."

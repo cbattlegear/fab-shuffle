@@ -112,15 +112,12 @@ main { max-width: 62rem; margin: 0 auto; padding: 1.5rem 2rem 4rem; }
 .mapping-row button { justify-self: start; }
 .mapping-controls button { min-height: 2.75rem; }
 .mapping-controls .hint { overflow-wrap: anywhere; }
-.write-freeze { margin-top: 1.25rem; }
-.write-freeze label { align-items: flex-start; }
-.write-freeze .hint { margin: 0.4rem 0 0; }
 .resume-artifacts { margin-bottom: 1.25rem; }
 .resume-artifacts summary { cursor: pointer; padding: 0.5rem 0; }
 .resume-artifacts ul { padding-left: 1.25rem; font-size: 0.9rem; overflow-wrap: anywhere; max-height: 18rem; overflow-y: auto; }
 .resume-artifacts li + li { margin-top: 0.65rem; }
 .resume-artifacts :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.credentials[hidden], .mapping-controls[hidden], .write-freeze[hidden], .tool[hidden] { display: none; }
+.credentials[hidden], .mapping-controls[hidden], .tool[hidden] { display: none; }
 @media (max-width: 40rem) {
   .mapping-row { grid-template-columns: minmax(0, 1fr); }
   .credentials input { font-size: 1rem; }
@@ -399,6 +396,18 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 
 .steps .step-warnings li { margin-bottom: 0.2rem; }
+
+.step-activity { margin-top: 0.45rem; color: var(--text-dim); font-size: 0.85rem; }
+.step-activity summary { cursor: pointer; color: var(--accent); width: fit-content; }
+.step-activity summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.activity-items { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.activity-items > li { padding: 0.4rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.activity-items summary { color: var(--text); font-weight: 500; }
+.activity-current { display: block; margin: 0.2rem 0 0 1.1rem; color: var(--text-dim); font-weight: normal; }
+.activity-items ol { margin: 0.2rem 0 0; padding-left: 1.2rem; }
+.dependency-progress-status { margin: 0 0 0.4rem; color: var(--text-dim); font-size: 0.85rem; }
+.dependency-progress .activity-items { list-style: none; padding-left: 0; color: var(--text-dim); }
+.dependency-progress .step-activity { margin-top: 0.4rem; }
 
 .warnings {
   margin-top: 1.25rem;

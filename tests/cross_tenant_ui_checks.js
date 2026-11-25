@@ -5,6 +5,8 @@ const vm = require("node:vm");
 
 function fixture() {
   const requests = [], streams = [];
+  const timers = new Map();
+  let now = 0, nextTimer = 0;
   class Element {
     constructor(tag) {
       this.tagName = tag; this.children = []; this.dataset = {}; this.handlers = {};
@@ -75,7 +77,13 @@ function fixture() {
   document.activeElement = document.body;
   const context = vm.createContext({
     document, console, URLSearchParams, AbortController,
-    setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
+    setTimeout(callback, delay) {
+      const id = ++nextTimer;
+      timers.set(id, { callback, at: now + delay });
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    setInterval: () => 1, clearInterval() {},
     FormData: class {
       constructor(form) { this.form = form; }
       entries() { return this.form.querySelectorAll("input").filter((i) => i.name).map((i) => [i.name, i.value]); }
@@ -90,9 +98,23 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, loginBody, updateLoginMode, renderReview, renderIdentity, migrationBody,
-      mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume,
+      mappingOptions, addMappingRow, recheckMappings, setStartEnabled, resumeRun, prepareResume, resumeOptions,
       invalidateMappings, loadResumable, loadConnectionOptions, watchRun, resetReadiness };`, context);
   const flush = async () => { for (let i = 0; i < 18; i++) await Promise.resolve(); };
+  async function tick(ms) {
+    const end = now + ms;
+    while (true) {
+      const next = Array.from(timers.entries()).filter(([, timer]) => timer.at <= end)
+        .sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at;
+      timers.delete(next[0]);
+      next[1].callback();
+      await flush();
+    }
+    now = end;
+    await flush();
+  }
   async function reply(index, data, status = 200) {
     requests[index].resolve({ ok: status < 400, status, text: async () => JSON.stringify(data) });
     await flush();
@@ -114,10 +136,61 @@ function fixture() {
     ui.renderReview();
     ui.setStartEnabled(true);
   }
-  return { get, ui, document, requests, streams, reply, flush, paired };
+  return { get, ui, document, requests, streams, reply, flush, tick, paired };
 }
 
 const scenarios = {
+  async workspace_name_conflict(f) {
+    f.paired();
+    f.ui.state.preview.visibleWorkspaceNames = ["Source-copy", "Other existing"];
+    f.ui.renderReview();
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("start-run").disabled, true);
+    assert.equal(f.get("target-name-conflict").hidden, false);
+    assert.match(f.get("target-name-conflict").textContent, /Choose a different name/);
+    f.get("target-name").value = "Free name";
+    f.get("target-name").handlers.input();
+    assert.equal(f.get("start-run").disabled, false);
+    assert.equal(f.get("target-name-conflict").hidden, true);
+    f.get("target-name").value = " Other existing ";
+    f.get("target-name").handlers.input();
+    assert.equal(f.get("start-run").disabled, true);
+    f.get("target-name").value = "";
+    f.get("target-name").handlers.input();
+    assert.equal(f.get("start-run").disabled, true);
+    f.ui.state.resumeRunId = "previous";
+    f.ui.state.preview.targetWorkspaceId = "recorded-target";
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("start-run").disabled, false);
+    f.ui.state.preview.targetWorkspaceId = "";
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("start-run").disabled, true);
+    assert.match(f.get("target-name-conflict").textContent, /saved plan cannot be renamed/);
+    assert.match(f.get("target-name-conflict").textContent, /start a new migration/);
+  },
+  async single_sql_connections(f) {
+    f.paired();
+    f.ui.state.paired = false;
+    f.ui.state.preview.counts = [{ type: "SQLDatabase", label: "SQL database", count: 1 }];
+    f.get("opt-data").checked = true;
+    f.get("opt-files").checked = false;
+    f.ui.renderReview();
+    f.ui.setStartEnabled(true);
+    assert.equal(f.get("write-freeze"), null);
+    assert.equal(f.get("start-run").disabled, false);
+    assert.equal(Object.hasOwn(f.ui.migrationBody(), "write_freeze_confirmed"), false);
+    assert.equal(Object.hasOwn(f.ui.migrationBody(), "sql_copy_connections"), false);
+    f.ui.state.preview.counts = [];
+    f.ui.state.preview.hasSqlDatabase = true;
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "sql_copy_connections"), false);
+    f.get("opt-data").checked = false;
+    f.get("opt-files").checked = true;
+    f.get("opt-files").handlers.change();
+    assert.equal(f.get("start-run").disabled, false);
+    assert.equal(f.get("opt-write-freeze"), null);
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
+  },
   async login(f) {
     f.ui.state.forceRebuild = true;
     const form = f.get("login-form");
@@ -152,14 +225,11 @@ const scenarios = {
     f.paired();
     assert.equal(f.get("opt-permissions").disabled, true);
     assert.equal(f.get("opt-permissions").checked, false);
-    assert.equal(f.get("write-freeze").hidden, false);
+    assert.equal(f.get("write-freeze"), null);
     assert.match(f.get("review-summary").textContent, /source-tenant.*source-app/s);
     assert.match(f.get("review-summary").textContent, /target-tenant.*target-app/s);
-    assert.equal(f.get("start-run").disabled, true);
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
     assert.equal(f.get("start-run").disabled, false);
-    f.get("opt-write-freeze").checked = false;
+    assert.equal(Object.hasOwn(f.ui.resumeOptions(), "write_freeze_confirmed"), false);
     f.get("opt-data").checked = false;
     f.get("opt-files").checked = false;
     f.get("opt-files").handlers.change();
@@ -171,13 +241,10 @@ const scenarios = {
     f.ui.state.preview.targetTenantId = f.ui.state.preview.sourceTenantId;
     f.ui.renderReview();
     f.ui.setStartEnabled(true);
-    assert.equal(f.get("write-freeze").hidden, false);
-    assert.equal(f.get("start-run").disabled, true);
+    assert.equal(f.get("write-freeze"), null);
+    assert.equal(f.get("start-run").disabled, false);
     assert.equal(f.get("opt-permissions").disabled, true);
     assert.match(f.get("strategy-callout").textContent, /Rebuild with destination credentials/);
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
-    assert.equal(f.get("start-run").disabled, false);
     assert.equal(f.ui.migrationBody().strategy, "rebuild");
     assert.equal(f.ui.migrationBody().copy_permissions, false);
     f.ui.state.paired = false;
@@ -188,7 +255,6 @@ const scenarios = {
   },
   async mappings_and_execution(f) {
     f.paired();
-    f.get("opt-write-freeze").checked = true;
     const connection = f.ui.addMappingRow("connection").querySelectorAll("input");
     connection[0].value = "source-connection";
     assert.throws(() => f.ui.migrationBody(), /Complete every ID/);
@@ -210,7 +276,6 @@ const scenarios = {
   },
   async stale_and_failed_assessment(f) {
     f.paired();
-    f.get("opt-write-freeze").checked = true;
     f.ui.recheckMappings();
     f.ui.invalidateMappings();
     await f.reply(0, { blockers: [], dependencies: [], connectionAccess: null });
@@ -232,6 +297,23 @@ const scenarios = {
     await f.reply(0, { runId: "resumed", resumedFrom: "previous" });
     assert.equal(f.ui.state.runId, "resumed");
     assert.match(f.streams[0].url, /session_id=bound-session/);
+  },
+  async resume_missing_target_conflict(f) {
+    f.paired();
+    f.ui.prepareResume("previous", f.get("retry-run"));
+    await f.reply(0, {
+      plan: { ...f.ui.state.preview, capacityId: "capacity", sourceWorkspaceId: "workspace",
+        connectionMappings: {}, referenceMappings: [] },
+      cleanupWhenDone: true, targetWorkspaceId: "", items: [],
+      visibleWorkspaceNames: ["Source-copy"],
+    });
+    await f.reply(1, { connections: [] });
+    await f.reply(2, { connections: [] });
+    await f.reply(3, { dependencies: [], blockers: [], connectionAccess: null });
+    assert.equal(f.get("start-run").disabled, true);
+    assert.match(f.get("target-name-conflict").textContent, /Inspect the workspace in Fabric/);
+    assert.match(f.get("target-name-conflict").textContent, /start a new migration/);
+    assert.match(f.get("resume-target-id").textContent, /attempt to create/);
   },
   async edit_mappings_before_retry(f) {
     f.paired();

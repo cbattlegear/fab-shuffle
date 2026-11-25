@@ -159,6 +159,40 @@ def build_warehouse_copy_job(
     }
 
 
+def build_sql_server_copy_job(
+    *, source_connection_id: str, target_connection_id: str, tables: Iterable[TableRef],
+) -> dict[str, Any]:
+    """Build the operator-supplied SQL Server Copy Job shape."""
+    def endpoint(connection_id: str) -> dict[str, Any]:
+        return {
+            "type": "SqlServerTable",
+            "connectionSettings": {
+                "type": "SqlServer",
+                "externalReferences": {"connection": connection_id},
+            },
+        }
+
+    activities = [
+        _activity(
+            table,
+            destination_extras={"tableOption": "autoCreate", "writeBehavior": "Append"},
+            enable_staging=False,
+        )
+        for table in tables
+    ]
+    for activity in activities:
+        activity["properties"]["typeConversionSettings"]["typeConversion"]["allowDataTruncation"] = False
+    return {
+        "properties": {
+            "jobMode": "Batch",
+            "source": endpoint(source_connection_id),
+            "destination": endpoint(target_connection_id),
+            "policy": {"timeout": COPY_JOB_TIMEOUT, "retry": 0},
+        },
+        "activities": activities,
+    }
+
+
 def create_copy_job(
     client: FabricClient,
     workspace_id: str,
@@ -303,6 +337,7 @@ class CopyJobSpec:
     # The source item whose data this moves, so a caller can write down that it is done and
     # not spend hours doing it again. Not needed to run the job.
     item_id: str = ""
+    fingerprint: str = ""
 
 
 @dataclass(slots=True)
@@ -317,6 +352,7 @@ class _InFlight:
     submission_state: _SubmissionState = "unknown"
     poll_not_before: float | None = None
     terminal_observed: bool = False
+    fingerprint: str = ""
 
     def snapshot(self) -> CopyJobRun:
         return CopyJobRun(
@@ -330,6 +366,7 @@ class _InFlight:
             last_error=self.last_error,
             submission_state=self.submission_state,
             poll_not_before=self.poll_not_before,
+            fingerprint=self.fingerprint,
         )
 
 
@@ -348,6 +385,7 @@ class CopyJobRun:
     submission_state: _SubmissionState = "unknown"
     # UTC Unix seconds survive process restarts; monotonic timestamps do not.
     poll_not_before: float | None = None
+    fingerprint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +497,9 @@ def run_copy_jobs(
     on_done: Callable[[CopyJobSpec], None] | None = None,
     on_started: Callable[[CopyJobSpec, str, str], None] | None = None,
     on_state: Callable[[CopyJobRun], None] | None = None,
+    before_submit: Callable[[CopyJobSpec], None] | None = None,
+    before_create: Callable[[CopyJobSpec], None] | None = None,
+    on_terminal: Callable[[CopyJobRun], None] | None = None,
     resume_jobs: Sequence[CopyJobRun] = (),
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """Run a batch of Copy Jobs together rather than one after another.
@@ -542,6 +583,18 @@ def run_copy_jobs(
         if on_state:
             notify("on_state", on_state, job.snapshot())
 
+    def terminal(job: _InFlight) -> None:
+        if on_terminal:
+            try:
+                on_terminal(job.snapshot())
+            except Exception as error:
+                detail = f" Service reported: {job.last_error}." if job.last_error else ""
+                stop(
+                    f"{job.spec.label} restoration failed: {error}.{detail} "
+                    "Resolve the reported problem, then resume to reconcile this job.",
+                    cause=error,
+                )
+
     def report() -> None:
         if on_progress and total:
             notify("on_progress", on_progress, counts().summary())
@@ -569,8 +622,14 @@ def run_copy_jobs(
             next_poll_at=time.monotonic() + delay,
             submission_state=saved.submission_state,
             poll_not_before=saved.poll_not_before,
+            fingerprint=saved.fingerprint,
         )
         if saved.submission_state == "created" and saved.copy_job_id and not saved.instance_id:
+            if spec.fingerprint and spec.fingerprint != saved.fingerprint:
+                raise FabricError(
+                    f"Recorded Copy Job {saved.copy_job_id} has a different or unknown definition. "
+                    "Reconcile it before changing this transfer."
+                )
             pending.append(job)
         else:
             in_flight.append(job)
@@ -588,8 +647,17 @@ def run_copy_jobs(
             if time.monotonic() >= deadline:
                 stop(f"the batch waiting budget of {SETTINGS.copy_job_timeout_seconds}s expired")
             if not pending:
+                if before_create:
+                    try:
+                        before_create(queue[0])
+                    except Exception as error:
+                        stop(
+                            f"{queue[0].label} preflight failed: {error}. Resolve the reported "
+                            "problem, then resume",
+                            cause=error,
+                        )
                 spec = queue.popleft()
-                job = _InFlight(spec, None, None)
+                job = _InFlight(spec, None, None, fingerprint=spec.fingerprint)
                 in_flight.append(job)
                 checkpoint(job)
                 if time.monotonic() >= deadline:
@@ -621,6 +689,19 @@ def run_copy_jobs(
             if not copy_job_id:
                 pending.appendleft(job)
                 stop("a saved creation has no item ID; reconcile it before resuming")
+            if before_submit:
+                in_flight.append(job)
+                try:
+                    before_submit(job.spec)
+                except Exception as error:
+                    job.last_error = str(error)
+                    terminal(job)
+                    stop(
+                        f"{job.spec.label} preflight failed: {error}. Resolve the reported "
+                        "problem, then resume the existing unsubmitted job",
+                        cause=error,
+                    )
+                in_flight.remove(job)
             job.submission_state = "submitting"
             job.last_status = "Unknown"
             in_flight.append(job)
@@ -631,6 +712,11 @@ def run_copy_jobs(
                 submission = _submit_copy_job(client, job.spec.workspace_id, copy_job_id)
             except (FabricError, CopyJobFailed) as error:
                 if _submission_rejected(error):
+                    job.submission_state = "created"
+                    job.last_status = "NotStarted"
+                    job.last_error = str(error)
+                    checkpoint(job)
+                    terminal(job)
                     in_flight.remove(job)
                     failed_to_start += 1
                     warnings.append(
@@ -683,16 +769,29 @@ def run_copy_jobs(
                 job.next_poll_at = time.monotonic() + SETTINGS.copy_job_poll_seconds
                 continue
 
+            if status == "Deduped" and job.spec.fingerprint:
+                job.last_error = _failure_detail(instance).lstrip(": ")
+                stop(
+                    f"Copy Job {job.copy_job_id} was Deduped{_failure_detail(instance)}. "
+                    "Reconcile any other running instance in Fabric before retrying"
+                )
             job.terminal_observed = True
             if status not in SUCCESS_JOB_STATES:
                 failed += 1
+                job.last_error = _failure_detail(instance).lstrip(": ")
                 warnings.append(
                     f"{job.spec.label} did not copy: the job ended as {status}{_failure_detail(instance)}. "
                     "Correct the reported error and retry this transfer."
                 )
             else:
                 succeeded += 1
+            terminal(job)
             if status in SUCCESS_JOB_STATES and on_done:
+                if job.spec.fingerprint and job.spec.fingerprint != job.fingerprint:
+                    stop(
+                        f"Copy Job {job.copy_job_id} completed with a different or unknown "
+                        "recorded transfer definition. Reconcile its tables before proceeding"
+                    )
                 notify("on_done", on_done, job.spec)
             checkpoint(job)
             in_flight.remove(job)

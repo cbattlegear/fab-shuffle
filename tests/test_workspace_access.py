@@ -67,6 +67,24 @@ def test_a_failed_grant_is_reported_but_does_not_stop_the_rest():
     assert client.granted == [("ws-target", "user-2", "Member")]
 
 
+def test_role_copy_reports_each_real_attempt_and_failure():
+    client = RoleClient(fail_ids={"user-1"})
+    events = []
+    warnings = workspaces.copy_role_assignments(
+        client, [ADMIN, MEMBER], "ws-target",
+        on_activity=lambda assignment, action, state: events.append(
+            (assignment["principal"]["id"], action, state)
+        ),
+    )
+    assert len(warnings) == 1
+    assert events == [
+        ("user-1", "Role assignment started", "running"),
+        ("user-1", "Role assignment failed", "failed"),
+        ("user-2", "Role assignment started", "running"),
+        ("user-2", "Role assignment created", "succeeded"),
+    ]
+
+
 # ------------------------------------------------------- orchestrator wiring
 
 

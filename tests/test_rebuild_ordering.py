@@ -770,7 +770,10 @@ def test_pipelines_are_rebound_and_their_connections_checked(monkeypatch):
         if path == "connections":
             # A personal connection cannot be shared, so it must be reported.
             return [
-                {"id": CONNECTION, "displayName": "My Files", "connectivityType": "PersonalCloud"}
+                {
+                    "id": CONNECTION, "displayName": "My Files", "connectivityType": "PersonalCloud",
+                    "connectionDetails": {"type": "Web", "path": "https://external.example.com/files"},
+                }
             ]
         if path == f"workspaces/{SOURCE_WS}/items":
             items = [

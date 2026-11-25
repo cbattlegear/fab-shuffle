@@ -20,7 +20,7 @@ function fixture() {
       this.hidden = false;
       this.disabled = false;
       this.open = false;
-      this.classList = { toggle() {} };
+      this.classList = { toggle() {}, add() {}, remove() {} };
     }
     set textContent(text) { this._text = String(text); this.children = []; }
     get textContent() { return this._text + this.children.map((child) => child.textContent).join(""); }
@@ -45,6 +45,8 @@ function fixture() {
       if (selector.startsWith("#")) return this.id === selector.slice(1);
       if (selector.startsWith(".")) return this.className.split(" ").includes(selector.slice(1));
       if (selector === "[data-readiness-key]") return this.dataset.readinessKey !== undefined;
+      if (selector === "details[data-activity-step]") return this.tagName === "details" && this.dataset.activityStep !== undefined;
+      if (selector === "details[data-activity-key]") return this.tagName === "details" && this.dataset.activityKey !== undefined;
       return this.tagName === selector;
     }
     querySelectorAll(selector) {
@@ -125,7 +127,8 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(root, "static", "app.js"), "utf8") + `
     globalThis.ui = { state, resetReadiness, observeReadiness, renderReadinessItems,
-      renderReadinessStatus, watchRun, renderRun, scheduleReadiness };`, context);
+      renderReadinessStatus, watchRun, renderRun, renderDependencyAssessment, settleAssessment,
+      renderDependencies, showDependenciesPending, scheduleReadiness };`, context);
   const ui = context.ui;
   const get = (id) => document.querySelector(`#${id}`);
   const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
@@ -208,6 +211,129 @@ function advisories(overrides = {}) {
 }
 
 const scenarios = {
+  async activity(f) {
+    f.ui.state.runId = "one";
+    const snapshot = {
+      id: "one", status: "running", readinessRevision: 0,
+      steps: [{ id: "deps", title: "Dependencies", status: "running", warnings: [],
+        activity: [{ id: "a", type: "Notebook", name: "<img src=x onerror=alert(1)>",
+          actions: [{ action: "<script>bad</script>", state: "running" }] }] }],
+    };
+    f.ui.renderRun(snapshot);
+    let details = f.get("step-list").querySelector("details[data-activity-step]");
+    assert.ok(details);
+    assert.match(details.textContent, /<img src=x/);
+    assert.equal(details.querySelector("img"), null);
+    details.open = true;
+    let history = details.querySelector("details[data-activity-key]");
+    history.open = true;
+    history.querySelector("summary").focus();
+    snapshot.steps[0].activity[0].actions.push({ action: "Finished", state: "succeeded" });
+    f.ui.renderRun(snapshot);
+    details = f.get("step-list").querySelector("details[data-activity-step]");
+    history = details.querySelector("details[data-activity-key]");
+    assert.equal(details.open, true);
+    assert.equal(history.open, true);
+    assert.equal(f.document.activeElement, history.querySelector("summary"));
+    assert.match(details.textContent, /Finished/);
+  },
+  async shared_activity(f) {
+    f.ui.state.preview = {};
+    f.ui.state.dependencyAssessment = {
+      status: "running",
+      step: {
+        id: "dependencies", title: "Read-only dependency check",
+        activityTotal: 56, activityCompleted: 8, activityOmitted: 6,
+        activity: [{ id: "a", type: "Notebook", name: "<img src=x onerror=alert(1)>",
+          actions: [{ action: "Reading upstream relations", state: "running" }] }],
+      },
+    };
+    f.ui.renderDependencyAssessment();
+    const host = f.get("dependencies").querySelector(".dependency-progress");
+    let details = host.querySelector("details[data-activity-step]");
+    assert.ok(details);
+    assert.match(details.textContent, /Item activity \(8\/56\)/);
+    assert.equal(details.querySelector("img"), null);
+    details.open = true;
+    let history = details.querySelector("details[data-activity-key]");
+    history.open = true;
+    f.ui.state.dependencyAssessment.step.activity[0].actions.push({
+      action: "Connection references read", state: "succeeded",
+    });
+    f.ui.state.dependencyAssessment.step.activityCompleted = 9;
+    f.ui.renderDependencyAssessment();
+    details = host.querySelector("details[data-activity-step]");
+    history = details.querySelector("details[data-activity-key]");
+    assert.equal(details.open, true);
+    assert.equal(history.open, true);
+    assert.match(details.textContent, /Item activity \(9\/56\)/);
+    assert.match(details.textContent, /Connection references read/);
+
+    f.ui.state.dependencyAssessment.step.activityTotal = undefined;
+    f.ui.state.dependencyAssessment.step.activityCompleted = 9;
+    f.ui.renderDependencyAssessment();
+    details = host.querySelector("details[data-activity-step]");
+    assert.match(details.textContent, /Item activity \(9\/\? completed; 1\+ shown\)/);
+  },
+  async dependency_warnings(f) {
+    const warning = "CopyJob 'SQLDbTest' depends on Unknown 'missing-source', which is not migrated.";
+    f.ui.state.preview = { blockers: [] };
+    f.ui.state.assessmentPending = true;
+    f.ui.state.dependencyAssessment = {
+      status: "succeeded",
+      result: { dependencies: [warning], connectionAccess: null },
+      step: {
+        id: "dependencies", detail: "Read-only dependency assessment complete.",
+        activityTotal: 69, activityCompleted: 69,
+        activity: [{ id: "copy", type: "CopyJob", name: "SQLDbTest",
+          actions: [{ action: "Upstream relations read", state: "succeeded" }] }],
+      },
+    };
+    f.ui.renderDependencyAssessment();
+    const panel = f.get("dependencies");
+    const host = panel.querySelector(".dependency-progress");
+    const list = panel.querySelector(".dependency-warnings");
+    host.querySelector("details[data-activity-step]").open = true;
+    host.querySelector("details[data-activity-key]").open = true;
+    await f.ui.settleAssessment(Promise.resolve(f.ui.state.dependencyAssessment.result));
+    assert.equal(panel.hidden, false);
+    assert.equal(list.children.length, 1);
+    assert.equal(list.children[0].textContent, warning);
+    assert.match(host.textContent, /Item activity \(69\/69\)/);
+    assert.match(host.textContent, /Upstream relations read/);
+    assert.equal(host.querySelector("details[data-activity-step]").open, true);
+    assert.equal(host.querySelector("details[data-activity-key]").open, true);
+
+    f.ui.state.preview.mappingBlockers = ["Notebook '<img src=x>' needs a destination mapping."];
+    f.ui.renderDependencies();
+    assert.equal(list.children.length, 2);
+    assert.equal(list.querySelector("img"), null);
+    f.ui.renderDependencyAssessment();
+    assert.equal(list.children.length, 2);
+    f.ui.showDependenciesPending();
+    assert.equal(list.children.length, 0);
+    assert.match(host.textContent, /Upstream relations read/);
+    await f.ui.settleAssessment(Promise.resolve({ dependencies: [], connectionAccess: null }));
+    assert.equal(panel.hidden, true);
+    assert.equal(list.children.length, 0);
+  },
+  async dependency_errors(f) {
+    f.ui.state.preview = { blockers: [] };
+    f.ui.state.dependencyAssessment = {
+      step: { id: "dependencies", activity: [{ id: "copy", name: "SQLDbTest",
+        actions: [{ action: "Relations read failed", state: "failed" }] }] },
+    };
+    f.ui.renderDependencyAssessment();
+    await f.ui.settleAssessment(Promise.reject(new Error("RequestBlocked: try again later")));
+    const panel = f.get("dependencies");
+    const list = panel.querySelector(".dependency-warnings");
+    assert.equal(panel.hidden, false);
+    assert.equal(list.children.length, 1);
+    assert.match(list.textContent, /Dependencies could not be checked: RequestBlocked: try again later/);
+    assert.match(panel.querySelector(".dependency-progress").textContent, /Relations read failed/);
+    assert.match(panel.querySelector(".dependency-progress").textContent, /Check failed: RequestBlocked/);
+    assert.equal(f.ui.state.mappingsChecked, false);
+  },
   async hidden_until_halted(f) {
     f.begin("one", null);
     assert.equal(f.get("cutover-readiness").hidden, true);

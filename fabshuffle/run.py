@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import queue
 import threading
 import uuid
@@ -15,7 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from fabshuffle import journal
-from fabshuffle.lifecycle import EvidenceState, Lifecycle
+from fabshuffle.lifecycle import EvidenceState, Lifecycle, safe_text
+
+logger = logging.getLogger("fabshuffle.stage")
+activity_logger = logging.getLogger("fabshuffle.activity")
+MAX_ACTIVITY_ITEMS = 50
+MAX_ACTIVITY_HISTORY = 5
+MAX_ACTIVITY_OPERATIONS = 32
 
 
 class StepStatus(StrEnum):
@@ -47,9 +54,71 @@ class Step:
     warnings: list[str] = field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
+    activity: dict[str, dict[str, Any]] = field(default_factory=dict)
+    activity_omitted: int = 0
+    activity_total: int | None = None
+    activity_completed: int = 0
+    activity_operation: str | None = None
+
+    def record_activity(
+        self,
+        item_id: str,
+        name: str,
+        item_type: str,
+        action: str,
+        state: str,
+        operation: str = "",
+        *,
+        counted: bool = True,
+    ) -> None:
+        """Record one bounded item action for both migration and read-only review progress."""
+        item_id = str(item_id)[:128]
+        name, item_type, action = (safe_text(str(value))[:300] for value in (name, item_type, action))
+        entry = self.activity.get(item_id)
+        if entry is None:
+            if len(self.activity) >= MAX_ACTIVITY_ITEMS:
+                oldest = next(iter(self.activity))
+                evicted = next(
+                    (key for key, value in self.activity.items() if not value["_inflight"]),
+                    oldest,
+                )
+                del self.activity[evicted]
+                self.activity_omitted += 1
+            entry = {"id": item_id, "name": name, "type": item_type, "actions": [], "_inflight": {}}
+        else:
+            del self.activity[item_id]
+        self.activity[item_id] = entry
+        inflight = entry["_inflight"]
+        operation = safe_text(str(operation))[:100] or "item"
+        if operation not in inflight and (
+            (state == "running" and len(inflight) >= MAX_ACTIVITY_OPERATIONS)
+            or (state != "running" and "_overflow" in inflight)
+        ):
+            operation = "_overflow"
+        if state == "running":
+            inflight[operation] = inflight.get(operation, 0) + 1
+        elif state in ("succeeded", "failed", "skipped", "planned", "unknown") and operation in inflight:
+            inflight[operation] -= 1
+            if not inflight[operation]:
+                del inflight[operation]
+            if counted:
+                self.activity_completed += 1
+        entry["actions"].append({"action": action, "state": state, "time": _now()})
+        del entry["actions"][:-MAX_ACTIVITY_HISTORY]
+
+    def close_active_activity(self) -> None:
+        """Close in-flight actions as unknown when their stage ends before confirmation."""
+        for entry in list(self.activity.values()):
+            for operation, count in list(entry["_inflight"].items()):
+                for _ in range(count):
+                    self.record_activity(
+                        entry["id"], entry["name"], entry["type"],
+                        "Work ended before this action was confirmed", "unknown", operation,
+                        counted=self.activity_operation is None or operation == self.activity_operation,
+                    )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "id": self.id,
             "title": self.title,
             "status": self.status.value,
@@ -57,7 +126,17 @@ class Step:
             "warnings": list(self.warnings),
             "startedAt": self.started_at,
             "finishedAt": self.finished_at,
+            "activity": [
+                {**deepcopy({key: value for key, value in entry.items() if key != "_inflight"}),
+                 "active": bool(entry["_inflight"])}
+                for entry in self.activity.values()
+            ],
+            "activityOmitted": self.activity_omitted,
         }
+        if self.activity_total is not None:
+            result["activityTotal"] = self.activity_total
+        result["activityCompleted"] = self.activity_completed
+        return result
 
 
 class CancelledError(RuntimeError):
@@ -88,7 +167,9 @@ class MigrationRun:
 
         self._steps: list[Step] = []
         self._steps_by_id: dict[str, Step] = {}
-        self._lock = threading.Lock()
+        self._active_step: str | None = None
+        self._secrets: tuple[str, ...] = ()
+        self._lock = threading.RLock()
         self._cancel = threading.Event()
         self._subscribers: list[queue.Queue[dict[str, Any] | None]] = []
         self.readiness_revision = 0
@@ -134,6 +215,8 @@ class MigrationRun:
             step.status = StepStatus.RUNNING
             step.started_at = _now()
             step.detail = ""
+            self._active_step = step_id
+        logger.info("Stage started: %s", self._safe_text(title))
         self._publish()
         return step
 
@@ -143,6 +226,55 @@ class MigrationRun:
             if not step:
                 return
             step.detail = detail
+        activity_logger.info("Stage progress: %s — %s", self._safe_text(step.title), self._safe_text(detail))
+        self._publish()
+
+    def _safe_text(self, value: str) -> str:
+        for secret in self._secrets:
+            value = value.replace(secret, "[redacted]")
+        return safe_text(value)
+
+    def item_activity(
+        self, item_id: str, name: str, item_type: str, action: str, state: str,
+        operation: str = "",
+        *, step_id: str | None = None,
+    ) -> None:
+        """Publish a bounded, payload-free history of actual item actions."""
+        with self._lock:
+            step = self._steps_by_id.get(step_id or self._active_step or "")
+            if not step:
+                return
+            safe_operation = self._safe_text(str(operation)) or "item"
+            step.record_activity(
+                item_id, self._safe_text(str(name)), self._safe_text(str(item_type)),
+                self._safe_text(str(action)), state, safe_operation,
+                counted=step.activity_operation is None or safe_operation == step.activity_operation,
+            )
+        activity_logger.info("%s: %s %s — %s (%s)", step.title, item_type, name, action, state)
+        self._publish()
+
+    def set_activity_total(
+        self, step_id: str, total: int, *, operation: str | None = None,
+    ) -> None:
+        with self._lock:
+            step = self._steps_by_id.get(step_id)
+            if not step:
+                return
+            step.activity_total = max(0, int(total))
+            step.activity_operation = operation
+        self._publish()
+
+    def add_activity_total(
+        self, step_id: str, total: int, *, operation: str,
+    ) -> None:
+        with self._lock:
+            step = self._steps_by_id.get(step_id)
+            if not step:
+                return
+            if step.activity_operation not in (None, operation):
+                raise ValueError(f"Activity count operation already set for step {step_id}")
+            step.activity_operation = operation
+            step.activity_total = (step.activity_total or 0) + max(0, int(total))
         self._publish()
 
     def finish_step(
@@ -156,12 +288,19 @@ class MigrationRun:
             step = self._steps_by_id.get(step_id)
             if not step:
                 return
+            step.close_active_activity()
             step.status = status
             step.finished_at = _now()
             if detail:
                 step.detail = detail
             if warnings:
                 step.warnings.extend(warnings)
+            if self._active_step == step_id:
+                self._active_step = None
+        log = logger.warning if status == StepStatus.FAILED else logger.info
+        log("Stage %s: %s — %s", status.value, self._safe_text(step.title), self._safe_text(detail))
+        for warning in warnings or ():
+            logger.warning("Stage %s: %s", self._safe_text(step.title), self._safe_text(warning))
         self._publish()
 
     # ------------------------------------------------------------------ status
@@ -176,6 +315,10 @@ class MigrationRun:
             self.status = status
             self.error = error
             self.finished_at = _now()
+        if error:
+            logger.error("Migration %s: %s", status.value, self._safe_text(error))
+        else:
+            logger.info("Migration %s", status.value)
         self._publish()
         self._close_subscribers()
 
@@ -215,10 +358,10 @@ class MigrationRun:
     # -------------------------------------------------------------- event feed
 
     def subscribe(self) -> queue.Queue[dict[str, Any] | None]:
-        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=200)
+        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=5)
         with self._lock:
+            subscriber.put_nowait(self.snapshot())
             self._subscribers.append(subscriber)
-        subscriber.put(self.snapshot())
         return subscriber
 
     def unsubscribe(self, subscriber: queue.Queue[dict[str, Any] | None]) -> None:
@@ -227,20 +370,27 @@ class MigrationRun:
                 self._subscribers.remove(subscriber)
 
     def _publish(self) -> None:
-        snapshot = self.snapshot()
         with self._lock:
-            subscribers = list(self._subscribers)
-        for subscriber in subscribers:
-            # A slow reader must not stall the migration; it will catch up on the next event.
-            with contextlib.suppress(queue.Full):
-                subscriber.put_nowait(snapshot)
+            snapshot = self.snapshot()
+            for subscriber in self._subscribers:
+                # Discard stale snapshots instead of blocking migration or losing the latest.
+                try:
+                    subscriber.put_nowait(snapshot)
+                except queue.Full:
+                    with contextlib.suppress(queue.Empty, queue.Full):
+                        subscriber.get_nowait()
+                        subscriber.put_nowait(snapshot)
 
     def _close_subscribers(self) -> None:
         with self._lock:
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
-            with contextlib.suppress(queue.Full):
+            try:
                 subscriber.put_nowait(None)
+            except queue.Full:
+                with contextlib.suppress(queue.Empty, queue.Full):
+                    subscriber.get_nowait()
+                    subscriber.put_nowait(None)
 
 
 class RunConflict(RuntimeError):
@@ -401,6 +551,7 @@ class RunRegistry:
                 if (
                     not replay.ignored and replay.restart_state != "complete"
                     and (replay.interrupted or replay.status == RunStatus.CANCELLED.value
+                         or replay.copy_jobs or replay.sql_effects
                          or failed_work or replay.restart_state == "pending")
                     and not self._active(lineage, target, replay.plan, replay.scratch_workspace_id)
                     and "*" not in self._cleaning

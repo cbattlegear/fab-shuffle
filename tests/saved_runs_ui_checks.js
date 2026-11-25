@@ -19,6 +19,14 @@ const buttons = (f, index = 0) => row(f, index).querySelectorAll("button");
 const confirm = (f) => f.get("saved-run-confirm-submit").click();
 const payload = (f, index) => JSON.parse(f.requests[index].options.body);
 const stage = (f, name) => f.document.querySelectorAll(".panel").find((panel) => panel.dataset.stage === name);
+async function finishDependencyAssessment(f, request, result, id) {
+  assert.match(f.requests[request].url, /^\/api\/preview\/dependencies\/assessments\?/);
+  await f.reply(request, { assessmentId: id, status: "running" });
+  await f.tick(750);
+  const pollRequest = f.requests.length - 1;
+  assert.equal(f.requests[pollRequest].url, `/api/preview/dependencies/assessments/${id}`);
+  await f.reply(pollRequest, { assessmentId: id, status: "succeeded", result });
+}
 
 async function load(f, runs = [saved]) {
   const request = f.requests.length;
@@ -142,7 +150,6 @@ const scenarios = {
     ["old-source-ws", "old-source-item", "old-target-ws", "old-target-item"].forEach((value, index) => {
       reference[index].value = value;
     });
-    f.get("opt-write-freeze").checked = true;
     f.get("resume-target-id").textContent = "old-target-ws";
     f.get("resume-item-ids").textContent = "old-target-item";
     f.get("target-name").value = "old-target-name";
@@ -168,7 +175,7 @@ const scenarios = {
     assert.ok(f.ui.state.assessmentVersion > beforeVersion);
     assert.equal(oldStream.closed, true);
     assert.equal(controller.signal.aborted, true);
-    assert.equal(f.get("opt-write-freeze").checked, false);
+    assert.equal(f.get("opt-write-freeze"), null);
     assert.equal(f.get("opt-permissions").checked, false);
     assert.equal(f.get("opt-permissions").disabled, true);
     assert.equal(f.get("connection-mapping-rows").children.length, 0);
@@ -212,8 +219,6 @@ const scenarios = {
     await f.reply(mappingRequest - 2, { connections: [] });
     await f.reply(mappingRequest - 1, { connections: [] });
     await f.reply(mappingRequest, { blockers: [], dependencies: [], connectionAccess: null });
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
     assert.equal(f.get("start-run").textContent, "Start migration");
     f.get("start-run").click();
     const createRequest = f.requests.length - 1;
@@ -241,7 +246,10 @@ const scenarios = {
     const previewRequest = f.requests.length - 1;
     const dependenciesRequest = previewRequest - 1;
     assert.match(f.requests[previewRequest].url, /^\/api\/preview\?/);
-    assert.match(f.requests[dependenciesRequest].url, /^\/api\/preview\/dependencies\?/);
+    assert.match(
+      f.requests[dependenciesRequest].url,
+      /^\/api\/preview\/dependencies\/assessments\?/,
+    );
     for (const index of [previewRequest, dependenciesRequest]) {
       assert.equal(new URL(f.requests[index].url, "http://fixture").searchParams.get("strategy"), "rebuild");
     }
@@ -251,14 +259,18 @@ const scenarios = {
       targetWorkspaceName: "Fresh Power BI workspace", blockers: [], unsupportedSummary: [],
       counts: [{ label: "Reports", count: 1 }], largeSemanticModels: [],
     });
-    await f.reply(dependenciesRequest, { blockers: [], dependencies: [], connectionAccess: null });
+    await finishDependencyAssessment(
+      f, dependenciesRequest, { blockers: [], dependencies: [], connectionAccess: null },
+      "restart-preview-assessment",
+    );
     assert.equal(f.get("start-run").textContent, "Start migration");
     f.get("recheck").click();
     const recheckRequest = f.requests.length - 1;
     assert.equal(new URL(f.requests[recheckRequest].url, "http://fixture").searchParams.get("strategy"), "rebuild");
-    await f.reply(recheckRequest, { blockers: [], dependencies: [], connectionAccess: null });
-    f.get("opt-write-freeze").checked = true;
-    f.get("opt-write-freeze").handlers.change();
+    await finishDependencyAssessment(
+      f, recheckRequest, { blockers: [], dependencies: [], connectionAccess: null },
+      "restart-recheck-assessment",
+    );
     f.get("start-run").click();
     const startRequest = f.requests.length - 1;
     assert.equal(f.requests[startRequest].url, "/api/runs");

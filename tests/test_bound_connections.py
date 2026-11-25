@@ -16,6 +16,9 @@ is created.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 from fabshuffle import orchestrator
 from fabshuffle.fabric.definitions import part
 
@@ -173,3 +176,40 @@ def test_the_access_list_reaches_the_dependency_report(monkeypatch) -> None:
     )
 
     assert [e.connection_id for e in report.access] == ["c-1"]
+
+
+def test_connection_definition_reads_overlap_and_keep_all_bindings() -> None:
+    lock = threading.Lock()
+    full = threading.Event()
+    release = threading.Event()
+    active = 0
+    maximum = 0
+
+    class BlockingClient(Client):
+        def post(self, path, json=None, params=None, wait=True):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 4:
+                    full.set()
+            try:
+                assert release.wait(5)
+                return super().post(path, json=json, params=params, wait=wait)
+            finally:
+                with lock:
+                    active -= 1
+
+    items = [{"id": str(i), "displayName": f"Pipeline {i}"} for i in range(9)]
+    client = BlockingClient({"DataPipeline": items}, [REACHABLE])
+    client.binding = {item["id"]: SHARED for item in items}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(orchestrator.scan_connection_access, client, source_workspace_id="ws")
+        try:
+            assert full.wait(5)
+        finally:
+            release.set()
+        access = future.result(timeout=5)
+    assert maximum == 4
+    assert len(access) == 1
+    assert len(access[0].used_by) == len(items)

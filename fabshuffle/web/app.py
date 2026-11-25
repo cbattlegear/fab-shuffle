@@ -56,6 +56,11 @@ from fabshuffle.orchestrator import (
     run_migration,
 )
 from fabshuffle.run import REGISTRY, MigrationRun, RunConflict, RunStatus
+from fabshuffle.web.dependency_progress import (
+    AssessmentCancelled,
+    DependencyAssessment,
+    DependencyAssessmentRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,7 @@ STATIC_DIR = WEB_DIR / "static"
 TEMPLATES_DIR = WEB_DIR / "templates"
 
 SESSION_HEADER = "X-Fab-Shuffle-Session"
+DEPENDENCY_ASSESSMENTS = DependencyAssessmentRegistry()
 
 
 # --------------------------------------------------------------------- sessions
@@ -122,6 +128,7 @@ class SessionStore:
             return self._sessions.get(session_id)
 
     def drop(self, session_id: str) -> None:
+        DEPENDENCY_ASSESSMENTS.cancel_session(session_id)
         with self._lock:
             self._sessions.pop(session_id, None)
 
@@ -181,6 +188,24 @@ def _tenant_plan_inputs(session: Session, target: FabricClient) -> dict[str, Any
     }
 
 
+def _visible_workspace_names(client: FabricClient) -> list[str]:
+    return [
+        workspace["displayName"] for workspace in workspaces.list_workspaces(client)
+        if workspace.get("displayName")
+    ]
+
+
+def _check_workspace_name(client: FabricClient, name: str, *, resuming: bool = False) -> None:
+    if name not in _visible_workspace_names(client):
+        return
+    action = (
+        "This saved plan cannot be renamed. Inspect the existing workspace in Fabric, then "
+        "go back and start a new migration with a different destination name."
+        if resuming else "Choose a different destination workspace name."
+    )
+    raise HTTPException(status_code=409, detail=f"A workspace named '{name}' is already visible. {action}")
+
+
 def _run_conflict(error: RunConflict) -> HTTPException:
     return HTTPException(
         status_code=409, detail={"message": str(error), "runId": error.run_id}
@@ -196,12 +221,6 @@ def _start_attempt(
     _require_identity(session, record)
     if session.paired and plan.strategy is not Strategy.REBUILD:
         raise HTTPException(status_code=409, detail="Paired migration must rebuild the workspace.")
-    if session.paired and (plan.include_data or plan.include_files) and not plan.write_freeze_confirmed:
-        raise HTTPException(
-            status_code=409,
-            detail="Pause source writes and confirm the write freeze before copying data or files "
-            "with separate destination credentials, or turn off both copy options.",
-        )
     if plan.execution_blocker:
         raise HTTPException(status_code=409, detail=plan.execution_blocker)
     run = MigrationRun(
@@ -283,6 +302,7 @@ class ConfirmFullRestart(ConfirmSavedAction):
 
 
 class StartRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     capacity_id: str = Field(min_length=1)
     source_workspace_id: str = Field(min_length=1)
     target_workspace_name: str | None = None
@@ -331,7 +351,7 @@ class StartRunRequest(BaseModel):
         return result
 
     def plan_options(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"cleanup_when_done"})
+        return self.model_dump(exclude={"cleanup_when_done", "write_freeze_confirmed"})
 
 
 class ResumeRunRequest(BaseModel):
@@ -339,6 +359,7 @@ class ResumeRunRequest(BaseModel):
     start_database_mirrors: StrictBool = False
     connection_mappings: dict[str, str] | None = Field(default=None, max_length=1000)
     reference_mappings: list[dict[str, str]] | None = Field(default=None, max_length=1000)
+    write_freeze_confirmed: StrictBool | None = None
 
     @field_validator("connection_mappings")
     @classmethod
@@ -351,7 +372,9 @@ class ResumeRunRequest(BaseModel):
         return StartRunRequest.item_ids(value) if value is not None else None
 
     def apply(self, plan: MigrationPlan) -> MigrationPlan:
-        return replace(plan, **self.model_dump(exclude_none=True))
+        options = self.model_dump(exclude_none=True, exclude={"write_freeze_confirmed"})
+        options["write_freeze_confirmed"] = False
+        return replace(plan, **options)
 
 
 # ------------------------------------------------------------------------- app
@@ -519,6 +542,7 @@ def create_app() -> FastAPI:
                     result.update(_semantic_model_preview(session, source_workspace_id, plan))
                     return result
 
+                result["visibleWorkspaceNames"] = _visible_workspace_names(target)
                 # Counted from the assessment rather than by listing each type again: it costs
                 # nothing, covers every supported type automatically, and cannot disagree with
                 # what the migration then does.
@@ -577,6 +601,55 @@ def create_app() -> FastAPI:
             )
         return result
 
+    @app.post("/api/preview/dependencies/assessments", status_code=202)
+    async def start_dependency_assessment(
+        source_workspace_id: str,
+        strategy: Literal["rebuild"] | None = None,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        rebuild = session.paired or bool(strategy)
+        try:
+            assessment, reused = DEPENDENCY_ASSESSMENTS.create(
+                session.id, source_workspace_id, rebuild,
+            )
+        except RuntimeError as error:
+            raise HTTPException(status_code=429, detail=str(error)) from error
+        if not reused:
+            try:
+                threading.Thread(
+                    target=_run_dependency_assessment,
+                    args=(assessment, session),
+                    name=f"dependency-assessment-{assessment.id[:8]}",
+                    daemon=True,
+                ).start()
+            except RuntimeError as error:
+                assessment.fail(error)
+                raise HTTPException(
+                    status_code=503, detail="Could not start the dependency assessment.",
+                ) from error
+        return {**assessment.snapshot(), "reused": reused}
+
+    @app.get("/api/preview/dependencies/assessments/{assessment_id}")
+    async def get_dependency_assessment(
+        assessment_id: str,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        assessment = DEPENDENCY_ASSESSMENTS.get(session.id, assessment_id)
+        if assessment is None:
+            raise HTTPException(status_code=404, detail="Dependency assessment not found.")
+        return assessment.snapshot()
+
+    @app.delete("/api/preview/dependencies/assessments/{assessment_id}", status_code=202)
+    async def cancel_dependency_assessment(
+        assessment_id: str,
+        session: Session = Depends(require_session),
+    ) -> dict[str, Any]:
+        assessment = DEPENDENCY_ASSESSMENTS.get(session.id, assessment_id)
+        if assessment is None:
+            raise HTTPException(status_code=404, detail="Dependency assessment not found.")
+        assessment.cancel()
+        return assessment.snapshot()
+
     @app.post("/api/preview/dependencies")
     async def preview_destination_dependencies(
         body: StartRunRequest, session: Session = Depends(require_session),
@@ -596,9 +669,12 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         def prepare() -> MigrationPlan:
             with _planning_clients(session) as (client, target):
-                return build_plan(
+                plan = build_plan(
                     client, **body.plan_options(), **_tenant_plan_inputs(session, target),
                 )
+                if plan.strategy is Strategy.REBUILD:
+                    _check_workspace_name(target, plan.target_workspace_name)
+                return plan
 
         plan = await _run_fabric(prepare)
         run = _start_attempt(
@@ -711,10 +787,20 @@ def create_app() -> FastAPI:
         run_id: str,
         session: Session = Depends(require_execution_session),
     ) -> dict[str, Any]:
-        replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
+        def prepare() -> tuple[journal.Replay, MigrationPlan, list[str]]:
+            replay, plan = _resume_plan(session, run_id)
+            names: list[str] = []
+            if plan.strategy is Strategy.REBUILD and not replay.target_workspace_id:
+                with _planning_clients(session) as (_source, target):
+                    names = _visible_workspace_names(target)
+            return replay, plan, names
+
+        replay, plan, names = await _run_fabric(prepare)
         return {
             "runId": run_id, "plan": _plan_dict(plan), "cleanupWhenDone": replay.cleanup,
             "targetWorkspaceId": replay.target_workspace_id,
+            "visibleWorkspaceNames": names,
+            "inventoryComplete": replay.inventory_complete,
             "items": [
                 {"sourceId": source_id, "targetId": item.get("target", ""),
                  "name": item.get("name", ""), "type": item.get("type", "")}
@@ -791,8 +877,12 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         """Adopt the previous target with explicit mappings and this attempt's activation opt-in."""
         replay, plan = await asyncio.to_thread(_resume_plan, session, run_id)
-        if body is not None:
-            plan = body.apply(plan)
+        plan = (body or ResumeRunRequest()).apply(plan)
+        if plan.strategy is Strategy.REBUILD and not replay.target_workspace_id:
+            def check_name() -> None:
+                with _planning_clients(session) as (_source, target):
+                    _check_workspace_name(target, plan.target_workspace_name, resuming=True)
+            await _run_fabric(check_name)
         run = _start_attempt(session, plan, cleanup=replay.cleanup, prior=replay)
         return {"runId": run.id, "plan": _plan_dict(plan), "resumedFrom": run_id}
 
@@ -924,7 +1014,9 @@ def _resume_plan(session: Session, run_id: str) -> tuple[journal.Replay, Migrati
             detail="This migration was ignored or marked for full restart. It cannot be resumed.",
         )
     try:
-        return replay, replace(plan_from_journal(replay), start_database_mirrors=False)
+        return replay, replace(
+            plan_from_journal(replay), start_database_mirrors=False, write_freeze_confirmed=False,
+        )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -1239,6 +1331,9 @@ def _dependency_report(
     client_id: str,
     object_id: str = "",
     tenant_id: str = "",
+    on_item=None,
+    on_total=None,
+    check_cancelled=None,
 ) -> dict[str, Any]:
     """Run the same dependency check the migration runs, before anything is created.
 
@@ -1247,15 +1342,23 @@ def _dependency_report(
     connection has to be shared first.
     """
     if not migrated:
+        if on_total:
+            on_total(0)
         return {"dependencies": [], "connectionAccess": None}
 
     try:
-        report = dependency_warnings(
-            client,
-            source_workspace_id=source_workspace_id,
-            migrated=migrated,
-            client_id=client_id,
-        )
+        options = {
+            "source_workspace_id": source_workspace_id,
+            "migrated": migrated,
+            "client_id": client_id,
+        }
+        if on_item:
+            options["on_item"] = on_item
+        if on_total:
+            options["on_total"] = on_total
+        if check_cancelled:
+            options["check_cancelled"] = check_cancelled
+        report = dependency_warnings(client, **options)
     except FabricApiError as error:
         return {
             "dependencies": [f"Dependencies could not be checked: {error}"],
@@ -1286,6 +1389,46 @@ def _dependency_report(
         else None
     )
     return {"dependencies": report.messages(), "connectionAccess": access}
+
+
+def _run_dependency_assessment(assessment: DependencyAssessment, session: Session) -> None:
+    assessment.start()
+    try:
+        with FabricClient(session.tokens) as client:
+            assessment.update("Reading source workspace items.")
+            source_items = list_items(client, assessment.source_workspace_id)
+            assessment.check_cancelled()
+            workspace_assessment = assess_workspace(
+                source_items,
+                force_rebuild=assessment.rebuild,
+                require_stopped=session.paired,
+            )
+            assessment.check_cancelled()
+            if workspace_assessment.strategy is Strategy.REASSIGN:
+                result = {"dependencies": [], "connectionAccess": None}
+                assessment.set_activity_total(0)
+            else:
+                assessment.update(
+                    f"Checking relations and connection references for "
+                    f"{len(workspace_assessment.migrated)} item(s)."
+                )
+                result = _dependency_report(
+                    client,
+                    source_workspace_id=assessment.source_workspace_id,
+                    migrated=workspace_assessment.migrated,
+                    client_id=session.principal.client_id,
+                    object_id=_object_id(session),
+                    tenant_id=session.principal.tenant_id,
+                    on_item=assessment.on_item,
+                    on_total=assessment.set_activity_total,
+                    check_cancelled=assessment.check_cancelled,
+                )
+                assessment.check_cancelled()
+        assessment.complete(result)
+    except AssessmentCancelled:
+        assessment.cancelled()
+    except Exception as error:
+        assessment.fail(error)
 
 
 def _semantic_model_preview(

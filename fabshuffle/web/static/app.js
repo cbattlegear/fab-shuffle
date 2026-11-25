@@ -16,6 +16,9 @@ const state = {
   crossTenant: false,
   assessmentVersion: 0,
   assessmentPending: false,
+  dependencyAssessmentId: null,
+  dependencyAssessment: null,
+  dependencyPollController: null,
   mappingsChecked: false,
   resumeRunId: null,
   resumeReturnStage: "capacity",
@@ -59,6 +62,7 @@ function showError(message) {
 }
 
 function goTo(stage) {
+  if (stage !== "review" && state.assessmentPending) cancelDependencyAssessment();
   $$(".panel").forEach((panel) => {
     panel.hidden = panel.dataset.stage !== stage;
   });
@@ -158,7 +162,6 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#capacity-next").disabled = true;
     $("#workspace-next").disabled = true;
     $("#opt-permissions").checked = !state.paired;
-    $("#opt-write-freeze").checked = false;
     $("#opt-start-mirrors").checked = false;
     form.reset();
     updateLoginMode();
@@ -557,6 +560,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
       ...plan, blockers: [], unsupportedSummary: [], dependencies: [],
       counts: [], migratedTotal: 0, largeSemanticModels: [],
       targetWorkspaceId: saved.targetWorkspaceId,
+      visibleWorkspaceNames: saved.visibleWorkspaceNames || [],
     };
     resetMappings();
     $("#opt-data").checked = plan.includeData;
@@ -578,7 +582,7 @@ async function prepareResume(runId, button, returnStage = "progress") {
     renderReview();
     $("#resume-target-id").textContent = saved.targetWorkspaceId
       ? `Destination workspace ID: ${saved.targetWorkspaceId}`
-      : "No destination workspace was recorded yet. Resuming will create it.";
+      : "No destination workspace was recorded. Resuming will attempt to create it.";
     const items = $("#resume-item-ids");
     items.innerHTML = "";
     for (const item of saved.items) {
@@ -735,10 +739,11 @@ $("#workspace-next").addEventListener("click", async () => {
   // for it before showing anything left the wizard looking stuck.
   state.resumeRunId = null;
   resetMappings();
+  state.preview = null;
   state.assessmentPending = true;
+  cancelDependencyAssessment({ invalidate: false });
   const version = ++state.assessmentVersion;
-  const dependencies = state.paired ? null : api(`/api/preview/dependencies?${params}`);
-  dependencies?.catch(() => {});
+  const dependencies = state.paired ? null : startDependencyAssessment(params, version, sessionId);
 
   try {
     goTo("review");
@@ -773,10 +778,13 @@ $("#recheck").addEventListener("click", async () => {
   const params = new URLSearchParams({ source_workspace_id: state.workspace.id });
   if (state.forceRebuild) params.set("strategy", "rebuild");
 
+  cancelDependencyAssessment({ invalidate: false });
+  const version = ++state.assessmentVersion;
   showDependenciesPending();
+  state.assessmentPending = true;
   setStartEnabled(false);
   try {
-    await settleAssessment(api(`/api/preview/dependencies?${params}`));
+    await settleAssessment(startDependencyAssessment(params, version, state.sessionId), version);
   } finally {
     busy(button, false);
   }
@@ -798,32 +806,124 @@ async function settleAssessment(request, version = state.assessmentVersion) {
     state.preview.dependencies = [`Dependencies could not be checked: ${error.message}`];
     state.preview.connectionAccess = null;
     state.mappingsChecked = false;
+    state.dependencyAssessment = {
+      assessmentId: state.dependencyAssessmentId,
+      status: "failed",
+      error: error.message,
+      step: {
+        id: "dependencies",
+        title: "Checking dependencies (read-only review)",
+        status: "failed",
+        detail: `Check failed: ${error.message}`,
+        warnings: [],
+        activity: state.dependencyAssessment?.step?.activity || [],
+        activityOmitted: state.dependencyAssessment?.step?.activityOmitted || 0,
+      },
+    };
     $("#mapping-status").textContent = `Check failed: ${error.message}. Re-check to retry.`;
   }
   state.assessmentPending = false;
   stopAssessmentTimer();
+  renderDependencyAssessment();
   renderDependencies();
   renderConnectionAccess();
   // Only now is it known whether anything blocks the run.
   setStartEnabled(state.preview.blockers.length === 0);
 }
 
-// Paired runs freeze for data and files; single-principal rebuilds only for files, which are streamed.
-function freezeApplies() {
-  if (state.preview?.strategy === "reassign") return false;
-  return state.paired || $("#opt-files").checked;
+async function startDependencyAssessment(params, version, sessionId) {
+  const query = new URLSearchParams(params);
+  let assessmentId = null;
+  let pollFailures = 0;
+  const startedAt = Date.now();
+  try {
+    const started = await api(`/api/preview/dependencies/assessments?${query}`, { method: "POST" });
+    assessmentId = started.assessmentId;
+    if (version !== state.assessmentVersion || sessionId !== state.sessionId) {
+      cancelRemoteDependencyAssessment(assessmentId);
+      return null;
+    }
+    state.dependencyAssessmentId = assessmentId;
+    state.dependencyAssessment = started;
+    if (state.preview) renderDependencyAssessment(started);
+
+    while (Date.now() - startedAt < 120_000) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (version !== state.assessmentVersion || sessionId !== state.sessionId) return null;
+      const controller = new AbortController();
+      state.dependencyPollController = controller;
+      let snapshot;
+      try {
+        snapshot = await api(
+          `/api/preview/dependencies/assessments/${encodeURIComponent(assessmentId)}`,
+          { signal: controller.signal },
+        );
+        pollFailures = 0;
+      } catch (error) {
+        if (error.name === "AbortError") return null;
+        if (++pollFailures >= 8) throw new Error(`Could not reconnect to dependency progress: ${error.message}`);
+        if (state.preview) renderDependencyAssessment({
+          ...state.dependencyAssessment,
+          step: {
+            ...state.dependencyAssessment?.step,
+            detail: `Reconnecting to the read-only dependency check (${pollFailures}/8).`,
+          },
+        });
+        continue;
+      } finally {
+        if (state.dependencyPollController === controller) state.dependencyPollController = null;
+      }
+      if (version !== state.assessmentVersion || sessionId !== state.sessionId) return null;
+      state.dependencyAssessment = snapshot;
+      if (state.preview) renderDependencyAssessment(snapshot);
+      if (snapshot.status === "succeeded") return snapshot.result || {};
+      if (snapshot.status === "failed") throw new Error(snapshot.error || "Dependency check failed.");
+      if (snapshot.status === "cancelled" || snapshot.status === "cancelling") {
+        throw new Error("Dependency check stopped. Re-check to start a new assessment.");
+      }
+    }
+    throw new Error("Dependency check timed out. Re-check to try again.");
+  } catch (error) {
+    if (assessmentId && version === state.assessmentVersion) cancelRemoteDependencyAssessment(assessmentId);
+    throw error;
+  }
+}
+
+function cancelRemoteDependencyAssessment(assessmentId) {
+  if (!assessmentId || !state.sessionId) return;
+  api(`/api/preview/dependencies/assessments/${encodeURIComponent(assessmentId)}`, {
+    method: "DELETE",
+  }).catch(() => {});
+}
+
+function cancelDependencyAssessment({ invalidate = true } = {}) {
+  if (invalidate) state.assessmentVersion++;
+  stopAssessmentTimer();
+  if (state.dependencyPollController) state.dependencyPollController.abort();
+  state.dependencyPollController = null;
+  cancelRemoteDependencyAssessment(state.dependencyAssessmentId);
+  state.dependencyAssessmentId = null;
+  state.dependencyAssessment = null;
+  state.assessmentPending = false;
 }
 
 function setStartEnabled(enabled) {
-  $("#write-freeze").hidden = !freezeApplies();
   const start = $("#start-run");
-  const freezeMissing = freezeApplies() && (!state.paired || $("#opt-data").checked || $("#opt-files").checked) &&
-    !$("#opt-write-freeze").checked;
+  const resumingWithoutTarget = !!state.resumeRunId && !state.preview?.targetWorkspaceId;
+  const conflict = (!state.resumeRunId || resumingWithoutTarget) && state.preview?.strategy === "rebuild" &&
+    (state.preview?.visibleWorkspaceNames || []).includes(
+      $("#target-name").value.trim() || state.preview.targetWorkspaceName,
+    );
+  const nameConflict = $("#target-name-conflict");
+  nameConflict.hidden = !conflict;
+  nameConflict.textContent = !conflict ? "" : resumingWithoutTarget
+    ? "A workspace with this name is already visible. This saved plan cannot be renamed. Inspect the workspace in Fabric, then go back and start a new migration with a different name."
+    : "A workspace with this name is already visible. Choose a different name.";
   const mappingBlocked = state.paired && (!state.mappingsChecked || state.preview?.mappingBlockers?.length);
-  start.disabled = !enabled || state.assessmentPending || freezeMissing || !!mappingBlocked;
+  start.disabled = !enabled || state.assessmentPending || !!mappingBlocked || !!conflict;
   start.title = !enabled || state.assessmentPending ? "Finish the assessment and resolve its blockers"
     : mappingBlocked ? "Re-check destination mappings and resolve their blockers"
-    : freezeMissing ? "Confirm the source write freeze, or turn off both data and file copying" : "";
+    : conflict ? (resumingWithoutTarget ? "Start a new migration with a different name" : "Choose a different destination workspace name") : "";
 }
 
 
@@ -883,7 +983,6 @@ function resetMappings() {
   connectionOptionsVersion++;
   $("#connection-mapping-rows").innerHTML = "";
   $("#reference-mapping-rows").innerHTML = "";
-  $("#opt-write-freeze").checked = false;
   $("#opt-start-mirrors").checked = false;
   state.mappingsChecked = false;
 }
@@ -924,15 +1023,17 @@ function migrationBody() {
     include_files: $("#opt-files").checked,
     copy_permissions: state.paired ? false : $("#opt-permissions").checked,
     cleanup_when_done: $("#opt-cleanup").checked,
-    write_freeze_confirmed: $("#opt-write-freeze").checked,
     start_database_mirrors: !reassign && $("#opt-start-mirrors").checked,
     ...mappingOptions(),
   };
 }
 
 function resumeOptions() {
+  const mappings = mappingOptions();
   return {
-    ...(state.paired ? mappingOptions() : {}),
+    ...(state.paired ? {
+      connection_mappings: mappings.connection_mappings, reference_mappings: mappings.reference_mappings,
+    } : {}),
     start_database_mirrors: state.preview?.strategy !== "reassign" && $("#opt-start-mirrors").checked,
   };
 }
@@ -989,8 +1090,11 @@ $("#recheck-mappings").addEventListener("click", () => {
   loadConnectionOptions();
   recheckMappings();
 });
-["#opt-data", "#opt-files", "#opt-write-freeze"].forEach((id) => {
+["#opt-data", "#opt-files"].forEach((id) => {
   $(id).addEventListener("change", () => setStartEnabled(!!state.preview && !state.preview.blockers.length));
+});
+$("#target-name").addEventListener("input", () => {
+  setStartEnabled(!!state.preview && !state.preview.blockers.length);
 });
 
 function renderReviewPending() {
@@ -1009,9 +1113,9 @@ function renderReviewPending() {
   );
   // The name and options depend on the strategy, so they stay hidden until it is known.
   $("#target-name-field").hidden = true;
+  $("#target-name-conflict").hidden = true;
   $("#rebuild-options").hidden = true;
   $("#destination-mappings").hidden = true;
-  $("#write-freeze").hidden = true;
   $("#start-run").disabled = true;
 }
 
@@ -1025,7 +1129,9 @@ function renderDependencies() {
       "not created pointing back at the source."
     : "References the migration cannot follow, and connections you will have to grant access to. " +
       "The new workspace will be created, but these need fixing before it works.";
-  fillList(container, [...(state.preview.dependencies || []), ...(state.preview.mappingBlockers || [])]);
+  fillList(container, [...(state.preview.dependencies || []), ...(state.preview.mappingBlockers || [])],
+    ".dependency-warnings");
+  renderDependencyAssessment();
 }
 
 function renderConnectionAccess() {
@@ -1098,12 +1204,8 @@ function showDependenciesPending() {
   container.classList.add("pending");
   container.querySelector("h3").textContent = "Checking dependencies…";
   container.querySelector(".hint").hidden = true;
-  const list = container.querySelector("ul");
-  list.innerHTML = "";
-  const item = document.createElement("li");
-  item.id = "assessment-progress";
-  list.appendChild(item);
-  startAssessmentTimer(item);
+  container.querySelector(".dependency-warnings").replaceChildren();
+  renderDependencyAssessment();
 }
 
 /** Tick a live count so a slow assessment visibly moves. */
@@ -1116,8 +1218,7 @@ function startAssessmentTimer(element) {
   const tick = () => {
     const seconds = Math.round((Date.now() - started) / 1000);
     element.textContent =
-      `Reading references and connections across ${scope} — ${seconds}s elapsed. ` +
-      "This walks one API call per item, so it takes a moment on a large workspace.";
+      `Waiting for the first dependency update across ${scope} — ${seconds}s elapsed.`;
   };
   tick();
   state.assessmentTimer = setInterval(tick, 1000);
@@ -1128,6 +1229,42 @@ function stopAssessmentTimer() {
     clearInterval(state.assessmentTimer);
     state.assessmentTimer = null;
   }
+}
+
+function renderDependencyAssessment(snapshot = state.dependencyAssessment) {
+  const container = $("#dependencies");
+  if (!container || !state.preview) return;
+  const host = container.querySelector(".dependency-progress");
+  const expansion = captureActivityExpansion(host);
+  host.replaceChildren();
+  const step = snapshot?.step;
+  if (!step) {
+    if (state.assessmentPending) {
+      const waiting = document.createElement("p");
+      waiting.className = "dependency-progress-status";
+      waiting.setAttribute("role", "status");
+      waiting.textContent = "Starting the read-only dependency check…";
+      host.appendChild(waiting);
+      if (!state.assessmentTimer) startAssessmentTimer(waiting);
+    } else stopAssessmentTimer();
+    return;
+  }
+  stopAssessmentTimer();
+  const status = document.createElement("p");
+  status.className = "dependency-progress-status";
+  status.setAttribute("role", "status");
+  status.textContent = step.detail || "Read-only dependency check in progress.";
+  host.appendChild(status);
+  renderStepActivity(step, host, expansion);
+}
+
+function captureActivityExpansion(root) {
+  return {
+    steps: new Set([...root.querySelectorAll("details[data-activity-step]")]
+      .filter((entry) => entry.open).map((entry) => entry.dataset.activityStep)),
+    items: new Set([...root.querySelectorAll("details[data-activity-key]")]
+      .filter((entry) => entry.open).map((entry) => entry.dataset.activityKey)),
+  };
 }
 
 function itemTotal(counts) {
@@ -1182,7 +1319,7 @@ function renderReview() {
   }
   if (resuming) {
     rows.push(["Destination workspace", preview.targetWorkspaceName],
-      ["Destination workspace ID", preview.targetWorkspaceId || "Not created yet"]);
+      ["Destination workspace ID", preview.targetWorkspaceId || "Not recorded"]);
   } else if (reassign) {
     rows.push(["Large semantic models", String(preview.largeSemanticModels.length)]);
   } else {
@@ -1218,7 +1355,6 @@ function renderReview() {
   $("#target-name").disabled = resuming;
   ["#opt-data", "#opt-files", "#opt-cleanup"].forEach((id) => { $(id).disabled = resuming; });
   $("#destination-mappings").hidden = !state.paired || reassign;
-  $("#write-freeze").hidden = reassign || !freezeApplies();
   $("#opt-permissions").disabled = state.paired || resuming;
   if (state.paired) $("#opt-permissions").checked = false;
   $("#opt-permissions").title = state.paired ? "Grant access to the destination workspace separately." : "";
@@ -1229,10 +1365,10 @@ function renderReview() {
   $("#start-run").textContent = resuming ? "Resume migration" : reassign ? "Reassign workspace" : "Start migration";
 }
 
-function fillList(container, entries) {
+function fillList(container, entries, selector = "ul") {
   container.hidden = !entries.length;
   if (!entries.length) return;
-  const list = container.querySelector("ul");
+  const list = container.querySelector(selector);
   list.innerHTML = "";
   entries.forEach((entry) => {
     const item = document.createElement("li");
@@ -1304,14 +1440,19 @@ function watchRun(runId) {
   state.events = events;
 
   events.onmessage = (message) => {
-    if (state.events === events) renderRun(JSON.parse(message.data));
+    if (state.events !== events) return;
+    const run = JSON.parse(message.data);
+    renderRun(run);
+    if (run.status !== "running" && run.status !== "pending") events.close();
   };
   events.onerror = () => {
-    events.close();
     if (state.events !== events) return;
-    // The stream ends when the run finishes; fall back to a single fetch for the final state.
+    // Keep EventSource's reconnect behavior; the snapshot catches up after a dropped stream.
     api(`/api/runs/${runId}`).then((run) => {
-      if (state.events === events) renderRun(run);
+      if (state.events === events) {
+        renderRun(run);
+        if (run.status !== "running" && run.status !== "pending") events.close();
+      }
     }).catch(() => {});
   };
 }
@@ -1335,6 +1476,9 @@ function renderRun(run) {
   }
 
   const list = $("#step-list");
+  const expansion = captureActivityExpansion(list);
+  const focusedItem = document.activeElement?.closest?.("details[data-activity-key]")?.dataset.activityKey;
+  const focusedStage = document.activeElement?.closest?.("details[data-activity-step]")?.dataset.activityStep;
   list.innerHTML = "";
   run.steps.forEach((step) => {
     const item = document.createElement("li");
@@ -1349,6 +1493,7 @@ function renderRun(run) {
     item.querySelector(".title").textContent = step.title;
     item.querySelector(".detail").textContent = step.detail || "";
 
+    renderStepActivity(step, item.querySelector(".step-body"), expansion);
     if (step.warnings.length) {
       const warnings = document.createElement("ul");
       warnings.className = "step-warnings";
@@ -1359,8 +1504,16 @@ function renderRun(run) {
       });
       item.querySelector(".step-body").appendChild(warnings);
     }
+
     list.appendChild(item);
   });
+  if (focusedItem) {
+    [...list.querySelectorAll("details[data-activity-key]")]
+      .find((entry) => entry.dataset.activityKey === focusedItem)?.querySelector("summary")?.focus();
+  } else if (focusedStage) {
+    [...list.querySelectorAll("details[data-activity-step]")]
+      .find((entry) => entry.dataset.activityStep === focusedStage)?.querySelector("summary")?.focus();
+  }
 
   const finished = run.status !== "running" && run.status !== "pending";
   $("#cancel-run").hidden = finished;
@@ -1371,6 +1524,58 @@ function renderRun(run) {
   const leftSomething = (run.summary?.warnings || []).length > 0;
   $("#retry-run").hidden = !finished || !run.targetWorkspace || !leftSomething;
   $("#retry-run").textContent = state.paired ? "Update mappings and retry" : "Retry what did not migrate";
+}
+
+function renderStepActivity(step, parent, expansion = captureActivityExpansion(parent)) {
+  const activities = Array.isArray(step.activity) ? step.activity : [];
+  if (!activities.length && !Number.isInteger(step.activityTotal)) return null;
+  const details = document.createElement("details");
+  details.className = "step-activity";
+  details.dataset.activityStep = step.id;
+  details.open = expansion.steps.has(step.id);
+  const summary = document.createElement("summary");
+  const completed = Number.isInteger(step.activityCompleted) ? step.activityCompleted : 0;
+  const total = Number.isInteger(step.activityTotal) ? step.activityTotal : "?";
+  const shown = `${activities.length}${step.activityOmitted ? "+" : ""} shown`;
+  summary.textContent = `Item activity (${completed}/${total}${total === "?" ? " completed; " : ""}${total === "?" ? shown : ""})`;
+  details.appendChild(summary);
+  const rows = document.createElement("ul");
+  rows.className = "activity-items";
+  activities.forEach((activity) => {
+    const row = document.createElement("li");
+    const history = document.createElement("details");
+    history.dataset.activityKey = JSON.stringify([step.id, activity.id]);
+    history.open = expansion.items.has(history.dataset.activityKey);
+    const label = document.createElement("summary");
+    label.textContent = [activity.type, activity.name].filter(Boolean).join(" · ");
+    const latest = (activity.actions || []).at(-1);
+    if (latest) {
+      const current = document.createElement("span");
+      current.className = "activity-current";
+      const concurrent = activity.active && latest.state !== "running" ? "; another action running" : "";
+      current.textContent = `${latest.action} (${latest.state}${concurrent})`;
+      label.appendChild(current);
+    }
+    history.appendChild(label);
+    const actions = document.createElement("ol");
+    (activity.actions || []).forEach((action) => {
+      const entry = document.createElement("li");
+      entry.textContent = `${action.action} (${action.state})`;
+      actions.appendChild(entry);
+    });
+    history.appendChild(actions);
+    row.appendChild(history);
+    rows.appendChild(row);
+  });
+  details.appendChild(rows);
+  if (step.activityOmitted) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = `${step.activityOmitted} earlier item entr${step.activityOmitted === 1 ? "y" : "ies"} no longer shown.`;
+    details.appendChild(note);
+  }
+  parent.appendChild(details);
+  return details;
 }
 
 // ---------------------------------------------------------- cutover readiness

@@ -1,8 +1,7 @@
 """Tenant-wide advisory scan for connections that still point at the source workspace.
 
 A migrated item's own connection references are handled elsewhere (see
-:mod:`fabshuffle.fabric.connections`): only a mapping the operator supplied is ever rewritten,
-and nothing is created, adopted by name, or deleted. This module answers a different, narrower
+:mod:`fabshuffle.fabric.connections`). This module answers a different, narrower
 question - reporting only, never a gate on migration: of every connection this credential can
 see anywhere in the tenant, which ones still name the source workspace, one of its items, or one
 of its data-store endpoints? Those are exactly the connections something *outside* this

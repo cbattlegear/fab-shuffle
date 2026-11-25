@@ -204,7 +204,8 @@
           References the migration cannot follow, and connections you will have to grant access
           to. The new workspace will be created, but these need fixing before it works.
         </p>
-        <ul></ul>
+        <div class="dependency-progress" aria-live="polite"></div>
+        <ul class="dependency-warnings"></ul>
       </div>
 
       <div id="review-warnings" class="warnings" hidden>
@@ -213,8 +214,9 @@
       </div>
 
       <label class="field" id="target-name-field">New workspace name
-        <input id="target-name" autocomplete="off" spellcheck="false" />
+        <input id="target-name" autocomplete="off" spellcheck="false" aria-describedby="target-name-conflict" />
       </label>
+      <p id="target-name-conflict" class="hint" role="status" hidden></p>
       <fieldset class="options" id="rebuild-options">
         <legend>Options</legend>
         <label><input type="checkbox" id="opt-data" checked /> Copy table data</label>
@@ -249,13 +251,6 @@
         <p id="mapping-status" class="hint" role="status">Re-check after editing mappings.</p>
         <button id="recheck-mappings" type="button" class="secondary">Re-check destination mappings</button>
       </section>
-      <fieldset id="write-freeze" class="options write-freeze" hidden>
-        <legend>Source write freeze</legend>
-        <label><input type="checkbox" id="opt-write-freeze" /> I have paused source writes and will keep them paused until copying finishes.</label>
-        <p class="hint">Required when files are copied, and when separate destination credentials are used to
-          copy table data, even within one tenant. Otherwise turn off the copy options.
-          This confirmation does not establish cutover readiness.</p>
-      </fieldset>
       <div class="actions">
         <button class="secondary" id="review-back" data-back="workspace">Back</button>
         <button class="secondary" id="resume-back" type="button" hidden>Back without resuming</button>

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from fabshuffle.config import SETTINGS
@@ -272,6 +272,7 @@ def copy_role_assignments(
     *,
     roles: set[str] | None = None,
     principal_types: set[str] | None = None,
+    on_activity: Callable[[dict[str, Any], str, str], None] | None = None,
 ) -> list[str]:
     """Replay source role assignments onto ``target_workspace_id``.
 
@@ -292,15 +293,28 @@ def copy_role_assignments(
         if principal_types and principal_type not in principal_types:
             continue
 
+        if on_activity:
+            on_activity(assignment, "Role assignment started", "running")
+        if not principal_id or not principal_type or not role:
+            if on_activity:
+                on_activity(assignment, "Principal or role information is incomplete", "skipped")
+            continue
         try:
             add_role_assignment(client, target_workspace_id, principal_id, principal_type, role)
         except FabricApiError as error:
             # Admins are granted up front and again in the final pass, so an existing
             # assignment is expected rather than a problem.
             if error.status_code == 409:
+                if on_activity:
+                    on_activity(assignment, "Role assignment already exists", "succeeded")
                 continue
             name = principal.get("displayName") or principal_id
             warnings.append(f"Could not grant {role} to {name}: HTTP {error.status_code}")
+            if on_activity:
+                on_activity(assignment, "Role assignment failed", "failed")
+        else:
+            if on_activity:
+                on_activity(assignment, "Role assignment created", "succeeded")
     return warnings
 
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -113,6 +116,115 @@ def test_full_restart_preview_rebuilds_powerbi_content_instead_of_reassigning_so
     assert response.json()["migratedTotal"] == 1
     assert client.get("/api/preview/dependencies", params=params, headers=auth(session_id)).status_code == 200
     assert observed[0][0]["id"] == "model"
+
+
+def test_dependency_assessment_progress_is_session_scoped_and_counted(
+    client, session_id, monkeypatch,
+):
+    install(monkeypatch, [{"id": "lh", "displayName": "Lake", "type": "Lakehouse"}])
+
+    def report(_client, *, on_item, on_total, **_kwargs):
+        on_total(1)
+        item = {"id": "lh", "displayName": "Lake", "type": "Lakehouse"}
+        on_item(item, "Reading upstream relations")
+        on_item(item, "Upstream relations read")
+        return {"dependencies": [], "connectionAccess": None}
+
+    monkeypatch.setattr(web, "_dependency_report", report)
+    started = client.post(
+        "/api/preview/dependencies/assessments",
+        params={"source_workspace_id": "ws-1", "strategy": "rebuild"},
+        headers=auth(session_id),
+    )
+    assert started.status_code == 202, started.text
+    assessment_id = started.json()["assessmentId"]
+
+    snapshot = started.json()
+    deadline = time.monotonic() + 2
+    while snapshot["status"] in ("pending", "running") and time.monotonic() < deadline:
+        time.sleep(0.01)
+        response = client.get(
+            f"/api/preview/dependencies/assessments/{assessment_id}",
+            headers=auth(session_id),
+        )
+        assert response.status_code == 200
+        snapshot = response.json()
+
+    assert snapshot["status"] == "succeeded"
+    assert snapshot["step"]["activityTotal"] == 1
+    assert snapshot["step"]["activityCompleted"] == 1
+    assert snapshot["result"]["dependencies"] == []
+
+    other = web.SESSIONS.create(ServicePrincipal("tenant", "other", "secret"), StubTokens())
+    try:
+        denied = client.get(
+            f"/api/preview/dependencies/assessments/{assessment_id}",
+            headers=auth(other.id),
+        )
+        assert denied.status_code == 404
+    finally:
+        web.SESSIONS.drop(other.id)
+
+
+def test_dependency_assessment_cancellation_closes_in_flight_read_as_unknown(
+    client, session_id, monkeypatch,
+):
+    install(monkeypatch, [{"id": "lh", "displayName": "Lake", "type": "Lakehouse"}])
+    reading = threading.Event()
+    release = threading.Event()
+
+    def report(_client, *, on_item, on_total, **_kwargs):
+        on_total(1)
+        item = {"id": "lh", "displayName": "Lake", "type": "Lakehouse"}
+        on_item(item, "Reading upstream relations")
+        reading.set()
+        release.wait(2)
+        on_item(item, "Upstream relations read")
+        return {"dependencies": [], "connectionAccess": None}
+
+    monkeypatch.setattr(web, "_dependency_report", report)
+    started = client.post(
+        "/api/preview/dependencies/assessments",
+        params={"source_workspace_id": "ws-1", "strategy": "rebuild"},
+        headers=auth(session_id),
+    )
+    assert started.status_code == 202, started.text
+    assessment_id = started.json()["assessmentId"]
+    assert reading.wait(1)
+
+    cancelled = client.delete(
+        f"/api/preview/dependencies/assessments/{assessment_id}",
+        headers=auth(session_id),
+    )
+    assert cancelled.status_code == 202
+    assert cancelled.json()["status"] == "cancelling"
+    release.set()
+
+    snapshot = cancelled.json()
+    deadline = time.monotonic() + 2
+    while snapshot["status"] != "cancelled" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        response = client.get(
+            f"/api/preview/dependencies/assessments/{assessment_id}",
+            headers=auth(session_id),
+        )
+        snapshot = response.json()
+    assert snapshot["status"] == "cancelled"
+    step = snapshot["step"]
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["active"] is False
+    assert step["activity"][0]["actions"][-1]["state"] == "unknown"
+
+
+def test_rebuild_preview_returns_visible_names_for_review(client, session_id, monkeypatch):
+    install(monkeypatch, [{"id": "lh", "displayName": "Lake", "type": "Lakehouse"}])
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: [{"id": "existing", "displayName": "Sales-westeurope"}],
+    )
+    result = preview(client, session_id)
+    assert result["targetWorkspaceName"] == "Sales-westeurope"
+    assert result["visibleWorkspaceNames"] == ["Sales-westeurope"]
 
 
 def test_preview_recommends_reassignment_for_power_bi_only(client, session_id, monkeypatch):

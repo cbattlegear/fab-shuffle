@@ -16,6 +16,10 @@ NODE = shutil.which("node")
     "scenario",
     [
         "throttle",
+        "activity",
+        "shared_activity",
+        "dependency_warnings",
+        "dependency_errors",
         "terminal",
         "run_races",
         "filters",

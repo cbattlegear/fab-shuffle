@@ -4,6 +4,7 @@ import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,7 +12,7 @@ from fastapi.testclient import TestClient
 from fabshuffle import journal
 from fabshuffle.auth import ServicePrincipal, TokenProvider
 from fabshuffle.config import SETTINGS
-from fabshuffle.orchestrator import MigrationPlan
+from fabshuffle.orchestrator import MigrationPlan, Strategy
 from fabshuffle.run import REGISTRY, MigrationRun, RunStatus, StepStatus
 from fabshuffle.web import app as web
 
@@ -42,6 +43,7 @@ def client(monkeypatch) -> TestClient:
     registry = RunRegistry()
     monkeypatch.setattr(web, "REGISTRY", registry)
     monkeypatch.setitem(globals(), "REGISTRY", registry)
+    monkeypatch.setattr(web.workspaces, "list_workspaces", lambda _client: [])
     return TestClient(web.app)
 
 
@@ -120,6 +122,35 @@ def test_run_lifecycle_and_event_stream(client: TestClient, session_id: str, mon
 
     run = REGISTRY.get(run_id)
     assert run is not None and run.status == RunStatus.SUCCEEDED
+
+
+def test_reassign_start_does_not_check_existing_workspace_name(client, session_id, monkeypatch):
+    monkeypatch.setattr(web, "build_plan", lambda *args, **kwargs: replace(PLAN, strategy=Strategy.REASSIGN))
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: pytest.fail("Reassignment should not check workspace name availability"),
+    )
+    monkeypatch.setattr(web, "run_migration", lambda run, *a, **k: run.mark_finished(RunStatus.SUCCEEDED))
+    response = client.post(
+        "/api/runs", headers=auth(session_id), json={"capacity_id": "cap-1", "source_workspace_id": "ws-1"},
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_reassign_resume_without_target_does_not_check_name(client, session_id, journal_dir, monkeypatch):
+    run_id = uuid.uuid4().hex
+    book = journal.Journal(SETTINGS.journal_for(run_id))
+    book.run_created(web._plan_record(replace(PLAN, strategy=Strategy.REASSIGN)), cleanup=True)
+    book.finished("failed", "assignment failed")
+    monkeypatch.setattr(
+        web.workspaces, "list_workspaces",
+        lambda _client: pytest.fail("Reassignment should not check workspace name availability"),
+    )
+    monkeypatch.setattr(web, "run_migration", lambda run, *a, **k: run.mark_finished(RunStatus.SUCCEEDED))
+    review = client.get(f"/api/runs/{run_id}/resume-plan", headers=auth(session_id))
+    assert review.status_code == 200, review.text
+    response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
+    assert response.status_code == 200, response.text
 
 
 def test_event_stream_requires_a_session(client: TestClient, session_id: str, monkeypatch):
@@ -231,6 +262,37 @@ def test_resuming_a_run_that_finished_is_allowed(
     response = client.post(f"/api/runs/{run_id}/resume", headers=auth(session_id))
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("legacy_confirmation", [False, True])
+def test_file_copy_start_and_legacy_resume_do_not_require_confirmation(
+    client, session_id, journal_dir, monkeypatch, legacy_confirmation,
+):
+    seen = []
+
+    def build(*_args, **kwargs):
+        assert "write_freeze_confirmed" not in kwargs
+        return replace(PLAN, include_data=False, include_files=True, write_freeze_confirmed=False)
+
+    def migrate(run, principal, plan, **kwargs):
+        seen.append(plan)
+        run.mark_finished(RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(web, "build_plan", build)
+    monkeypatch.setattr(web, "run_migration", migrate)
+    started = client.post(
+        "/api/runs", headers=auth(session_id),
+        json={"capacity_id": "cap-1", "source_workspace_id": "ws-1", "include_data": False,
+              "include_files": True, "write_freeze_confirmed": legacy_confirmation},
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["plan"]["writeFreezeConfirmed"] is False
+    old_run = write_journal()
+    resumed = client.post(f"/api/runs/{old_run}/resume", headers=auth(session_id))
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["plan"]["writeFreezeConfirmed"] is False
+    assert not seen[-1].write_freeze_confirmed
+    assert journal.read(SETTINGS.journal_for(old_run)).plan["write_freeze_confirmed"] is True
 
 
 def test_resuming_a_run_that_finished_retries_what_it_left_behind(

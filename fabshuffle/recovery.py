@@ -25,6 +25,8 @@ def restart_blocker(replay: journal.Replay) -> str:
         return "The recorded destination or scratch workspace is the source; deletion is refused."
     if replay.copy_jobs:
         return "Copy Jobs may still be running. Resume and reconcile them before full restart."
+    if replay.sql_effects:
+        return "SQL constraints or triggers need reconciliation before full restart."
     return ""
 
 

@@ -17,7 +17,7 @@ always rebuild; single-principal runs can reassign Power BI-only workspaces or r
 | Warehouse schema | SqlPackage extract, UnpackDacPac script, TDS execution | Destination-aware DacFx script with security exclusions |
 | Warehouse rows | Native Fabric Copy Jobs | Independently authenticated SQL row streaming |
 | Fabric SQL database schema | Export/apply item definition | Destination-aware SQL schema transfer with security exclusions |
-| Fabric SQL database rows | One native bcp table export/import at a time | Independently authenticated SQL row streaming |
+| Fabric SQL database rows | SQL Server Copy Jobs with automatically created connections | Independently authenticated SQL row streaming |
 | KQL rows | Cross-cluster `.set-or-replace` | Source query streaming and destination ingestion; target update policies disabled |
 | Cosmos DB documents | SDK reads and upserts | SDK reads/upserts with separate source and destination credentials |
 
@@ -26,10 +26,57 @@ do not use that workspace or native cross-tenant Copy Jobs as transport. Both mo
 local staging where needed, independently of whether that filesystem is a Docker volume or
 an Azure Files mount.
 
-The bcp path writes a SQL access token to an owner-only temporary file (mode `0600`,
-UTF-16LE without a BOM) and removes it in `finally`. This is not a saved session credential
-or recovery-journal entry. A hard process termination can bypass normal cleanup; protect
-the container filesystem and do not reuse temporary token files.
+For single-principal SQL row copies, Fab Shuffle uses the signed-in service principal to
+create a shareable SQL Server connection for each endpoint after the destination exists.
+The [Fabric create-connection API](https://learn.microsoft.com/rest/api/fabric/core/connections/create-connection)
+requires the Fabric admin to allow service principals to create connections. Fab Shuffle requests
+the SQL Server connection directly and lets Fabric test it. Fabric stores the connection credentials;
+the local journal stores connection names and IDs, never the secret. The connections remain
+in Fabric after the migration; don't change or delete them while a run may need to resume.
+If an accepted create response is lost, Fab Shuffle looks for its recorded connection and
+refuses to create a duplicate if it cannot verify the result.
+
+If Fabric rejects provisioning, check the service error and resolve the permissions or endpoint
+issue before resuming. Grant the signed-in principal CONTROL on the destination database.
+Pause writes to both databases and keep the migration-owned connections unchanged while copying.
+An unfinished Copy Job from an older preview that used manually supplied connections cannot
+resume without the original migration-owned connection records. Verify in Fabric that the old
+job is no longer writing before starting a fresh migration to a new destination.
+
+The Copy Job uses the supplied SQL Server Append shape. Before submission Fab Shuffle checks
+the connection paths and verifies destination tables are empty; enabled row-level security
+prevents that proof. Before appending, Fab Shuffle records and disables relevant enabled
+destination foreign keys, check constraints and DML triggers. Originally disabled objects
+remain disabled. After the job reaches a confirmed terminal state, it restores the prior
+enabled and trust states; previously trusted constraints are validated against the copied
+data. If restoration fails, resolve the reported SQL error and resume; the run is not
+considered successfully copied until restoration succeeds. While a job's outcome is unknown,
+its recorded objects remain suspended and the job is reconciled before they are restored.
+See Microsoft's guidance on disabling
+[foreign keys](https://learn.microsoft.com/sql/relational-databases/tables/disable-foreign-key-constraints-with-insert-and-update-statements?view=sql-server-ver17),
+[check constraints](https://learn.microsoft.com/sql/relational-databases/tables/disable-check-constraints-with-insert-and-update-statements?view=sql-server-ver17),
+and [triggers](https://learn.microsoft.com/sql/t-sql/statements/disable-trigger-transact-sql?view=sql-server-ver17).
+
+A confirmed failed job may leave partial rows: on retry, Fab Shuffle clears its destination
+tables using transactional `DELETE` while the recorded constraints and triggers are
+suspended. `TRUNCATE` cannot clear tables referenced by foreign keys even if those keys are
+disabled ([SQL Server documentation](https://learn.microsoft.com/sql/t-sql/statements/truncate-table-transact-sql?view=sql-server-ver17)).
+The clear is permitted only for the same verified target and transfer definition,
+and does not reset identity counters. If restoring a failed job's constraints fails because
+its partial data is inconsistent, resuming may clear the partial tables before restoring
+them; another retry can then start the copy. If clearing fails, resolve the reported SQL error
+before resuming. A created but unsubmitted job may be submitted once; an unresolved submitted
+job is polled, never resubmitted. Pause writes to both
+databases until copying and final reconciliation finish; this is not enforced by a database lock.
+Validate row values, identity columns, constraints and application behavior
+before cutover.
+
+The user supplied a working SQL Server connection definition for Fabric SQL databases, but
+this implementation has not been live-verified. Microsoft's
+[SQL Server connector overview](https://learn.microsoft.com/fabric/data-factory/connector-sql-server-database-overview)
+states that service principal authentication applies only to SQL Server on Azure VMs.
+The Copy Job definition and Fabric SQL connection behavior have not been independently
+live-verified.
 
 ## Dependency order
 
@@ -46,7 +93,7 @@ pin the sequence. Later phases may only rely on mappings established earlier.
 | `lakehouses` | Create lakehouses before stores and definitions that reference their data or SQL endpoints. Move eligible tables and files. |
 | `warehouses` | Transfer schema before rows so later consumers have destinations to bind. |
 | `sqldatabases` | Recreate Fabric SQL databases and Cosmos DB databases, then copy eligible data using the mode-specific paths above. |
-| `connections` | Validate only explicit operator mappings against the destination. With no mappings, there is no validation work. No connection is automatically created or adopted by name. |
+| `connections` | Trace referenced endpoints; reconcile eligible SQL Database service-principal connections and validate existing explicit mappings before creating consumers. |
 | `mirrored` | Recreate mirrored stores and map returned SQL endpoint identities. Database mirrors arrive stopped; an explicit start option runs here before shortcuts. Databricks catalog sync remains disabled. |
 | `shortcuts` | Reconcile lakehouse and KQL shortcuts after their target stores exist. Refresh lakehouse SQL endpoint metadata, then transfer endpoint schema. |
 | `realtime` | Recreate KQL querysets/dashboards and eligible eventstreams. Paired eventstreams are withheld because inactive creation is not established for every node. |
@@ -57,6 +104,22 @@ pin the sequence. Later phases may only rely on mappings established earlier.
 | `connectionadvisory` | Persist a read-only snapshot of visible connections targeting the source; do not mutate connections or item mappings. |
 | `permissions` | Replay remaining workspace roles only when enabled for a single-principal run. Paired runs never copy access assignments. |
 | Cleanup | After content phases, reconcile tracked jobs and remove owned scratch resources when requested. Retain journals for recovery. |
+
+Live progress shows each stage's tracked work-item count as completed/total. The denominator
+comes from the stage's candidate worklist, not the bounded activity display; the numerator
+advances once when a tracked item reaches a terminal state (including failed or explicitly
+unknown outcomes), rather than once per API call. Expand an item to see its recent actions.
+Review uses the same activity presentation for its read-only dependency walk. A total remains
+indeterminate (`?`) when the worklist cannot be known in advance.
+Migration dependency progress includes known source-definition, shortcut, and relation
+read candidates before the first item read; the total grows when connection-binding
+candidates are discovered. Review does not perform the migration-only source-reference scan.
+Dependency reads overlap at most four items, with paced requests and a shared cooldown when
+Fabric returns 429. Finished reads free a worker immediately even when an earlier read is
+still waiting; results are aggregated in input order and connection scans buffer only IDs.
+Logs record aggregate counts and elapsed time for relation, connection
+definition, and shortcut reads, without recording definition contents. Times are wall-clock
+durations, including pacing and overlapping requests, not sums of individual request times.
 
 In single-principal rebuilds, source workspace **Admin** assignments are attempted during
 workspace creation even when final permission copying is disabled. This preserves human
@@ -73,15 +136,28 @@ and destination workspace/item IDs; its metadata is read with the corresponding 
 Connection detection and connection cutover advisories serve different purposes:
 
 - Dependency checks inspect connections actually referenced by selected items or shortcuts.
-  Explicit mappings are validated after the relevant stores exist.
+  SQL Server paths are matched by the complete server/database pair. A same-tenant connection
+  that uniquely matches a migrated Fabric SQL database receives a recorded, destination-bound
+  ShareableCloud replacement using the signed-in service principal and safe organizational
+  privacy/no-SSO defaults; original authentication and usage settings are not copied. Fabric
+  does not return the original credential identity or secret, so the replacement identity and
+  permissions may differ. The run warning names the replacement and points to **Settings >
+  Manage connections and gateways** to edit it. Existing access assignments are reconciled
+  only when source metadata matches the previously supported ShareableCloud/service-principal
+  rules; other replacements are not automatically shared. The run warning asks operators to
+  review or share those connections in the UI as needed. Ambiguous, unsupported, inaccessible
+  or cross-tenant source endpoints remain blocked; explicit mappings are validated after the
+  relevant stores exist. Discovery covers structured IDs in readable JSON parts and supported
+  shortcuts, not dynamically constructed or opaque references.
+  Missing endpoint metadata on another store does not veto a verified external connection
+  or an exact SQL endpoint match. Connection names are never used to infer its destination.
 - Cutover advisories inventory all connections visible to the source credential. SQL paths
   require a server/database pair, not a database GUID or name in isolation. Other paths use
   recognised literal source references. This does not prove which consumers still use a
   connection.
 
-Neither path creates, adopts by name, deletes, or copies credentials/sharing for a connection.
-An earlier automatic-recreation path was deliberately removed: matching a friendly name is
-not proof of identity, and existing connection secrets cannot be faithfully exported.
+The advisory scan never mutates connections. Migration never adopts a connection by name
+without a durable creation intent, deletes the original, or copies an existing secret.
 Old identifier-only advisory snapshots are withheld as stale rather than silently treated
 as new exact-pair results.
 
@@ -106,8 +182,23 @@ SQL schema jobs use private staging for DACPACs, generated scripts, tool tempora
 and logs, then remove it on exit. Schema disk usage is monitored; an external process can
 overshoot between checks. Script reading, SQLCMD expansion, reference rewriting and batch
 materialization have separate memory checks. Neither budget is an OS-level aggregate quota.
-Legacy single-principal bcp native exports remain outside this disk
-budget (Files are streamed and never staged); see [storage sizing](../README.md#choosing-the-azure-files-size).
+Files are streamed and SQL Copy Jobs do not stage their rows locally; see
+[storage sizing](../README.md#choosing-the-azure-files-size).
+
+Schema connection setup is retried before DDL. A disconnect during a prefix consisting only
+of known session SET options and literal PRINT statements can reconnect and replay that
+prefix. Once any other SQL has been submitted, a communication failure stops the script:
+later batches are not sent over the broken connection and uncertain batches are not replayed.
+Inspect the destination and regenerate a target-aware deployment before retrying DDL.
+
+Eventstream creation retries the reported `ArtifactOperationConflict` only after its LRO
+has ended as Failed, a bounded wait, and a paginated destination check finds no matching
+Eventstream. An existing or partially created item is never adopted or overwritten by name.
+Timeouts, transport losses and other failures are not replayed. The service's conflict code
+and message remain visible when retries are exhausted. Its internal conflicting operation
+cannot be identified from that error alone. LRO polling honors `Retry-After` and waits for
+terminal operation state, including HTTP 200 responses whose status is still Running.
+An unrecognized operation status is reported explicitly, not accepted as completion.
 
 ## Item-specific history and constraints
 
@@ -173,8 +264,9 @@ accepts source credentials plus a destination object:
 ```
 
 Use the returned `sessionId` in `X-Fab-Shuffle-Session`. `POST /api/preview/dependencies`
-and `POST /api/runs` accept options including `write_freeze_confirmed`,
-`start_database_mirrors`, `connection_mappings` and `reference_mappings`.
+and `POST /api/runs` accept options including `start_database_mirrors`,
+`connection_mappings` and `reference_mappings`. The legacy `write_freeze_confirmed` field
+is accepted for compatibility but ignored; it does not gate a copy.
 External references contain `source_workspace_id`, `source_item_id`,
 `target_workspace_id` and `target_item_id`.
 

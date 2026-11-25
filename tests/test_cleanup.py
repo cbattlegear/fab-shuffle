@@ -42,7 +42,7 @@ def test_cleanup_deletes_the_workspace_without_touching_items(tmp_path):
     client = FakeClient()
     run = make_run()
 
-    warnings = orchestrator.cleanup_run(run, client, tmp_path)
+    warnings = orchestrator.cleanup_run(run, client, tmp_path / "staging")
 
     assert warnings == []
     assert client.deleted == [f"workspaces/{SCRATCH_ID}"]
@@ -52,11 +52,15 @@ def test_cleanup_deletes_the_workspace_without_touching_items(tmp_path):
     step = run.snapshot()["steps"][0]
     assert step["id"] == "cleanup"
     assert step["status"] == StepStatus.SUCCEEDED
+    assert step["activityTotal"] == 1
+    assert step["activityCompleted"] == 1
 
 
 def test_cleanup_reports_a_failed_workspace_delete_without_raising(tmp_path):
     run = make_run()
-    warnings = orchestrator.cleanup_run(run, FakeClient(fail_workspace_delete=True), tmp_path)
+    warnings = orchestrator.cleanup_run(
+        run, FakeClient(fail_workspace_delete=True), tmp_path / "staging",
+    )
 
     assert len(warnings) == 1 and SCRATCH_ID in warnings[0]
     # The workspace is still tracked so the operator can retry.
@@ -74,6 +78,28 @@ def test_cleanup_removes_local_staging(tmp_path):
     orchestrator.cleanup_run(run, FakeClient(), staging)
 
     assert not staging.exists()
+    step = run.snapshot()["steps"][0]
+    assert step["activityTotal"] == 2
+    assert step["activityCompleted"] == 2
+
+
+def test_cleanup_reports_local_staging_delete_failure(monkeypatch, tmp_path):
+    staging = tmp_path / "run-scratch"
+    staging.mkdir()
+
+    def fail_delete(_path):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(orchestrator.shutil, "rmtree", fail_delete)
+    run = MigrationRun(source_workspace_name="Sales", capacity_name="F64")
+    warnings = orchestrator.cleanup_run(run, FakeClient(), staging)
+
+    assert len(warnings) == 1 and "access denied" in warnings[0]
+    step = run.snapshot()["steps"][0]
+    assert step["status"] == StepStatus.FAILED
+    assert step["activityTotal"] == 1
+    assert step["activityCompleted"] == 1
+    assert step["activity"][0]["actions"][-1]["state"] == "failed"
 
 
 # --------------------------------------------------------- leftover discovery

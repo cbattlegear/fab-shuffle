@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -25,7 +28,22 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _SAFE_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# Below the documented 200/minute item-definition quota for this client's assessment.
+_ASSESSMENT_REQUEST_INTERVAL = 0.35
 _TERMINAL_OPERATION_STATES = frozenset({"Succeeded", "Failed", "Undefined"})
+_LOG_ROUTE_SEGMENTS = frozenset({
+    "v1", "workspaces", "items", "operations", "result", "connections", "relations",
+    "upstream", "downstream", "getDefinition", "updateDefinition", "jobs", "instances",
+    "lakehouses", "warehouses", "eventhouses", "sqlDatabases", "shortcuts",
+})
+
+
+def _log_route(url: str) -> str:
+    """Keep only fixed route components, never query parameters or resource names."""
+    return "/".join(
+        part if part in _LOG_ROUTE_SEGMENTS else "{resource}"
+        for part in urlsplit(url).path.split("/") if part
+    )
 
 
 class FabricError(RuntimeError):
@@ -129,6 +147,10 @@ class FabricClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._tokens = tokens
+        self._throttle_condition = threading.Condition()
+        self._throttle_until = 0.0
+        self._throttle_next = 0.0
+        self._throttle_check: Callable[[], None] | None = None
         self.base_url = base_url.rstrip("/")
         self._http = httpx.Client(
             timeout=httpx.Timeout(SETTINGS.request_timeout_seconds),
@@ -169,6 +191,33 @@ class FabricClient:
             headers.update(extra)
         return headers
 
+    @contextmanager
+    def coordinated_throttling(self, check_cancelled: Callable[[], None] | None = None) -> Iterator[None]:
+        """Share a 429 cooldown between the concurrent reads of one assessment."""
+        with self._throttle_condition:
+            self._throttle_until = 0.0
+            self._throttle_next = 0.0
+            self._throttle_check = check_cancelled or (lambda: None)
+        try:
+            yield
+        finally:
+            with self._throttle_condition:
+                self._throttle_check = None
+                self._throttle_until = 0.0
+                self._throttle_next = 0.0
+                self._throttle_condition.notify_all()
+
+    def _wait_for_throttle(self) -> None:
+        with self._throttle_condition:
+            while self._throttle_check is not None:
+                self._throttle_check()
+                now = time.monotonic()
+                remaining = max(self._throttle_until, self._throttle_next) - now
+                if remaining <= 0:
+                    self._throttle_next = now + _ASSESSMENT_REQUEST_INTERVAL
+                    break
+                self._throttle_condition.wait(min(remaining, 0.1))
+
     def request(
         self,
         method: str,
@@ -196,6 +245,9 @@ class FabricClient:
         attempts = max(1, SETTINGS.max_retries)
 
         for attempt in range(1, attempts + 1):
+            self._wait_for_throttle()
+            route = _log_route(url)
+            logger.debug("Fabric API %s %s attempt %s/%s", method, route, attempt, attempts)
             try:
                 response = self._http.request(
                     method,
@@ -205,6 +257,7 @@ class FabricClient:
                     params=params,
                     headers=self._headers(headers),
                 )
+                logger.debug("Fabric API %s %s returned HTTP %s", method, route, response.status_code)
             except httpx.RequestError as error:
                 if not safe_read or attempt == attempts or not isinstance(error, httpx.TransportError):
                     raise FabricTransportError(method, url, attempt, error) from error
@@ -220,6 +273,15 @@ class FabricClient:
             retryable = response.status_code == 429 or (
                 safe_read and response.status_code in RETRYABLE_STATUS
             )
+            if response.status_code == 429:
+                delay = _retry_after_seconds(response, fallback=min(60.0, 2.0 ** attempt))
+                with self._throttle_condition:
+                    coordinated = self._throttle_check is not None
+                    if coordinated:
+                        self._throttle_until = max(self._throttle_until, time.monotonic() + delay)
+                        self._throttle_condition.notify_all()
+            else:
+                coordinated = False
             if retryable and attempt < attempts:
                 delay = _retry_after_seconds(response, fallback=min(60.0, 2.0 ** attempt))
                 logger.warning(
@@ -231,7 +293,8 @@ class FabricClient:
                     attempt,
                     attempts,
                 )
-                time.sleep(delay)
+                if not coordinated:
+                    time.sleep(delay)
                 continue
 
             if expected is not None:
@@ -357,11 +420,13 @@ class FabricClient:
 
     def wait_for_operation(self, operation_id: str, *, poll_seconds: float | None = None) -> dict[str, Any]:
         """Poll ``/operations/{id}`` until it succeeds, then return its result body."""
-        delay = poll_seconds or SETTINGS.lro_poll_seconds
+        delay = SETTINGS.lro_poll_seconds if poll_seconds is None else poll_seconds
         deadline = time.monotonic() + SETTINGS.lro_timeout_seconds
 
         while True:
-            state = self.get(f"operations/{operation_id}")
+            time.sleep(delay)
+            response = self.request("GET", f"operations/{operation_id}")
+            state = self._json(response)
             status = state.get("status", "Running")
 
             if status == "Succeeded":
@@ -380,17 +445,34 @@ class FabricClient:
                     f"Operation {operation_id} did not complete within "
                     f"{SETTINGS.lro_timeout_seconds}s (last status {status})"
                 )
-            time.sleep(delay)
+            delay = _retry_after_seconds(response, delay)
 
     def _poll_location(self, location: str, *, poll_seconds: float) -> dict[str, Any]:
         deadline = time.monotonic() + SETTINGS.lro_timeout_seconds
+        delay = poll_seconds
         while True:
+            time.sleep(delay)
             response = self.request("GET", location, expected=(200, 201, 202))
-            if response.status_code != 202:
-                return self._json(response)
+            payload = self._json(response)
+            status = payload.get("status")
+            if isinstance(status, str) and status in _TERMINAL_OPERATION_STATES:
+                if status != "Succeeded":
+                    raise OperationFailed(location, status, payload.get("error"))
+                result = response.headers.get("Location") or f"{location.rstrip('/')}/result"
+                try:
+                    return self.get(result)
+                except FabricApiError as error:
+                    if error.status_code in (400, 404):
+                        return payload
+                    raise
+            if "status" in payload and status not in ("Running", "NotStarted"):
+                raise FabricError(f"Operation at {location} returned an unrecognized status: {status!r}")
+            if response.status_code != 202 and "status" not in payload:
+                return payload
             if time.monotonic() > deadline:
                 raise OperationTimeout(f"Operation at {location} did not complete in time")
-            time.sleep(_retry_after_seconds(response, poll_seconds))
+            location = response.headers.get("Location") or location
+            delay = _retry_after_seconds(response, poll_seconds)
 
 
 __all__ = [

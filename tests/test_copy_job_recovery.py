@@ -30,6 +30,110 @@ def spec():
     )
 
 
+def test_terminal_restoration_precedes_success_checkpoint_and_is_retried(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    calls = []
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: {"id": "copy"})
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *a: copyjobs._CopyJobSubmission("instance", 0))
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *a: ("Completed", {}))
+    def failed_restore(job):
+        assert not journal.read(ctx.journal.path).data_is_done("lakehouse", "tables")
+        calls.append(job.last_status)
+        raise RuntimeError("constraint validation failed")
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="constraint validation failed"):
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [spec()], "lakehouse", on_terminal=failed_restore)
+    replay = journal.read(ctx.journal.path)
+    assert not replay.data_is_done("lakehouse", "tables")
+    assert replay.copy_jobs[("lakehouse", "copy-lakehouse")]["job"]["last_status"] == "Completed"
+    second = make_context(tmp_path, prior=replay)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: pytest.fail("must poll existing job"))
+    orchestrator._run_copy_jobs(
+        second, "lakehouses", [spec()], "lakehouse", on_terminal=lambda job: calls.append(job.last_status),
+    )
+    assert calls == ["Completed", "Completed"]
+    assert journal.read(second.journal.path).data_is_done("lakehouse", "tables")
+
+
+def test_unresolved_job_never_invokes_terminal_restoration(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: {"id": "copy"})
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *a: copyjobs._CopyJobSubmission("instance", 0))
+    def unavailable(*_):
+        raise FabricError("Cannot read job status")
+    monkeypatch.setattr(copyjobs, "_job_status", unavailable)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete):
+        orchestrator._run_copy_jobs(
+            ctx, "lakehouses", [spec()], "lakehouse",
+            on_terminal=lambda *_: pytest.fail("Unknown job may still be writing"),
+        )
+
+
+def test_preflight_failure_restores_effects_before_leaving_unsubmitted_job(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: {"id": "copy"})
+    def reject(_spec):
+        raise RuntimeError("destination is not empty")
+    restored = []
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="destination is not empty"):
+        orchestrator._run_copy_jobs(
+            ctx, "lakehouses", [spec()], "lakehouse", before_submit=reject,
+            check_before_create=False, on_terminal=lambda job: restored.append(job.submission_state),
+        )
+    assert restored == ["created"]
+    job = journal.read(ctx.journal.path).copy_jobs[("lakehouse", "copy-lakehouse")]["job"]
+    assert job["instance_id"] is None
+
+
+def test_rejected_submission_remains_recoverable_if_restoration_fails(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: {"id": "copy"})
+    def reject(*_):
+        raise FabricApiError("POST", "instances", 400, '{"errorCode":"Nope","message":"refused"}')
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", reject)
+    def failed_restore(_job):
+        raise RuntimeError("restore failed")
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="restore failed"):
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [spec()], "lakehouse", on_terminal=failed_restore)
+    job = journal.read(ctx.journal.path).copy_jobs[("lakehouse", "copy-lakehouse")]["job"]
+    assert job["submission_state"] == "created"
+    assert job["instance_id"] is None
+
+
+def test_terminal_service_error_survives_failed_restoration(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *a: {"id": "copy"})
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *a: copyjobs._CopyJobSubmission("instance", 0))
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *a: ("Failed", {
+        "failureReason": {"errorCode": "SqlOperationFailed", "message": "foreign key conflict"},
+    }))
+    def failed_restore(_job):
+        raise RuntimeError("restore failed")
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="restore failed") as raised:
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [spec()], "lakehouse", on_terminal=failed_restore)
+    job = journal.read(ctx.journal.path).copy_jobs[("lakehouse", "copy-lakehouse")]["job"]
+    assert "SqlOperationFailed" in job["last_error"]
+    assert "foreign key conflict" in job["last_error"]
+    assert "SqlOperationFailed" in str(raised.value)
+    assert "foreign key conflict" in str(raised.value)
+
+
+def test_sql_effect_state_survives_resume_and_can_be_cleared(tmp_path):
+    ctx = make_context(tmp_path)
+    state = {"server": "target", "database": "db", "tables": [["dbo", "A"]], "effects": []}
+    ctx.journal.sql_effects("lakehouse", "target-lakehouse", state)
+    replay = journal.read(ctx.journal.path)
+    second = make_context(tmp_path, prior=replay)
+    assert second.sql_effects["lakehouse"] == {"target": "target-lakehouse", "state": state}
+    second.journal.sql_effects("lakehouse", "target-lakehouse", None)
+    assert journal.read(second.journal.path).sql_effects == {}
+
+
 def test_lost_progress_is_durable_and_resume_polls_without_starting_again(tmp_path, monkeypatch):
     ctx = make_context(tmp_path)
     creates, starts = [], []
@@ -220,3 +324,131 @@ def test_created_but_unsubmitted_job_is_started_without_recreation(tmp_path, mon
     assert orchestrator._run_copy_jobs(second, "lakehouses", [spec()], "lakehouse") == []
     assert submissions == [(second.client, "scratch", "copy")]
     assert journal.read(second.journal.path).copy_jobs == {}
+
+
+def test_preflight_failure_does_not_create_or_submit_a_job(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *args: pytest.fail("must not create"))
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *args: pytest.fail("must not submit"))
+
+    def reject(_spec):
+        raise ValueError("destination is not empty")
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match=r"destination is not empty.*resume"):
+        orchestrator._run_copy_jobs(ctx, "lakehouses", [spec()], "lakehouse", before_submit=reject)
+    assert not journal.read(ctx.journal.path).copy_jobs
+
+
+def test_preflight_failure_keeps_existing_unsubmitted_job(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    ctx.journal.copy_job({
+        "workspace_id": "scratch", "copy_job_id": "copy", "instance_id": None,
+        "item_id": "lakehouse", "display_name": "copy-lakehouse", "label": "Lakehouse",
+        "submission_state": "created",
+    }, target_id="target-lakehouse")
+    second = make_context(tmp_path, prior=journal.read(ctx.journal.path))
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *args: pytest.fail("must not submit"))
+
+    def reject(_spec):
+        raise ValueError("destination is not empty")
+
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match=r"destination is not empty.*resume"):
+        orchestrator._run_copy_jobs(second, "lakehouses", [spec()], "lakehouse", before_submit=reject)
+    saved = journal.read(second.journal.path).copy_jobs[("lakehouse", "copy-lakehouse")]["job"]
+    assert saved["submission_state"] == "created" and saved["instance_id"] is None
+
+
+def test_failed_sql_job_records_target_bound_retry_before_clearing(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    sql_spec = copyjobs.CopyJobSpec(
+        workspace_id="scratch", display_name="sql-copy", content={},
+        label="SQL", item_id="lakehouse", fingerprint="definition",
+    )
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *args: {"id": "copy"})
+    monkeypatch.setattr(
+        copyjobs, "_submit_copy_job", lambda *args: copyjobs._CopyJobSubmission("instance", 0),
+    )
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *args: ("Failed", {
+        "status": "Failed", "failureReason": {"errorCode": "CopyFailed", "message": "failed"},
+    }))
+    warnings = orchestrator._run_copy_jobs(ctx, "sqldatabases", [sql_spec], "SQL database")
+    replay = journal.read(ctx.journal.path)
+    key = ("lakehouse", "sql_retry", "definition")
+    assert key in replay.data_done
+    assert replay.data_targets[key] == "target-lakehouse"
+    assert not replay.copy_jobs
+    assert warnings and "Failed" in warnings[0]
+
+
+def test_deduped_sql_job_does_not_authorize_truncation(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    sql_spec = copyjobs.CopyJobSpec(
+        workspace_id="scratch", display_name="sql-copy", content={},
+        label="SQL", item_id="lakehouse", fingerprint="definition",
+    )
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *args: {"id": "copy"})
+    monkeypatch.setattr(
+        copyjobs, "_submit_copy_job", lambda *args: copyjobs._CopyJobSubmission("instance", 0),
+    )
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *args: ("Deduped", {"status": "Deduped"}))
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="Deduped"):
+        orchestrator._run_copy_jobs(ctx, "sqldatabases", [sql_spec], "SQL database")
+    saved = journal.read(ctx.journal.path)
+    assert saved.copy_jobs
+    assert ("lakehouse", "sql_retry", "definition") not in saved.data_done
+
+
+def test_failed_job_is_repolled_if_terminal_checkpoint_is_interrupted(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    sql_spec = copyjobs.CopyJobSpec(
+        workspace_id="scratch", display_name="sql-copy", content={},
+        label="SQL", item_id="lakehouse", fingerprint="definition",
+    )
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs.SETTINGS, "copy_job_poll_seconds", 0)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *args: {"id": "copy"})
+    monkeypatch.setattr(
+        copyjobs, "_submit_copy_job", lambda *args: copyjobs._CopyJobSubmission("instance", 0),
+    )
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *args: ("Failed", {"status": "Failed"}))
+    write = ctx.journal.copy_job
+
+    def interrupted(job, *, target_id, active=True):
+        if not active:
+            raise OSError("journal unavailable")
+        write(job, target_id=target_id, active=active)
+
+    monkeypatch.setattr(ctx.journal, "copy_job", interrupted)
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="journal unavailable"):
+        orchestrator._run_copy_jobs(ctx, "sqldatabases", [sql_spec], "SQL database")
+    saved = journal.read(ctx.journal.path)
+    assert saved.copy_jobs and ("lakehouse", "sql_retry", "definition") in saved.data_done
+    second = make_context(tmp_path, prior=saved)
+    monkeypatch.setattr(copyjobs, "create_copy_job", lambda *args: pytest.fail("must reconcile first"))
+    monkeypatch.setattr(copyjobs, "_submit_copy_job", lambda *args: pytest.fail("must not resubmit"))
+    assert orchestrator._run_copy_jobs(second, "sqldatabases", [sql_spec], "SQL database")
+    assert not journal.read(second.journal.path).copy_jobs
+
+
+def test_running_changed_definition_is_polled_but_never_checkpointed(tmp_path, monkeypatch):
+    ctx = make_context(tmp_path)
+    ctx.journal.copy_job({
+        "workspace_id": "scratch", "copy_job_id": "copy", "instance_id": "instance",
+        "item_id": "lakehouse", "display_name": "copy-lakehouse", "label": "Lakehouse",
+        "submission_state": "submitted", "fingerprint": "old",
+    }, target_id="target-lakehouse")
+    second = make_context(tmp_path, prior=journal.read(ctx.journal.path))
+    changed = copyjobs.CopyJobSpec(
+        workspace_id="scratch", display_name="copy-lakehouse", content={},
+        label="Lakehouse", item_id="lakehouse", fingerprint="new",
+    )
+    polls = []
+    monkeypatch.setattr(copyjobs.time, "sleep", lambda _: None)
+    monkeypatch.setattr(copyjobs, "_job_status", lambda *a: (polls.append(1) or "Completed", {}))
+    with pytest.raises(copyjobs.CopyJobBatchIncomplete, match="different or unknown"):
+        orchestrator._run_copy_jobs(second, "lakehouses", [changed], "lakehouse")
+    replay = journal.read(second.journal.path)
+    assert polls and not replay.data_is_done("lakehouse", "tables")
+    assert replay.copy_jobs[("lakehouse", "copy-lakehouse")]["job"]["fingerprint"] == "old"

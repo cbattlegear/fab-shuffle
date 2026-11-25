@@ -43,7 +43,7 @@ principal, and destination-capacity access for the destination principal.
 
 Choose a local Docker container or Azure Container Apps. **Run and test through the Docker
 image, not a host Python preview.** It includes the required SqlPackage,
-UnpackDacPac, bcp and ODBC tools. SQL authentication uses service-principal access tokens,
+UnpackDacPac and ODBC tools. SQL authentication uses service-principal access tokens,
 not your desktop identity.
 
 ### Locally
@@ -104,7 +104,7 @@ Neither resizes the share nor changes the container's RAM allocation.
 Size for **peak concurrent staging plus retained files and headroom**, not simply the largest
 data store. Both credential modes stream lakehouse `Files/` content rather than staging whole
 directories. Delta checkpoint inspection can still use bounded disk staging; single-principal
-SQL database copies stage one native bcp table export at a time.
+SQL database rows use Fabric Copy Jobs.
 
 Run [`Get-FabShuffleStorageEstimate.ps1`](scripts/Get-FabShuffleStorageEstimate.ps1) in
 PowerShell 7+ with **Az.Accounts** and **Az.Storage**, using your user account with access
@@ -125,12 +125,8 @@ directories as a conservative legacy staging allowance. This can overestimate th
 return **Incomplete** when file enumeration fails or a source file exceeds 4 TiB, even though
 Files content is now streamed. Its `-FileConcurrency` controls that old allowance, not the
 `FAB_SHUFFLE_FILE_TRANSFER_WORKERS` setting. If the estimate is incomplete, size the required
-SQL exports, schema and checkpoint staging, retained files and headroom independently.
-
-If a single-principal run includes SQLDatabase data, supply `-LargestBcpTableGiB`: the
-largest measured or conservatively estimated native table export, **not compressed database
-storage size**. This size is not available from Fabric item metadata. Missing measurements
-or access failures produce **Incomplete**, with no quota recommendation. Metadata scans
+schema and checkpoint staging, retained files and headroom independently.
+Missing measurements or access failures produce **Incomplete**, with no quota recommendation. Metadata scans
 can take time and incur read costs; the estimate is not a guarantee against source growth.
 
 The template mounts the share through the Container Apps environment's `AzureFile` storage
@@ -156,13 +152,12 @@ copied to the share before switching; adding the mount does not copy the old eph
 3. **Pick the source workspace.**
 4. **Review** the plan. Fab Shuffle tells you whether the workspace can simply be reassigned
    or has to be rebuilt, lists anything it cannot move, and refuses to start if there is a
-   blocker.
+   blocker. For rebuilds it checks the chosen name against destination workspaces visible to
+   the service principal. This cannot guarantee availability: another workspace may be
+   invisible or created concurrently, and Fabric can still reject the name at creation.
 5. **Migrate**, watching each step report progress live, then delete the temporary artifacts.
 
 Session client secrets and the token cache are held in memory, not persisted for recovery.
-The single-principal bcp path does write a SQL access token to an owner-only temporary file
-and removes it afterward. Protect the container filesystem; an abrupt process termination
-can bypass normal cleanup.
 
 ## Migration modes
 
@@ -195,13 +190,11 @@ definitions are retained. Destination administrators must arrange human access a
 workspace identities or gateway infrastructure themselves. Sensitivity labels and tenant
 policies require destination configuration; encrypted report/model labels can prevent export.
 
-**Stop source writes before copying data or files.** The review screen requires confirmation.
-The freeze must cover scheduled jobs, ingestion, maintenance and expiration processes, and
-must remain in place through reconciliation and any retries. If the source changes, start a
-fresh migration rather than treating old checkpoints as a new snapshot. Metadata-only
-migrations can omit data and files without this confirmation. With a single service principal
-the freeze is required only for lakehouse Files, which are now streamed and verified against
-the version first read, so a file that changes mid-copy fails the transfer.
+Copies are not a point-in-time snapshot. If source writes continue, copied items may reflect
+different times and later changes may be missed, including on resume. For consistent cutover,
+pause writes (including scheduled jobs and maintenance) through copying and reconciliation;
+if the source changes, start a fresh migration rather than treating old checkpoints as a new
+snapshot. A lakehouse file changed during streaming fails its version check.
 
 On the review screen, map source connection IDs to connections configured in the destination.
 For dependencies outside the migrating workspace, provide both source and destination
@@ -227,8 +220,7 @@ budget. These are per-operation application checks, not aggregate RAM/filesystem
 Schema tools can briefly overshoot between checks and are stopped when excess is detected.
 SQL schema transfers use private, disk-budgeted staging in both credential modes and remove
 those artifacts after the transfer; script processing keeps its separate memory budget.
-The older single-principal bcp disk-staging path remains uncapped by these settings;
-size the share for its complete staging workload. Lakehouse Files no longer stage on disk.
+Lakehouse Files and SQL Copy Job rows do not stage on local disk.
 Delta preflight checks managed Tables and unmanaged Delta tables under Files for unsafe
 references; it does not rewrite logs to conceal dependencies. Unsupported features and
 budget failures are reported with corrective actions. See
@@ -291,7 +283,7 @@ unresolved dependencies; the review screen and per-item results report those sep
 | Lakehouse | Schema; tables via Copy Jobs; Files via OneLake streaming | Schema; tables and Files via OneLake streaming | Schema-enabled lakehouses supported; shortcuts excluded from table-data copy |
 | Lakehouse SQL analytics endpoint | Refresh and schema transfer | Refresh and schema transfer | Views, procedures and functions; catalog readiness is separate from byte-copy success |
 | Warehouse | T-SQL schema and Copy Job data | T-SQL schema and streamed rows | Collation preserved; paired transfer excludes source security assignments |
-| Fabric SQL database | Definition schema and bcp rows | T-SQL schema and streamed rows | Native bcp stages one table export at a time; paired schema excludes source security assignments |
+| Fabric SQL database | Definition schema and SQL Server Copy Job rows | T-SQL schema and streamed rows | Provisions SQL Server connections using sign-in credentials; paired schema excludes source security assignments |
 | Cosmos DB database | Container definitions and SDK document copy | Container definitions and independently authenticated document copy | Destination connectivity and data access required |
 | Eventhouse | Recreated | Recreated | Created before its KQL databases |
 | KQL database (`ReadWrite`) | Definition and cross-cluster data copy | Definition and streamed data | Paired target update policies remain disabled; table shortcuts reconciled separately |
@@ -304,7 +296,7 @@ unresolved dependencies; the review screen and per-item results report those sep
 | Notebook | Definition and rebinding | Definition and rebinding | Default lakehouse and environment attachment remapped |
 | Environment | Libraries and Spark settings | Libraries and Spark settings | Publish before running dependent jobs |
 | Dataflow Gen2 (CI/CD) | Definition and rebinding | Definition and rebinding | Gen1 and classic Gen2 are not supported |
-| Data pipeline / Copy Job | Definition and rebinding | Definition and rebinding | Referenced source-bound connections need explicit replacement mappings |
+| Data pipeline / Copy Job | Definition and rebinding | Definition and rebinding | Referenced connections must be verified or safely rebound |
 | Apache Airflow job | Configuration and DAG files | Configuration and DAG files with reference checks | Inspect scheduler pause settings and runtime dependencies before enabling |
 | OneLake / KQL table shortcuts | Create missing; reuse identical | Create missing; reuse identical after destination checks | No overwrite of conflicting targets |
 | Workspace folders | Recreated hierarchy and placement | Recreated hierarchy and placement | Item identities are remapped |
@@ -427,16 +419,24 @@ phase sequence and the single-principal versus paired differences.
 
 ### Connections
 
-Fab Shuffle never creates, adopts by name, or deletes a connection on the operator's behalf,
-in any mode. A connection id is tenant scoped: it can be reused within that tenant when its
-target and access are still appropriate, but it does not resolve in another tenant.
-Existing connection credentials are not exported. Automatic connection recreation was
-deliberately removed; see the [reference-safety rationale](docs/migration-details.md#reference-and-connection-safety).
+Fab Shuffle traces connections referenced by migrated items to their endpoints. An accessible
+same-tenant connection to an external store is reused unchanged. For a SQL Server connection
+whose exact endpoint uniquely matches a migrated Fabric SQL database, it creates a
+migration-owned ShareableCloud replacement to the verified destination using the signed-in
+service principal and safe organizational privacy/no-SSO defaults. The original connection's
+authentication, gateway, privacy and usage settings are not copied, and the original connection
+is not changed or deleted.
 
-Supply replacement connection IDs through `connection_mappings`, keyed by source connection
-ID. They are read back with destination credentials and validated once the relevant stores
-exist. Changed or removed mappings invalidate the old binding instead of silently preserving
-it. Without supplied mappings there is no connection-replacement phase.
+Fabric does not disclose the original connection's credential identity or secret; the
+replacement uses the signed-in principal and may therefore have different permissions. The
+run warning names the replacement and gives the path to edit it in **Settings > Manage
+connections and gateways**. Review its credentials, access and dependent items before cutover.
+Connection role assignments are copied only for connections whose existing metadata matched
+the prior service-principal/shareable-cloud rules; other replacements are not shared
+automatically, to avoid granting other principals use of a different identity. Share the
+replacement with required consumers in the UI if needed. Endpoint
+ambiguity, unsupported connector metadata, inaccessible endpoints and cross-tenant references
+remain blocked. Existing `connection_mappings` for unrelated connectors remain supported.
 
 Migration dependency checks apply only to connections that a *migrated* item or shortcut
 actually references: a data pipeline, Copy Job, eventstream, mirrored database or Activator whose exported
@@ -445,13 +445,12 @@ connection lives on the shortcut target, not in the item's own definition). Sepa
 cutover advisories report visible connections pointing into the source workspace, including
 ones no migrated item uses. That read-only inventory does not recreate connections or block
 the creation of unrelated items.
+Discovery covers structured connection IDs in readable JSON definition parts and supported
+shortcuts; it cannot prove that dynamically constructed or opaque references were found.
+Inspect those consumers before retiring the source workspace.
 
-A dependent item whose referenced connection still points into the source workspace, with no
-supplied `connection_mappings` entry for it, is refused rather than created against a
-connection that stops resolving once the source workspace is gone. The warning names the
-connection and the item and asks for a destination replacement to be created and mapped by
-hand in `connection_mappings`; it does not create one and does not promise that doing so will
-fix the underlying data source.
+A dependent item whose referenced connection cannot be verified or rebound is refused rather
+than created against a connection that stops resolving once the source workspace is gone.
 
 In single-principal mode, referenced connections that target something outside the moving
 workspace can be reused without recreation. Paired mode still needs explicit destination
@@ -568,6 +567,18 @@ resume rather than started twice; if a submission has no confirmed job or instan
 and reconcile it in Fabric before resolving its journal record. Do not delete its scratch
 workspace while completion is unknown.
 
+SQL Copy Jobs temporarily disable relevant destination constraints and DML triggers and
+record their original state for restoration after the job finishes. If restoration fails,
+resolve the reported SQL error and resume; an unresolved job is reconciled before its
+constraints or triggers are restored. Confirmed failed copies may be cleared with `DELETE`
+before retrying. Copying is not a point-in-time snapshot if source writes continue.
+
+If a rebuild stopped before recording a destination workspace, review and resume check its
+saved name against visible destination workspaces. If the name is taken, inspect the existing
+workspace in Fabric, then start a new migration with a different name; the saved plan cannot
+be renamed and the existing workspace is not adopted. A name absent from the list can still
+be rejected by Fabric, including after a concurrent create.
+
 The same machinery retries a run that *did* finish but left items behind — a connection that
 was not shared yet, say, or a workspace that could not be read. Fix the cause, press **Retry
 what did not migrate** on the progress screen to review and resume the saved attempt. Missing
@@ -587,12 +598,13 @@ Each saved migration offers two confirmed actions in addition to resuming:
 - **Full restart** deletes the recorded destination workspace and its contents, along with
   the run's recorded scratch workspace if it still exists, then returns to destination
   capacity selection. The source is retained. The next migration is a fresh run: no old item
-  mappings, completed-copy checkpoints, destination capacity or write-freeze confirmation
+  mappings, completed-copy checkpoints or destination capacity
   are reused.
 
 Neither action is available while a related migration is running. Full restart is refused
 for reassignment runs (their workspace is the source), mismatched destination confirmations,
-or unresolved Copy Jobs. Reconcile those jobs first; Ignore does not stop them.
+unresolved Copy Jobs, or SQL constraints and triggers awaiting reconciliation. Reconcile
+them first; Ignore does not stop jobs or restore SQL objects.
 If deletion fails midway, the entry remains available to **finish the full restart**, but
 cannot resume the old copy into a partly deleted destination. Only confirmed workspace
 deletions are skipped on the next restart attempt. Service errors are retained in the message.
@@ -604,10 +616,25 @@ Two things follow from this:
 - **Journals live on the volume**, under `local/journal` for single-principal runs or
   `local/journal-paired-v1` for paired runs. They hold workspace and item ids and
   names — the same things the screen shows — and no credentials. The hundred most recent are
-  kept, along with the latest recoverable attempts and unresolved Copy Jobs.
+  kept, along with the latest recoverable attempts, unresolved Copy Jobs, and recorded SQL
+  effects awaiting restoration.
 
 Without a mounted volume the journal goes when the container does, and there is nothing to
 pick up. That is the main reason the `docker run` line above mounts one.
+
+### Migration activity and logging
+
+Expand a migration stage to see its recorded item actions as they happen. The live view
+retains up to 50 recently active items per stage and five recent actions per item. Older
+entries are evicted, preferring completed items, with an eviction count shown in the view.
+Expand each item to see its action history. These actions report work, not cutover-readiness
+guarantees.
+
+Set `FAB_SHUFFLE_LOG_LEVEL` to `basic` (default, stage transitions), `verbose` (stages
+and item actions), or `debug` (also Fabric API request status and workstream diagnostics),
+for example `docker run -e FAB_SHUFFLE_LOG_LEVEL=verbose ...`. Warnings and errors remain
+visible in every mode. Request bodies, credentials and arbitrary SqlPackage output are not
+logged; debug streams only recognized safe SqlPackage progress lines and exit status.
 
 ### Building the image yourself
 
@@ -666,7 +693,7 @@ Every setting has a sensible default; override with environment variables when n
 | `FAB_SHUFFLE_HOST` | `0.0.0.0` | Bind address |
 | `FAB_SHUFFLE_SCRATCH` | `/app/local` | Local staging directory |
 | `FAB_SHUFFLE_MAX_MEMORY_BYTES` | `1073741824` (1 GiB) | Per-operation in-memory processing budget; not a container RAM cap |
-| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota or legacy bcp cap |
+| `FAB_SHUFFLE_MAX_DISK_STAGING_BYTES` | `10737418240` (10 GiB) | Per-operation bounded schema/checkpoint disk budget; not a share quota |
 | `FAB_SHUFFLE_FILE_TRANSFER_WORKERS` | `4` | Files copied at once within a lakehouse (`1` is serial). `FAB_SHUFFLE_MAX_MEMORY_BYTES` is split between workers; no disk is used |
 | `FAB_SHUFFLE_SCHEMA_CONCURRENCY` | `2` | Concurrent schema transfers |
 | `FAB_SHUFFLE_MAX_RETRIES` | `6` | Retries for throttled/transient Fabric calls |
@@ -690,7 +717,7 @@ API integration. The [support matrix](fabshuffle/fabric/support.py) and
 
 **Use Docker for application execution, tests and lint, on every host OS.** The validation
 target extends the same pinned Debian/Python runtime as the production image, including
-SqlPackage, UnpackDacPac, bcp and ODBC. It adds hash-locked development dependencies
+SqlPackage, UnpackDacPac and ODBC. It adds hash-locked development dependencies
 and digest-pinned Node and PowerShell for the JavaScript UI and generated-script tests.
 
 ```bash

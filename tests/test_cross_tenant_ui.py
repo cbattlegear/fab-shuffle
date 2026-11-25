@@ -12,7 +12,8 @@ import pytest
     "stale_and_failed_assessment", "paired_resume",
     "edit_mappings_before_retry",
     "same_tenant_pair_requires_freeze",
-    "mirror_start_option", "same_tenant_mirror_retry",
+    "mirror_start_option", "same_tenant_mirror_retry", "single_sql_connections",
+    "workspace_name_conflict", "resume_missing_target_conflict",
 ])
 def test_cross_tenant_ui(scenario):
     node = shutil.which("node")
