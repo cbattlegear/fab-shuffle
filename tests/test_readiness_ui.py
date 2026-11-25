@@ -18,6 +18,8 @@ NODE = shutil.which("node")
         "throttle",
         "activity",
         "shared_activity",
+        "dependency_warnings",
+        "dependency_errors",
         "terminal",
         "run_races",
         "filters",

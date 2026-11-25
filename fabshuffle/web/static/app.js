@@ -1129,7 +1129,8 @@ function renderDependencies() {
       "not created pointing back at the source."
     : "References the migration cannot follow, and connections you will have to grant access to. " +
       "The new workspace will be created, but these need fixing before it works.";
-  fillList(container, [...(state.preview.dependencies || []), ...(state.preview.mappingBlockers || [])]);
+  fillList(container, [...(state.preview.dependencies || []), ...(state.preview.mappingBlockers || [])],
+    ".dependency-warnings");
   renderDependencyAssessment();
 }
 
@@ -1203,7 +1204,7 @@ function showDependenciesPending() {
   container.classList.add("pending");
   container.querySelector("h3").textContent = "Checking dependencies…";
   container.querySelector(".hint").hidden = true;
-  container.querySelector("ul").replaceChildren();
+  container.querySelector(".dependency-warnings").replaceChildren();
   renderDependencyAssessment();
 }
 
@@ -1364,10 +1365,10 @@ function renderReview() {
   $("#start-run").textContent = resuming ? "Resume migration" : reassign ? "Reassign workspace" : "Start migration";
 }
 
-function fillList(container, entries) {
+function fillList(container, entries, selector = "ul") {
   container.hidden = !entries.length;
   if (!entries.length) return;
-  const list = container.querySelector("ul");
+  const list = container.querySelector(selector);
   list.innerHTML = "";
   entries.forEach((entry) => {
     const item = document.createElement("li");
